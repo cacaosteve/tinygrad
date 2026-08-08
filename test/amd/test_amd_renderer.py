@@ -1328,6 +1328,54 @@ class TestAMDRenderer(unittest.TestCase):
       getenv.cache_clear()
       to_program_cache.clear()
 
+  def test_half_matmul_b128_overlaps_inflight_a_u16(self):
+    # Next B (B128) issues after A U16 with no waitcnt between — B addr/dest VGPRs are
+    # distinct from live A load dests (pre-regalloc hoist before A pack).
+    import os, re
+    old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "TC_LOCAL", "TC_UPCAST", "TC_UPCAST_TILES", "ALLOW_UPCAST16")}
+    for k in old: os.environ.pop(k, None)
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      with Context(BEAM=0):
+        ast = (Tensor.empty(256, 256, dtype=dtypes.half, device="AMD") @
+               Tensor.empty(256, 256, dtype=dtypes.half, device="AMD"))
+        prg = _to_prg(ast.schedule_linear().src[-1].src[0])
+      names = _amd_inst_names(prg)
+      insts = _REN._insts_from_linear(_prg_lin(prg))
+      found = False
+      for i, n in enumerate(names):
+        if n != "GLOBAL_LOAD_U16": continue
+        for j in range(i + 1, min(i + 80, len(names))):
+          if names[j] == "S_WAITCNT_VMCNT": break
+          if names[j] != "GLOBAL_LOAD_B128": continue
+          found = True
+          def vgpr_idxs(reg) -> set[int]:
+            if reg is None: return set()
+            s = str(reg)
+            if m := re.fullmatch(r"v\[(\d+):(\d+)\]", s):
+              return set(range(int(m.group(1)), int(m.group(2)) + 1))
+            if m := re.fullmatch(r"v\[(\d+)\]", s):
+              return {int(m.group(1))}
+            return set()
+          a_regs: set[int] = set()
+          for k in range(i, j):
+            if names[k] == "GLOBAL_LOAD_U16": a_regs |= vgpr_idxs(getattr(insts[k], "vdst", None))
+          b_regs = vgpr_idxs(getattr(insts[j], "vdst", None)) | vgpr_idxs(getattr(insts[j], "addr", None))
+          for k in range(j - 1, i, -1):
+            if not names[k].startswith(("V_ADD", "V_LSHL", "V_MOV")): break
+            b_regs |= vgpr_idxs(getattr(insts[k], "vdst", None))
+          self.assertFalse(a_regs & b_regs, f"B regs {sorted(b_regs)} overlap A U16 dests {sorted(a_regs)}")
+          break
+        if found: break
+      self.assertTrue(found, "expected B128 issued while A U16 still in flight (no intervening waitcnt)")
+    finally:
+      for k, v in old.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+      getenv.cache_clear()
+      to_program_cache.clear()
+
   def test_half_matmul_default_is_spill_free_sixteen_wmma(self):
     # Default ISA: register path UPCAST=4×4 (product 16) + LOCAL=4 → 16 WMMA.
     import os

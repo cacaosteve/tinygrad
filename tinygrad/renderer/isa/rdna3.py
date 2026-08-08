@@ -1655,6 +1655,66 @@ def _sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
     i += 1
   return out
 
+def _is_addr_alu(u:UOp) -> bool:
+  return (u.op is Ops.INS and u.arg in (AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR,
+                                        AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.MOV) and
+          u.dtype.scalar() in dtypes.ints)
+
+def _hoist_b_between_a_and_pack(ops:list[UOp]) -> list[UOp]:
+  """Issue wide B (B128) while scalar A U16 loads are still in flight.
+
+  Pre-regalloc: A loads → PACK_A → WMMA → EXTRACT* → B_addr* → B_LOAD → [PACK_B]
+  becomes:      A loads → B_addr* → B_LOAD → [PACK_B] → PACK_A → WMMA → ...
+  Regalloc then gives B distinct VGPRs from live A dests. Post-regalloc hoist alone cannot:
+  B addr ADDs otherwise reuse A's load VGPRs (dest-as-addr band).
+  """
+  if not any(u.op is Ops.INS and u.arg is AMDOps.WMMA for u in ops): return ops
+  out = list(ops)
+  i = 0
+  while i < len(out):
+    u = out[i]
+    if not (u.op is Ops.INS and u.arg is AMDOps.LOAD and u.dtype.scalar() is dtypes.half and _elem_count(u) >= 8):
+      i += 1
+      continue
+    start = i
+    while start > 0 and _is_addr_alu(out[start - 1]): start -= 1
+    end = i + 1
+    if end < len(out) and out[end].op is Ops.INS and out[end].arg is AMDOps.PACK_F16 and _pack_f16_is_vec_load(out[end]):
+      end += 1
+    j = start - 1
+    while j >= 0 and out[j].op is Ops.INS and out[j].arg is AMDOps.EXTRACT: j -= 1
+    if j < 0 or not (out[j].op is Ops.INS and out[j].arg is AMDOps.WMMA):
+      i += 1
+      continue
+    wmma_i = j
+    j -= 1
+    if j < 0 or not (out[j].op is Ops.INS and out[j].arg is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(out[j])):
+      i += 1
+      continue
+    pack_a_i = j
+    k = pack_a_i - 1
+    while k >= 0 and out[k].op is Ops.INS and out[k].arg is AMDOps.LOAD and \
+          out[k].dtype.scalar() is dtypes.half and _elem_count(out[k]) == 1:
+      k -= 1
+    if k + 1 >= pack_a_i:
+      i += 1
+      continue
+    mid, chunk = out[pack_a_i:start], out[start:end]
+    mid_set, chunk_set = set(mid), set(chunk)
+    if any(s in mid_set for cu in chunk for s in cu.src):
+      i += 1
+      continue
+    if any(s in chunk_set for mu in mid for s in mu.src):
+      i += 1
+      continue
+    if any(s in chunk_set for s in out[wmma_i].src):
+      i += 1
+      continue
+    del out[start:end]
+    out[pack_a_i:pack_a_i] = chunk
+    i = pack_a_i + len(chunk)
+  return out
+
 def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
   # Bubble LOAD/PACK_F16 (+ int addr) above preceding WMMAs when independent.
   # Must not clobber a WMMA's A/B/ACC — UPCAST≥4 reuses PACK VGPRs across tiles; hoisting
@@ -2384,11 +2444,14 @@ class AMDRenderer(ISARenderer):
     return next((r for r in x.tag[0].cons if r.index == want), None)
 
   def after_pre_regalloc(self, lst:list[UOp]) -> list[UOp]:
-    """Schedule each f32→f16 CAST immediately before its STORE.
+    """Pre-regalloc schedule tweaks: A/B VMEM overlap, then cast-before-store.
 
-    Product-16 epilogue otherwise keeps 128 half temps live at once; regalloc spills them into
-    live WMMA ACC (v126+) and clobbers unread lanes (half rows 62–63).
+    1. Hoist next B between A U16 issue and A pack so B gets distinct VGPRs from live A dests.
+    2. Schedule each f32→f16 CAST immediately before its STORE — product-16 epilogue otherwise
+       keeps 128 half temps live; regalloc spills them into live WMMA ACC (v126+) and clobbers
+       unread lanes (half rows 62–63).
     """
+    lst = _hoist_b_between_a_and_pack(lst)
     uses: dict[UOp, list[UOp]] = {}
     for u in lst:
       for src in u.src: uses.setdefault(src, []).append(u)
