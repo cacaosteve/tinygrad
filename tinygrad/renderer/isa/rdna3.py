@@ -1199,7 +1199,7 @@ def _promote_reg_buffer(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
 
 def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|None:
   if x in _amd_skip(ctx): return x, []
-  # Fused B LOADs stay in the list (address rewrite) but drop VGPR tags — PACK emits u16+d16_hi.
+  # Fused hi LOADs stay for address rewrite but drop VGPR tags — emit path does d16_hi into lo.
   if x in _amd_fused_d16(ctx):
     nx = x.replace(tag=None)
     return nx, [nx]
