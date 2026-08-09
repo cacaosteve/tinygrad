@@ -503,23 +503,27 @@ def _compute_amd_skip(uops:list[UOp]) -> set[UOp]:
   skip |= identity_loads
   return skip
 
-def _fused_d16_hi_loads(uops:list[UOp]) -> set[UOp]:
-  # PACK_F16 emits u16+d16_hi into the pack VGPR — scalar LOADs are encode-only skip.
-  # Do not put these in _compute_amd_skip: pre_regalloc `_promote_reg_access` drops skip INS
-  # from the linear list (`return x, []`), which breaks live ranges for PACK srcs.
-  fused: set[UOp] = set()
+def _d16_hi_lo_map(uops:list[UOp]) -> dict[UOp, UOp]:
+  pairs: dict[UOp, UOp] = {}
+  candidates: set[UOp] = set()
   for u in uops:
     if u.op is not Ops.INS or u.arg is not AMDOps.PACK_F16: continue
     if _pack_f16_is_vec_load(u) or len(u.src) < 2 or len(u.src) % 2: continue
     for i in range(len(u.src) // 2):
       lo, hi = u.src[2 * i], u.src[2 * i + 1]
-      if _pack_f16_d16_hi_pair(lo, hi): fused.update((lo, hi))
-  if not fused: return set()
+      if _pack_f16_d16_hi_pair(lo, hi):
+        pairs[hi] = lo
+        candidates.update((lo, hi))
+  if not pairs: return {}
   uses: dict[UOp, int] = {}
   for u in uops:
     for su in u.src:
-      if su in fused: uses[su] = uses.get(su, 0) + 1
-  return {ld for ld in fused if uses.get(ld, 0) <= 1}
+      if su in candidates: uses[su] = uses.get(su, 0) + 1
+  return {hi: lo for hi, lo in pairs.items() if uses.get(hi, 0) <= 1 and uses.get(lo, 0) <= 1}
+
+def _fused_d16_hi_loads(uops:list[UOp]) -> set[UOp]:
+  # Hi LOADs only (no VGPR). Not in _compute_amd_skip — promote drops those from the list.
+  return set(_d16_hi_lo_map(uops))
 
 def _amd_skip(ctx:PreRegAllocContext) -> set[UOp]:
   if "skip" not in ctx.scratch and ctx.uops: ctx.scratch["skip"] = _compute_amd_skip(ctx.uops)
@@ -819,7 +823,8 @@ def _pack_f16_half2_load(lo:UOp, hi:UOp) -> tuple[UOp, int]|None:
 
 def _pack_f16_d16_hi_pair(lo:UOp, hi:UOp) -> bool:
   # Two scalar global half LOADs → global_load_u16 + global_load_d16_hi_b16 into one VGPR (LLVM).
-  # Default off: AMD_D16_HI=1 can hang ones@ones on gfx1100 (wait timeout); v_pack path is correct.
+  # Default off until HW-proven in GEMM. data=vdst required (unset DATA encodes as v0).
+  # Hi LOADs emit d16_hi into lo VGPR; PACK only MOVs. lo-before-hi must be pre-regalloc.
   if not getenv("AMD_D16_HI", 0): return False
   if not (lo.op is Ops.INS and lo.arg is AMDOps.LOAD and hi.op is Ops.INS and hi.arg is AMDOps.LOAD): return False
   if _elem_count(lo) != 1 or _elem_count(hi) != 1: return False
@@ -831,44 +836,6 @@ def _pack_f16_d16_hi_pair(lo:UOp, hi:UOp) -> bool:
 def _pack_f16_has_d16_hi(u:UOp) -> bool:
   if _pack_f16_is_vec_load(u) or len(u.src) < 2 or len(u.src) % 2: return False
   return any(_pack_f16_d16_hi_pair(u.src[2 * i], u.src[2 * i + 1]) for i in range(len(u.src) // 2))
-
-def _pack_f16_emit_d16_burst(u:UOp) -> list|None:
-  # LLVM-style: hoist byte-addr scales, then s_clause + tight VMEM bursts (no LSHL between loads).
-  # Lo: scale into pack lane, load u16 (dest-as-addr). Hi: scale hi idx in place (idx dead after), d16_hi.
-  if not _pack_f16_has_d16_hi(u): return None
-  n = len(u.src) // 2
-  pairs = [(u.src[2 * i], u.src[2 * i + 1]) for i in range(n)]
-  if not all(_pack_f16_d16_hi_pair(lo, hi) for lo, hi in pairs): return None
-  item = _mem_itemsize(pairs[0][0].dtype)
-  if item != 2: return None
-  base = greg(u)
-  ret: list = []
-  # --- lo u16: addr in pack lane ---
-  for i, (lo, _) in enumerate(pairs):
-    dst = _reg_lane(base, i)
-    pre, addr = _scaled_addr(dst, lo.src[1], item)
-    if addr != dst: ret += pre + [r3.v_mov_b32_e32(dst, addr)]
-    else: ret += pre
-  if n: ret.append(r3.s_clause(simm16=n - 1))
-  for i, (lo, _) in enumerate(pairs):
-    dst = _reg_lane(base, i)
-    ret.append(r3.global_load_u16(dst, dst, saddr=_src(lo.src[0])))
-  # --- hi d16_hi: scale hi element idx in place (idx dead after), then clause+loads ---
-  hi_addrs: list[Reg] = []
-  scaled: set[int] = set()
-  for _, hi in pairs:
-    src = _src(hi.src[1])
-    if not isinstance(src, Reg) or src.offset < 256:
-      # SGPR/imm index — fall back to TMP path for this pack
-      return None
-    if src.offset not in scaled:
-      ret.append(r3.v_lshlrev_b32_e64(src, 1, src))
-      scaled.add(src.offset)
-    hi_addrs.append(src)
-  if n: ret.append(r3.s_clause(simm16=n - 1))
-  for i, (_, hi) in enumerate(pairs):
-    ret.append(r3.global_load_d16_hi_b16(_reg_lane(base, i), hi_addrs[i], saddr=_src(hi.src[0])))
-  return ret
 
 def _pack_f16_identity_load(u:UOp) -> UOp|None:
   # PACK_F16(EXTRACT(L,0)..EXTRACT(L,2n-1)) with L = half×n LLOAD → reuse L's VGPRs.
@@ -903,8 +870,7 @@ def _pack_f16_insts(u:UOp) -> list:
       return []
     return [r3.v_mov_b32_e32(_dst(u), _src(src))]
   if len(u.src) < 2 or len(u.src) % 2: raise CompileError(f"pack_f16 needs even src, got {len(u.src)}")
-  if (burst := _pack_f16_emit_d16_burst(u)) is not None: return burst
-  ret, d16_hi = [], []
+  ret = []
   for i in range(len(u.src) // 2):
     lo, hi = u.src[2*i], u.src[2*i+1]
     if (got := _pack_f16_half2_load(lo, hi)) is not None:
@@ -912,20 +878,17 @@ def _pack_f16_insts(u:UOp) -> list:
       src_slot, dst_slot = _reg_lane(greg(base), slot), _reg_lane(greg(u), i)
       if src_slot != dst_slot: ret.append(r3.v_mov_b32_e32(dst_slot, src_slot))
       continue
-    # Fallback when burst cannot in-place scale hi idx (SGPR/imm).
-    if _pack_f16_d16_hi_pair(lo, hi):
-      dst = _reg_lane(greg(u), i)
-      pre0, a0 = _scaled_addr(TMP_VADDR, lo.src[1], _mem_itemsize(lo.dtype))
-      pre1, a1 = _scaled_addr(TMP_VDATA, hi.src[1], _mem_itemsize(hi.dtype))
-      ret += pre0 + [r3.global_load_u16(dst, a0, saddr=_src(lo.src[0]))]
-      d16_hi += pre1 + [r3.global_load_d16_hi_b16(dst, a1, saddr=_src(hi.src[0]))]
+    # lo VGPR already has u16+d16_hi packed — MOV into pack lane.
+    if _pack_f16_d16_hi_pair(lo, hi) and isinstance(greg(lo), Register):
+      src_slot, dst_slot = _dst(lo), _reg_lane(greg(u), i)
+      if src_slot != dst_slot: ret.append(r3.v_mov_b32_e32(dst_slot, src_slot))
       continue
     # Always v_pack from lo/hi. Do not shortcut through the half2 load VGPR: EXTRACT(hi)
     # may LSHR that load in place, so a later mov from the load reg sees [hi,0] (2026-07-20).
     pre0, a = _vgpr_data(TMP_VDATA, lo)
     pre1, b = _vgpr_data(TMP_VADDR, hi)
     ret += pre0 + pre1 + [r3.v_pack_b32_f16(_reg_lane(greg(u), i), a, b)]
-  return ret + d16_hi
+  return ret
 
 AMD_ATOMIC_ADD = "__hip_atomic_fetch_add({0}, {1}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);"
 def _atomic_add_ins(x:UOp) -> UOp|None:
@@ -1349,7 +1312,8 @@ def _cmp_eq(u:UOp):
 
 _MASKED_MEM = (AMDOps.LOAD, AMDOps.STORE, AMDOps.LLOAD, AMDOps.LSTORE, AMDOps.SLOAD, AMDOps.SSTORE)
 
-def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_cache:_StoreAddrCache|None=None):
+def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_cache:_StoreAddrCache|None=None,
+                  d16_hi_lo:dict[UOp, UOp]|None=None):
   if u.op is not Ops.INS or (skip and u in skip): return []
   if isinstance(u.arg, Inst): return [u.arg]
   match u.arg:
@@ -1479,6 +1443,15 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       pre, true_val = _vgpr_data(TMP_VDATA, u.src[1])
       return pre + [r3.v_cndmask_b32_e32(_dst(u), _src(u.src[2]), true_val)]
     case AMDOps.LOAD:
+      if (lo := (d16_hi_lo or {}).get(u)) is not None:
+        # Fused hi: merge into lo VGPR. data=vdst required (unset DATA → v0).
+        # Use TMP_VDATA (v254) not TMP_VADDR (v255): d16_hi with addr=v255 misbehaves on gfx1100.
+        # Caller flush_regs(lo) before emit — no embedded vmcnt(0) (that serialized every pair).
+        dst = _dst(lo)
+        pre, addr = _scaled_addr(TMP_VDATA, u.src[1], _mem_itemsize(u.dtype))
+        pre, addr = _masked_addr(pre, addr, masked)
+        if addr != TMP_VDATA: pre = pre + [r3.v_mov_b32_e32(TMP_VDATA, addr)]
+        return pre + [r3.global_load_d16_hi_b16(dst, TMP_VDATA, dst, saddr=_src(u.src[0]))]
       pre, addr = _scaled_addr(_dst(u) if _reg_slots(u) == 1 else TMP_VADDR, u.src[1], _mem_itemsize(u.dtype))
       pre, addr = _masked_addr(pre, addr, masked)
       return pre + _global_load_insts(u, addr)
@@ -1861,9 +1834,23 @@ def _clauseable_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   if u in skip or mask_depth or u.op is not Ops.INS or u.arg is not AMDOps.LOAD: return False
   return _reg_slots(u) == 1 and u.dtype.scalar() is dtypes.half
 
+def _order_d16_lo_before_hi(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp]:
+  # Fused hi must follow its lo in BOTH regalloc and emit order. Emit-only reorder lets lo's
+  # dest-as-addr reuse hi's index VGPR after regalloc ended that index's live range at hi.
+  if not d16_hi_lo: return ops
+  out = list(ops)
+  for hi, lo in d16_hi_lo.items():
+    try: hi_i, lo_i = out.index(hi), out.index(lo)
+    except ValueError: continue
+    if hi_i > lo_i: continue
+    out.pop(hi_i)
+    out.insert(out.index(lo) + 1, hi)
+  return out
+
 def insts_from_linear(lin:UOp):
   ops = list(lin.src)
-  skip = _compute_amd_skip(ops) | _fused_d16_hi_loads(ops)
+  skip = _compute_amd_skip(ops)  # fused d16 hi LOADs still emit (d16_hi into lo)
+  d16_hi_lo = _d16_hi_lo_map(ops)
   mask_depth = 0
   # vm: (dest_regs, n_vmem_ops) in issue order — soft vmcnt must count ops, not UOps
   # (PACK_F16 can emit 16 loads; treating that as 1 desyncs vmcnt → MMU faults).
@@ -1903,7 +1890,8 @@ def insts_from_linear(lin:UOp):
     if (n:=_vm_load_count(insts)) and regs: pending_vm.append((regs, n))
   def _pending_src(regs:set[int]) -> bool:
     return any(pr & regs for pr, _ in pending_vm) or bool(pending["lgkm"] & regs)
-  scheduled = _hoist_loads_before_wmma(_sink_wmma_past_loads(_hoist_lloads_before_extracts(ops)))
+  scheduled = _order_d16_lo_before_hi(
+    _hoist_loads_before_wmma(_sink_wmma_past_loads(_hoist_lloads_before_extracts(ops))), d16_hi_lo)
   oi = 0
   while oi < len(scheduled):
     u = scheduled[oi]
@@ -1930,7 +1918,7 @@ def insts_from_linear(lin:UOp):
       else: flush_regs(set().union(*(_reg_idxs(s) for s in u.src), _reg_idxs(u)))
     if u.op is Ops.INS and u.arg is AMDOps.IF_MASK:
       store_addr_cache.clear()
-      emitted = list(insts_for_uop(u, skip))
+      emitted = list(insts_for_uop(u, skip, d16_hi_lo=d16_hi_lo))
       for inst in emitted: emit(inst)
       mask_depth += 1
       if (domain:=_wait_domain_for_load(u)) is not None:
@@ -1948,13 +1936,15 @@ def insts_from_linear(lin:UOp):
       if u.op is Ops.INS and u.arg is AMDOps.END_MASK: mask_depth -= 1
       oi += 1
       continue
+    if u in d16_hi_lo: flush_regs(_reg_idxs(d16_hi_lo[u]))
     # Cluster scalar half loads: all dest-as-addr scales, then s_clause + tight VMEM (LLVM-style B).
     # ~+40% @2048 vs no clause on gfx1100 — always on (no opt-out knob).
-    if _clauseable_half_gload(u, skip, mask_depth):
+    if u not in d16_hi_lo and _clauseable_half_gload(u, skip, mask_depth):
       j = oi + 1
-      while j < len(scheduled) and _clauseable_half_gload(scheduled[j], skip, mask_depth): j += 1
+      while j < len(scheduled) and scheduled[j] not in d16_hi_lo and \
+            _clauseable_half_gload(scheduled[j], skip, mask_depth): j += 1
       if j - oi >= 2:
-        parts = [list(insts_for_uop(scheduled[k], skip, False)) for k in range(oi, j)]
+        parts = [list(insts_for_uop(scheduled[k], skip, False, d16_hi_lo=d16_hi_lo)) for k in range(oi, j)]
         if all(_vm_load_count(p) == 1 for p in parts):
           store_addr_cache.clear()
           scales, loads = [], []
@@ -1970,10 +1960,12 @@ def insts_from_linear(lin:UOp):
           oi = j
           continue
     is_store = u.op is Ops.INS and u.arg is AMDOps.STORE
-    emitted = list(insts_for_uop(u, skip, masked, store_addr_cache if is_store else None))
+    emitted = list(insts_for_uop(u, skip, masked, store_addr_cache if is_store else None, d16_hi_lo))
     # VALU copy of an outstanding VMEM/LDS dest must wait first (PACK/MOV across pools).
     if emitted and u.op is Ops.INS and u.arg in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV):
       src = set().union(*(_reg_idxs(s) for s in u.src))
+      for s in u.src:
+        if s in d16_hi_lo: src |= _reg_idxs(d16_hi_lo[s])
       if src and _pending_src(src): flush_regs(src)
     # EXTRACT between C-stores often emits nothing (pack+lane alias); only clobber CSE on real emits.
     # Keep page CSE across CAST (uses TMP_VDATA, not TMP_VADDR) — cast-before-store otherwise
@@ -1983,11 +1975,21 @@ def insts_from_linear(lin:UOp):
       store_addr_cache.clear()
     elif not is_store and any(getattr(i, "vdst", None) == TMP_VADDR for i in emitted):
       store_addr_cache.clear()
-    for inst in emitted: emit(inst)
+    vm_after_wait: list = []
+    saw_vm_wait0 = False
+    for inst in emitted:
+      emit(inst)
+      if getattr(inst, "op_name", "") == "S_WAITCNT_VMCNT" and getattr(inst, "simm16", None) == 0:
+        pending_vm.clear()
+        vm_after_wait = []
+        saw_vm_wait0 = True
+      else:
+        vm_after_wait.append(inst)
     if u.op is Ops.INS and u.arg is AMDOps.END_MASK: mask_depth -= 1
     if (domain:=_wait_domain_for_load(u)) is not None:
-      if domain == "vm": note_vm(_reg_idxs(u), emitted)
-      else: pending[domain] |= _reg_idxs(u)
+      regs = _reg_idxs(d16_hi_lo[u]) if u in d16_hi_lo else _reg_idxs(u)
+      if domain == "vm": note_vm(regs, vm_after_wait if saw_vm_wait0 else emitted)
+      else: pending[domain] |= regs
     if (domain:=_wait_domain_for_store(u)) is not None:
       pending[domain] |= _store_src_regs(u)
     oi += 1
@@ -2520,6 +2522,8 @@ class AMDRenderer(ISARenderer):
     3. Schedule each f32→f16 CAST immediately before its STORE — product-16 epilogue otherwise
        keeps 128 half temps live; regalloc spills them into live WMMA ACC (v126+) and clobbers
        unread lanes (half rows 62–63).
+    4. AMD_D16_HI: keep each fused lo LOAD before its hi — post-regalloc-only reorder lets lo
+       dest-as-addr reuse hi's still-live index VGPR (MMU on gfx1100).
     """
     lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
     uses: dict[UOp, list[UOp]] = {}
@@ -2532,14 +2536,15 @@ class AMDRenderer(ISARenderer):
       us = uses.get(u, [])
       if len(us) == 1 and us[0].op is Ops.INS and us[0].arg is AMDOps.STORE and len(us[0].src) > 2 and us[0].src[2] is u:
         store_cast[us[0]] = u
-    if not store_cast: return lst
-    skip = set(store_cast.values())
-    out: list[UOp] = []
-    for u in lst:
-      if u in skip: continue
-      if u in store_cast: out.append(store_cast[u])
-      out.append(u)
-    return out
+    if store_cast:
+      skip = set(store_cast.values())
+      out: list[UOp] = []
+      for u in lst:
+        if u in skip: continue
+        if u in store_cast: out.append(store_cast[u])
+        out.append(u)
+      lst = out
+    return _order_d16_lo_before_hi(lst, _d16_hi_lo_map(lst))
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True
     if x.op is not Ops.INS or x.dtype.scalar() not in (dtypes.int32, dtypes.uint32): return False
