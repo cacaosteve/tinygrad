@@ -1878,6 +1878,29 @@ class TestAMDRenderer(unittest.TestCase):
       getenv.cache_clear()
       to_program_cache.clear()
 
+  def test_half_matmul_prefetch_next_a_gated_by_k_tiles(self):
+    # Next-A B128 prefetch: on for N=2048 (K tiles <256); off for N=4096 (HW regress).
+    import os
+    import tinygrad.renderer.isa.rdna3 as rdna3
+    old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_PREFETCH_A")}
+    os.environ["TC_LDS_AB"] = "0"
+    os.environ.pop("AMD_PREFETCH_A", None)
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      for n, want in ((2048, True), (4096, False)):
+        with Context(BEAM=0):
+          ast = (Tensor.empty(n, n, dtype=dtypes.half, device="AMD") @
+                 Tensor.empty(n, n, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
+          _to_prg(ast.schedule_linear().src[-1].src[0])
+        self.assertEqual(rdna3._PREFETCH_NEXT_A, want, f"N={n}")
+    finally:
+      for k, v in old.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+      getenv.cache_clear()
+      to_program_cache.clear()
+
   def test_tc_lds_ab_not_default_until_faster(self):
     # Step C: ISA default is register+B128 until LDS wins @4096 on HW.
     import os
