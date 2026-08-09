@@ -2268,11 +2268,11 @@ def apply_tc_hand_opts(tk, rngs):
   from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
   lds_ab = getenv("TC_LDS_AB", 0)
   # Register path: ALLOW_UPCAST16 defaults on → product-16 (4×4).
-  # LOCAL=4 wins @2048; LOCAL=2 wins @4096 after B-prefetch + soft WMMA wait (K tiles ≥256).
+  # LOCAL=4 wins @2048 and @4096 on gfx1100 (3-trial medians); LOCAL=2 was slower @4096.
   # LDS path keeps ALLOW_UPCAST16 off (spills); product-8 + LOCAL=2×2 remains the LDS default.
   up_cap = getenv("TC_UPCAST", 4)
   k_tiles = int(rngs[2].src[0].arg) if len(rngs) > 2 and rngs[2].src[0].op is Ops.CONST else 0
-  loc_cap = getenv("TC_LOCAL", 2 if lds_ab or k_tiles >= 256 else 4)
+  loc_cap = getenv("TC_LOCAL", 2 if lds_ab else 4)
   up16 = _allow_upcast16()
   max_tiles = min(getenv("TC_UPCAST_TILES", 16 if up16 else 8), 8 if not up16 else 10**9)
   if lds_ab and getenv("ALLOW_LDS_PRODUCT8", 1) == 0:
