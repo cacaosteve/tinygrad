@@ -834,10 +834,6 @@ def _pack_f16_d16_hi_pair(lo:UOp, hi:UOp) -> bool:
   if _is_lds_ref(hi.src[0]) or _is_scratch_ref(hi.src[0]): return False
   return True
 
-def _pack_f16_has_d16_hi(u:UOp) -> bool:
-  if _pack_f16_is_vec_load(u) or len(u.src) < 2 or len(u.src) % 2: return False
-  return any(_pack_f16_d16_hi_pair(u.src[2 * i], u.src[2 * i + 1]) for i in range(len(u.src) // 2))
-
 def _pack_f16_identity_load(u:UOp) -> UOp|None:
   # PACK_F16(EXTRACT(L,0)..EXTRACT(L,2n-1)) with L = half×n LLOAD → reuse L's VGPRs.
   if len(u.src) < 2 or len(u.src) % 2: return None
