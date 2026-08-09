@@ -15,9 +15,6 @@ from tinygrad.schedule.rangeify import BufferizeOpts
 from tinygrad.uop import Ops, FastEnum, auto
 from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
 
-# Auto AMD_D16_HI when apply_tc_hand_opts sees K tiles ≥128 (~N≥2048 half GEMM).
-_D16_HI_AUTO = False
-
 # RDNA3: kernarg in s[0:1], local ids packed in v0. Even SGPR bases for 64-bit kernarg loads.
 # WGID follows USER_SGPR_COUNT: s2 when count=2 (1D locals); s15 when gfx1100 pads to 15 (2D locals).
 KERNARG_REG = s[0:1]
@@ -823,10 +820,10 @@ def _pack_f16_half2_load(lo:UOp, hi:UOp) -> tuple[UOp, int]|None:
   return base, lo_lane // 2
 
 def _pack_f16_d16_hi_pair(lo:UOp, hi:UOp) -> bool:
-  # Two scalar global half LOADs → global_load_u16 + global_load_d16_hi_b16 into one VGPR (LLVM).
-  # Auto-on for K tiles ≥128 (~N≥2048); else off. AMD_D16_HI=0/1 forces. data=vdst required.
+  # Two scalar global half LOADs → global_load_u16 + global_load_d16_hi_b16 into one VGPR.
+  # Opt-in only (AMD_D16_HI=1). Auto-on was a HW loss: hi needs flush_regs(lo) → no B clause.
   # Hi LOADs emit d16_hi into lo; PACK MOVs. lo-before-hi must be pre-regalloc.
-  if not getenv("AMD_D16_HI", 1 if _D16_HI_AUTO else 0): return False
+  if not getenv("AMD_D16_HI", 0): return False
   if not (lo.op is Ops.INS and lo.arg is AMDOps.LOAD and hi.op is Ops.INS and hi.arg is AMDOps.LOAD): return False
   if _elem_count(lo) != 1 or _elem_count(hi) != 1: return False
   if lo.dtype.scalar() is not dtypes.half or hi.dtype.scalar() is not dtypes.half: return False
@@ -2269,15 +2266,12 @@ pm_stage_wmma_ab = PatternMatcher([(UPat(Ops.WMMA, name="wmma"), stage_wmma_ab_t
 
 def apply_tc_hand_opts(tk, rngs):
   from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
-  global _D16_HI_AUTO
   lds_ab = getenv("TC_LDS_AB", 0)
   # Register path: ALLOW_UPCAST16 defaults on → product-16 (4×4).
   # LOCAL=4 wins @2048; LOCAL=2 wins @4096 after B-prefetch + soft WMMA wait (K tiles ≥256).
   # LDS path keeps ALLOW_UPCAST16 off (spills); product-8 + LOCAL=2×2 remains the LDS default.
   up_cap = getenv("TC_UPCAST", 4)
   k_tiles = int(rngs[2].src[0].arg) if len(rngs) > 2 and rngs[2].src[0].op is Ops.CONST else 0
-  # d16_hi wins @2048/@4096 vs v_pack on gfx1100 (5-trial medians); small N stays v_pack.
-  _D16_HI_AUTO = (not lds_ab) and k_tiles >= 128
   loc_cap = getenv("TC_LOCAL", 2 if lds_ab or k_tiles >= 256 else 4)
   up16 = _allow_upcast16()
   max_tiles = min(getenv("TC_UPCAST_TILES", 16 if up16 else 8), 8 if not up16 else 10**9)
