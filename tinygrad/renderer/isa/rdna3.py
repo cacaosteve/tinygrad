@@ -2336,7 +2336,7 @@ def apply_tc_hand_opts(tk, rngs):
   up_cap = getenv("TC_UPCAST", 4)
   k_tiles = int(rngs[2].src[0].arg) if len(rngs) > 2 and rngs[2].src[0].op is Ops.CONST else 0
   # Next-A B128 prefetch: +~2% @2048, −~14% @4096 (VGPR/occupancy) — only below K tiles 256.
-  _PREFETCH_NEXT_A = (not lds_ab) and k_tiles < 256 and getenv("AMD_PREFETCH_A", 1)
+  _PREFETCH_NEXT_A = bool((not lds_ab) and k_tiles < 256 and getenv("AMD_PREFETCH_A", 1))
   loc_cap = getenv("TC_LOCAL", 2 if lds_ab else 4)
   up16 = _allow_upcast16()
   max_tiles = min(getenv("TC_UPCAST_TILES", 16 if up16 else 8), 8 if not up16 else 10**9)
