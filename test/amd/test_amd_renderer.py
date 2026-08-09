@@ -1827,7 +1827,7 @@ class TestAMDRenderer(unittest.TestCase):
       to_program_cache.clear()
 
   def test_half_matmul_register_path_vpack_default(self):
-    # Default AMD_D16_HI off → u16 + v_pack. Pin product-4 1D locals for load counts.
+    # Small GEMM (K tiles <128): default stays u16 + v_pack. Pin product-4 1D locals for load counts.
     import os
     old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_D16_HI", "TC_LOCAL", "TC_UPCAST", "TC_UPCAST_TILES")}
     os.environ["TC_LDS_AB"] = "0"
@@ -1848,6 +1848,29 @@ class TestAMDRenderer(unittest.TestCase):
       self.assertEqual(inst_names.count("GLOBAL_LOAD_D16_HI_B16"), 0)
       self.assertGreater(inst_names.count("V_PACK_B32_F16"), 0)
       self.assertEqual(inst_names.count("V_WMMA_F32_16X16X16_F16"), 4)
+    finally:
+      for k, v in old.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+      getenv.cache_clear()
+      to_program_cache.clear()
+
+  def test_half_matmul_auto_d16_hi_when_k_tiles_ge_128(self):
+    # N=2048 → K tiles ≥128 → auto AMD_D16_HI (unless forced off).
+    import os
+    old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_D16_HI")}
+    os.environ["TC_LDS_AB"] = "0"
+    os.environ.pop("AMD_D16_HI", None)
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      with Context(BEAM=0):
+        ast = (Tensor.empty(2048, 2048, dtype=dtypes.half, device="AMD") @
+               Tensor.empty(2048, 2048, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
+        prg = _to_prg(ast.schedule_linear().src[-1].src[0])
+      inst_names = _amd_inst_names(prg)
+      self.assertGreater(inst_names.count("GLOBAL_LOAD_D16_HI_B16"), 0)
+      self.assertEqual(inst_names.count("V_PACK_B32_F16"), 0)
     finally:
       for k, v in old.items():
         if v is None: os.environ.pop(k, None)
