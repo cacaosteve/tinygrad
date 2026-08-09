@@ -69,3 +69,7 @@ mutants
 dagre/
 graphlib/
 uv.lock
+
+# local agent / session notes (not for upstream)
+.cursor/
+notes/

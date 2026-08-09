@@ -48,6 +48,7 @@ class FourVGPRAMDRenderer(AMDRenderer):
 def _prg_lin(prg): return prg.src[1]
 def _prg_src(prg): return prg.src[2]
 def _prg_bin(prg): return prg.src[3]
+def _amd_rt(prg): return Device["AMD"].runtime(prg.to_elf())
 
 def _amd_desc(prg):
   _, sections, _ = elf_loader(_prg_bin(prg).arg)
@@ -2478,7 +2479,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_hardware_range_smoke(self):
     out = Tensor.empty(8, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     buf, prg = out._buffer().ensure_allocated(), _range_program()
-    rt = Device["AMD"].runtime(prg.arg.function_name, _prg_bin(prg).arg, *prg.arg.aux, runtimevars=prg.arg.runtimevars, prg=prg)
+    rt = _amd_rt(prg)
     rt(buf.get_buf("AMD"), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), list(range(1, 9)))
 
@@ -2487,7 +2488,7 @@ class TestAMDRenderer(unittest.TestCase):
     inp = Tensor(list(range(16)), dtype=dtypes.uint32, device="AMD").contiguous().realize()
     out = Tensor.empty(16, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _two_uint_var_program()
-    rt = Device["AMD"].runtime(prg.arg.function_name, _prg_bin(prg).arg, *prg.arg.aux, runtimevars=prg.arg.runtimevars, prg=prg)
+    rt = _amd_rt(prg)
     rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(2, 3), wait=True)
     self.assertEqual(out.tolist(), [i + 5 for i in range(16)])
 
@@ -2495,7 +2496,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_hardware_reg_buffer_smoke(self):
     out = Tensor.empty(16, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     buf, prg = out._buffer().ensure_allocated(), _reg_buffer_program()
-    rt = Device["AMD"].runtime(prg.arg.function_name, _prg_bin(prg).arg, *prg.arg.aux, runtimevars=prg.arg.runtimevars, prg=prg)
+    rt = _amd_rt(prg)
     rt(buf.get_buf("AMD"), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [i + 6 for i in range(16)])
 
@@ -2505,7 +2506,7 @@ class TestAMDRenderer(unittest.TestCase):
     inp1 = Tensor([100 + i for i in range(16)], dtype=dtypes.uint32, device="AMD").contiguous().realize()
     out = Tensor.empty(16, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp0, inp1)], _gated_load_program()
-    rt = Device["AMD"].runtime(prg.arg.function_name, _prg_bin(prg).arg, *prg.arg.aux, runtimevars=prg.arg.runtimevars, prg=prg)
+    rt = _amd_rt(prg)
     rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [100 + 2*i if i < 4 else i if i < 8 else 0 for i in range(16)])
 
@@ -2531,7 +2532,7 @@ class TestAMDRenderer(unittest.TestCase):
     mask = Tensor([True, False, True, False], dtype=dtypes.bool, device="AMD").contiguous().realize()
     out = Tensor.empty(4, dtype=dtypes.float16, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp0, inp1, mask)], _float16_where_program()
-    rt = Device["AMD"].runtime(prg.arg.function_name, _prg_bin(prg).arg, *prg.arg.aux, runtimevars=prg.arg.runtimevars, prg=prg)
+    rt = _amd_rt(prg)
     rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [1.5, -2.0, 3.5, -4.0])
 
@@ -2541,7 +2542,7 @@ class TestAMDRenderer(unittest.TestCase):
     inp = Tensor(vals, dtype=dtypes.float16, device="AMD").contiguous().realize()
     out = Tensor.empty(4, dtype=dtypes.float16, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _float16_unary_program()
-    rt = Device["AMD"].runtime(prg.arg.function_name, _prg_bin(prg).arg, *prg.arg.aux, runtimevars=prg.arg.runtimevars, prg=prg)
+    rt = _amd_rt(prg)
     rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     expected = [math.sqrt(x) + math.log2(x) + math.trunc(x + 0.75) - math.trunc(x) + 1.0 / x + math.sin(x) for x in vals]
     for got, exp in zip(out.tolist(), expected):
@@ -2553,7 +2554,7 @@ class TestAMDRenderer(unittest.TestCase):
     inp1 = Tensor([2.0, 3.0, 4.0, 5.0], dtype=dtypes.float16, device="AMD").contiguous().realize()
     out = Tensor.empty(4, dtype=dtypes.float16, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp0, inp1)], _float16_fused_mulacc_program()
-    rt = Device["AMD"].runtime(prg.arg.function_name, _prg_bin(prg).arg, *prg.arg.aux, runtimevars=prg.arg.runtimevars, prg=prg)
+    rt = _amd_rt(prg)
     rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [3.0, 7.0, 13.0, 21.0])
 
@@ -2586,7 +2587,7 @@ class TestAMDRenderer(unittest.TestCase):
     div = Tensor([3, -3, 3, -3], dtype=dtypes.int32, device="AMD").contiguous().realize()
     out = Tensor.empty(4, dtype=dtypes.int32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp, div)], _var_divmod_program()
-    rt = Device["AMD"].runtime(prg.arg.function_name, _prg_bin(prg).arg, *prg.arg.aux, runtimevars=prg.arg.runtimevars, prg=prg)
+    rt = _amd_rt(prg)
     rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [-21, 19, 21, -19])
 
@@ -2595,7 +2596,7 @@ class TestAMDRenderer(unittest.TestCase):
     inp = Tensor([0.0, 1.0, 2.0, 3.0], dtype=dtypes.float32, device="AMD").contiguous().realize()
     out = Tensor.empty(4, dtype=dtypes.float32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _exp2_program()
-    rt = Device["AMD"].runtime(prg.arg.function_name, _prg_bin(prg).arg, *prg.arg.aux, runtimevars=prg.arg.runtimevars, prg=prg)
+    rt = _amd_rt(prg)
     rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [1.0, 2.0, 4.0, 8.0])
 
@@ -2604,7 +2605,7 @@ class TestAMDRenderer(unittest.TestCase):
     inp = Tensor([1.0, 4.0, 16.0, 64.0], dtype=dtypes.float32, device="AMD").contiguous().realize()
     out = Tensor.empty(4, dtype=dtypes.float32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _unary_math_program()
-    rt = Device["AMD"].runtime(prg.arg.function_name, _prg_bin(prg).arg, *prg.arg.aux, runtimevars=prg.arg.runtimevars, prg=prg)
+    rt = _amd_rt(prg)
     rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [1.0, 4.0, 8.0, 14.0])
 
@@ -2613,7 +2614,7 @@ class TestAMDRenderer(unittest.TestCase):
     inp = Tensor([-2.0, 0.0, 1.0, math.pi / 2], dtype=dtypes.float32, device="AMD").contiguous().realize()
     out = Tensor.empty(4, dtype=dtypes.float32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _sin_program()
-    rt = Device["AMD"].runtime(prg.arg.function_name, _prg_bin(prg).arg, *prg.arg.aux, runtimevars=prg.arg.runtimevars, prg=prg)
+    rt = _amd_rt(prg)
     rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     for got, expected in zip(out.tolist(), [math.sin(x) for x in [-2.0, 0.0, 1.0, math.pi / 2]]):
       self.assertAlmostEqual(got, expected, places=5)

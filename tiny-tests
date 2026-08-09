@@ -10,8 +10,8 @@
 
   # force bounce instead of tid-fill on LLVM: TC_LDS_TID=0 DEV=AMD:LLVM ./tiny-tests --bench --bench-lds
 
-# UPCAST16 hangs display GPUs — do not run without ALLOW_UPCAST16=1
-# TC_LDS_AB remains opt-in until LDS @4096 beats register (Step C).
+# Register-path default is product-16 (ALLOW_UPCAST16 defaults on; off under TC_LDS_AB).
+# Force product-8: TC_UPCAST_TILES=8. TC_LDS_AB remains opt-in until LDS @4096 beats register.
 # Product-8 LDS: ALLOW_LDS_PRODUCT8=1 (serialized A batches; check mse before bench).
 # HW loop: --counts (inst mix) → N=1024 CNT=1 --bench → N=4096 only if stable.
 """
@@ -43,14 +43,16 @@ def _set_tc_lds_ab(on: bool):
   _clear_tc(*keep)
 
 def _set_upcast16(on: bool):
+  # on=True → product-16 (current register default); on=False → force product-8.
+  os.environ["TC_LDS_AB"] = "0"
   if on:
     os.environ["TC_UPCAST"] = "4"
     os.environ["TC_UPCAST_TILES"] = "16"
     os.environ["ALLOW_UPCAST16"] = "1"
-    os.environ["TC_LDS_AB"] = "0"
     _clear_tc("TC_UPCAST", "TC_UPCAST_TILES", "TC_LDS_AB")
   else:
-    _clear_tc()
+    os.environ["TC_UPCAST_TILES"] = "8"
+    _clear_tc("TC_UPCAST_TILES", "TC_LDS_AB")
     os.environ.pop("ALLOW_UPCAST16", None)
 
 def _mse(n: int = 256) -> float:
@@ -150,7 +152,7 @@ def _counts_half(n: int, label: str) -> dict[str, int]:
 def main():
   p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument("--upcast16", action="store_true",
-                 help="spill-gate + mse + bench default vs TC_UPCAST_TILES=16 (needs ALLOW_UPCAST16=1)")
+                 help="spill-gate + mse + bench product-8 vs default product-16")
   p.add_argument("--bench", action="store_true", help="bench register path (TC_LDS_AB=0) @N")
   p.add_argument("--bench-lds", action="store_true", help="also bench TC_LDS_AB=1 after --bench")
   p.add_argument("--bench-reg", action="store_true", help="alias of --bench (register is default)")
@@ -167,28 +169,23 @@ def main():
   print(f"DEV={os.environ.get('DEV', '(unset)')}  renderer={ren_name}  N={n}  CNT={cnt}  rev={rev}  bench=float-out", flush=True)
 
   if args.upcast16:
-    if os.environ.get("ALLOW_UPCAST16", "0") != "1":
-      raise SystemExit(
-        "REFUSED: UPCAST16 disconnects gfx1100 display GPUs (2026-07-20) even with SPILL=0 offline.\n"
-        "Stay on default tiles=8. Override only on compute-only: ALLOW_UPCAST16=1 ./tiny-tests --upcast16"
-      )
-    print("WARNING: ALLOW_UPCAST16=1 — may TDR/disconnect", flush=True)
+    # Default register path is product-16; compare against forced product-8.
     _set_upcast16(False)
-    d = _counts_half(256, "default@256")
+    d = _counts_half(256, "product8@256")
     _set_upcast16(True)
-    u = _counts_half(256, "UPCAST16@256")
+    u = _counts_half(256, "product16@256")
     if d["SPILL"] or d["FILL"] or u["SPILL"] or u["FILL"]:
-      raise SystemExit("SPILL/FILL nonzero — abort UPCAST16")
+      raise SystemExit("SPILL/FILL nonzero — abort product-16 compare")
     if u["WMMA"] < 16:
-      raise SystemExit(f"expected >=16 WMMA, got {u['WMMA']}")
+      raise SystemExit(f"expected >=16 WMMA on product-16, got {u['WMMA']}")
     if not args.skip_mse:
       mse = _mse(256)
-      print(f"UPCAST16 mse@256 = {mse}")
+      print(f"product16 mse@256 = {mse}")
       if mse > 1e-2: raise SystemExit(f"mse too high: {mse}")
     _set_upcast16(False)
-    _bench_half(n, cnt, "default")
+    _bench_half(n, cnt, "product8")
     _set_upcast16(True)
-    _bench_half(n, cnt, "UPCAST16")
+    _bench_half(n, cnt, "product16")
     return
 
   # mse on the path we are about to time (register unless --bench-lds / --counts needs both)
