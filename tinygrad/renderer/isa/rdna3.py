@@ -823,9 +823,9 @@ def _pack_f16_half2_load(lo:UOp, hi:UOp) -> tuple[UOp, int]|None:
 
 def _pack_f16_d16_hi_pair(lo:UOp, hi:UOp) -> bool:
   # Two scalar global half LOADs → global_load_u16 + global_load_d16_hi_b16 into one VGPR (LLVM).
-  # Default off until HW-proven in GEMM. data=vdst required (unset DATA encodes as v0).
+  # Default on (gfx1100): ~+9% @4096 vs v_pack; AMD_D16_HI=0 opts out. data=vdst required.
   # Hi LOADs emit d16_hi into lo VGPR; PACK only MOVs. lo-before-hi must be pre-regalloc.
-  if not getenv("AMD_D16_HI", 0): return False
+  if not getenv("AMD_D16_HI", 1): return False
   if not (lo.op is Ops.INS and lo.arg is AMDOps.LOAD and hi.op is Ops.INS and hi.arg is AMDOps.LOAD): return False
   if _elem_count(lo) != 1 or _elem_count(hi) != 1: return False
   if lo.dtype.scalar() is not dtypes.half or hi.dtype.scalar() is not dtypes.half: return False
