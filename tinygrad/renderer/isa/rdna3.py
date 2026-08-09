@@ -146,7 +146,7 @@ def _reg_lane(reg:Register, lane:int) -> Reg:
   return _reg_to_amd(Register(f"{reg.name}_{lane}", reg.index + lane))
 def _parallel_vmov(moves:list[tuple[Reg, Reg|int|float]]) -> list:
   pending = [(dst, src) for dst,src in moves if not isinstance(src, Reg) or dst != src]
-  ret = []
+  ret: list = []
   while pending:
     # Pair zero-imm into VOPD on even/odd VGPR banks (hand WMMA ACC init).
     if len(pending) >= 2:
