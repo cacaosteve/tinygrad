@@ -17,6 +17,8 @@ from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
 
 # RDNA3: kernarg in s[0:1], local ids packed in v0. Even SGPR bases for 64-bit kernarg loads.
 # WGID follows USER_SGPR_COUNT: s2 when count=2 (1D locals); s15 when gfx1100 pads to 15 (2D locals).
+# Next-A B128 prefetch helps @2048 (~+2%) but regresses @4096 (~−14%); set from apply_tc_hand_opts.
+_PREFETCH_NEXT_A = False
 KERNARG_REG = s[0:1]
 WGID = tuple(Register(f"s{i}", i) for i in range(2, 5))  # 1D default; 2D uses s15+ via _wgid_reg
 LID = tuple(Register(f"v{i}", 256+i) for i in range(3))
@@ -1690,6 +1692,66 @@ def _hoist_b_between_a_and_pack(ops:list[UOp]) -> list[UOp]:
     i = pack_a_i + len(chunk)
   return out
 
+def _prefetch_next_a_b128_before_pack(ops:list[UOp]) -> list[UOp]:
+  """Issue next wide A (B128) before current PACK_A so both A tiles are in flight.
+
+  Pre-regalloc: A0 → PACK_A0 → WMMA* → … → A1_addr* → A1
+  becomes:      A0 → A1_addr* → A1 → PACK_A0 → WMMA* → …
+  Regalloc assigns A0/A1 distinct VGPRs (needs ~+8 VGPR). Emit soft-waits leave A1 in flight.
+  """
+  if not any(u.op is Ops.INS and u.arg is AMDOps.WMMA for u in ops): return ops
+  out = list(ops)
+  i = 0
+  while i < len(out):
+    u = out[i]
+    if not (u.op is Ops.INS and u.arg is AMDOps.PACK_F16 and _pack_f16_is_vec_load(u)):
+      i += 1
+      continue
+    if i + 1 >= len(out) or not (out[i + 1].op is Ops.INS and out[i + 1].arg is AMDOps.WMMA):
+      i += 1
+      continue
+    if out[i + 1].src[1] is not u and out[i + 1].src[2] is not u:
+      i += 1
+      continue
+    # Find next wide A after this pack (skip WMMA/PACK/B-u16/EXTRACT/addr).
+    j = i + 1
+    while j < len(out):
+      v = out[j]
+      if v.op is Ops.INS and v.arg is AMDOps.LOAD and v.dtype.scalar() is dtypes.half and _elem_count(v) >= 8:
+        break
+      if v.op is Ops.INS and v.arg in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.STORE,
+                                       AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER):
+        j = -1
+        break
+      j += 1
+    else:
+      j = -1
+    if j < 0:
+      i += 1
+      continue
+    start = j
+    while start > i + 1 and _is_addr_alu(out[start - 1]): start -= 1
+    if start <= i + 1:
+      i += 1
+      continue
+    end = j + 1
+    mid, chunk = out[i:start], out[start:end]
+    mid_set, chunk_set = set(mid), set(chunk)
+    if any(s in mid_set for cu in chunk for s in cu.src):
+      i += 1
+      continue
+    if any(s in chunk_set for mu in mid for s in mu.src):
+      i += 1
+      continue
+    # Don't hoist an A that feeds a WMMA we're skipping past (already its input).
+    if any(s in chunk_set for s in out[i + 1].src):
+      i += 1
+      continue
+    del out[start:end]
+    out[i:i] = chunk
+    i = i + len(chunk) + len(mid)
+  return out
+
 def _prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
   """Issue next strided B U16 tile while current B U16 loads are still in flight.
 
@@ -2266,12 +2328,15 @@ pm_stage_wmma_ab = PatternMatcher([(UPat(Ops.WMMA, name="wmma"), stage_wmma_ab_t
 
 def apply_tc_hand_opts(tk, rngs):
   from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+  global _PREFETCH_NEXT_A
   lds_ab = getenv("TC_LDS_AB", 0)
   # Register path: ALLOW_UPCAST16 defaults on → product-16 (4×4).
   # LOCAL=4 wins @2048 and @4096 on gfx1100 (3-trial medians); LOCAL=2 was slower @4096.
   # LDS path keeps ALLOW_UPCAST16 off (spills); product-8 + LOCAL=2×2 remains the LDS default.
   up_cap = getenv("TC_UPCAST", 4)
   k_tiles = int(rngs[2].src[0].arg) if len(rngs) > 2 and rngs[2].src[0].op is Ops.CONST else 0
+  # Next-A B128 prefetch: +~2% @2048, −~14% @4096 (VGPR/occupancy) — only below K tiles 256.
+  _PREFETCH_NEXT_A = (not lds_ab) and k_tiles < 256 and getenv("AMD_PREFETCH_A", 1)
   loc_cap = getenv("TC_LOCAL", 2 if lds_ab else 4)
   up16 = _allow_upcast16()
   max_tiles = min(getenv("TC_UPCAST_TILES", 16 if up16 else 8), 8 if not up16 else 10**9)
@@ -2516,14 +2581,16 @@ class AMDRenderer(ISARenderer):
   def after_pre_regalloc(self, lst:list[UOp]) -> list[UOp]:
     """Pre-regalloc schedule tweaks: A/B VMEM overlap, then cast-before-store.
 
-    1. Hoist next wide B between A U16 and A pack so B gets distinct VGPRs from live A dests.
-    2. Prefetch next strided B U16 before current B pack so both tiles are in flight.
-    3. Schedule each f32→f16 CAST immediately before its STORE — product-16 epilogue otherwise
+    1. Prefetch next wide A (B128) before PACK_A when K tiles <256 (helps @2048; hurts @4096).
+    2. Hoist next wide B between A U16 and A pack so B gets distinct VGPRs from live A dests.
+    3. Prefetch next strided B U16 before current B pack so both tiles are in flight.
+    4. Schedule each f32→f16 CAST immediately before its STORE — product-16 epilogue otherwise
        keeps 128 half temps live; regalloc spills them into live WMMA ACC (v126+) and clobbers
        unread lanes (half rows 62–63).
-    4. AMD_D16_HI: keep each fused lo LOAD before its hi — post-regalloc-only reorder lets lo
+    5. AMD_D16_HI: keep each fused lo LOAD before its hi — post-regalloc-only reorder lets lo
        dest-as-addr reuse hi's still-live index VGPR (MMU on gfx1100).
     """
+    lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
     lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
     uses: dict[UOp, list[UOp]] = {}
     for u in lst:
