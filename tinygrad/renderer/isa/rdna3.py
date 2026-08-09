@@ -26,10 +26,14 @@ LID = tuple(Register(f"v{i}", 256+i) for i in range(3))
 SGPR = tuple(Register(f"s{i}", i) for i in range(6, 104, 2) if i != 16)
 VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
 # Hand kernel parks ACC at v128+; use v126..v253 (128 regs) so low VGPRs stay for dest-as-addr.
-# Occupancy (gfx1100, 1536 VGPR/SIMD): tip max 256 → 6 waves; ≤216 → 7 waves. Mid-ACC v86..v213
-# + TMP@214/215 gets max=216 but always 8×B32 spill (~23k GFLOPS @2048): 216−128 ACC−2 TMP=86
-# non-ACC slots, tip needs ~94 low for dest-as-addr. Overlapping PACK into ACC clobbers (wrong
-# RMSE). Next: remat ≥8 non-ACC lives, or early C-store to shrink live ACC — not pool shuffle.
+# Occupancy (gfx1100, 1536 VGPR/SIMD): tip max 256 → 6 waves; ≤216 → 7 waves.
+# Mid-ACC v86..v213 + TMP@214/215:
+#   - with A/B hoists (HB+PB): always 8×B32 spill (~23k @2048) — 216−128−2=86 non-ACC slots,
+#     tip needs ~94 with dest-as-addr + hoist live ranges.
+#   - PB only (no HB, no next-A): spill-free max=216, ~29.3k @2048 (≈tip) but ~43k @4096
+#     (tip ~49–51k) — 7th wave does not pay for losing HB at large N.
+# Overlapping PACK into ACC clobbers RMSE. Next: early C-store or remat to free ≥8 so
+# mid+HB+PB is spill-free; do not flip default layout until @4096 wins.
 WMMA_ACC_VGPR = VGPR[123:]
 # Disjoint pools: LDS half2 loads stay low; PACK_F16 early-clobber dests stay high (product-8 fix).
 # Under ALLOW_UPCAST16 ACC grows to v126..v253 and overlaps the high PACK band — use mid PACK then.
