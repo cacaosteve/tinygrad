@@ -1447,6 +1447,28 @@ class TestAMDRenderer(unittest.TestCase):
       getenv.cache_clear()
       to_program_cache.clear()
 
+  def test_half_matmul_local_follows_k_tiles(self):
+    # LOCAL=4 when K/16 < 256 (N=2048); LOCAL=2 when K/16 ≥ 256 (N=4096) — HW A/B on gfx1100.
+    import os
+    old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "TC_LOCAL", "TC_UPCAST", "TC_UPCAST_TILES", "ALLOW_UPCAST16")}
+    for k in old: os.environ.pop(k, None)
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      for n, loc in ((2048, 4), (4096, 2)):
+        with Context(BEAM=0):
+          ast = (Tensor.empty(n, n, dtype=dtypes.half, device="AMD") @
+                 Tensor.empty(n, n, dtype=dtypes.half, device="AMD"))
+          prg = _to_prg(ast.schedule_linear().src[-1].src[0])
+        self.assertIn(Opt(OptOps.LOCAL, 1, loc), prg.src[0].arg.applied_opts, f"N={n}")
+        self.assertEqual(prg.arg.local_size, (32, loc, 1), f"N={n}")
+    finally:
+      for k, v in old.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+      getenv.cache_clear()
+      to_program_cache.clear()
+
   def test_half_matmul_irregular_n_compiles_spill_free(self):
     # Multi-WG / non-power-of-two N still lowers to product-16 register WMMA without spills.
     import os
