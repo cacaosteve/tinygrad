@@ -1638,6 +1638,9 @@ def _sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
       # Keep tile-local schedule: don't sink past scalar half A loads. Otherwise all A packs
       # first and B B128 lands after a full wait — loses A/B VMEM overlap vs LLVM.
       if v.arg is AMDOps.LOAD and v.dtype.scalar() is dtypes.half and _elem_count(v) == 1: break
+      # Don't sink past scalar B packs — that forces wait on the prefetched next B tile before
+      # WMMA0, killing the VMEM overlap _prefetch_next_bu16_before_pack set up.
+      if v.arg is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(v): break
       v_dst = _reg_idxs(v)
       v_src = set().union(*(_reg_idxs(s) for s in v.src))
       if v_src & wmma_dst: break
@@ -1919,11 +1922,10 @@ def insts_from_linear(lin:UOp):
       oi += 1
       continue
     if _needs_vm_flush(u):
-      # Soft allow can no-op when dest ACC intersects an early pending batch. Drain VM before WMMA.
+      # Soft wait on WMMA A/B/ACC srcs only — full vm drain killed prefetched next-B U16 overlap.
       # Also drain lgkm on WMMA srcs — TC_LDS_AB feeds A/B from DS_LOAD; skipping that wait
       # left WMMA reading in-flight LDS data (NaN/inf). Hand kernel waits lgkmcnt(0) first.
       if u.op is Ops.INS and u.arg is AMDOps.WMMA:
-        flush("vm")
         flush_regs(set().union(*(_reg_idxs(s) for s in u.src)))
       else: flush_regs(set().union(*(_reg_idxs(s) for s in u.src), _reg_idxs(u)))
     if u.op is Ops.INS and u.arg is AMDOps.IF_MASK:

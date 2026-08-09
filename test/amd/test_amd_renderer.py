@@ -1378,6 +1378,7 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_half_matmul_prefetches_next_b_u16_before_pack(self):
     # Next strided B U16 tile issues before current B pack/wait — distinct VGPRs, overlap VMEM.
+    # WMMA0 must stay before PACK_B1 so soft-wait can leave B1 in flight through WMMA0.
     import os
     old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "TC_LOCAL", "TC_UPCAST", "TC_UPCAST_TILES", "ALLOW_UPCAST16")}
     for k in old: os.environ.pop(k, None)
@@ -1394,15 +1395,20 @@ class TestAMDRenderer(unittest.TestCase):
         if n != "GLOBAL_LOAD_U16": continue
         # Within one wait window: a second U16 clause (prefetch) before vmcnt.
         u16 = 0
-        clauses = 0
         for j in range(i, min(i + 120, len(names))):
           if names[j] == "S_WAITCNT_VMCNT": break
-          if names[j] == "S_CLAUSE": clauses += 1
           if names[j] == "GLOBAL_LOAD_U16": u16 += 1
         if u16 >= 32:
           found = True
           break
       self.assertTrue(found, "expected two B U16 tiles in flight before waitcnt (prefetch)")
+      w0 = next(i for i, n in enumerate(names) if "WMMA" in n)
+      # After first WMMA: next scalar pack streak then second WMMA (not pack-pack-wmma-wmma).
+      packs_before_w1 = 0
+      for j in range(w0 + 1, len(names)):
+        if "WMMA" in names[j]: break
+        if names[j] == "V_PACK_B32_F16": packs_before_w1 += 1
+      self.assertGreaterEqual(packs_before_w1, 8, "WMMA0 must precede PACK_B1 (prefetch overlap)")
     finally:
       for k, v in old.items():
         if v is None: os.environ.pop(k, None)
