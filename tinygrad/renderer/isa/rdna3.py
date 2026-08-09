@@ -1442,13 +1442,18 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
     case AMDOps.LOAD:
       if (lo := (d16_hi_lo or {}).get(u)) is not None:
         # Fused hi: merge into lo VGPR. data=vdst required (unset DATA → v0).
-        # Use TMP_VDATA (v254) not TMP_VADDR (v255): d16_hi with addr=v255 misbehaves on gfx1100.
-        # Caller flush_regs(lo) before emit — no embedded vmcnt(0) (that serialized every pair).
+        # Prefer in-place <<1 on hi idx VGPR (dead after) so consecutive d16_his don't serialize on TMP.
+        # Else TMP_VDATA (not v255). Caller flush_regs(lo) before emit.
         dst = _dst(lo)
-        pre, addr = _scaled_addr(TMP_VDATA, u.src[1], _mem_itemsize(u.dtype))
-        pre, addr = _masked_addr(pre, addr, masked)
-        if addr != TMP_VDATA: pre = pre + [r3.v_mov_b32_e32(TMP_VDATA, addr)]
-        return pre + [r3.global_load_d16_hi_b16(dst, TMP_VDATA, dst, saddr=_src(u.src[0]))]
+        idx = _src(u.src[1])
+        if isinstance(idx, Reg) and idx.offset >= 256 and not masked:
+          pre, addr = [r3.v_lshlrev_b32_e64(idx, 1, idx)], idx
+        else:
+          pre, addr = _scaled_addr(TMP_VDATA, u.src[1], _mem_itemsize(u.dtype))
+          pre, addr = _masked_addr(pre, addr, masked)
+          if addr != TMP_VDATA: pre = pre + [r3.v_mov_b32_e32(TMP_VDATA, addr)]
+          addr = TMP_VDATA
+        return pre + [r3.global_load_d16_hi_b16(dst, addr, dst, saddr=_src(u.src[0]))]
       pre, addr = _scaled_addr(_dst(u) if _reg_slots(u) == 1 else TMP_VADDR, u.src[1], _mem_itemsize(u.dtype))
       pre, addr = _masked_addr(pre, addr, masked)
       return pre + _global_load_insts(u, addr)
