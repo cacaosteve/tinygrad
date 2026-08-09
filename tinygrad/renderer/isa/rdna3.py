@@ -288,8 +288,6 @@ def _wait_domain_for_load(u:UOp) -> str|None:
   if u.op is not Ops.INS: return None
   if u.arg in (AMDOps.LOAD, AMDOps.SLOAD, AMDOps.FILL): return "vm"
   if u.arg in (AMDOps.KERNARG, AMDOps.LLOAD): return "lgkm"
-  # PACK_F16 may emit global u16+d16_hi itself (LLVM-style strided B).
-  if u.arg is AMDOps.PACK_F16 and _pack_f16_has_d16_hi(u): return "vm"
   return None
 
 def _wait_domain_for_store(u:UOp) -> str|None:
