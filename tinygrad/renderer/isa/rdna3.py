@@ -1715,6 +1715,71 @@ def _hoist_b_between_a_and_pack(ops:list[UOp]) -> list[UOp]:
     i = pack_a_i + len(chunk)
   return out
 
+def _prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
+  """Issue next strided B U16 tile while current B U16 loads are still in flight.
+
+  Pre-regalloc: B0_u16* → PACK_B0 → WMMA → EXTRACT* → B1_addr* → B1_u16* → PACK_B1
+  becomes:      B0_u16* → B1_addr* → B1_u16* → PACK_B0 → WMMA → EXTRACT* → PACK_B1
+  Regalloc assigns B0/B1 distinct VGPRs; soft wait on PACK_B0 leaves B1 in flight through WMMA0.
+  """
+  if not any(u.op is Ops.INS and u.arg is AMDOps.WMMA for u in ops): return ops
+  out = list(ops)
+  i = 0
+  while i < len(out):
+    u = out[i]
+    if not (u.op is Ops.INS and u.arg is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(u)):
+      i += 1
+      continue
+    if i + 1 >= len(out) or not (out[i + 1].op is Ops.INS and out[i + 1].arg is AMDOps.WMMA):
+      i += 1
+      continue
+    if out[i + 1].src[1] is not u and out[i + 1].src[2] is not u:
+      i += 1
+      continue
+    # Insert before optional PACK_A (vec) that sits between B0 U16 and PACK_B0.
+    insert_at = i - 1 if (i > 0 and out[i - 1].op is Ops.INS and out[i - 1].arg is AMDOps.PACK_F16 and
+                          _pack_f16_is_vec_load(out[i - 1])) else i
+    # Require a preceding scalar half load streak (current B tile).
+    k = insert_at - 1
+    while k >= 0 and out[k].op is Ops.INS and out[k].arg is AMDOps.LOAD and \
+          out[k].dtype.scalar() is dtypes.half and _elem_count(out[k]) == 1:
+      k -= 1
+    if k + 1 >= insert_at:
+      i += 1
+      continue
+    wmma_i = i + 1
+    j = wmma_i + 1
+    while j < len(out) and out[j].op is Ops.INS and out[j].arg is AMDOps.EXTRACT: j += 1
+    start = j
+    while j < len(out) and _is_addr_alu(out[j]): j += 1
+    load0 = j
+    while j < len(out) and out[j].op is Ops.INS and out[j].arg is AMDOps.LOAD and \
+          out[j].dtype.scalar() is dtypes.half and _elem_count(out[j]) == 1:
+      j += 1
+    if j == load0:
+      i += 1
+      continue
+    end = j
+    # Also pull the next contiguous A wide load into the same VMEM window (leave its PACK_A
+    # with PACK_B1 so WMMA0 only consumes B0). Restores U16→B128 overlap at A-row transitions.
+    j2 = end
+    while j2 < len(out) and _is_addr_alu(out[j2]): j2 += 1
+    if j2 < len(out) and out[j2].op is Ops.INS and out[j2].arg is AMDOps.LOAD and \
+       out[j2].dtype.scalar() is dtypes.half and _elem_count(out[j2]) >= 8:
+      end = j2 + 1
+    mid, chunk = out[insert_at:start], out[start:end]
+    mid_set, chunk_set = set(mid), set(chunk)
+    if any(s in mid_set for cu in chunk for s in cu.src):
+      i += 1
+      continue
+    if any(s in chunk_set for mu in mid for s in mu.src):
+      i += 1
+      continue
+    del out[start:end]
+    out[insert_at:insert_at] = chunk
+    i = insert_at + len(chunk) + len(mid)
+  return out
+
 def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
   # Bubble LOAD/PACK_F16 (+ int addr) above preceding WMMAs when independent.
   # Must not clobber a WMMA's A/B/ACC — UPCAST≥4 reuses PACK VGPRs across tiles; hoisting
@@ -2446,12 +2511,13 @@ class AMDRenderer(ISARenderer):
   def after_pre_regalloc(self, lst:list[UOp]) -> list[UOp]:
     """Pre-regalloc schedule tweaks: A/B VMEM overlap, then cast-before-store.
 
-    1. Hoist next B between A U16 issue and A pack so B gets distinct VGPRs from live A dests.
-    2. Schedule each f32→f16 CAST immediately before its STORE — product-16 epilogue otherwise
+    1. Hoist next wide B between A U16 and A pack so B gets distinct VGPRs from live A dests.
+    2. Prefetch next strided B U16 before current B pack so both tiles are in flight.
+    3. Schedule each f32→f16 CAST immediately before its STORE — product-16 epilogue otherwise
        keeps 128 half temps live; regalloc spills them into live WMMA ACC (v126+) and clobbers
        unread lanes (half rows 62–63).
     """
-    lst = _hoist_b_between_a_and_pack(lst)
+    lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
     uses: dict[UOp, list[UOp]] = {}
     for u in lst:
       for src in u.src: uses.setdefault(src, []).append(u)

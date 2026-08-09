@@ -1305,7 +1305,7 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_half_matmul_keeps_wmma_tile_local(self):
     # Do not sink WMMA past scalar A loads / hoist those above WMMA — keeps first WMMA
-    # after one A pack (≤16 U16), enabling A/B overlap vs all-A-then-B.
+    # after ≤2 B U16 tiles (prefetch) + contiguous A B128, not all-A-then-B.
     import os
     old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "TC_LOCAL", "TC_UPCAST", "TC_UPCAST_TILES", "ALLOW_UPCAST16")}
     for k in old: os.environ.pop(k, None)
@@ -1319,7 +1319,7 @@ class TestAMDRenderer(unittest.TestCase):
       names = _amd_inst_names(prg)
       w0 = next(i for i, n in enumerate(names) if "WMMA" in n)
       pre = names[:w0]
-      self.assertLessEqual(pre.count("GLOBAL_LOAD_U16"), 16)
+      self.assertLessEqual(pre.count("GLOBAL_LOAD_U16"), 32)  # B0 + prefetched B1
       self.assertGreaterEqual(pre.count("GLOBAL_LOAD_B128"), 1)
     finally:
       for k, v in old.items():
@@ -1369,6 +1369,40 @@ class TestAMDRenderer(unittest.TestCase):
           break
         if found: break
       self.assertTrue(found, "expected B128 issued while A U16 still in flight (no intervening waitcnt)")
+    finally:
+      for k, v in old.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+      getenv.cache_clear()
+      to_program_cache.clear()
+
+  def test_half_matmul_prefetches_next_b_u16_before_pack(self):
+    # Next strided B U16 tile issues before current B pack/wait — distinct VGPRs, overlap VMEM.
+    import os
+    old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "TC_LOCAL", "TC_UPCAST", "TC_UPCAST_TILES", "ALLOW_UPCAST16")}
+    for k in old: os.environ.pop(k, None)
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      with Context(BEAM=0):
+        ast = (Tensor.empty(256, 256, dtype=dtypes.half, device="AMD") @
+               Tensor.empty(256, 256, dtype=dtypes.half, device="AMD"))
+        prg = _to_prg(ast.schedule_linear().src[-1].src[0])
+      names = _amd_inst_names(prg)
+      found = False
+      for i, n in enumerate(names):
+        if n != "GLOBAL_LOAD_U16": continue
+        # Within one wait window: a second U16 clause (prefetch) before vmcnt.
+        u16 = 0
+        clauses = 0
+        for j in range(i, min(i + 120, len(names))):
+          if names[j] == "S_WAITCNT_VMCNT": break
+          if names[j] == "S_CLAUSE": clauses += 1
+          if names[j] == "GLOBAL_LOAD_U16": u16 += 1
+        if u16 >= 32:
+          found = True
+          break
+      self.assertTrue(found, "expected two B U16 tiles in flight before waitcnt (prefetch)")
     finally:
       for k, v in old.items():
         if v is None: os.environ.pop(k, None)
