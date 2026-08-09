@@ -25,7 +25,9 @@ LID = tuple(Register(f"v{i}", 256+i) for i in range(3))
 # Skip s16 — reserved as WGID_Y when USER_SGPR=15 (gfx1100 2D locals).
 SGPR = tuple(Register(f"s{i}", i) for i in range(6, 104, 2) if i != 16)
 VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
-# Hand kernel parks ACC at v128+; use v126..v253 (128 regs) so low VGPRs stay contiguous for addresses.
+# Hand kernel parks ACC at v128+; use v126..v253 (128 regs) so low VGPRs stay for dest-as-addr.
+# Occupancy note (gfx1100, 1536 VGPR/SIMD): max 256 → 6 waves; LLVM ~219 → 7 waves. Moving ACC
+# low reaches ≤219 but spills (dest-as-addr fights ACC) and regresses. Next: spill-free compact.
 WMMA_ACC_VGPR = VGPR[123:]
 # Disjoint pools: LDS half2 loads stay low; PACK_F16 early-clobber dests stay high (product-8 fix).
 # Under ALLOW_UPCAST16 ACC grows to v126..v253 and overlaps the high PACK band — use mid PACK then.
