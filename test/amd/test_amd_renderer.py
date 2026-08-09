@@ -1795,14 +1795,14 @@ class TestAMDRenderer(unittest.TestCase):
       to_program_cache.clear()
 
   def test_half_matmul_register_path_strided_operand_is_u16(self):
-    # Contiguous A → B128; strided B → u16+d16_hi (default). Pin product-4 1D locals for load counts.
+    # Contiguous A → B128; strided B → u16+d16_hi when AMD_D16_HI=1.
     import os
     old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_D16_HI", "TC_LOCAL", "TC_UPCAST", "TC_UPCAST_TILES")}
     os.environ["TC_LDS_AB"] = "0"
     os.environ["TC_LOCAL"] = "0"
     os.environ["TC_UPCAST"] = "2"
     os.environ["TC_UPCAST_TILES"] = "4"
-    os.environ.pop("AMD_D16_HI", None)
+    os.environ["AMD_D16_HI"] = "1"
     getenv.cache_clear()
     to_program_cache.clear()
     try:
@@ -1826,15 +1826,15 @@ class TestAMDRenderer(unittest.TestCase):
       getenv.cache_clear()
       to_program_cache.clear()
 
-  def test_half_matmul_register_path_vpack_opt_out(self):
-    # AMD_D16_HI=0 → u16 + v_pack. Pin product-4 1D locals for load counts.
+  def test_half_matmul_register_path_vpack_default(self):
+    # Default AMD_D16_HI off → u16 + v_pack. Pin product-4 1D locals for load counts.
     import os
     old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_D16_HI", "TC_LOCAL", "TC_UPCAST", "TC_UPCAST_TILES")}
     os.environ["TC_LDS_AB"] = "0"
     os.environ["TC_LOCAL"] = "0"
     os.environ["TC_UPCAST"] = "2"
     os.environ["TC_UPCAST_TILES"] = "4"
-    os.environ["AMD_D16_HI"] = "0"
+    os.environ.pop("AMD_D16_HI", None)
     getenv.cache_clear()
     to_program_cache.clear()
     try:
