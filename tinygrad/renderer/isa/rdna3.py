@@ -1940,11 +1940,16 @@ def _order_d16_lo_before_hi(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp
     his: list[UOp] = []
     while j + 1 < len(out) and out[j] in lo_set and out[j + 1] in d16_hi_lo and \
           d16_hi_lo[out[j + 1]] is out[j]:
-      los.append(out[j]); his.append(out[j + 1]); j += 2
+      los.append(out[j])
+      his.append(out[j + 1])
+      j += 2
     if len(los) >= 2:
-      batched.extend(los); batched.extend(his); i = j
+      batched.extend(los)
+      batched.extend(his)
+      i = j
     else:
-      batched.append(out[i]); i += 1
+      batched.append(out[i])
+      i += 1
   return batched
 
 def insts_from_linear(lin:UOp):
