@@ -32,11 +32,11 @@ VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
 #   - HB+PB: 1× half×8 spill (~24k @2048) — 216−128−2=86 non-ACC vs ~94 needed.
 #   - PB only: spill-free, ≈tip @2048, loses @4096 vs tip (tip can beat LLVM @4096 when warm).
 # HB tip ablation is ~wash; PB is the overlap win. Overlapping PACK into ACC clobbers RMSE.
-# Remaining @2048 gap (~2–3% vs LLVM after AMD_B_LSHL_ADD): LLVM B128×8 then vmcnt(8)|WMMA×4.
-# Ours: B128×2|U16×32|W(16)|M|W(0)|M. PACK_B-aware A-prefetch after PB keeps U16×32+extra A and
-# soft W(18)|M|W(2) but is wash/slightly slower @2048 (no occupancy win). Compact per-lane B
-# (LLVM ~96B offsets vs our N-stride ~61KB) still needs layout/isel — not emit peel. AMD_D16_HI
-# stays env-gated. AMD_B_LSHL_ADD default on.
+# Remaining @2048 gap (compact B closes most vs LLVM): LLVM B128×8 then vmcnt(8)|WMMA×4.
+# B gathers factor as k*4096+{0,32,64,96} (@N≥2048). AMD_B_COMPACT (default on): isel CSE
+# per-k page idx + in-place <<1 once + GLOBAL offset rem — keeps s_clause, cuts addr ALU.
+# AMD_B_COMPACT=0 falls back to AMD_B_LSHL_ADD dest-as-addr full-imm peel. AMD_D16_HI stays
+# env-gated. Tried/failed: TMP page CSE without shared page idxs (~1 load/page, ~22k).
 WMMA_ACC_VGPR = VGPR[123:]
 # Disjoint pools: LDS half2 loads stay low; PACK_F16 early-clobber dests stay high (product-8 fix).
 # Under ALLOW_UPCAST16 ACC grows to v126..v253 and overlaps the high PACK band — use mid PACK then.
@@ -205,12 +205,13 @@ def _full_src(x:UOp) -> Reg:
 def _reg_chunk(reg:Register, off:int, slots:int) -> Reg:
   return _reg_to_amd(Register(reg.name, reg.index+off, _cons=reg.cons), slots)
 
-def _global_load_insts(u:UOp, addr:Reg) -> list:
+def _global_load_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
   slots, sc = _reg_slots(u), u.dtype.scalar()
   saddr = _src(u.src[0])
+  off_kw = {"offset": byte_off} if 0 < byte_off <= 0xfff else {}
   if slots == 1:
     if (load:=_global_load(u.dtype, _elem_count(u))) is None: raise CompileError(f"no global load {u.dtype}")
-    return [load(_dst(u), addr, saddr=saddr)]
+    return [load(_dst(u), addr, saddr=saddr, **off_kw)]
   # multi-VGPR by byte width: float×2/×4 or half×4/×8 → B64/B128 (ungated only; coalesce rejects gated)
   if sc not in (dtypes.float16, dtypes.float32): raise CompileError(f"no vec global load {u.dtype}")
   if not isinstance(greg(u), Register): raise CompileError(f"expected reg dst {u}")
@@ -222,6 +223,16 @@ def _global_load_insts(u:UOp, addr:Reg) -> list:
             r3.global_load_b128(_reg_chunk(greg(u), 0, 4), addr, saddr=saddr),
             r3.global_load_b128(_reg_chunk(greg(u), 4, 4), addr, saddr=saddr, offset=16)]
   raise CompileError(f"no global load {u.dtype}")
+
+# CSE per-k B gather bases (elem idx = base + k*(4096/itemsize)). Cleared each linear emit.
+_B_PAGE_IDX: dict[tuple[int, int], UOp] = {}
+
+def _b_page_idx(base:UOp, page:int, itemsize:int) -> UOp:
+  key = (id(base), page)
+  if (hit := _B_PAGE_IDX.get(key)) is not None: return hit
+  # Always ADD (incl. page 0) so the page VGPR is distinct from raw `base` (safe in-place <<1).
+  _B_PAGE_IDX[key] = (out := base + (page * (0x1000 // itemsize)))
+  return out
 
 def _apply_byte_off(addr:Reg, byte_off:int, idx:UOp|None=None, itemsize:int=1) -> tuple[list, Reg, int]:
   """GLOBAL offset is 0..4095; peel larger byte_off into addr via v_lshl_add / v_add."""
@@ -684,6 +695,9 @@ def _ds_off(byte_off:int) -> dict:
 def _mem_byte_off(u:UOp, src_i:int=3) -> int:
   return int(u.src[src_i].arg) if len(u.src) > src_i and u.src[src_i].op is Ops.CONST else 0
 
+def _is_b_compact_load(u:UOp) -> bool:
+  return len(u.src) > 3 and u.src[3].op is Ops.CONST and u.src[3].tag == "b_compact"
+
 def _lds_byte_off(u:UOp) -> int:
   return _mem_byte_off(u, 3)
 
@@ -707,12 +721,22 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
     return x.ins(AMDOps.SLOAD, dtype=x.dtype, src=(a.src[0], a.src[1], count))
   if _global_load(x.dtype, n) is None and not (x.dtype.scalar() is dtypes.half and n == 16):
     raise CompileError(f"no global load {x.dtype} x{n}")
-  # Peel ADD+imm into byte_off for scalar half B gathers. Emit uses v_lshl_add into dest
-  # (AMD_B_LSHL_ADD) — keeps dest-as-addr s_clause (unlike TMP+GLOBAL page peel).
-  if getenv("AMD_B_LSHL_ADD", 1) and n == 1 and x.dtype.scalar() is dtypes.half:
-    idx, off = _peel_add_imm(a.src[1], _mem_itemsize(x.dtype), max_byte=0x7fffffff, deep=True)
-    src = (a.src[0], idx, count) if off == 0 else (a.src[0], idx, count, UOp.const(off, dtypes.int32).rtag())
-    return x.ins(AMDOps.LOAD, dtype=x.dtype, src=src)
+  # Compact B: peel to per-k page idx + rem≤4095 GLOBAL offset (LLVM @N≥2048). Else full-imm
+  # v_lshl_add into dest (AMD_B_LSHL_ADD) — keeps dest-as-addr s_clause.
+  if n == 1 and x.dtype.scalar() is dtypes.half:
+    itemsize = _mem_itemsize(x.dtype)
+    if getenv("AMD_B_COMPACT", 1):
+      base, total = _peel_add_imm(a.src[1], itemsize, max_byte=0x7fffffff, deep=True)
+      if total > 0:
+        page, rem = divmod(total, 0x1000)
+        idx = _b_page_idx(base, page, itemsize)
+        # Always attach rem (incl. 0) tagged so emit can in-place <<1 safely.
+        src = (a.src[0], idx, count, UOp.const(rem, dtypes.int32).rtag("b_compact"))
+        return x.ins(AMDOps.LOAD, dtype=x.dtype, src=src)
+    elif getenv("AMD_B_LSHL_ADD", 1):
+      idx, off = _peel_add_imm(a.src[1], itemsize, max_byte=0x7fffffff, deep=True)
+      src = (a.src[0], idx, count) if off == 0 else (a.src[0], idx, count, UOp.const(off, dtypes.int32).rtag())
+      return x.ins(AMDOps.LOAD, dtype=x.dtype, src=src)
   return x.ins(AMDOps.LOAD, dtype=x.dtype, src=(a.src[0], a.src[1], count))
 
 def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
@@ -1327,7 +1351,7 @@ def _cmp_eq(u:UOp):
 _MASKED_MEM = (AMDOps.LOAD, AMDOps.STORE, AMDOps.LLOAD, AMDOps.LSTORE, AMDOps.SLOAD, AMDOps.SSTORE)
 
 def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_cache:_StoreAddrCache|None=None,
-                  d16_hi_lo:dict[UOp, UOp]|None=None):
+                  d16_hi_lo:dict[UOp, UOp]|None=None, byte_scaled:set[int]|None=None):
   if u.op is not Ops.INS or (skip and u in skip): return []
   if isinstance(u.arg, Inst): return [u.arg]
   match u.arg:
@@ -1472,6 +1496,13 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
           addr = TMP_VDATA
         return pre + [r3.global_load_d16_hi_b16(dst, addr, dst, saddr=_src(u.src[0]))]
       itemsize, byte_off = _mem_itemsize(u.dtype), _mem_byte_off(u)
+      # Compact B: in-place <<1 on page idx once, GLOBAL offset=rem (shared addr across rem loads).
+      if byte_scaled is not None and _is_b_compact_load(u) and _reg_slots(u) == 1 and not masked and itemsize == 2:
+        idx = _src(u.src[1])
+        if not isinstance(idx, Reg) or idx.offset < 256: raise CompileError("compact B needs VGPR idx")
+        scale = [] if idx.offset in byte_scaled else [r3.v_lshlrev_b32_e64(idx, 1, idx)]
+        byte_scaled.add(idx.offset)
+        return scale + _global_load_insts(u, idx, byte_off)
       # Peeled B gather: (base<<1)+byte_off into dest — one VALU, still dest-as-addr for s_clause.
       if byte_off > 0 and _reg_slots(u) == 1 and not masked and itemsize == 2:
         dst = _dst(u)
@@ -1964,6 +1995,9 @@ def insts_from_linear(lin:UOp):
   pending: dict[str, set[int]] = {"lgkm": set(), "vs": set()}
   items, targets, byte = [], {}, 0
   store_addr_cache = _StoreAddrCache()
+  _B_PAGE_IDX.clear()
+  # Compact B: VGPR idxs already shifted to bytes (in-place <<1 once per page).
+  byte_scaled: set[int]|None = set() if getenv("AMD_B_COMPACT", 1) else None
   def emit(inst):
     nonlocal byte
     items.append(inst)
@@ -1996,6 +2030,8 @@ def insts_from_linear(lin:UOp):
     if (n:=_vm_load_count(insts)) and regs: pending_vm.append((regs, n))
   def _pending_src(regs:set[int]) -> bool:
     return any(pr & regs for pr, _ in pending_vm) or bool(pending["lgkm"] & regs)
+  def _emit_uop(u, masked=False, with_store_cache=False):
+    return list(insts_for_uop(u, skip, masked, store_addr_cache if with_store_cache else None, d16_hi_lo, byte_scaled))
   scheduled = _order_d16_lo_before_hi(
     _hoist_loads_before_wmma(_sink_wmma_past_loads(_hoist_lloads_before_extracts(ops))), d16_hi_lo)
   oi = 0
@@ -2024,7 +2060,7 @@ def insts_from_linear(lin:UOp):
       else: flush_regs(set().union(*(_reg_idxs(s) for s in u.src), _reg_idxs(u)))
     if u.op is Ops.INS and u.arg is AMDOps.IF_MASK:
       store_addr_cache.clear()
-      emitted = list(insts_for_uop(u, skip, d16_hi_lo=d16_hi_lo))
+      emitted = _emit_uop(u)
       for inst in emitted: emit(inst)
       mask_depth += 1
       if (domain:=_wait_domain_for_load(u)) is not None:
@@ -2055,15 +2091,23 @@ def insts_from_linear(lin:UOp):
         while j_hi < len(scheduled) and scheduled[j_hi] in d16_hi_lo: j_hi += 1
       end = j_hi if j_hi - j >= 2 else j
       if end - oi >= 2:
-        parts = [list(insts_for_uop(scheduled[k], skip, False, d16_hi_lo=d16_hi_lo)) for k in range(oi, end)]
+        parts = [_emit_uop(scheduled[k]) for k in range(oi, end)]
         hi_ok = all(k < j or (not any(getattr(i, "vdst", None) == TMP_VDATA for i in parts[k - oi]))
                     for k in range(j, end))
         if hi_ok and all(_vm_load_count(p) == 1 for p in parts):
           store_addr_cache.clear()
           scales, loads = [], []
+          seen_scale: set[int] = set()
           for p in parts:
             sc, ld = _split_scale_and_loads(p)
-            scales.extend(sc)
+            for s in sc:
+              # Compact B: one in-place <<1 per page idx; drop duplicate scales in the hoist.
+              dst = getattr(s, "vdst", None)
+              key = getattr(dst, "offset", None)
+              if key is not None:
+                if key in seen_scale: continue
+                seen_scale.add(key)
+              scales.append(s)
             loads.extend(ld)
           for inst in scales: emit(inst)
           emit(r3.s_clause(simm16=len(loads) - 1))
@@ -2075,7 +2119,7 @@ def insts_from_linear(lin:UOp):
           continue
     if u in d16_hi_lo: flush_regs(_reg_idxs(d16_hi_lo[u]))
     is_store = u.op is Ops.INS and u.arg is AMDOps.STORE
-    emitted = list(insts_for_uop(u, skip, masked, store_addr_cache if is_store else None, d16_hi_lo))
+    emitted = _emit_uop(u, masked, with_store_cache=is_store)
     # VALU copy of an outstanding VMEM/LDS dest must wait first (PACK/MOV across pools).
     if emitted and u.op is Ops.INS and u.arg in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV):
       src = set().union(*(_reg_idxs(s) for s in u.src))
@@ -2383,6 +2427,7 @@ pm_stage_wmma_ab = PatternMatcher([(UPat(Ops.WMMA, name="wmma"), stage_wmma_ab_t
 def apply_tc_hand_opts(tk, rngs):
   from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
   global _PREFETCH_NEXT_A
+  _B_PAGE_IDX.clear()
   lds_ab = getenv("TC_LDS_AB", 0)
   # Register path: ALLOW_UPCAST16 defaults on → product-16 (4×4).
   # LOCAL=4 wins @2048 and @4096 on gfx1100 (3-trial medians); LOCAL=2 was slower @4096.
@@ -2714,7 +2759,9 @@ class AMDRenderer(ISARenderer):
       else: ret.append(f"  {u.arg.name.lower()} " + ", ".join(str(greg(s) or s.arg) for s in u.src))
     return "\n".join(ret)
 
-  def render(self, uops:list[UOp]) -> str: return self.asm_str(uops, "kernel")
+  def render(self, uops:list[UOp]) -> str:
+    _B_PAGE_IDX.clear()
+    return self.asm_str(uops, "kernel")
   def _insts_for_uop(self, u:UOp): return insts_for_uop(u)
   def _insts_from_linear(self, lin:UOp): return insts_from_linear(lin)
 

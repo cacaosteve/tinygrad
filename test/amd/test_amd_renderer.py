@@ -1673,7 +1673,7 @@ class TestAMDRenderer(unittest.TestCase):
       self.assertEqual(names.count("V_CVT_F16_F32_E32"), 128)
       self.assertEqual(names.count("GLOBAL_STORE_B16"), 128)
       # CAST must not clobber store-addr CSE (TMP_VADDR page base). Count only after the last
-      # WMMA — B gather peels also emit V_LSHL_ADD (AMD_B_LSHL_ADD) in the K loop.
+      # WMMA — B gathers use compact page <<1 / LSHL_ADD; C-store peels also emit LSHL_ADD.
       last_wmma = max(i for i, n in enumerate(names) if n.startswith("V_WMMA_"))
       self.assertLessEqual(sum(1 for n in names[last_wmma:] if n == "V_LSHL_ADD_U32"), 20)
     finally:
@@ -1900,6 +1900,35 @@ class TestAMDRenderer(unittest.TestCase):
       inst_names = _amd_inst_names(prg)
       self.assertEqual(inst_names.count("GLOBAL_LOAD_D16_HI_B16"), 0)
       self.assertGreater(inst_names.count("V_PACK_B32_F16"), 0)
+    finally:
+      for k, v in old.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+      getenv.cache_clear()
+      to_program_cache.clear()
+
+  def test_half_matmul_compact_b_global_offsets(self):
+    # AMD_B_COMPACT default: per-k page idx + GLOBAL offset rem ∈ {0,32,64,96} @N=2048.
+    import os
+    old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_B_COMPACT", "AMD_D16_HI")}
+    os.environ["TC_LDS_AB"] = "0"
+    os.environ.pop("AMD_B_COMPACT", None)
+    os.environ.pop("AMD_D16_HI", None)
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      with Context(BEAM=0):
+        ast = (Tensor.empty(2048, 2048, dtype=dtypes.half, device="AMD") @
+               Tensor.empty(2048, 2048, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
+        prg = _to_prg(ast.schedule_linear().src[-1].src[0])
+      insts = _REN._insts_from_linear(_prg_lin(prg))
+      u16_offs = sorted({int(getattr(i, "offset", 0) or 0) for i in insts
+                         if getattr(i, "op_name", "") == "GLOBAL_LOAD_U16"})
+      self.assertEqual(u16_offs, [0, 32, 64, 96])
+      names = [getattr(i, "op_name", "") for i in insts]
+      self.assertGreaterEqual(names.count("V_LSHLREV_B32_E64"), 8)
+      self.assertGreaterEqual(sum(1 for i in insts if getattr(i, "op_name", "") == "S_CLAUSE"
+                                  and int(getattr(i, "simm16", 0) or 0) >= 15), 1)
     finally:
       for k, v in old.items():
         if v is None: os.environ.pop(k, None)
