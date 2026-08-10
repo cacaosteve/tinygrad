@@ -32,10 +32,11 @@ VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
 #   - HB+PB: 1× half×8 spill (~24k @2048) — 216−128−2=86 non-ACC vs ~94 needed.
 #   - PB only: spill-free, ≈tip @2048, loses @4096 vs tip (tip can beat LLVM @4096 when warm).
 # HB tip ablation is ~wash; PB is the overlap win. Overlapping PACK into ACC clobbers RMSE.
-# Remaining @2048 gap (~2–3% vs LLVM after AMD_B_LSHL_ADD): LLVM still denser A prefetch +
-# ~96B GLOBAL offsets. Ours gather stride N (span ~61KB) so GLOBAL-offset bases cannot share a
-# clause — peel B ADD+imm → v_lshl_add into dest instead (default on; AMD_B_LSHL_ADD=0 opts out).
-# AMD_D16_HI stays env-gated (wash vs tip).
+# Remaining @2048 gap (~2–3% vs LLVM after AMD_B_LSHL_ADD): LLVM B128×8 then vmcnt(8)|WMMA×4.
+# Ours: B128×2|U16×32|W(16)|M|W(0)|M. PACK_B-aware A-prefetch after PB keeps U16×32+extra A and
+# soft W(18)|M|W(2) but is wash/slightly slower @2048 (no occupancy win). Compact per-lane B
+# (LLVM ~96B offsets vs our N-stride ~61KB) still needs layout/isel — not emit peel. AMD_D16_HI
+# stays env-gated. AMD_B_LSHL_ADD default on.
 WMMA_ACC_VGPR = VGPR[123:]
 # Disjoint pools: LDS half2 loads stay low; PACK_F16 early-clobber dests stay high (product-8 fix).
 # Under ALLOW_UPCAST16 ACC grows to v126..v253 and overlaps the high PACK band — use mid PACK then.
