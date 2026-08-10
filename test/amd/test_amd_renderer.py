@@ -1938,7 +1938,7 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_half_matmul_prefetch_next_a_default_on(self):
     # Next-A B128 prefetch default on for both N=2048 and N=4096 (within-K early A).
-    # PACK_B-aware A-after-B only for K tiles ≥256 (N=4096) — helps @4096, regresses @2048.
+    # PACK_B-aware A-after-B is opt-in only (wrong on random half @4096 when defaulted on).
     import os
     import tinygrad.renderer.isa.rdna3 as rdna3
     old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_PREFETCH_A", "AMD_PREFETCH_A_PACKB")}
@@ -1948,13 +1948,13 @@ class TestAMDRenderer(unittest.TestCase):
     getenv.cache_clear()
     to_program_cache.clear()
     try:
-      for n, after_b in ((2048, False), (4096, True)):
+      for n in (2048, 4096):
         with Context(BEAM=0):
           ast = (Tensor.empty(n, n, dtype=dtypes.half, device="AMD") @
                  Tensor.empty(n, n, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
           _to_prg(ast.schedule_linear().src[-1].src[0])
         self.assertTrue(rdna3._PREFETCH_NEXT_A, f"N={n}")
-        self.assertEqual(rdna3._PREFETCH_A_AFTER_B, after_b, f"N={n} PACK_B-aware")
+        self.assertFalse(rdna3._PREFETCH_A_AFTER_B, f"N={n} PACK_B-aware default off")
     finally:
       for k, v in old.items():
         if v is None: os.environ.pop(k, None)

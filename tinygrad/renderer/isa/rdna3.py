@@ -19,8 +19,9 @@ from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
 # WGID follows USER_SGPR_COUNT: s2 when count=2 (1D locals); s15 when gfx1100 pads to 15 (2D locals).
 # Next-A B128 prefetch: within-K upcast tiles. Was gated k_tiles<256 (off @4096) which also
 # blocked early A overlap vs LLVM’s B128×8 before WMMA; re-measure with compact B.
-# PACK_B-aware A prefetch (after B hoist) helps @4096 (~1–2% vs LLVM) but regresses @2048 —
-# enable only when K tiles ≥256 (N≥4096 product-16).
+# PACK_B-aware A-after-B (AMD_PREFETCH_A_PACKB) looked +@4096 in GFLOPS but corrupts random
+# half GEMM on gfx1100 (ones/id still exact; ASM vs LLVM rmse~1.9 @4096). Default off —
+# tip A-before-B order stays correct. Opt-in only for experiments.
 _PREFETCH_NEXT_A = False
 _PREFETCH_A_AFTER_B = False
 KERNARG_REG = s[0:1]
@@ -41,8 +42,7 @@ VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
 # per-k page idx + in-place <<1 once + GLOBAL offset rem — keeps s_clause, cuts addr ALU.
 # AMD_B_COMPACT=0 falls back to AMD_B_LSHL_ADD dest-as-addr full-imm peel. AMD_D16_HI stays
 # env-gated. Tried/failed: TMP page CSE without shared page idxs (~1 load/page, ~22k);
-# fixed-point multi-A B128×8 (~−10% @2048). @4096: PACK_B-aware A-after-B + merged A B128
-# s_clause closes most of the gap (med-of-3 ~1.6% behind LLVM).
+# fixed-point multi-A B128×8 (~−10% @2048); PACK_B-aware A-after-B (wrong @4096 random).
 WMMA_ACC_VGPR = VGPR[123:]
 # Disjoint pools: LDS half2 loads stay low; PACK_F16 early-clobber dests stay high (product-8 fix).
 # Under ALLOW_UPCAST16 ACC grows to v126..v253 and overlaps the high PACK band — use mid PACK then.
@@ -2505,8 +2505,8 @@ def apply_tc_hand_opts(tk, rngs):
   # Default on for all K; AMD_PREFETCH_A=0 opts out. Old k_tiles<256 gate starved @4096 early A.
   k_tiles = int(rngs[2].src[0].arg) if len(rngs) > 2 and rngs[2].src[0].op is Ops.CONST else 0
   _PREFETCH_NEXT_A = bool((not lds_ab) and getenv("AMD_PREFETCH_A", 1))
-  # PACK_B-aware A-after-B: +@4096, −@2048 — only for K tiles ≥256 (N≥4096 half product-16).
-  _PREFETCH_A_AFTER_B = bool(_PREFETCH_NEXT_A and k_tiles >= 256 and getenv("AMD_PREFETCH_A_PACKB", 1))
+  # PACK_B-aware A-after-B: opt-in only — default path wrong on random half @4096 (gfx1100).
+  _PREFETCH_A_AFTER_B = bool(_PREFETCH_NEXT_A and k_tiles >= 256 and getenv("AMD_PREFETCH_A_PACKB", 0))
   loc_cap = getenv("TC_LOCAL", 2 if lds_ab else 4)
   up16 = _allow_upcast16()
   max_tiles = min(getenv("TC_UPCAST_TILES", 16 if up16 else 8), 8 if not up16 else 10**9)
@@ -2766,8 +2766,7 @@ class AMDRenderer(ISARenderer):
     """Pre-regalloc schedule tweaks: A/B VMEM overlap, then cast-before-store.
 
     1. Prefetch next wide A (B128) before PACK_A (within-K; default all N).
-       @4096: run after B hoist with PACK_B-aware match (AMD_PREFETCH_A_PACKB).
-       @2048: tip order — A prefetch before B hoist, strict PACK_A→WMMA.
+       Default tip order — A before B hoist. AMD_PREFETCH_A_PACKB=1: A after B (opt-in).
     2. Hoist next wide B between A U16 and A pack so B gets distinct VGPRs from live A dests.
     3. Prefetch next strided B U16 before current B pack so both tiles are in flight.
     4. Schedule each f32→f16 CAST immediately before its STORE — product-16 epilogue otherwise
