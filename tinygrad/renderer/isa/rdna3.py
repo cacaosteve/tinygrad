@@ -17,32 +17,20 @@ from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
 
 # RDNA3: kernarg in s[0:1], local ids packed in v0. Even SGPR bases for 64-bit kernarg loads.
 # WGID follows USER_SGPR_COUNT: s2 when count=2 (1D locals); s15 when gfx1100 pads to 15 (2D locals).
-# Next-A B128 prefetch: within-K upcast tiles. Was gated k_tiles<256 (off @4096) which also
-# blocked early A overlap vs LLVM’s B128×8 before WMMA; re-measure with compact B.
-# PACK_B-aware A-after-B (AMD_PREFETCH_A_PACKB) looked +@4096 in GFLOPS but corrupts random
-# half GEMM on gfx1100 (ones/id still exact; ASM vs LLVM rmse~1.9 @4096). Default off —
-# tip A-before-B order stays correct. Opt-in only for experiments.
+# Next-A B128 prefetch: within-K upcast tiles (LLVM issues A burst before WMMA).
+# AMD_PREFETCH_A=0 opts out. Tried/failed: PACK_B-aware A-after-B (wrong @4096 random);
+# fixed-point multi-A B128×8 (~−10% @2048).
 _PREFETCH_NEXT_A = False
-_PREFETCH_A_AFTER_B = False
 KERNARG_REG = s[0:1]
 WGID = tuple(Register(f"s{i}", i) for i in range(2, 5))  # 1D default; 2D uses s15+ via _wgid_reg
 LID = tuple(Register(f"v{i}", 256+i) for i in range(3))
 # Skip s16 — reserved as WGID_Y when USER_SGPR=15 (gfx1100 2D locals).
 SGPR = tuple(Register(f"s{i}", i) for i in range(6, 104, 2) if i != 16)
 VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
-# Hand kernel parks ACC at v128+; use v126..v253 (128 regs) so low VGPRs stay for dest-as-addr.
-# Occupancy (gfx1100, 1536 VGPR/SIMD): tip max 256 → 6 waves. LLVM same schedule is next_free=224
-# (also 6 waves). ACC@v96..v223+TMP@v1/v2 matches 224 spill-free but slows vs high-ACC tip.
-# Mid-ACC v86..v213 + TMP@214/215 (≤216 → 7 waves):
-#   - HB+PB: 1× half×8 spill (~24k @2048) — 216−128−2=86 non-ACC vs ~94 needed.
-#   - PB only: spill-free, ≈tip @2048, loses @4096 vs tip (tip can beat LLVM @4096 when warm).
-# HB tip ablation is ~wash; PB is the overlap win. Overlapping PACK into ACC clobbers RMSE.
-# Remaining @2048 gap (compact B closes most vs LLVM): LLVM B128×8 then vmcnt(8)|WMMA×4.
+# Occupancy notes / failed experiments live in git history; keep defaults that match LLVM.
 # B gathers factor as k*4096+{0,32,64,96} (@N≥2048). AMD_B_COMPACT (default on): isel CSE
 # per-k page idx + in-place <<1 once + GLOBAL offset rem — keeps s_clause, cuts addr ALU.
-# AMD_B_COMPACT=0 falls back to AMD_B_LSHL_ADD dest-as-addr full-imm peel. AMD_D16_HI stays
-# env-gated. Tried/failed: TMP page CSE without shared page idxs (~1 load/page, ~22k);
-# fixed-point multi-A B128×8 (~−10% @2048); PACK_B-aware A-after-B (wrong @4096 random).
+# AMD_B_COMPACT=0 → AMD_B_LSHL_ADD dest-as-addr. AMD_D16_HI stays env-gated (mock NaNs).
 WMMA_ACC_VGPR = VGPR[123:]
 # Disjoint pools: LDS half2 loads stay low; PACK_F16 early-clobber dests stay high (product-8 fix).
 # Under ALLOW_UPCAST16 ACC grows to v126..v253 and overlaps the high PACK band — use mid PACK then.
@@ -1752,92 +1740,64 @@ def _hoist_b_between_a_and_pack(ops:list[UOp]) -> list[UOp]:
     i = pack_a_i + len(chunk)
   return out
 
-def _prefetch_next_a_b128_before_pack(ops:list[UOp], allow_pack_b:bool=False, repeat:bool=False) -> list[UOp]:
+def _prefetch_next_a_b128_before_pack(ops:list[UOp]) -> list[UOp]:
   """Issue next wide A (B128) before current PACK_A so both A tiles are in flight.
 
-  Pre-regalloc: A0 → PACK_A0 → [PACK_B] → WMMA* → … → A1_addr* → A1
-  becomes:      A0 → A1_addr* → A1 → PACK_A0 → [PACK_B] → WMMA* → …
+  Pre-regalloc: A0 → PACK_A0 → WMMA* → … → A1_addr* → A1
+  becomes:      A0 → A1_addr* → A1 → PACK_A0 → WMMA* → …
   Regalloc assigns A0/A1 distinct VGPRs (needs ~+8 VGPR). Emit soft-waits leave A1 in flight.
-
-  When allow_pack_b: skip scalar PACK_B between PACK_A and WMMA (needed after B hoist).
-  Strict mode (allow_pack_b=False) keeps tip @2048; PACK_B-aware helps @4096 only.
-  When repeat: fixed-point multi-A hoist (B128×8 shape) — @4096 only; regresses @2048.
   """
   if not any(u.op is Ops.INS and u.arg is AMDOps.WMMA for u in ops): return ops
   out = list(ops)
-  changed = True
-  while changed:
-    changed = False
-    i = 0
-    while i < len(out):
-      u = out[i]
-      if not (u.op is Ops.INS and u.arg is AMDOps.PACK_F16 and _pack_f16_is_vec_load(u)):
-        i += 1
-        continue
-      if allow_pack_b:
-        wmma_i = i + 1
-        while wmma_i < len(out):
-          v = out[wmma_i]
-          if v.op is Ops.INS and v.arg is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(v):
-            wmma_i += 1
-            continue
-          if v.op is Ops.INS and v.arg is AMDOps.WMMA and (v.src[1] is u or v.src[2] is u):
-            break
-          wmma_i = -1
-          break
-        else:
-          wmma_i = -1
-        if wmma_i < 0:
-          i += 1
-          continue
-      else:
-        if i + 1 >= len(out) or not (out[i + 1].op is Ops.INS and out[i + 1].arg is AMDOps.WMMA):
-          i += 1
-          continue
-        if out[i + 1].src[1] is not u and out[i + 1].src[2] is not u:
-          i += 1
-          continue
-        wmma_i = i + 1
-      # Find next wide A after this WMMA (skip WMMA/PACK/B-u16/EXTRACT/addr).
-      j = wmma_i + 1
-      while j < len(out):
-        v = out[j]
-        if v.op is Ops.INS and v.arg is AMDOps.LOAD and v.dtype.scalar() is dtypes.half and _elem_count(v) >= 8:
-          break
-        if v.op is Ops.INS and v.arg in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.STORE,
-                                         AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER):
-          j = -1
-          break
-        j += 1
-      else:
+  i = 0
+  while i < len(out):
+    u = out[i]
+    if not (u.op is Ops.INS and u.arg is AMDOps.PACK_F16 and _pack_f16_is_vec_load(u)):
+      i += 1
+      continue
+    if i + 1 >= len(out) or not (out[i + 1].op is Ops.INS and out[i + 1].arg is AMDOps.WMMA):
+      i += 1
+      continue
+    if out[i + 1].src[1] is not u and out[i + 1].src[2] is not u:
+      i += 1
+      continue
+    # Find next wide A after this pack (skip WMMA/PACK/B-u16/EXTRACT/addr).
+    j = i + 1
+    while j < len(out):
+      v = out[j]
+      if v.op is Ops.INS and v.arg is AMDOps.LOAD and v.dtype.scalar() is dtypes.half and _elem_count(v) >= 8:
+        break
+      if v.op is Ops.INS and v.arg in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.STORE,
+                                       AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER):
         j = -1
-      if j < 0:
-        i += 1
-        continue
-      start = j
-      while start > wmma_i + 1 and _is_addr_alu(out[start - 1]): start -= 1
-      if start <= i + 1:
-        i += 1
-        continue
-      end = j + 1
-      mid, chunk = out[i:start], out[start:end]
-      mid_set, chunk_set = set(mid), set(chunk)
-      if any(s in mid_set for cu in chunk for s in cu.src):
-        i += 1
-        continue
-      if any(s in chunk_set for mu in mid for s in mu.src):
-        i += 1
-        continue
-      skipped_wmma_srcs = set().union(*(out[wi].src for wi in range(i + 1, wmma_i + 1)
-                                        if out[wi].op is Ops.INS and out[wi].arg is AMDOps.WMMA))
-      if skipped_wmma_srcs & chunk_set:
-        i += 1
-        continue
-      del out[start:end]
-      out[i:i] = chunk
-      changed = True
-      i = i + len(chunk) + len(mid)
-    if not repeat: break
+        break
+      j += 1
+    else:
+      j = -1
+    if j < 0:
+      i += 1
+      continue
+    start = j
+    while start > i + 1 and _is_addr_alu(out[start - 1]): start -= 1
+    if start <= i + 1:
+      i += 1
+      continue
+    end = j + 1
+    mid, chunk = out[i:start], out[start:end]
+    mid_set, chunk_set = set(mid), set(chunk)
+    if any(s in mid_set for cu in chunk for s in cu.src):
+      i += 1
+      continue
+    if any(s in chunk_set for mu in mid for s in mu.src):
+      i += 1
+      continue
+    # Don't hoist an A that feeds a WMMA we're skipping past (already its input).
+    if any(s in chunk_set for s in out[i + 1].src):
+      i += 1
+      continue
+    del out[start:end]
+    out[i:i] = chunk
+    i = i + len(chunk) + len(mid)
   return out
 
 def _prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
@@ -2494,7 +2454,7 @@ pm_stage_wmma_ab = PatternMatcher([(UPat(Ops.WMMA, name="wmma"), stage_wmma_ab_t
 
 def apply_tc_hand_opts(tk, rngs):
   from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
-  global _PREFETCH_NEXT_A, _PREFETCH_A_AFTER_B
+  global _PREFETCH_NEXT_A
   _B_PAGE_IDX.clear()
   lds_ab = getenv("TC_LDS_AB", 0)
   # Register path: ALLOW_UPCAST16 defaults on → product-16 (4×4).
@@ -2502,11 +2462,8 @@ def apply_tc_hand_opts(tk, rngs):
   # LDS path keeps ALLOW_UPCAST16 off (spills); product-8 + LOCAL=2×2 remains the LDS default.
   up_cap = getenv("TC_UPCAST", 4)
   # Next-A B128 prefetch for within-K upcast tiles (LLVM issues all A before WMMA burst).
-  # Default on for all K; AMD_PREFETCH_A=0 opts out. Old k_tiles<256 gate starved @4096 early A.
-  k_tiles = int(rngs[2].src[0].arg) if len(rngs) > 2 and rngs[2].src[0].op is Ops.CONST else 0
+  # Default on for all K; AMD_PREFETCH_A=0 opts out.
   _PREFETCH_NEXT_A = bool((not lds_ab) and getenv("AMD_PREFETCH_A", 1))
-  # PACK_B-aware A-after-B: opt-in only — default path wrong on random half @4096 (gfx1100).
-  _PREFETCH_A_AFTER_B = bool(_PREFETCH_NEXT_A and k_tiles >= 256 and getenv("AMD_PREFETCH_A_PACKB", 0))
   loc_cap = getenv("TC_LOCAL", 2 if lds_ab else 4)
   up16 = _allow_upcast16()
   max_tiles = min(getenv("TC_UPCAST_TILES", 16 if up16 else 8), 8 if not up16 else 10**9)
@@ -2766,7 +2723,6 @@ class AMDRenderer(ISARenderer):
     """Pre-regalloc schedule tweaks: A/B VMEM overlap, then cast-before-store.
 
     1. Prefetch next wide A (B128) before PACK_A (within-K; default all N).
-       Default tip order — A before B hoist. AMD_PREFETCH_A_PACKB=1: A after B (opt-in).
     2. Hoist next wide B between A U16 and A pack so B gets distinct VGPRs from live A dests.
     3. Prefetch next strided B U16 before current B pack so both tiles are in flight.
     4. Schedule each f32→f16 CAST immediately before its STORE — product-16 epilogue otherwise
@@ -2775,12 +2731,8 @@ class AMDRenderer(ISARenderer):
     5. AMD_D16_HI: keep each fused lo LOAD before its hi — post-regalloc-only reorder lets lo
        dest-as-addr reuse hi's still-live index VGPR (MMU on gfx1100).
     """
-    if _PREFETCH_A_AFTER_B:
-      lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
-      lst = _prefetch_next_a_b128_before_pack(lst, allow_pack_b=True) if _PREFETCH_NEXT_A else lst
-    else:
-      lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
-      lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
+    lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
+    lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
     uses: dict[UOp, list[UOp]] = {}
     for u in lst:
       for src in u.src: uses.setdefault(src, []).append(u)
