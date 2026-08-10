@@ -1646,8 +1646,10 @@ class TestAMDRenderer(unittest.TestCase):
       names = _amd_inst_names(prg)
       self.assertEqual(names.count("V_CVT_F16_F32_E32"), 128)
       self.assertEqual(names.count("GLOBAL_STORE_B16"), 128)
-      # CAST must not clobber store-addr CSE (TMP_VADDR page base).
-      self.assertLessEqual(names.count("V_LSHL_ADD_U32"), 20)
+      # CAST must not clobber store-addr CSE (TMP_VADDR page base). Count only after the last
+      # WMMA — B gather peels also emit V_LSHL_ADD (AMD_B_LSHL_ADD) in the K loop.
+      last_wmma = max(i for i, n in enumerate(names) if n.startswith("V_WMMA_"))
+      self.assertLessEqual(sum(1 for n in names[last_wmma:] if n == "V_LSHL_ADD_U32"), 20)
     finally:
       for k, v in old.items():
         if v is None: os.environ.pop(k, None)
