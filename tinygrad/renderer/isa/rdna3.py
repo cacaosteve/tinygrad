@@ -32,12 +32,10 @@ VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
 #   - HB+PB: 1× half×8 spill (~24k @2048) — 216−128−2=86 non-ACC vs ~94 needed.
 #   - PB only: spill-free, ≈tip @2048, loses @4096 vs tip (tip can beat LLVM @4096 when warm).
 # HB tip ablation is ~wash; PB is the overlap win. Overlapping PACK into ACC clobbers RMSE.
-# Remaining @2048 gap (~7–9% vs LLVM): LLVM B128×8 then vmcnt(8)|WMMA×4 + small-offset B loads.
-# Tried (RMSE-clean but slower — do not ship): (1) AMD_LOAD_OFFSET page+GLOBAL peel — B elem
-# strides ≥2048 → 4K page per load, splits s_clause (~22k @2048). (2) Fix A-prefetch past PACK_B
-# (prefetch never fired: PACK_A→PACK_B→WMMA) — pulls next A but ~−4% @2048 (VGPR). AMD_D16_HI=1
-# stays env-gated (wash vs tip). Next: byte-addressed B (LLVM-scale offsets) or opt/tiling for
-# more A before first WMMA without occupancy hit.
+# Remaining @2048 gap (~2–3% vs LLVM after AMD_B_LSHL_ADD): LLVM still denser A prefetch +
+# ~96B GLOBAL offsets. Ours gather stride N (span ~61KB) so GLOBAL-offset bases cannot share a
+# clause — peel B ADD+imm → v_lshl_add into dest instead (default on; AMD_B_LSHL_ADD=0 opts out).
+# AMD_D16_HI stays env-gated (wash vs tip).
 WMMA_ACC_VGPR = VGPR[123:]
 # Disjoint pools: LDS half2 loads stay low; PACK_F16 early-clobber dests stay high (product-8 fix).
 # Under ALLOW_UPCAST16 ACC grows to v126..v253 and overlaps the high PACK band — use mid PACK then.
@@ -708,6 +706,12 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
     return x.ins(AMDOps.SLOAD, dtype=x.dtype, src=(a.src[0], a.src[1], count))
   if _global_load(x.dtype, n) is None and not (x.dtype.scalar() is dtypes.half and n == 16):
     raise CompileError(f"no global load {x.dtype} x{n}")
+  # Peel ADD+imm into byte_off for scalar half B gathers. Emit uses v_lshl_add into dest
+  # (AMD_B_LSHL_ADD) — keeps dest-as-addr s_clause (unlike TMP+GLOBAL page peel).
+  if getenv("AMD_B_LSHL_ADD", 1) and n == 1 and x.dtype.scalar() is dtypes.half:
+    idx, off = _peel_add_imm(a.src[1], _mem_itemsize(x.dtype), max_byte=0x7fffffff, deep=True)
+    src = (a.src[0], idx, count) if off == 0 else (a.src[0], idx, count, UOp.const(off, dtypes.int32).rtag())
+    return x.ins(AMDOps.LOAD, dtype=x.dtype, src=src)
   return x.ins(AMDOps.LOAD, dtype=x.dtype, src=(a.src[0], a.src[1], count))
 
 def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
@@ -1465,7 +1469,12 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
           if addr != TMP_VDATA: pre = pre + [r3.v_mov_b32_e32(TMP_VDATA, addr)]
           addr = TMP_VDATA
         return pre + [r3.global_load_d16_hi_b16(dst, addr, dst, saddr=_src(u.src[0]))]
-      pre, addr = _scaled_addr(_dst(u) if _reg_slots(u) == 1 else TMP_VADDR, u.src[1], _mem_itemsize(u.dtype))
+      itemsize, byte_off = _mem_itemsize(u.dtype), _mem_byte_off(u)
+      # Peeled B gather: (base<<1)+byte_off into dest — one VALU, still dest-as-addr for s_clause.
+      if byte_off > 0 and _reg_slots(u) == 1 and not masked and itemsize == 2:
+        dst = _dst(u)
+        return [r3.v_lshl_add_u32(dst, _src(u.src[1]), 1, byte_off)] + _global_load_insts(u, dst)
+      pre, addr = _scaled_addr(_dst(u) if _reg_slots(u) == 1 else TMP_VADDR, u.src[1], itemsize)
       pre, addr = _masked_addr(pre, addr, masked)
       return pre + _global_load_insts(u, addr)
     case AMDOps.STORE:
