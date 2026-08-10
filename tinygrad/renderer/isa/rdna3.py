@@ -32,10 +32,12 @@ VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
 #   - HB+PB: 1× half×8 spill (~24k @2048) — 216−128−2=86 non-ACC vs ~94 needed.
 #   - PB only: spill-free, ≈tip @2048, loses @4096 vs tip (tip can beat LLVM @4096 when warm).
 # HB tip ablation is ~wash; PB is the overlap win. Overlapping PACK into ACC clobbers RMSE.
-# Remaining @2048 gap (~7–9% vs LLVM): soft vmcnt(8/14/1) through multi-WMMA + offset addressing.
-# AMD_D16_HI=1: batch pure (lo,hi)+ → lo+…hi+, emit one mixed u16+d16_hi s_clause (LLVM; no mid
-# lo-wait). HW: RMSE clean, ≈tip v_pack (~28.5k @2048 / ~78–80k @4096) — keep env-gated (no
-# clear win over default; do not auto-on).
+# Remaining @2048 gap (~7–9% vs LLVM): LLVM B128×8 then vmcnt(8)|WMMA×4 + small-offset B loads.
+# Tried (RMSE-clean but slower — do not ship): (1) AMD_LOAD_OFFSET page+GLOBAL peel — B elem
+# strides ≥2048 → 4K page per load, splits s_clause (~22k @2048). (2) Fix A-prefetch past PACK_B
+# (prefetch never fired: PACK_A→PACK_B→WMMA) — pulls next A but ~−4% @2048 (VGPR). AMD_D16_HI=1
+# stays env-gated (wash vs tip). Next: byte-addressed B (LLVM-scale offsets) or opt/tiling for
+# more A before first WMMA without occupancy hit.
 WMMA_ACC_VGPR = VGPR[123:]
 # Disjoint pools: LDS half2 loads stay low; PACK_F16 early-clobber dests stay high (product-8 fix).
 # Under ALLOW_UPCAST16 ACC grows to v126..v253 and overlaps the high PACK band — use mid PACK then.
