@@ -840,7 +840,8 @@ def _pack_f16_half2_load(lo:UOp, hi:UOp) -> tuple[UOp, int]|None:
 
 def _pack_f16_d16_hi_pair(lo:UOp, hi:UOp) -> bool:
   # Two scalar global half LOADs → global_load_u16 + global_load_d16_hi_b16 into one VGPR.
-  # Opt-in only (AMD_D16_HI=1). Auto-on was a HW loss: hi needs flush_regs(lo) → no B clause.
+  # Opt-in only (AMD_D16_HI=1). Not default: HW was a wash/~loss vs v_pack; MOCKKFD currently
+  # NaNs on ones@ones (emu D16_HI incomplete) — do not treat as review-ready until HW+mock OK.
   # Hi LOADs emit d16_hi into lo; PACK MOVs. lo-before-hi must be pre-regalloc.
   if not getenv("AMD_D16_HI", 0): return False
   if not (lo.op is Ops.INS and lo.arg is AMDOps.LOAD and hi.op is Ops.INS and hi.arg is AMDOps.LOAD): return False

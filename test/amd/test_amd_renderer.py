@@ -1329,6 +1329,32 @@ class TestAMDRenderer(unittest.TestCase):
       getenv.cache_clear()
       to_program_cache.clear()
 
+  def test_half_matmul_amd_d16_hi_emits_fused_loads(self):
+    # Compile-only: AMD_D16_HI=1 fuses B half pairs into u16 + d16_hi (opt-in; not default).
+    # Do not realize under MOCKKFD — emu still NaNs on this path.
+    import os
+    old = {k: os.environ.get(k) for k in
+           ("TC_LDS_AB", "TC_LOCAL", "TC_UPCAST", "TC_UPCAST_TILES", "ALLOW_UPCAST16", "AMD_D16_HI")}
+    for k in old: os.environ.pop(k, None)
+    os.environ["AMD_D16_HI"] = "1"
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      with Context(BEAM=0):
+        ast = (Tensor.empty(256, 256, dtype=dtypes.half, device="AMD") @
+               Tensor.empty(256, 256, dtype=dtypes.half, device="AMD"))
+        prg = _to_prg(ast.schedule_linear().src[-1].src[0])
+      names = _amd_inst_names(prg)
+      self.assertGreaterEqual(names.count("GLOBAL_LOAD_D16_HI_B16"), 16)
+      self.assertLess(names.count("GLOBAL_LOAD_U16"), 64)
+      self.assertEqual(sum(1 for u in _prg_lin(prg).src if u.op is Ops.INS and u.arg is AMDOps.WMMA), 16)
+    finally:
+      for k, v in old.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+      getenv.cache_clear()
+      to_program_cache.clear()
+
   def test_half_matmul_b128_overlaps_inflight_a_u16(self):
     # Next B (B128) issues after A U16 with no waitcnt between — B addr/dest VGPRs are
     # distinct from live A load dests (pre-regalloc hoist before A pack).
