@@ -1936,8 +1936,8 @@ class TestAMDRenderer(unittest.TestCase):
       getenv.cache_clear()
       to_program_cache.clear()
 
-  def test_half_matmul_prefetch_next_a_gated_by_k_tiles(self):
-    # Next-A B128 prefetch: on for N=2048 (K tiles <256); off for N=4096 (HW regress).
+  def test_half_matmul_prefetch_next_a_default_on(self):
+    # Next-A B128 prefetch default on for both N=2048 and N=4096 (within-K early A).
     import os
     import tinygrad.renderer.isa.rdna3 as rdna3
     old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_PREFETCH_A")}
@@ -1946,12 +1946,12 @@ class TestAMDRenderer(unittest.TestCase):
     getenv.cache_clear()
     to_program_cache.clear()
     try:
-      for n, want in ((2048, True), (4096, False)):
+      for n in (2048, 4096):
         with Context(BEAM=0):
           ast = (Tensor.empty(n, n, dtype=dtypes.half, device="AMD") @
                  Tensor.empty(n, n, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
           _to_prg(ast.schedule_linear().src[-1].src[0])
-        self.assertEqual(rdna3._PREFETCH_NEXT_A, want, f"N={n}")
+        self.assertTrue(rdna3._PREFETCH_NEXT_A, f"N={n}")
     finally:
       for k, v in old.items():
         if v is None: os.environ.pop(k, None)
