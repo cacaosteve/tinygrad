@@ -32,8 +32,10 @@ VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
 #   - HB+PB: 1× half×8 spill (~24k @2048) — 216−128−2=86 non-ACC vs ~94 needed.
 #   - PB only: spill-free, ≈tip @2048, loses @4096 vs tip (tip can beat LLVM @4096 when warm).
 # HB tip ablation is ~wash; PB is the overlap win. Overlapping PACK into ACC clobbers RMSE.
-# Remaining @2048 gap (~7%): LLVM uses d16_hi + large s_clause through multi-WMMA soft waits;
-# our AMD_D16_HI still kills B clause / MMU — need lo-clause→hi-clause without hang.
+# Remaining @2048 gap (~7–9% vs LLVM): soft vmcnt(8/14/1) through multi-WMMA + offset addressing.
+# AMD_D16_HI=1: batch pure (lo,hi)+ → lo+…hi+, emit one mixed u16+d16_hi s_clause (LLVM; no mid
+# lo-wait). HW: RMSE clean, ≈tip v_pack (~28.5k @2048 / ~78–80k @4096) — keep env-gated (no
+# clear win over default; do not auto-on).
 WMMA_ACC_VGPR = VGPR[123:]
 # Disjoint pools: LDS half2 loads stay low; PACK_F16 early-clobber dests stay high (product-8 fix).
 # Under ALLOW_UPCAST16 ACC grows to v126..v253 and overlaps the high PACK band — use mid PACK then.
@@ -1906,7 +1908,11 @@ def _clauseable_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
 def _order_d16_lo_before_hi(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp]:
   # Fused hi must follow its lo in BOTH regalloc and emit order. Emit-only reorder lets lo's
   # dest-as-addr reuse hi's index VGPR after regalloc ended that index's live range at hi.
+  # Pair-local lo,hi,lo,hi serializes VMEM (per-hi flush_regs). Batch pure (lo,hi)+ streaks
+  # (no intervening addr ALU) to lo+ then hi+ so emit can s_clause each run — LLVM pattern.
+  # Streaks with addr* between loads are left pairwise (addr must stay with its load).
   if not d16_hi_lo: return ops
+  lo_set = set(d16_hi_lo.values())
   out = list(ops)
   for hi, lo in d16_hi_lo.items():
     try: hi_i, lo_i = out.index(hi), out.index(lo)
@@ -1914,7 +1920,20 @@ def _order_d16_lo_before_hi(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp
     if hi_i > lo_i: continue
     out.pop(hi_i)
     out.insert(out.index(lo) + 1, hi)
-  return out
+  batched: list[UOp] = []
+  i = 0
+  while i < len(out):
+    j = i
+    los: list[UOp] = []
+    his: list[UOp] = []
+    while j + 1 < len(out) and out[j] in lo_set and out[j + 1] in d16_hi_lo and \
+          d16_hi_lo[out[j + 1]] is out[j]:
+      los.append(out[j]); his.append(out[j + 1]); j += 2
+    if len(los) >= 2:
+      batched.extend(los); batched.extend(his); i = j
+    else:
+      batched.append(out[i]); i += 1
+  return batched
 
 def insts_from_linear(lin:UOp):
   ops = list(lin.src)
@@ -2005,16 +2024,23 @@ def insts_from_linear(lin:UOp):
       if u.op is Ops.INS and u.arg is AMDOps.END_MASK: mask_depth -= 1
       oi += 1
       continue
-    if u in d16_hi_lo: flush_regs(_reg_idxs(d16_hi_lo[u]))
-    # Cluster scalar half loads: all dest-as-addr scales, then s_clause + tight VMEM (LLVM-style B).
+    # Cluster scalar half loads: dest-as-addr scales, then s_clause + tight VMEM (LLVM-style B).
     # ~+40% @2048 vs no clause on gfx1100 — always on (no opt-out knob).
+    # With AMD_D16_HI lo+…hi+ batch: extend the clause through following d16_his (LLVM mixes
+    # u16+d16_hi in one s_clause with no mid-wait; hard flush_regs(lo) was the GFLOPS cliff).
     if u not in d16_hi_lo and _clauseable_half_gload(u, skip, mask_depth):
       j = oi + 1
       while j < len(scheduled) and scheduled[j] not in d16_hi_lo and \
             _clauseable_half_gload(scheduled[j], skip, mask_depth): j += 1
-      if j - oi >= 2:
-        parts = [list(insts_for_uop(scheduled[k], skip, False, d16_hi_lo=d16_hi_lo)) for k in range(oi, j)]
-        if all(_vm_load_count(p) == 1 for p in parts):
+      j_hi = j
+      if d16_hi_lo and j > oi:
+        while j_hi < len(scheduled) and scheduled[j_hi] in d16_hi_lo: j_hi += 1
+      end = j_hi if j_hi - j >= 2 else j
+      if end - oi >= 2:
+        parts = [list(insts_for_uop(scheduled[k], skip, False, d16_hi_lo=d16_hi_lo)) for k in range(oi, end)]
+        hi_ok = all(k < j or (not any(getattr(i, "vdst", None) == TMP_VDATA for i in parts[k - oi]))
+                    for k in range(j, end))
+        if hi_ok and all(_vm_load_count(p) == 1 for p in parts):
           store_addr_cache.clear()
           scales, loads = [], []
           for p in parts:
@@ -2025,9 +2051,11 @@ def insts_from_linear(lin:UOp):
           emit(r3.s_clause(simm16=len(loads) - 1))
           for inst in loads: emit(inst)
           for k, p in enumerate(parts):
-            note_vm(_reg_idxs(scheduled[oi + k]), p)
-          oi = j
+            su = scheduled[oi + k]
+            note_vm(_reg_idxs(d16_hi_lo[su]) if su in d16_hi_lo else _reg_idxs(su), p)
+          oi = end
           continue
+    if u in d16_hi_lo: flush_regs(_reg_idxs(d16_hi_lo[u]))
     is_store = u.op is Ops.INS and u.arg is AMDOps.STORE
     emitted = list(insts_for_uop(u, skip, masked, store_addr_cache if is_store else None, d16_hi_lo))
     # VALU copy of an outstanding VMEM/LDS dest must wait first (PACK/MOV across pools).
