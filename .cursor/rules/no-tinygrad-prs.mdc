@@ -1,0 +1,8 @@
+---
+description: Do not open PRs against tinygrad org repos unless explicitly asked
+alwaysApply: true
+---
+
+# No tinygrad PRs
+
+Never open, create, or re-open pull requests against tinygrad/tinygrad (or other tinygrad org repos) unless the user explicitly asks in that conversation. Pushing to a personal fork branch is fine. Do not create draft PRs for shipping on your own. Only update an existing upstream PR if the user asks.

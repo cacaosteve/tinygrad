@@ -71,5 +71,7 @@ graphlib/
 uv.lock
 
 # local agent / session notes (not for upstream)
-.cursor/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/no-tinygrad-prs.mdc
 notes/
