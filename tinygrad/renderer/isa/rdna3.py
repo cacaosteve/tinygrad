@@ -786,6 +786,16 @@ def _pack_f16_is_vec_load(u:UOp) -> bool:
     return s.op is Ops.INS and s.arg in (AMDOps.LOAD, AMDOps.LLOAD) and _elem_count(s) >= 2
   return bool(u.src) and all(is_vec_mem(s) for s in u.src)
 
+def _wmma_ab_from_lds(wmma:UOp) -> bool:
+  """True if WMMA A/B is staged from LDS (TC_LDS_AB), not unrelated LLOAD elsewhere in the kernel."""
+  def from_lds(x:UOp, depth:int=0) -> bool:
+    if depth > 6 or x.op is not Ops.INS: return False
+    if x.arg is AMDOps.LLOAD: return True
+    if x.arg in (AMDOps.PACK_F16, AMDOps.EXTRACT, AMDOps.MOV):
+      return any(from_lds(s, depth + 1) for s in x.src)
+    return False
+  return len(wmma.src) >= 3 and (from_lds(wmma.src[1]) or from_lds(wmma.src[2]))
+
 def _wmma_ab_vec_loads(elems:tuple[UOp, ...]) -> tuple[UOp, ...]|None:
   # STACK of INDEX(half×n LOAD, 0..n-1)... → PACK srcs are the Ops.LOAD nodes (isel tags them once).
   if len(elems) != 16: return None
@@ -1490,12 +1500,14 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
           addr = TMP_VDATA
         return pre + [r3.global_load_d16_hi_b16(dst, addr, dst, saddr=_src(u.src[0]))]
       itemsize, byte_off = _mem_itemsize(u.dtype), _mem_byte_off(u)
-      # Compact B: in-place <<1 on page idx once, GLOBAL offset=rem (shared addr across rem loads).
+      # Compact B: in-place <<1 on page-idx UOp once (track by UOp id, not phys VGPR —
+      # regalloc may reuse the VGPR for a later unscaled page idx).
       if byte_scaled is not None and _is_b_compact_load(u) and _reg_slots(u) == 1 and not masked and itemsize == 2:
-        idx = _src(u.src[1])
+        idx_uop, idx = u.src[1], _src(u.src[1])
         if not isinstance(idx, Reg) or idx.offset < 256: raise CompileError("compact B needs VGPR idx")
-        scale = [] if idx.offset in byte_scaled else [r3.v_lshlrev_b32_e64(idx, 1, idx)]
-        byte_scaled.add(idx.offset)
+        key = id(idx_uop)
+        scale = [] if key in byte_scaled else [r3.v_lshlrev_b32_e64(idx, 1, idx)]
+        byte_scaled.add(key)
         return scale + _global_load_insts(u, idx, byte_off)
       # Peeled B gather: (base<<1)+byte_off into dest — one VALU, still dest-as-addr for s_clause.
       if byte_off > 0 and _reg_slots(u) == 1 and not masked and itemsize == 2:
@@ -2002,7 +2014,7 @@ def insts_from_linear(lin:UOp):
   items, targets, byte = [], {}, 0
   store_addr_cache = _StoreAddrCache()
   _B_PAGE_IDX.clear()
-  # Compact B: VGPR idxs already shifted to bytes (in-place <<1 once per page).
+  # Compact B: page-idx UOps already shifted to bytes (in-place <<1 once per idx UOp).
   byte_scaled: set[int]|None = set() if getenv("AMD_B_COMPACT", 1) else None
   def emit(inst):
     nonlocal byte
@@ -2693,20 +2705,20 @@ class AMDRenderer(ISARenderer):
     # Unroll lowers WMMA cin to zero PACKs + ADD into phi. Those PACKs must run each K
     # iteration: if they stay pre-loop, two-address WMMA keeps ACC across iters and the
     # phi ADDs double-count (test_tensor_cores_unroll_phi).
-    # Skip when the kernel stages A/B through LDS: those same zero PACKs are one-shot ACC
-    # inits and must stay pre-loop so two-address WMMA can accumulate across K.
-    if not any(u.op is Ops.INS and u.arg is AMDOps.LLOAD for u in lst):
-      if (loop_i := next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), None)) is not None:
-        zero_acc = {u.src[0] for u in lst if u.op is Ops.INS and u.arg is AMDOps.WMMA and
-                    _is_wmma_acc_reload_pack(u.src[0])}
-        move_i = [i for i,u in enumerate(lst) if i < loop_i and u in zero_acc]
-        if move_i:
-          packs = [lst[i] for i in move_i]
-          lst = [u for i,u in enumerate(lst) if i not in set(move_i)]
-          loop_i = next(i for i,u in enumerate(lst) if u.op is Ops.RANGE)
-          ins = loop_i + 1
-          if ins < len(lst) and lst[ins].op is Ops.AFTER: ins += 1
-          lst = lst[:ins] + packs + lst[ins:]
+    # Do not sink packs for WMMAs whose A/B come from LDS — those zeros are one-shot ACC
+    # inits for two-address accumulate across K (TC_LDS_AB). Unrelated LLOAD elsewhere
+    # must not suppress the UNROLL sink.
+    if (loop_i := next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), None)) is not None:
+      zero_acc = {u.src[0] for u in lst if u.op is Ops.INS and u.arg is AMDOps.WMMA and
+                  _is_wmma_acc_reload_pack(u.src[0]) and not _wmma_ab_from_lds(u)}
+      move_i = [i for i,u in enumerate(lst) if i < loop_i and u in zero_acc]
+      if move_i:
+        packs = [lst[i] for i in move_i]
+        lst = [u for i,u in enumerate(lst) if i not in set(move_i)]
+        loop_i = next(i for i,u in enumerate(lst) if u.op is Ops.RANGE)
+        ins = loop_i + 1
+        if ins < len(lst) and lst[ins].op is Ops.AFTER: ins += 1
+        lst = lst[:ins] + packs + lst[ins:]
     inits, tiles, idx_map = _wmma_acc_zero_inits(lst)
     if not inits: return lst, {}
     loop_i = next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), 0)

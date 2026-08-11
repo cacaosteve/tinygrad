@@ -1908,7 +1908,8 @@ class TestAMDRenderer(unittest.TestCase):
       to_program_cache.clear()
 
   def test_half_matmul_compact_b_global_offsets(self):
-    # AMD_B_COMPACT default: per-k page idx + GLOBAL offset rem ∈ {0,32,64,96} @N=2048.
+    # AMD_B_COMPACT default: per-k page idx UOp + GLOBAL offset rem ∈ {0,32,64,96} @N=2048.
+    # Emit scales once per idx UOp (id-keyed), so phys VGPR reuse cannot skip a later <<1.
     import os
     old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_B_COMPACT", "AMD_D16_HI")}
     os.environ["TC_LDS_AB"] = "0"
@@ -1936,6 +1937,38 @@ class TestAMDRenderer(unittest.TestCase):
       getenv.cache_clear()
       to_program_cache.clear()
 
+  def test_compact_b_byte_scaled_keys_idx_uop_not_phys(self):
+    # Same page-idx UOp → one <<1; a distinct idx UOp must scale again even if emit reused a VGPR.
+    import os
+    from tinygrad.uop import Ops
+    old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_B_COMPACT")}
+    os.environ["TC_LDS_AB"] = "0"
+    os.environ.pop("AMD_B_COMPACT", None)
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      with Context(BEAM=0):
+        prg = _to_prg((Tensor.empty(2048, 2048, dtype=dtypes.half, device="AMD") @
+                       Tensor.empty(2048, 2048, dtype=dtypes.half, device="AMD")).schedule_linear().src[-1].src[0])
+      compacts = [u for u in _prg_lin(prg).src if u.op is Ops.INS and u.arg is AMDOps.LOAD and amd_lib._is_b_compact_load(u)]
+      self.assertGreaterEqual(len(compacts), 2)
+      u0 = compacts[0]
+      same = next(u for u in compacts[1:] if u.src[1] is u0.src[1])
+      other = next(u for u in compacts[1:] if u.src[1] is not u0.src[1])
+      byte_scaled: set[int] = set()
+      def n_scale(u):
+        return sum(1 for i in amd_lib.insts_for_uop(u, set(), False, None, None, byte_scaled)
+                   if getattr(i, "op_name", "") == "V_LSHLREV_B32_E64")
+      self.assertEqual(n_scale(u0), 1)
+      self.assertEqual(n_scale(same), 0)   # same idx UOp: already scaled
+      self.assertEqual(n_scale(other), 1)  # different idx UOp: must scale (id-keyed, not phys)
+    finally:
+      for k, v in old.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+      getenv.cache_clear()
+      to_program_cache.clear()
+
   def test_tmp_vaddr_clause_safe_helper(self):
     # Guard for wide B128 s_clause hoist: ≥2 TMP_VADDR scales before TMP-addr loads is unsafe.
     T = amd_lib.TMP_VADDR
@@ -1947,6 +1980,39 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertTrue(amd_lib._tmp_vaddr_clause_safe([scale(), other], [load_tmp]))
     self.assertTrue(amd_lib._tmp_vaddr_clause_safe([scale(), scale()], [load_other]))
     self.assertFalse(amd_lib._tmp_vaddr_clause_safe([scale(), scale()], [load_tmp, load_tmp]))
+
+  def test_wmma_ab_from_lds_only_on_lds_operands(self):
+    # UNROLL ACC sink must key off WMMA A/B LDS staging, not any LLOAD in the kernel.
+    import os
+    from tinygrad.uop import Ops
+    old = os.environ.get("TC_LDS_AB")
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      os.environ["TC_LDS_AB"] = "0"
+      getenv.cache_clear()
+      to_program_cache.clear()
+      with Context(BEAM=0):
+        reg = _to_prg((Tensor.empty(64, 64, dtype=dtypes.half, device="AMD") @
+                       Tensor.empty(64, 64, dtype=dtypes.half, device="AMD")).schedule_linear().src[-1].src[0])
+      reg_wmmas = [u for u in _prg_lin(reg).src if u.op is Ops.INS and u.arg is AMDOps.WMMA]
+      self.assertTrue(reg_wmmas)
+      self.assertFalse(any(amd_lib._wmma_ab_from_lds(u) for u in reg_wmmas))
+
+      os.environ["TC_LDS_AB"] = "1"
+      getenv.cache_clear()
+      to_program_cache.clear()
+      with Context(BEAM=0):
+        lds = _to_prg((Tensor.empty(64, 64, dtype=dtypes.half, device="AMD") @
+                       Tensor.empty(64, 64, dtype=dtypes.half, device="AMD")).schedule_linear().src[-1].src[0])
+      lds_wmmas = [u for u in _prg_lin(lds).src if u.op is Ops.INS and u.arg is AMDOps.WMMA]
+      self.assertTrue(lds_wmmas)
+      self.assertTrue(any(amd_lib._wmma_ab_from_lds(u) for u in lds_wmmas))
+    finally:
+      if old is None: os.environ.pop("TC_LDS_AB", None)
+      else: os.environ["TC_LDS_AB"] = old
+      getenv.cache_clear()
+      to_program_cache.clear()
 
   def test_half_matmul_wide_b128_clause_not_tmp_vaddr_clobber(self):
     # Wide A clustering may hoist scales before s_clause; never ≥2 TMP_VADDR scales then TMP loads.
