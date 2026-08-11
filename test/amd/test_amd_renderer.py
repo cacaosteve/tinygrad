@@ -2007,7 +2007,7 @@ class TestAMDRenderer(unittest.TestCase):
                        Tensor.empty(64, 64, dtype=dtypes.half, device="AMD")).schedule_linear().src[-1].src[0])
       lds_wmmas = [u for u in _prg_lin(lds).src if u.op is Ops.INS and u.arg is AMDOps.WMMA]
       self.assertTrue(lds_wmmas)
-      self.assertTrue(any(amd_lib._wmma_ab_from_lds(u) for u in lds_wmmas))
+      self.assertTrue(all(amd_lib._wmma_ab_from_lds(u) for u in lds_wmmas))
     finally:
       if old is None: os.environ.pop("TC_LDS_AB", None)
       else: os.environ["TC_LDS_AB"] = old
