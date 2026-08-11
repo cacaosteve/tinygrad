@@ -1936,6 +1936,53 @@ class TestAMDRenderer(unittest.TestCase):
       getenv.cache_clear()
       to_program_cache.clear()
 
+  def test_tmp_vaddr_clause_safe_helper(self):
+    # Guard for wide B128 s_clause hoist: ≥2 TMP_VADDR scales before TMP-addr loads is unsafe.
+    T = amd_lib.TMP_VADDR
+    def scale(): return type("I", (), {"vdst": T})()
+    other = type("I", (), {"vdst": type("R", (), {"offset": 3})()})()
+    load_tmp = type("I", (), {"addr": T})()
+    load_other = type("I", (), {"addr": type("R", (), {"offset": 4})()})()
+    self.assertTrue(amd_lib._tmp_vaddr_clause_safe([scale()], [load_tmp, load_tmp]))
+    self.assertTrue(amd_lib._tmp_vaddr_clause_safe([scale(), other], [load_tmp]))
+    self.assertTrue(amd_lib._tmp_vaddr_clause_safe([scale(), scale()], [load_other]))
+    self.assertFalse(amd_lib._tmp_vaddr_clause_safe([scale(), scale()], [load_tmp, load_tmp]))
+
+  def test_half_matmul_wide_b128_clause_not_tmp_vaddr_clobber(self):
+    # Wide A clustering may hoist scales before s_clause; never ≥2 TMP_VADDR scales then TMP loads.
+    import os
+    old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_PREFETCH_A", "ALLOW_UPCAST16")}
+    os.environ["TC_LDS_AB"] = "0"
+    for k in ("AMD_PREFETCH_A", "ALLOW_UPCAST16"): os.environ.pop(k, None)
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      with Context(BEAM=0):
+        ast = (Tensor.empty(2048, 2048, dtype=dtypes.half, device="AMD") @
+               Tensor.empty(2048, 2048, dtype=dtypes.half, device="AMD"))
+        prg = _to_prg(ast.schedule_linear().src[-1].src[0])
+      insts = list(_REN._insts_from_linear(_prg_lin(prg)))
+      names = [getattr(i, "op_name", "") for i in insts]
+      self.assertGreaterEqual(names.count("GLOBAL_LOAD_B128"), 2)
+      T = amd_lib.TMP_VADDR
+      for i, n in enumerate(names):
+        if n != "S_CLAUSE": continue
+        j, n_sc = i - 1, 0
+        while j >= 0 and names[j].startswith("V_"):
+          if getattr(insts[j], "vdst", None) == T: n_sc += 1
+          j -= 1
+        j, n_ld = i + 1, 0
+        while j < len(insts) and names[j].startswith("GLOBAL_LOAD"):
+          if getattr(insts[j], "addr", None) == T: n_ld += 1
+          j += 1
+        self.assertFalse(n_sc >= 2 and n_ld >= 2, f"TMP_VADDR clobber at clause {i}: scales={n_sc} loads={n_ld}")
+    finally:
+      for k, v in old.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+      getenv.cache_clear()
+      to_program_cache.clear()
+
   def test_half_matmul_prefetch_next_a_default_on(self):
     # Next-A B128 prefetch default on for both N=2048 and N=4096 (within-K early A).
     import os

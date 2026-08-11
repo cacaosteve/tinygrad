@@ -1938,6 +1938,12 @@ def _split_scale_and_loads(emitted:list) -> tuple[list, list]:
   while i > 0 and _vm_load_count([emitted[i - 1]]): i -= 1
   return emitted[:i], emitted[i:]
 
+def _tmp_vaddr_clause_safe(scales:list, loads:list) -> bool:
+  # Multi-slot loads scale into TMP_VADDR. Hoisting ≥2 such scales before TMP-addr loads
+  # clobbers addr (load0 sees addr1). One scale + several loads is OK (half×16 B128 pair).
+  if sum(1 for s in scales if getattr(s, "vdst", None) == TMP_VADDR) <= 1: return True
+  return not any(getattr(ld, "addr", None) == TMP_VADDR for ld in loads)
+
 def _clauseable_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   # Scalar half global LOAD with dest-as-addr (no mask/TMP). Streak → hoist scales + s_clause.
   if u in skip or mask_depth or u.op is not Ops.INS or u.arg is not AMDOps.LOAD: return False
@@ -2100,12 +2106,13 @@ def insts_from_linear(lin:UOp):
           sc, ld = _split_scale_and_loads(p)
           scales.extend(sc)
           loads.extend(ld)
-        for inst in scales: emit(inst)
-        emit(r3.s_clause(simm16=len(loads) - 1))
-        for inst in loads: emit(inst)
-        for k in idxs: note_vm(_reg_idxs(scheduled[k]), parts[k - oi])
-        oi = j
-        continue
+        if _tmp_vaddr_clause_safe(scales, loads):
+          for inst in scales: emit(inst)
+          emit(r3.s_clause(simm16=len(loads) - 1))
+          for inst in loads: emit(inst)
+          for k in idxs: note_vm(_reg_idxs(scheduled[k]), parts[k - oi])
+          oi = j
+          continue
     # Cluster scalar half loads: dest-as-addr scales, then s_clause + tight VMEM (LLVM-style B).
     # ~+40% @2048 vs no clause on gfx1100 — always on (no opt-out knob).
     # With AMD_D16_HI lo+…hi+ batch: extend the clause through following d16_his (LLVM mixes
