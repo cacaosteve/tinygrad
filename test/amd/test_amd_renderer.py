@@ -1464,7 +1464,7 @@ class TestAMDRenderer(unittest.TestCase):
       self.assertNotIn(AMDOps.FILL, linear_ops)
       self.assertNotIn(AMDOps.SLOAD, linear_ops)
       self.assertNotIn(AMDOps.SSTORE, linear_ops)
-      # Scalar half A loads are s_clause-clustered (~+40% vs no clause on gfx1100).
+      # Default register path clusters scalar half loads under s_clause.
       self.assertGreaterEqual(_amd_inst_names(prg).count("S_CLAUSE"), 1)
     finally:
       for k, old in (("TC_UPCAST", old_u), ("TC_UPCAST_TILES", old_t), ("TC_LDS_AB", old_l),
@@ -1475,7 +1475,7 @@ class TestAMDRenderer(unittest.TestCase):
       to_program_cache.clear()
 
   def test_half_matmul_local4_default_register_path(self):
-    # LOCAL=4 default for register path @2048 and @4096 (HW: beats LOCAL=2 @4096).
+    # Register path defaults TC_LOCAL=4 (also enforced for large square N).
     import os
     old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "TC_LOCAL", "TC_UPCAST", "TC_UPCAST_TILES", "ALLOW_UPCAST16")}
     for k in old: os.environ.pop(k, None)
@@ -1885,7 +1885,7 @@ class TestAMDRenderer(unittest.TestCase):
       to_program_cache.clear()
 
   def test_half_matmul_default_vpack_not_auto_d16(self):
-    # N=2048 stays u16+v_pack by default — auto d16_hi serialized VMEM (~3× @2048 HW).
+    # Default is u16+v_pack; AMD_D16_HI stays opt-in (mid-clause flush serializes VMEM).
     import os
     old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_D16_HI")}
     os.environ["TC_LDS_AB"] = "0"
@@ -2073,7 +2073,7 @@ class TestAMDRenderer(unittest.TestCase):
       to_program_cache.clear()
 
   def test_tc_lds_ab_not_default_until_faster(self):
-    # Step C: ISA default is register+B128 until LDS wins @4096 on HW.
+    # TC_LDS_AB stays opt-in; default is register+B128.
     import os
     old = os.environ.get("TC_LDS_AB")
     os.environ.pop("TC_LDS_AB", None)

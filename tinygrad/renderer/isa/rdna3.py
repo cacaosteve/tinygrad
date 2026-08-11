@@ -17,9 +17,7 @@ from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
 
 # RDNA3: kernarg in s[0:1], local ids packed in v0. Even SGPR bases for 64-bit kernarg loads.
 # WGID follows USER_SGPR_COUNT: s2 when count=2 (1D locals); s15 when gfx1100 pads to 15 (2D locals).
-# Next-A B128 prefetch: within-K upcast tiles (LLVM issues A burst before WMMA).
-# AMD_PREFETCH_A=0 opts out. Tried/failed: PACK_B-aware A-after-B (wrong @4096 random);
-# fixed-point multi-A B128×8 (~−10% @2048).
+# AMD_PREFETCH_A (default 1): within-K next-A B128 before PACK so A tiles overlap WMMA; 0 opts out.
 _PREFETCH_NEXT_A = False
 KERNARG_REG = s[0:1]
 WGID = tuple(Register(f"s{i}", i) for i in range(2, 5))  # 1D default; 2D uses s15+ via _wgid_reg
@@ -27,8 +25,7 @@ LID = tuple(Register(f"v{i}", 256+i) for i in range(3))
 # Skip s16 — reserved as WGID_Y when USER_SGPR=15 (gfx1100 2D locals).
 SGPR = tuple(Register(f"s{i}", i) for i in range(6, 104, 2) if i != 16)
 VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
-# Occupancy notes / failed experiments live in git history; keep defaults that match LLVM.
-# B gathers factor as k*4096+{0,32,64,96} (@N≥2048). AMD_B_COMPACT (default on): isel CSE
+# B gathers factor as k*4096+{0,32,64,96} for large N. AMD_B_COMPACT (default on): isel CSE
 # per-k page idx + in-place <<1 once + GLOBAL offset rem — keeps s_clause, cuts addr ALU.
 # AMD_B_COMPACT=0 → AMD_B_LSHL_ADD dest-as-addr. AMD_D16_HI stays env-gated (mock NaNs).
 WMMA_ACC_VGPR = VGPR[123:]
@@ -855,8 +852,7 @@ def _wmma_inst(u:UOp):
 def _pack_f16_half2_load(lo:UOp, hi:UOp) -> tuple[UOp, int]|None:
   # EXTRACT(LLOAD, 2k)/EXTRACT(LLOAD, 2k+1) rebuilds the same half2 VGPR word — MOV it.
   # LLOAD-only: global LOAD shares the general VGPR pool with EXTRACT; hi LSHR can
-  # clobber the load before PACK MOVs it. Parking LOAD in PACK pool also failed
-  # (wide_regalloc collapsed distinct LOADs onto one VGPR).
+  # clobber the load before PACK MOVs it. Keep global half pairs on the v_pack path instead.
   if not (lo.op is Ops.INS and lo.arg is AMDOps.EXTRACT and hi.op is Ops.INS and hi.arg is AMDOps.EXTRACT): return None
   if lo.src[0] is not hi.src[0]: return None
   base = lo.src[0]
@@ -868,8 +864,7 @@ def _pack_f16_half2_load(lo:UOp, hi:UOp) -> tuple[UOp, int]|None:
 
 def _pack_f16_d16_hi_pair(lo:UOp, hi:UOp) -> bool:
   # Two scalar global half LOADs → global_load_u16 + global_load_d16_hi_b16 into one VGPR.
-  # Opt-in only (AMD_D16_HI=1). Not default: HW was a wash/~loss vs v_pack; MOCKKFD currently
-  # NaNs on ones@ones (emu D16_HI incomplete) — do not treat as review-ready until HW+mock OK.
+  # AMD_D16_HI=1 only: default stays u16+v_pack. Mock D16_HI is incomplete (ones@ones NaNs).
   # Hi LOADs emit d16_hi into lo; PACK MOVs. lo-before-hi must be pre-regalloc.
   if not getenv("AMD_D16_HI", 0): return False
   if not (lo.op is Ops.INS and lo.arg is AMDOps.LOAD and hi.op is Ops.INS and hi.arg is AMDOps.LOAD): return False
@@ -1757,7 +1752,7 @@ def _prefetch_next_a_b128_before_pack(ops:list[UOp]) -> list[UOp]:
 
   Pre-regalloc: A0 → PACK_A0 → WMMA* → … → A1_addr* → A1
   becomes:      A0 → A1_addr* → A1 → PACK_A0 → WMMA* → …
-  Regalloc assigns A0/A1 distinct VGPRs (needs ~+8 VGPR). Emit soft-waits leave A1 in flight.
+  Regalloc must give A0/A1 distinct VGPRs; soft waitcnt leaves A1 in flight into WMMA.
   """
   if not any(u.op is Ops.INS and u.arg is AMDOps.WMMA for u in ops): return ops
   out = list(ops)
@@ -2126,9 +2121,8 @@ def insts_from_linear(lin:UOp):
           oi = j
           continue
     # Cluster scalar half loads: dest-as-addr scales, then s_clause + tight VMEM (LLVM-style B).
-    # ~+40% @2048 vs no clause on gfx1100 — always on (no opt-out knob).
-    # With AMD_D16_HI lo+…hi+ batch: extend the clause through following d16_his (LLVM mixes
-    # u16+d16_hi in one s_clause with no mid-wait; hard flush_regs(lo) was the GFLOPS cliff).
+    # Always on. With AMD_D16_HI lo+…hi+ batch: extend the clause through following d16_his
+    # (u16+d16_hi in one s_clause); do not hard-flush on lo mid-clause.
     if u not in d16_hi_lo and _clauseable_half_gload(u, skip, mask_depth):
       j = oi + 1
       while j < len(scheduled) and scheduled[j] not in d16_hi_lo and \
@@ -2476,8 +2470,7 @@ def apply_tc_hand_opts(tk, rngs):
   global _PREFETCH_NEXT_A
   _B_PAGE_IDX.clear()
   lds_ab = getenv("TC_LDS_AB", 0)
-  # Register path: ALLOW_UPCAST16 defaults on → product-16 (4×4).
-  # LOCAL=4 wins @2048 and @4096 on gfx1100 (3-trial medians); LOCAL=2 was slower @4096.
+  # Register path: ALLOW_UPCAST16 defaults on → product-16 (4×4); TC_LOCAL defaults to 4.
   # LDS path keeps ALLOW_UPCAST16 off (spills); product-8 + LOCAL=2×2 remains the LDS default.
   up_cap = getenv("TC_UPCAST", 4)
   # Next-A B128 prefetch for within-K upcast tiles (LLVM issues all A before WMMA burst).
@@ -2551,11 +2544,13 @@ from tinygrad.codegen.late.index_mops import pm_index_mops, _index_through_resha
 
 _WMMA_AB_WIDTH = 16
 # Serialize A-tile batches so earlier LDS A packs die before later ones load (VGPR pressure).
-# Product-8 OK with batch 2 + disjoint LLOAD/PACK pools. Product-16 still wrong on gfx1100
-# (mse~450, spills) even with TC_LDS_A_BATCH=1 — AFTER does not constrain live ranges enough.
+# Product-8 is OK with batch 2 + disjoint LLOAD/PACK pools. Product-16 under LDS still spills /
+# mis-lives without stronger live-range constraints than AFTER provides.
 
 def expand_wmma_lds_tiles(u, a, b, c, done_arg, unroll_axis, ctx):
-  # TC_LDS_AB pre-contracts to STACK(16*tile,); slice per-tile STACK(16,) here.
+  # Shared AMDRenderer / AMDLLVMRenderer hook for TC_LDS_AB WMMA expansion: pre-contracted
+  # STACK(16*tile,) is sliced per tile here. Staging only runs when the renderer installs
+  # pm_stage_wmma_ab and TC_LDS_AB is set; import of this module wires the codegen hook.
   # Serialize A-tile batches with AFTER so earlier LDS A packs die before later ones load.
   if a.op is not Ops.STACK or len(a.src) <= _WMMA_AB_WIDTH or len(a.src) % _WMMA_AB_WIDTH != 0: return None
   ta, tb = len(a.src) // _WMMA_AB_WIDTH, (len(b.src) // _WMMA_AB_WIDTH) if b.op is Ops.STACK else 1
@@ -2784,8 +2779,8 @@ class AMDRenderer(ISARenderer):
   def rematerialize(self, x:UOp) -> bool:
     if x.op is not Ops.INS: return False
     # Under TC_LDS_AB: remat LDS half EXTRACTs (and LLOAD bases if ALLOW_UPCAST16).
-    # Address remat defaults ON under LDS — EXTRACT-only leaves addr spills and breaks mock
-    # (and is no faster on gfx1100). AMD_REMAT_ADDR=0 opts out for experiments.
+    # Address remat defaults ON under LDS — EXTRACT-only leaves addr spills / wrong mock.
+    # AMD_REMAT_ADDR=0 opts out.
     if getenv("TC_LDS_AB", 0) and getenv("AMD_REMAT", 1):
       if (x.arg is AMDOps.EXTRACT and x.dtype.scalar() is dtypes.half and x.src and
           x.src[0].op is Ops.INS and x.src[0].arg is AMDOps.LLOAD):
@@ -2894,6 +2889,8 @@ def wide_regalloc_rewrite(ctx, x:UOp):
 
 # ***** public install (was thin isa/amd.py) *****
 def _install_hooks():
+  # expand_wmma_lds_hook: shared AMD/AMDLLVM LDS WMMA tile expansion (gated by TC_LDS_AB +
+  # renderer pm_stage_wmma_ab). install_amdllvm_tc attaches the same TC hand opts to LLVM.
   from tinygrad.renderer.llvmir import AMDLLVMRenderer
   import tinygrad.codegen as cg
   cg.expand_wmma_lds_hook = expand_wmma_lds_tiles
