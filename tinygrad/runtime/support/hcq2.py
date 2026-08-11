@@ -141,14 +141,14 @@ def _build_wait_cmds(slots:dict[str, int], dep_lanes:list[tuple[tuple, int, int]
 
   # opt2: keep latest dep per (dep device, queue, cur lane)
   latest = {((dep[0][dlane], dep[1]), lane): (dep, dlane) for dep, dlane, lane in sorted(dep_lanes, key=lambda x: x[0][2])}
-  deps:dict[tuple, list[int|None]] = collections.defaultdict(lambda: [None]*len(devices))
-  for (_, lane), (dep, dlane) in latest.items(): deps[dep][lane] = dlane
+  deps:dict[tuple, dict[int, list[int]]] = collections.defaultdict(lambda: collections.defaultdict(list))
+  for (_, lane), (dep, dlane) in latest.items(): deps[dep][lane].append(dlane)
 
   waits = []
-  for (ddevs, dqueue, dtag), lanes in deps.items():
-    sig = UOp.mstack(*[make_signal(d, tag="sentinel_signal") if dl is None else make_signal(ddevs[dl], slots[dqueue])
-                       for dl, d in zip(lanes, devices)])
-    waits.append(UOp(Ops.INS, arg="wait", src=(sig, UOp.const(dtag + 1, dtypes.uint64))))
+  for (ddevs, dqueue, dtag), by_lane in deps.items():
+    for ls in itertools.zip_longest(*(by_lane[lane] for lane in range(len(devices)))):
+      s = UOp.mstack(*[make_signal(d, tag="sentinel_signal") if dl is None else make_signal(ddevs[dl], slots[dqueue]) for dl, d in zip(ls, devices)])
+      waits.append(UOp(Ops.INS, arg="wait", src=(s, UOp.const(dtag + 1, dtypes.uint64))))
   return waits, {dtag for _, _, dtag in deps}
 
 def _build_finalizers(batch:list[tuple[UOp, tuple[str, ...]]], batch_info:list[tuple[tuple[str, ...], str]],
@@ -623,6 +623,8 @@ class HCQAllocator(LRUAllocator[HCQDeviceType], Generic[HCQDeviceType]):
     if not hasattr(self, '_do_map'): raise NotImplementedError("map failed: no method implemented")
     return self._do_map(buf)
 
+  def _do_unmap(self, mb): self.dev.iface.free(mb)
+
   @suppress_finalizing
   def _free(self, buf:HCQ2Buffer, options:BufferSpec|None=None):
     if options is not None and options.external_ptr is not None: return
@@ -631,6 +633,6 @@ class HCQAllocator(LRUAllocator[HCQDeviceType], Generic[HCQDeviceType]):
 
   def _unmap(self, mb):
     self.dev.synchronize()
-    self.dev.iface.free(mb)
+    self._do_unmap(mb)
 
   def _offset(self, buf, size:int, offset:int) -> HCQ2Buffer: return buf.offset(offset=offset, size=size)
