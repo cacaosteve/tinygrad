@@ -2686,17 +2686,20 @@ class AMDRenderer(ISARenderer):
     # Unroll lowers WMMA cin to zero PACKs + ADD into phi. Those PACKs must run each K
     # iteration: if they stay pre-loop, two-address WMMA keeps ACC across iters and the
     # phi ADDs double-count (test_tensor_cores_unroll_phi).
-    if (loop_i := next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), None)) is not None:
-      zero_acc = {u.src[0] for u in lst if u.op is Ops.INS and u.arg is AMDOps.WMMA and
-                  _is_wmma_acc_reload_pack(u.src[0])}
-      move_i = [i for i,u in enumerate(lst) if i < loop_i and u in zero_acc]
-      if move_i:
-        packs = [lst[i] for i in move_i]
-        lst = [u for i,u in enumerate(lst) if i not in set(move_i)]
-        loop_i = next(i for i,u in enumerate(lst) if u.op is Ops.RANGE)
-        ins = loop_i + 1
-        if ins < len(lst) and lst[ins].op is Ops.AFTER: ins += 1
-        lst = lst[:ins] + packs + lst[ins:]
+    # Skip when the kernel stages A/B through LDS: those same zero PACKs are one-shot ACC
+    # inits and must stay pre-loop so two-address WMMA can accumulate across K.
+    if not any(u.op is Ops.INS and u.arg is AMDOps.LLOAD for u in lst):
+      if (loop_i := next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), None)) is not None:
+        zero_acc = {u.src[0] for u in lst if u.op is Ops.INS and u.arg is AMDOps.WMMA and
+                    _is_wmma_acc_reload_pack(u.src[0])}
+        move_i = [i for i,u in enumerate(lst) if i < loop_i and u in zero_acc]
+        if move_i:
+          packs = [lst[i] for i in move_i]
+          lst = [u for i,u in enumerate(lst) if i not in set(move_i)]
+          loop_i = next(i for i,u in enumerate(lst) if u.op is Ops.RANGE)
+          ins = loop_i + 1
+          if ins < len(lst) and lst[ins].op is Ops.AFTER: ins += 1
+          lst = lst[:ins] + packs + lst[ins:]
     inits, tiles, idx_map = _wmma_acc_zero_inits(lst)
     if not inits: return lst, {}
     loop_i = next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), 0)
