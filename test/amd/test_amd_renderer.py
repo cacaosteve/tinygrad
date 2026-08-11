@@ -2072,7 +2072,7 @@ class TestAMDRenderer(unittest.TestCase):
       getenv.cache_clear()
       to_program_cache.clear()
 
-  def test_tc_lds_ab_not_default_until_faster(self):
+  def test_tc_lds_ab_not_default(self):
     # TC_LDS_AB stays opt-in; default is register+B128.
     import os
     old = os.environ.get("TC_LDS_AB")
