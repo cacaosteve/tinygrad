@@ -151,6 +151,13 @@ def _dst_sgprs(inst) -> set[int]:
     if (off:=_field_offset(getattr(inst, name, None))) is not None and off < 128: ret.add(off)
   return ret
 
+def _writes_vcc(inst) -> bool:
+  return any(_field_offset(getattr(inst, name, None)) in {106, 107} for name in ("sdst", "sdata"))
+
+def _writes_exec(inst, op_name: str) -> bool:
+  return "SAVEEXEC" in op_name or "WREXEC" in op_name or \
+    any(_field_offset(getattr(inst, name, None)) in {126, 127} for name in ("sdst", "sdata"))
+
 @dataclass(frozen=True)
 class _TraceInfo:
   pkt_cls: type[PacketType]|None
@@ -162,7 +169,11 @@ class _TraceInfo:
   issue_latency: int = 1
   dst_latency: int|None = None
   reads_scc_delay: int|None = None
+  reads_vcc: bool = False
+  reads_exec: bool = False
   writes_scc_latency: int|None = None
+  writes_vcc_latency: int|None = None
+  writes_exec_latency: int|None = None
   wait_lgkm: bool = False
   wait_lgkm_extra: int = 0
   barrier: bool = False
@@ -175,6 +186,8 @@ class _WaveState:
   lds_ready: int = 2
   vmem_ready: int = 2
   scc_ready: int = 2
+  vcc_ready: int = 2
+  exec_ready: int = 2
   lgkm_ready: int = 2
   immediate_ready: int = 2
   last_time: int = 1
@@ -220,20 +233,29 @@ class RDNA3SQTTTraceBuilder:
         if self.workgroup_waves <= 1: return _TraceInfo(IMMEDIATE)
         return _TraceInfo(INST, {"op": InstOp.BARRIER}, barrier=True)
       if inst_op in _SOPP_BRANCH:
+        reads_vcc = inst_op in {SOPPOp3.S_CBRANCH_VCCZ.value, SOPPOp3.S_CBRANCH_VCCNZ.value}
+        reads_exec = inst_op in {SOPPOp3.S_CBRANCH_EXECZ.value, SOPPOp3.S_CBRANCH_EXECNZ.value}
         return _TraceInfo(INST, {"op": InstOp.JUMP if branch_taken else InstOp.JUMP_NO}, pipe="salu",
-                          issue_latency=10 if branch_taken else 1, reads_scc_delay=0 if branch_taken else 1)
+                          issue_latency=10 if branch_taken else (3 if reads_vcc or reads_exec else 1),
+                          reads_scc_delay=None if reads_vcc or reads_exec else (0 if branch_taken else 1),
+                          reads_vcc=reads_vcc, reads_exec=reads_exec)
       return _TraceInfo(INST, {"op": InstOp.SALU}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
                         writes_scc_latency=9 if op_name.startswith("S_CMP") else None)
     if issubclass(inst_type, _SALU):
-      op = InstOp.SALU_WR_EXEC if ("SAVEEXEC" in op_name or "WREXEC" in op_name) else InstOp.SALU
+      writes_exec = _writes_exec(inst, op_name)
+      op = InstOp.SALU_WR_EXEC if writes_exec else InstOp.SALU
       return _TraceInfo(INST, {"op": op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
-                        writes_scc_latency=9 if op_name.startswith("S_CMP") else None)
+                        writes_scc_latency=9 if op_name.startswith("S_CMP") else None,
+                        writes_vcc_latency=7 if _writes_vcc(inst) else None, writes_exec_latency=7 if writes_exec else None)
     if issubclass(inst_type, _VALU):
       op = _valu_op(op_name)
-      if op is None: return _TraceInfo(VALUINST, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU})
+      if op is None:
+        return _TraceInfo(VALUINST, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
+                          writes_vcc_latency=18 if op_name.startswith("V_CMP") else None)
       duration, issue_latency, dst_latency = _valu_latencies(op)
       return _TraceInfo(INST, {"op": op}, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
-                        duration=duration, issue_latency=issue_latency, dst_latency=dst_latency)
+                        duration=duration, issue_latency=issue_latency, dst_latency=dst_latency,
+                        writes_exec_latency=18 if op == InstOp.VALU1_WR_EXEC else None)
     if issubclass(inst_type, _SMEM):
       return _TraceInfo(INST, {"op": InstOp.SMEM_RD}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
     op = _mem_op(inst_type, op_name)
@@ -253,6 +275,7 @@ class RDNA3SQTTTraceBuilder:
     src_ready = max([vgpr_ready.get(r, st.vgpr_ready.get(r, 0)) for r in src_vgprs] +
                     [st.sgpr_ready.get(r, 0) for r in _src_sgprs(inst)] +
                     ([] if info.reads_scc_delay is None else [st.scc_ready + info.reads_scc_delay]) +
+                    ([st.vcc_ready] if info.reads_vcc else []) + ([st.exec_ready] if info.reads_exec else []) +
                     ([st.lgkm_ready + info.wait_lgkm_extra] if info.wait_lgkm else []) + [0])
     pipe_ready = getattr(st, f"{info.pipe}_ready") if info.pipe else 0
     immediate_ready = st.immediate_ready if info.pkt_cls == IMMEDIATE else 0
@@ -273,6 +296,8 @@ class RDNA3SQTTTraceBuilder:
       if info.pipe == "valu": st.vgpr_lds_ready[reg] = issue + 18
     for reg in _dst_sgprs(inst): st.sgpr_ready[reg] = ready
     if info.writes_scc_latency is not None: st.scc_ready = issue + info.writes_scc_latency
+    if info.writes_vcc_latency is not None: st.vcc_ready = issue + info.writes_vcc_latency
+    if info.writes_exec_latency is not None: st.exec_ready = issue + info.writes_exec_latency
     if info.pipe == "lds":
       op = info.kwargs.get("op")
       if isinstance(op, InstOp): st.lgkm_ready = max(st.lgkm_ready, issue + _lds_lgkm_latency(op, st.lgkm_ready > issue))

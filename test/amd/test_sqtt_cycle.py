@@ -236,6 +236,62 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(33, "INST", 0, 12, "JUMP_NO"),
     NormalizedSQTTEvent(35, "WAVEEND", 0, 16, None),
   ]),
+  "branch_vccz_taken": (TraceCase("branch_vccz_taken", [
+    s_mov_b32(VCC_LO, 0), s_cbranch_vccz(simm16=1), s_mov_b32(s[1], 9), s_mov_b32(s[2], 2), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "SALU"), NormalizedSQTTEvent(1, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(8, "INST", 0, 4, "JUMP"),
+    NormalizedSQTTEvent(18, "INST", 0, 12, "SALU"), NormalizedSQTTEvent(18, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(20, "WAVEEND", 0, 16, None),
+  ]),
+  "branch_vccnz_not_taken": (TraceCase("branch_vccnz_not_taken", [
+    s_mov_b32(VCC_LO, 0), s_cbranch_vccnz(simm16=1), s_mov_b32(s[1], 9), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "SALU"), NormalizedSQTTEvent(1, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(8, "INST", 0, 4, "JUMP_NO"),
+    NormalizedSQTTEvent(11, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(11, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(13, "WAVEEND", 0, 12, None),
+  ]),
+  "branch_execz_taken": (TraceCase("branch_execz_taken", [
+    s_mov_b32(EXEC_LO, 0), s_cbranch_execz(simm16=1), s_mov_b32(s[1], 9), s_mov_b32(s[2], 2), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "SALU_WR_EXEC"), NormalizedSQTTEvent(1, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(8, "INST", 0, 4, "JUMP"),
+    NormalizedSQTTEvent(18, "INST", 0, 12, "SALU"), NormalizedSQTTEvent(18, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(20, "WAVEEND", 0, 16, None),
+  ]),
+  "branch_execnz_not_taken": (TraceCase("branch_execnz_not_taken", [
+    s_mov_b32(EXEC_LO, 0), s_cbranch_execnz(simm16=1), s_mov_b32(s[1], 9), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "SALU_WR_EXEC"), NormalizedSQTTEvent(1, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(8, "INST", 0, 4, "JUMP_NO"),
+    NormalizedSQTTEvent(11, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(11, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(13, "WAVEEND", 0, 12, None),
+  ]),
+  "branch_vccz_after_vcmp_taken": (TraceCase("branch_vccz_after_vcmp_taken", [
+    v_cmp_eq_u32_e32(1, v[0]), s_cbranch_vccz(simm16=1), s_mov_b32(s[1], 9), s_mov_b32(s[2], 2), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(2, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(19, "INST", 0, 4, "JUMP"),
+    NormalizedSQTTEvent(29, "INST", 0, 12, "SALU"), NormalizedSQTTEvent(29, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(31, "WAVEEND", 0, 16, None),
+  ]),
+  "branch_execz_after_vcmpx_taken": (TraceCase("branch_execz_after_vcmpx_taken", [
+    v_cmpx_eq_u32_e32(1, v[0]), s_cbranch_execz(simm16=1), s_mov_b32(s[1], 9), s_mov_b32(s[2], 2), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "VALU1_WR_EXEC"),
+    NormalizedSQTTEvent(2, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(19, "INST", 0, 4, "JUMP"),
+    NormalizedSQTTEvent(29, "INST", 0, 12, "SALU"), NormalizedSQTTEvent(29, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(31, "WAVEEND", 0, 16, None),
+  ]),
   "valu_independent": (TraceCase("valu_independent", [v_mov_b32_e32(v[0], 0), v_mov_b32_e32(v[1], 1), v_mov_b32_e32(v[2], 2), s_endpgm()]), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
     NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
