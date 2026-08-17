@@ -957,6 +957,10 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
   "compose_valu_read_warmup": (TraceCase("compose_valu_read_warmup", [v_mov_b32_e32(v[0], 1)] + [
     v_mov_b32_e32(v[2+i], i) for i in range(6)] + [v_add_f32_e32(v[1], v[0], v[0]), s_endpgm()], local_size=32),
     [0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 9, 10, 11, 12, 15]),
+  "compose_trans_full_queue": (TraceCase("compose_trans_full_queue", [v_mov_b32_e32(v[0], 1)] + [
+    v_add_f32_e32(v[i], v[i-1], v[i-1]) for i in range(1, 14)] + [
+    v_rcp_f32_e32(v[14], v[13]), v_add_f32_e32(v[15], v[14], v[14]), s_endpgm()], local_size=32, vgpr_count=20),
+    [0, 1, 2, 3, 4, 5, 6, 6, 7, 8, 9, 10, 11, 12, 12, 13, 16, 17, 21, 22, 27, 32, 37, 42, 47, 52, 57, 62, 67, 72, 77, 87]),
 }
 
 EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {

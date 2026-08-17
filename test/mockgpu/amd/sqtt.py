@@ -250,6 +250,7 @@ class _WaveState:
   vgpr_exec_event: dict[int, int] = field(default_factory=dict)
   vgpr_producer_interp: dict[int, bool] = field(default_factory=dict)
   vgpr_producer_trans: dict[int, bool] = field(default_factory=dict)
+  vgpr_trans_issue_ready: dict[int, int] = field(default_factory=dict)
   vgpr_producer_shiftable: dict[int, bool] = field(default_factory=dict)
   shifted_exec_events: set[int] = field(default_factory=set)
   sgpr_ready: dict[int, int] = field(default_factory=dict)
@@ -420,7 +421,10 @@ class RDNA3SQTTTraceBuilder:
     base_issue = max(st.issue, pipe_ready, src_ready, immediate_ready, delay_ready)
     if info.pipe == "valu" and not info.matrix:
       st.valu_inflight = [time for time in st.valu_inflight if time > base_issue]
-      if len(st.valu_inflight) >= _VALU_INFLIGHT_LIMIT: base_issue = max(base_issue, min(st.valu_inflight))
+      if len(st.valu_inflight) >= _VALU_INFLIGHT_LIMIT:
+        if not info.trans and any(st.vgpr_producer_trans.get(r, False) for r in src_vgprs):
+          base_issue = max([base_issue] + [st.vgpr_trans_issue_ready.get(r, 0) for r in src_vgprs])
+        else: base_issue = max(base_issue, min(st.valu_inflight))
     if info.trans:
       st.trans_inflight = [time for time in st.trans_inflight if time > base_issue]
       if len(st.trans_inflight) >= _TRANS_INFLIGHT_LIMIT: base_issue = max(base_issue, min(st.trans_inflight))
@@ -489,6 +493,7 @@ class RDNA3SQTTTraceBuilder:
         st.vgpr_exec_event[reg] = exec_event
         st.vgpr_producer_interp[reg] = info.interp
         st.vgpr_producer_trans[reg] = info.trans
+        if info.trans: st.vgpr_trans_issue_ready[reg] = issue + 5
         st.vgpr_producer_shiftable[reg] = producer_shiftable
       if info.pipe == "valu": st.vgpr_lds_ready[reg] = issue + 18
       st.vgpr_lds_pending[reg] = lds_pending
