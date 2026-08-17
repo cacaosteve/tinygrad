@@ -937,6 +937,11 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
   "compose_valu_queue": (TraceCase("compose_valu_queue", [v_mov_b32_e32(v[0], 1)] + [
     v_add_f32_e32(v[i], v[i-1], v[i-1]) for i in range(1, 16)] + [s_endpgm()], local_size=32, vgpr_count=20),
     [0, 1, 2, 3, 4, 5, 6, 6, 7, 8, 9, 10, 11, 12, 12, 13, 16, 17, 21, 22, 27, 32, 37, 42, 47, 52, 57, 62, 67, 72, 77, 82]),
+  "compose_valu_interleaved": (TraceCase("compose_valu_interleaved", [v_mov_b32_e32(v[i], i+1) for i in range(3)] + [
+    v_add_f32_e32(v[d*3+c], v[(d-1)*3+c], v[(d-1)*3+c]) for d in range(1, 7) for c in range(3)] + [s_endpgm()],
+    local_size=32, vgpr_count=24),
+    [0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 8, 9, 10, 11, 12, 12, 13, 13, 14, 14, 15, 16, 17, 17, 18, 18, 19, 21, 22, 22,
+     23, 24, 27, 28, 29, 32, 33, 34, 37, 38, 39]),
   "compose_trans_queue": (TraceCase("compose_trans_queue", [
     v_rcp_f32_e32(v[1], v[0]), v_add_f32_e32(v[2], v[1], v[1]),
     v_rcp_f32_e32(v[3], v[2]), v_add_f32_e32(v[4], v[3], v[3]),

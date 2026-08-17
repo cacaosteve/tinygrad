@@ -219,14 +219,29 @@ class _TraceInfo:
 class _VALUQueueEntry:
   retire: int
   trans_retire: int|None
+  chains: frozenset[int]
 
 @dataclass
 class _VALUInstructionBuffer:
   entries: list[_VALUQueueEntry] = field(default_factory=list)
+  reg_chains: dict[int, frozenset[int]] = field(default_factory=dict)
+  dependent_chains: set[int] = field(default_factory=set)
+  next_chain: int = 0
 
-  def issue_ready(self, base_issue: int, *, trans: bool, trans_source_ready: list[int]) -> int:
+  def chains_for(self, srcs: set[int]) -> frozenset[int]:
+    chains = frozenset(chain for reg in srcs for chain in self.reg_chains.get(reg, ()))
+    if chains:
+      self.dependent_chains.update(chains)
+      return chains
+    self.next_chain += 1
+    return frozenset((self.next_chain,))
+
+  def issue_ready(self, base_issue: int, *, chains: frozenset[int], trans: bool, trans_source_ready: list[int]) -> int:
     active = [entry for entry in self.entries if entry.retire > base_issue]
-    if len(active) >= _VALU_INFLIGHT_LIMIT:
+    active_chains = (frozenset(chain for entry in active for chain in entry.chains) | chains) & self.dependent_chains
+    # The first dependency chain uses the base IB entry; each additional live chain reserves one more entry.
+    limit = max(1, _VALU_INFLIGHT_LIMIT - max(0, len(active_chains) - 1))
+    if len(active) >= limit:
       base_issue = max(base_issue, max(trans_source_ready) if not trans and trans_source_ready else min(entry.retire for entry in active))
     if trans:
       active_trans = [entry for entry in self.entries if entry.trans_retire is not None and entry.trans_retire > base_issue]
@@ -234,8 +249,9 @@ class _VALUInstructionBuffer:
         base_issue = max(base_issue, min(entry.trans_retire for entry in active_trans if entry.trans_retire is not None))
     return base_issue
 
-  def record(self, exec_time: int, *, trans: bool) -> None:
-    self.entries.append(_VALUQueueEntry(exec_time - 1, exec_time if trans else None))
+  def record(self, exec_time: int, *, chains: frozenset[int], dsts: set[int], trans: bool) -> None:
+    self.entries.append(_VALUQueueEntry(exec_time - 1, exec_time if trans else None, chains))
+    for reg in dsts: self.reg_chains[reg] = chains
 
 @dataclass
 class _WaveState:
@@ -253,6 +269,7 @@ class _WaveState:
   immediate_ready: int = 0
   salu_exec_ready: int = 2
   valu_exec_ready: int = 2
+  valub_exec_ready: int = 2
   lds_exec_ready: int = 2
   vmem_exec_ready: int = 2
   control_exec_ready: int = 2
@@ -440,9 +457,11 @@ class RDNA3SQTTTraceBuilder:
     active_delays = [dep for skip, dep in st.pending_delays if skip == 0]
     delay_ready = max([self._delay_ready(st, dep) for dep in active_delays] + [0])
     base_issue = max(st.issue, pipe_ready, src_ready, immediate_ready, delay_ready)
+    valu_chains: frozenset[int]|None = None
     if info.pipe == "valu" and not info.matrix:
+      valu_chains = st.valu_ib.chains_for(src_vgprs)
       trans_source_ready = [st.vgpr_trans_issue_ready[r] for r in src_vgprs if st.vgpr_producer_trans.get(r, False)]
-      base_issue = st.valu_ib.issue_ready(base_issue, trans=info.trans, trans_source_ready=trans_source_ready)
+      base_issue = st.valu_ib.issue_ready(base_issue, chains=valu_chains, trans=info.trans, trans_source_ready=trans_source_ready)
     sgpr_read_ready = st.sgpr_valu_read_ready if info.pipe == "salu" and (src_sgprs or dst_sgprs) else 0
     salu_read_stall, issue = sgpr_read_ready > base_issue, max(base_issue, sgpr_read_ready)
     lds_pending = info.pipe == "lds" and st.lgkm_ready > issue
@@ -479,7 +498,9 @@ class RDNA3SQTTTraceBuilder:
         elif info.interp:
           exec_time = max(issue + latency, exec_ready, dep_ready, st.matrix_interp_ready)
           if st.matrix_start_ready > issue: st.matrix_start_ready += 2
-        else: exec_time = max(issue + latency, exec_ready, dep_ready)
+        else:
+          valub_ready = st.valub_exec_ready if info.trans_pipe and not info.trans else 0
+          exec_time = max(issue + latency, exec_ready, dep_ready, valub_ready)
       else: exec_time = max(issue + info.exec_latency, exec_ready)
       setattr(st, f"{info.pipe}_exec_ready", exec_time + info.exec_release)
     if info.pipe is not None and info.exec_block:
@@ -497,6 +518,7 @@ class RDNA3SQTTTraceBuilder:
     natural_exec_latency = info.vgpr_read_latency if src_vgprs and info.vgpr_read_latency is not None else info.exec_latency
     producer_shiftable = (info.interp or (info.vgpr_read_latency is not None and bool(src_vgprs))) and exec_time == issue + natural_exec_latency
     producer_forward_latency = info.forward_latency + (1 if info.interp and not producer_shiftable else 0)
+    if info.trans_pipe and not info.trans and st.valu_exec_history: producer_forward_latency -= 1
     if info.vgpr_read_latency is not None and not src_vgprs and not st.valu_exec_history: producer_forward_latency += 1
     for reg in dst_vgprs:
       st.vgpr_ready[reg] = ready
@@ -528,8 +550,11 @@ class RDNA3SQTTTraceBuilder:
       if src_sgprs: st.sgpr_valu_read_ready = max(st.sgpr_valu_read_ready, exec_time)
       if info.trans:
         st.trans_exec_history.append((exec_time, st.trans_warm))
+        st.valub_exec_ready = max(st.valub_exec_ready, exec_time + 5)
       else: st.valu_exec_history.append(exec_time)
-      if not info.matrix: st.valu_ib.record(exec_time, trans=info.trans)
+      if not info.matrix:
+        assert valu_chains is not None
+        st.valu_ib.record(exec_time, chains=valu_chains, dsts=dst_vgprs, trans=info.trans)
     if info.pipe == "salu" and info.exec_cls is not None: st.salu_exec_history.append(exec_time)
     st.pending_delays = [(skip - 1, dep) for skip, dep in st.pending_delays if skip > 0]
     st.trans_warm = info.nop
