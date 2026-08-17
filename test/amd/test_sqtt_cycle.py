@@ -57,10 +57,16 @@ def _next_trace_pc(pc: int, pc_map: dict[int, object]) -> int:
   while pc in pc_map and _trace_silent_inst(pc_map[pc]): pc += pc_map[pc].size()
   return pc
 
-def _advance_pc(pc: int, inst, pkt: INST|VALUINST|IMMEDIATE) -> int:
+def _advance_pc(pc: int, inst, pkt: INST|VALUINST|IMMEDIATE, returns: list[int]) -> int:
   if isinstance(pkt, INST) and pkt.op == InstOp.JUMP:
     x = getattr(inst, "simm16") & 0xffff
     return pc + inst.size() + (x - 0x10000 if x & 0x8000 else x) * 4
+  if isinstance(pkt, INST) and pkt.op == InstOp.CALL:
+    if getattr(getattr(inst, "op", None), "name", "") == "S_CALL_B64":
+      returns.append(pc + inst.size())
+      x = getattr(inst, "simm16") & 0xffff
+      return pc + inst.size() + (x - 0x10000 if x & 0x8000 else x) * 4
+    if returns: return returns.pop()
   return pc + inst.size()
 
 def _rebase(events: Iterable[NormalizedSQTTEvent]) -> list[NormalizedSQTTEvent]:
@@ -69,30 +75,35 @@ def _rebase(events: Iterable[NormalizedSQTTEvent]) -> list[NormalizedSQTTEvent]:
   return [NormalizedSQTTEvent(e.time - base, e.kind, e.wave, e.pc, e.op) for e in ret]
 
 def normalize_controlled_hardware_trace(blob: bytes, instructions: list) -> list[NormalizedSQTTEvent]:
-  pc_map, wave_pc, events = _pc_map(instructions), {}, []
+  pc_map, wave_pc, wave_returns, events = _pc_map(instructions), {}, {}, []
   for pkt in decode(blob):
     if isinstance(pkt, (WAVESTART, WAVESTART_RDNA4)):
       wave_pc[pkt.wave] = 0
+      wave_returns[pkt.wave] = []
       events.append(NormalizedSQTTEvent(pkt._time, "WAVESTART", pkt.wave, None, None))
     elif isinstance(pkt, (WAVEEND, WAVEEND_RDNA4)):
       events.append(NormalizedSQTTEvent(pkt._time, "WAVEEND", pkt.wave, wave_pc.pop(pkt.wave, None), None))
+      wave_returns.pop(pkt.wave, None)
     elif isinstance(pkt, WAVERDY):
       for wave in range(16):
         if pkt.mask & (1 << wave): events.append(NormalizedSQTTEvent(pkt._time, "WAVERDY", wave, None, None))
-    elif isinstance(pkt, (INST, INST_RDNA4)) and not pkt.op.name.startswith("OTHER_") and pkt.wave in wave_pc:
+    elif isinstance(pkt, (INST, INST_RDNA4)) and pkt.wave in wave_pc:
+      try: op = pkt.op
+      except ValueError: continue
+      if op.name.startswith("OTHER_"): continue
       pc = _next_trace_pc(wave_pc[pkt.wave], pc_map)
-      events.append(NormalizedSQTTEvent(pkt._time, "INST", pkt.wave, pc, pkt.op.name))
-      wave_pc[pkt.wave] = _advance_pc(pc, pc_map[pc], pkt)
+      events.append(NormalizedSQTTEvent(pkt._time, "INST", pkt.wave, pc, op.name))
+      wave_pc[pkt.wave] = _advance_pc(pc, pc_map[pc], pkt, wave_returns[pkt.wave])
     elif isinstance(pkt, (VALUINST, IMMEDIATE)) and pkt.wave in wave_pc:
       pc = _next_trace_pc(wave_pc[pkt.wave], pc_map)
       events.append(NormalizedSQTTEvent(pkt._time, type(pkt).__name__.removesuffix("_MASK"), pkt.wave, pc, None))
-      wave_pc[pkt.wave] = _advance_pc(pc, pc_map[pc], pkt)
+      wave_pc[pkt.wave] = _advance_pc(pc, pc_map[pc], pkt, wave_returns[pkt.wave])
     elif isinstance(pkt, IMMEDIATE_MASK):
       for wave in range(16):
         if (pkt.mask & (1 << wave)) and wave in wave_pc:
           pc = _next_trace_pc(wave_pc[wave], pc_map)
           events.append(NormalizedSQTTEvent(pkt._time, "IMMEDIATE", wave, pc, None))
-          wave_pc[wave] = _advance_pc(pc, pc_map[pc], pkt)
+          wave_pc[wave] = _advance_pc(pc, pc_map[pc], pkt, wave_returns[wave])
     elif isinstance(pkt, ALUEXEC):
       events.append(NormalizedSQTTEvent(pkt._time, "ALUEXEC", None, None, pkt.src.name))
     elif isinstance(pkt, VMEMEXEC):
@@ -100,24 +111,26 @@ def normalize_controlled_hardware_trace(blob: bytes, instructions: list) -> list
   return _rebase(events)
 
 def normalize_mock_trace(blob: bytes, instructions: list) -> list[NormalizedSQTTEvent]:
-  pc_map, wave_pc, events = _pc_map(instructions), {}, []
+  pc_map, wave_pc, wave_returns, events = _pc_map(instructions), {}, {}, []
   for pkt in decode(blob):
     if isinstance(pkt, WAVESTART):
       wave_pc[pkt.wave] = 0
+      wave_returns[pkt.wave] = []
       events.append(NormalizedSQTTEvent(pkt._time, "WAVESTART", pkt.wave, None, None))
     elif isinstance(pkt, WAVEEND):
       events.append(NormalizedSQTTEvent(pkt._time, "WAVEEND", pkt.wave, wave_pc.pop(pkt.wave), None))
+      wave_returns.pop(pkt.wave)
     elif isinstance(pkt, WAVERDY):
       for wave in range(16):
         if pkt.mask & (1 << wave): events.append(NormalizedSQTTEvent(pkt._time, "WAVERDY", wave, None, None))
     elif isinstance(pkt, INST) and not pkt.op.name.startswith("OTHER_"):
       pc = _next_trace_pc(wave_pc[pkt.wave], pc_map)
       events.append(NormalizedSQTTEvent(pkt._time, "INST", pkt.wave, pc, pkt.op.name))
-      wave_pc[pkt.wave] = _advance_pc(pc, pc_map[pc], pkt)
+      wave_pc[pkt.wave] = _advance_pc(pc, pc_map[pc], pkt, wave_returns[pkt.wave])
     elif isinstance(pkt, (VALUINST, IMMEDIATE)):
       pc = _next_trace_pc(wave_pc[pkt.wave], pc_map)
       events.append(NormalizedSQTTEvent(pkt._time, type(pkt).__name__, pkt.wave, pc, None))
-      wave_pc[pkt.wave] = _advance_pc(pc, pc_map[pc], pkt)
+      wave_pc[pkt.wave] = _advance_pc(pc, pc_map[pc], pkt, wave_returns[pkt.wave])
     elif isinstance(pkt, ALUEXEC):
       events.append(NormalizedSQTTEvent(pkt._time, "ALUEXEC", None, None, pkt.src.name))
     elif isinstance(pkt, VMEMEXEC):
@@ -256,6 +269,14 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(23, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(23, "ALUEXEC", None, None, "SALU"),
     NormalizedSQTTEvent(33, "INST", 0, 12, "JUMP_NO"),
     NormalizedSQTTEvent(35, "WAVEEND", 0, 16, None),
+  ]),
+  "call_return": (TraceCase("call_return", [
+    s_call_b64(s[0:1], 1), s_endpgm(), s_mov_b32(s[2], 1), s_setpc_b64(s[0:1]),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "CALL"),
+    NormalizedSQTTEvent(3, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(29, "INST", 0, 8, "SALU"),
+    NormalizedSQTTEvent(30, "INST", 0, 12, "CALL"), NormalizedSQTTEvent(31, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(58, "WAVEEND", 0, 4, None),
   ]),
   "branch_vccz_taken": (TraceCase("branch_vccz_taken", [
     s_mov_b32(VCC_LO, 0), s_cbranch_vccz(simm16=1), s_mov_b32(s[1], 9), s_mov_b32(s[2], 2), s_endpgm(),
@@ -801,6 +822,7 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
 
 EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
   "salu_chain": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU")],
+  "call_return": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 30, "SALU")],
   "salu_saveexec": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU"), ("ALUEXEC", 5, "SALU")],
   "valu_independent": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 7, "VALU"), ("ALUEXEC", 8, "VALU")],
   "valu_simple_dependency": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 14, "VALU")],

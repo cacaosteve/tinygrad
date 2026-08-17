@@ -217,6 +217,7 @@ class _WaveState:
   valu_ready: int = 2
   lds_ready: int = 2
   vmem_ready: int = 2
+  control_ready: int = 2
   scc_ready: int = 2
   vcc_ready: int = 2
   exec_ready: int = 2
@@ -226,6 +227,7 @@ class _WaveState:
   valu_exec_ready: int = 2
   lds_exec_ready: int = 2
   vmem_exec_ready: int = 2
+  control_exec_ready: int = 2
   matrix_start_ready: int = 0
   matrix_interp_ready: int = 0
   last_time: int = 1
@@ -316,6 +318,11 @@ class RDNA3SQTTTraceBuilder:
       return _TraceInfo(INST, {"op": InstOp.SALU}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
                         exec_latency=2, forward_latency=2, writes_scc_latency=9 if op_name.startswith("S_CMP") else None)
     if issubclass(inst_type, _SALU):
+      if op_name == "S_CALL_B64":
+        return _TraceInfo(INST, {"op": InstOp.CALL}, pipe="control", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
+                          issue_latency=28, exec_latency=2)
+      if op_name in {"S_SETPC_B64", "S_SWAPPC_B64"}:
+        return _TraceInfo(INST, {"op": InstOp.CALL}, pipe="control", issue_latency=28)
       writes_exec = _writes_exec(inst, op_name)
       salu_op = InstOp.SALU_WR_EXEC if writes_exec else InstOp.SALU
       return _TraceInfo(INST, {"op": salu_op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},

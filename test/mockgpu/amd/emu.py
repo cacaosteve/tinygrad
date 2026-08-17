@@ -511,10 +511,17 @@ class _Ctx:
   def compile_sop_pcode(self, op, srcs: dict[str, UOp | int], sdst_reg: UOp, sdst_size: int) -> UOp:
     """Compile a scalar instruction with dynamic destination register."""
     pcode = get_pcode(op)
-    srcs.update(self.base_srcs(self.rexec()), VCC=self.rmask(_c(VCC_LO.offset)))
+    srcs.update(self.base_srcs(self.rexec()), VCC=self.rmask(_c(VCC_LO.offset)), PC=self.rpc().cast(dtypes.int64))
     if 'D0' not in srcs: srcs['D0'] = self.rsgpr_dyn(sdst_reg)  # D0 is current dest value for read-modify-write ops
     _, assigns = parse_pcode(pcode, srcs)
-    return UOp.sink(*self.scalar_stores(assigns, sdst_reg, sdst_size), *self.inc_pc())
+    pc_stores: list[UOp] = []
+    scalar_assigns: list[tuple[str, UOp]] = []
+    for dest, val in assigns:
+      if dest == 'PC' or dest.startswith('PC.'):
+        lo, hi = _split64(val.cast(dtypes.uint64))
+        pc_stores.extend([self.wsgpr_dyn(_c(PC_LO_IDX), lo), self.wsgpr_dyn(_c(PC_HI_IDX), hi)])
+      else: scalar_assigns.append((dest, val))
+    return UOp.sink(*self.scalar_stores(scalar_assigns, sdst_reg, sdst_size), *pc_stores, *([] if pc_stores else self.inc_pc()))
 
   def compile_lane_pcode(self, op, inst) -> UOp:
     """Compile cross-lane ops (READLANE/WRITELANE/PERMLANE) using pcode parser."""
@@ -694,7 +701,7 @@ def _compile_sop(inst: ir3.SOP1|ir3.SOP2|ir3.SOPC|ir3.SOPK|ir4.SOP1|ir4.SOP2|ir4
     elif isinstance(inst, irc.SOPK) and 'CMPK' not in op_name and 'SETREG' not in op_name: s0 = simm16_sext
     else: s0 = ctx.rsgpr_dyn(sdst_off)
     srcs: dict[str, UOp|int] = {'S0': s0, 'S1': simm16_sext, 'SIMM16': simm16_sext, 'D0': ctx.rsgpr_dyn(sdst_off)}
-    dst_off, dst_size = sdst_off, 1
+    dst_off, dst_size = sdst_off, bits['d'] // 32
     # S_GETREG_B32: extract bits from HW register. Handle as special case since HW_REGISTERS is not a normal variable.
     # HW register values are stored at SGPR[SGPR_COUNT-16 + hwRegId] by _init_wave.
     if 'GETREG' in op_name:
