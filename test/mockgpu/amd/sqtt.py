@@ -5,7 +5,7 @@ SQTT packets for that execution with a small deterministic timing model, so
 tests can compare instruction order and simple non-DRAM stalls.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import re
 from typing import Any
 
@@ -196,6 +196,7 @@ class _TraceInfo:
   forward_latency: int = 0
   matrix: bool = False
   interp: bool = False
+  trans: bool = False
   vgpr_read_latency: int|None = None
   reads_scc_delay: int|None = None
   reads_vcc: bool = False
@@ -206,6 +207,7 @@ class _TraceInfo:
   lgkm_latency: int|None = None
   wait_lgkm: bool = False
   wait_lgkm_extra: int = 0
+  immediate_delay: int = 0
   barrier: bool = False
 
 @dataclass
@@ -219,7 +221,7 @@ class _WaveState:
   vcc_ready: int = 2
   exec_ready: int = 2
   lgkm_ready: int = 2
-  immediate_ready: int = 2
+  immediate_ready: int = 0
   salu_exec_ready: int = 2
   valu_exec_ready: int = 2
   lds_exec_ready: int = 2
@@ -231,9 +233,18 @@ class _WaveState:
   vgpr_lds_ready: dict[int, int] = field(default_factory=dict)
   vgpr_exec_ready: dict[int, int] = field(default_factory=dict)
   vgpr_forward_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_interp_ready: dict[int, int] = field(default_factory=dict)
   vgpr_matrix_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_exec_event: dict[int, int] = field(default_factory=dict)
+  vgpr_producer_interp: dict[int, bool] = field(default_factory=dict)
+  vgpr_producer_shiftable: dict[int, bool] = field(default_factory=dict)
+  shifted_exec_events: set[int] = field(default_factory=set)
   sgpr_ready: dict[int, int] = field(default_factory=dict)
   sgpr_exec_ready: dict[int, int] = field(default_factory=dict)
+  valu_exec_history: list[int] = field(default_factory=list)
+  trans_exec_history: list[int] = field(default_factory=list)
+  salu_exec_history: list[int] = field(default_factory=list)
+  pending_delays: list[tuple[int, int]] = field(default_factory=list)
 
 @dataclass(frozen=True)
 class _PacketEvent:
@@ -251,9 +262,10 @@ class RDNA3SQTTTraceBuilder:
     self.seq = 0
     self._add(0, LAYOUT_HEADER, layout=3, sel_a=6)
 
-  def _add(self, time: int, pkt_cls: type[PacketType], **kwargs) -> None:
+  def _add(self, time: int, pkt_cls: type[PacketType], **kwargs) -> int:
     self.events.append(_PacketEvent(time, self.seq, pkt_cls, kwargs))
     self.seq += 1
+    return len(self.events) - 1
 
   def _wave(self, wave_id: int) -> _WaveState:
     if wave_id not in self.waves: self.waves[wave_id] = _WaveState()
@@ -262,13 +274,34 @@ class RDNA3SQTTTraceBuilder:
       self.started.add(wave_id)
     return self.waves[wave_id]
 
+  @staticmethod
+  def _delay_ready(st: _WaveState, dep: int) -> int:
+    if 1 <= dep <= 4 and len(st.valu_exec_history) >= dep: return st.valu_exec_history[-dep] - 1
+    if 5 <= dep <= 7 and len(st.trans_exec_history) >= dep - 4: return st.trans_exec_history[4 - dep] + 1
+    if dep == 9 and st.salu_exec_history: return st.salu_exec_history[-1]
+    return 0
+
+  def _shift_cross_interp_producers(self, st: _WaveState, src_vgprs: set[int], interp: bool) -> None:
+    events = {st.vgpr_exec_event[r] for r in src_vgprs if r in st.vgpr_exec_event and
+              st.vgpr_producer_interp.get(r) != interp and st.vgpr_producer_shiftable.get(r, False)}
+    for event_idx in events - st.shifted_exec_events:
+      self.events[event_idx] = replace(self.events[event_idx], time=self.events[event_idx].time - 1)
+      st.shifted_exec_events.add(event_idx)
+      for reg, reg_event_idx in st.vgpr_exec_event.items():
+        if reg_event_idx != event_idx: continue
+        st.vgpr_exec_ready[reg] -= 1
+        st.vgpr_forward_ready[reg] -= 1
+        st.vgpr_interp_ready[reg] -= 1
+
   def _classify(self, inst, branch_taken: bool|None) -> _TraceInfo:
     inst_type, inst_op, op_name = type(inst), inst.op.value if hasattr(inst, "op") else 0, _op_name(inst)
     if issubclass(inst_type, _SOPP):
       if inst_op in _SOPP_SKIP: return _TraceInfo(None)
       if inst_op in _SOPP_IMMEDIATE:
         waits_lgkm = inst_op in {SOPPOp3.S_WAITCNT.value, SOPPOp3.S_WAIT_IDLE.value} and getattr(inst, "simm16", 0) == 0
-        return _TraceInfo(IMMEDIATE, wait_lgkm=waits_lgkm, wait_lgkm_extra=1 if inst_op == SOPPOp3.S_WAIT_IDLE.value and waits_lgkm else 0)
+        immediate_delay = getattr(inst, "simm16", 0) if inst_op == SOPPOp3.S_NOP.value else 0
+        return _TraceInfo(IMMEDIATE, wait_lgkm=waits_lgkm, wait_lgkm_extra=1 if inst_op == SOPPOp3.S_WAIT_IDLE.value and waits_lgkm else 0,
+                          immediate_delay=immediate_delay)
       if inst_op in _SOPP_BARRIER:
         if self.workgroup_waves <= 1: return _TraceInfo(IMMEDIATE)
         return _TraceInfo(INST, {"op": InstOp.BARRIER}, barrier=True)
@@ -308,7 +341,7 @@ class RDNA3SQTTTraceBuilder:
                         duration=duration, issue_latency=issue_latency, dst_latency=dst_latency,
                         exec_latency=exec_latency, exec_release=4 if valu_op == InstOp.VALUB_16 else 1,
                         forward_latency=10 if valu_op == InstOp.VALUT_4 else 5,
-                        writes_exec_latency=18 if valu_op == InstOp.VALU1_WR_EXEC else None)
+                        writes_exec_latency=18 if valu_op == InstOp.VALU1_WR_EXEC else None, trans=valu_op == InstOp.VALUT_4)
     if issubclass(inst_type, _SMEM):
       return _TraceInfo(INST, {"op": InstOp.SMEM_RD}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
     mem_op = _mem_op(inst_type, op_name)
@@ -334,6 +367,13 @@ class RDNA3SQTTTraceBuilder:
     return _TraceInfo(INST, {"op": mem_op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
 
   def emit(self, wave_id: int, inst, branch_taken: bool|None) -> None:
+    inst_op = inst.op.value if hasattr(inst, "op") else 0
+    if isinstance(inst, _SOPP) and inst_op == SOPPOp3.S_DELAY_ALU.value:
+      st = self._wave(wave_id)
+      imm = getattr(inst, "simm16", 0)
+      if (dep0:=imm & 0xF): st.pending_delays.append((0, dep0))
+      if (dep1:=(imm >> 7) & 0xF): st.pending_delays.append(((imm >> 4) & 0x7, dep1))
+      return
     info = self._classify(inst, branch_taken)
     if info.pkt_cls is None: return
     st, wave = self._wave(wave_id), wave_id & 0x1F
@@ -345,8 +385,9 @@ class RDNA3SQTTTraceBuilder:
                     ([st.vcc_ready] if info.reads_vcc else []) + ([st.exec_ready] if info.reads_exec else []) +
                     ([st.lgkm_ready + info.wait_lgkm_extra] if info.wait_lgkm else []) + [0])
     pipe_ready = getattr(st, f"{info.pipe}_ready") if info.pipe else 0
-    immediate_ready = st.immediate_ready if info.pkt_cls == IMMEDIATE else 0
-    issue = max(st.issue, pipe_ready, src_ready, immediate_ready)
+    immediate_ready = st.immediate_ready + info.immediate_delay if info.pkt_cls == IMMEDIATE and st.immediate_ready else 0
+    delay_ready = max([self._delay_ready(st, dep) for skip, dep in st.pending_delays if skip == 0] + [0])
+    issue = max(st.issue, pipe_ready, src_ready, immediate_ready, delay_ready)
     kwargs = {"wave": wave, **info.kwargs} if info.pkt_cls in (INST, IMMEDIATE, VALUINST) else info.kwargs
     self._add(issue, info.pkt_cls, **kwargs)
 
@@ -358,7 +399,8 @@ class RDNA3SQTTTraceBuilder:
         exec_time = max(issue + info.exec_latency, exec_ready, dep_ready)
       elif info.pipe == "valu":
         latency = info.vgpr_read_latency if src_vgprs and info.vgpr_read_latency is not None else info.exec_latency
-        dep_map = st.vgpr_matrix_ready if info.matrix else st.vgpr_forward_ready
+        if not info.matrix: self._shift_cross_interp_producers(st, src_vgprs, info.interp)
+        dep_map = st.vgpr_matrix_ready if info.matrix else (st.vgpr_interp_ready if info.interp else st.vgpr_forward_ready)
         dep_ready = max([dep_map.get(r, 0) for r in src_vgprs] + [0])
         if info.matrix:
           matrix_start = max(issue, st.matrix_start_ready)
@@ -373,7 +415,7 @@ class RDNA3SQTTTraceBuilder:
       setattr(st, f"{info.pipe}_exec_ready", exec_time + info.exec_release)
     if info.pipe is not None and info.exec_block:
       setattr(st, f"{info.pipe}_exec_ready", max(getattr(st, f"{info.pipe}_exec_ready"), issue + info.exec_block))
-    if info.exec_cls is not None: self._add(exec_time, info.exec_cls, **info.exec_kwargs)
+    exec_event = self._add(exec_time, info.exec_cls, **info.exec_kwargs) if info.exec_cls is not None else None
     if info.barrier: self._add(issue + 1, WAVERDY, mask=1 << wave)
 
     if info.pipe:
@@ -384,7 +426,12 @@ class RDNA3SQTTTraceBuilder:
       st.vgpr_ready[reg] = ready
       st.vgpr_exec_ready[reg] = exec_time
       st.vgpr_forward_ready[reg] = exec_time + info.forward_latency
+      st.vgpr_interp_ready[reg] = exec_time + 6
       if info.matrix: st.vgpr_matrix_ready[reg] = exec_time + 34
+      if exec_event is not None:
+        st.vgpr_exec_event[reg] = exec_event
+        st.vgpr_producer_interp[reg] = info.interp
+        st.vgpr_producer_shiftable[reg] = info.interp or (info.vgpr_read_latency is not None and bool(src_vgprs))
       if info.pipe == "valu": st.vgpr_lds_ready[reg] = issue + 18
     for reg in _dst_sgprs(inst):
       st.sgpr_ready[reg] = ready
@@ -397,6 +444,10 @@ class RDNA3SQTTTraceBuilder:
       if isinstance(op, InstOp):
         latency = info.lgkm_latency if info.lgkm_latency is not None else _lds_lgkm_latency(op, st.lgkm_ready > issue)
         st.lgkm_ready = max(st.lgkm_ready, issue + latency)
+    if info.pipe == "valu" and info.exec_cls is not None:
+      (st.trans_exec_history if info.trans else st.valu_exec_history).append(exec_time)
+    if info.pipe == "salu" and info.exec_cls is not None: st.salu_exec_history.append(exec_time)
+    st.pending_delays = [(skip - 1, dep) for skip, dep in st.pending_delays if skip > 0]
     st.issue, st.last_time = issue + info.issue_latency, max(st.last_time, exec_time, ready)
 
   def finish(self, wave_id: int) -> None:

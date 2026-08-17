@@ -18,6 +18,7 @@ class TraceCase:
   instructions: list
   local_size: int = 1
   vgpr_count: int = 16
+  normalize_exec_start: bool = False
 
 @dataclass(frozen=True)
 class NormalizedSQTTEvent:
@@ -212,6 +213,10 @@ def _timed_events(events: Iterable[NormalizedSQTTEvent]) -> list[NormalizedSQTTE
   ret = [e for e in events if e.kind in {"INST", "VALUINST", "IMMEDIATE", "ALUEXEC", "VMEMEXEC"}]
   return _rebase(ret)
 
+def _normalize_exec_start(events: list[NormalizedSQTTEvent]) -> list[NormalizedSQTTEvent]:
+  base = next((e.time for e in events if e.kind in {"ALUEXEC", "VMEMEXEC"}), 0)
+  return [NormalizedSQTTEvent(e.time - base if e.kind in {"ALUEXEC", "VMEMEXEC"} else e.time, e.kind, e.wave, e.pc, e.op) for e in events]
+
 def _structural_events(events: Iterable[NormalizedSQTTEvent]) -> list[NormalizedSQTTEvent]:
   return [e for e in events if e.kind not in {"ALUEXEC", "VMEMEXEC", "WAVEEND"}]
 
@@ -332,6 +337,23 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(4, "IMMEDIATE", 0, 4, None),
     NormalizedSQTTEvent(6, "WAVEEND", 0, 8, None),
   ]),
+  "valu_nop4": (TraceCase("valu_nop4", [v_mov_b32_e32(v[0], 0), s_nop(4), v_mov_b32_e32(v[1], 1), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(7, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(8, "IMMEDIATE", 0, 4, None),
+    NormalizedSQTTEvent(9, "VALUINST", 0, 8, None), NormalizedSQTTEvent(15, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(16, "WAVEEND", 0, 12, None),
+  ]),
+  "valu_nop63": (TraceCase("valu_nop63", [v_mov_b32_e32(v[0], 0), s_nop(63), v_mov_b32_e32(v[1], 1), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(7, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(67, "IMMEDIATE", 0, 4, None),
+    NormalizedSQTTEvent(68, "VALUINST", 0, 8, None), NormalizedSQTTEvent(74, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(75, "WAVEEND", 0, 12, None),
+  ]),
+  "salu_nop63": (TraceCase("salu_nop63", [s_nop(63), s_mov_b32(s[0], 1), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "IMMEDIATE", 0, 0, None),
+    NormalizedSQTTEvent(2, "INST", 0, 4, "SALU"), NormalizedSQTTEvent(4, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(5, "WAVEEND", 0, 8, None),
+  ]),
   "valu_dependency": (TraceCase("valu_dependency", [v_lshlrev_b64(v[2:3], 2, v[0:1]), v_add_f32_e32(v[4], v[2], v[2]), s_endpgm()]), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
     NormalizedSQTTEvent(1, "INST", 0, 0, "VALUB_2"),
@@ -443,11 +465,40 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
   "vinterp_independent": (TraceCase("vinterp_independent", [
     v_interp_p10_f32(vdst=v[0], src0=v[1], src1=v[2], src2=v[3]),
     v_interp_p10_f32(vdst=v[4], src0=v[5], src1=v[6], src2=v[7]), s_endpgm(),
-  ], local_size=32), [
+  ], local_size=32, normalize_exec_start=True), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
     NormalizedSQTTEvent(1, "INST", 0, 0, "VINTERP"), NormalizedSQTTEvent(2, "INST", 0, 8, "VINTERP"),
     NormalizedSQTTEvent(10, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(11, "ALUEXEC", None, None, "VALU"),
     NormalizedSQTTEvent(12, "WAVEEND", 0, 16, None),
+  ]),
+  "vinterp_dependency": (TraceCase("vinterp_dependency", [
+    v_interp_p10_f32(vdst=v[0], src0=v[1], src1=v[2], src2=v[3]),
+    v_interp_p10_f32(vdst=v[4], src0=v[0], src1=v[5], src2=v[6]), s_endpgm(),
+  ], local_size=32, normalize_exec_start=True), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "VINTERP"),
+    NormalizedSQTTEvent(2, "INST", 0, 8, "VINTERP"), NormalizedSQTTEvent(10, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(16, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(17, "WAVEEND", 0, 16, None),
+  ]),
+  "vinterp_to_valu": (TraceCase("vinterp_to_valu", [
+    v_interp_p10_f32(vdst=v[0], src0=v[1], src1=v[2], src2=v[3]), v_add_f32_e32(v[4], v[0], v[0]), s_endpgm(),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "VINTERP"),
+    NormalizedSQTTEvent(2, "VALUINST", 0, 8, None), NormalizedSQTTEvent(9, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(14, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(15, "WAVEEND", 0, 12, None),
+  ]),
+  "valu_to_vinterp": (TraceCase("valu_to_vinterp", [
+    v_add_f32_e32(v[0], v[1], v[1]), v_interp_p10_f32(vdst=v[4], src0=v[0], src1=v[5], src2=v[6]), s_endpgm(),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(2, "INST", 0, 4, "VINTERP"), NormalizedSQTTEvent(9, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(15, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(16, "WAVEEND", 0, 12, None),
+  ]),
+  "const_to_vinterp": (TraceCase("const_to_vinterp", [
+    v_mov_b32_e32(v[0], 0), v_interp_p10_f32(vdst=v[4], src0=v[0], src1=v[5], src2=v[6]), s_endpgm(),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(2, "INST", 0, 4, "VINTERP"), NormalizedSQTTEvent(7, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(13, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(14, "WAVEEND", 0, 12, None),
   ]),
   "vinterp_wmma": (TraceCase("vinterp_wmma", [
     v_interp_p10_f32(vdst=v[8], src0=v[9], src1=v[10], src2=v[11]),
@@ -484,6 +535,40 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(1, "INST", 0, 0, "SALU"), NormalizedSQTTEvent(1, "ALUEXEC", None, None, "SALU"),
     NormalizedSQTTEvent(2, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(2, "ALUEXEC", None, None, "SALU"),
     NormalizedSQTTEvent(4, "WAVEEND", 0, 12, None),
+  ]),
+  "delay_valu_dep1": (TraceCase("delay_valu_dep1", [
+    v_mov_b32_e32(v[0], 0), s_delay_alu(1), v_mov_b32_e32(v[1], 1), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(6, "VALUINST", 0, 8, None), NormalizedSQTTEvent(7, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(12, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(13, "WAVEEND", 0, 12, None),
+  ]),
+  "delay_valu_dep4": (TraceCase("delay_valu_dep4", [
+    v_mov_b32_e32(v[0], 0), v_mov_b32_e32(v[1], 1), v_mov_b32_e32(v[2], 2), v_mov_b32_e32(v[3], 3),
+    s_delay_alu(4), v_mov_b32_e32(v[4], 4), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "VALUINST", 0, 0, None), NormalizedSQTTEvent(2, "VALUINST", 0, 4, None),
+    NormalizedSQTTEvent(3, "VALUINST", 0, 8, None), NormalizedSQTTEvent(4, "VALUINST", 0, 12, None),
+    NormalizedSQTTEvent(6, "VALUINST", 0, 20, None), NormalizedSQTTEvent(7, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(8, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(9, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(10, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(12, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(13, "WAVEEND", 0, 24, None),
+  ]),
+  "delay_trans_dep1": (TraceCase("delay_trans_dep1", [
+    v_rcp_f32_e32(v[1], v[0]), s_delay_alu(5), v_mov_b32_e32(v[2], 2), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "VALUT_4"),
+    NormalizedSQTTEvent(10, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(11, "VALUINST", 0, 8, None),
+    NormalizedSQTTEvent(17, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(18, "WAVEEND", 0, 12, None),
+  ]),
+  "delay_second_next": (TraceCase("delay_second_next", [
+    v_mov_b32_e32(v[0], 0), s_delay_alu(0x90), v_mov_b32_e32(v[1], 1), v_mov_b32_e32(v[2], 2), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(2, "VALUINST", 0, 8, None), NormalizedSQTTEvent(7, "VALUINST", 0, 12, None),
+    NormalizedSQTTEvent(7, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(8, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(13, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(14, "WAVEEND", 0, 16, None),
   ]),
   "lds_roundtrip": (TraceCase("lds_roundtrip", [
     v_lshlrev_b32_e32(v[1], 2, v[0]), ds_store_b32(addr=v[1], data0=v[0]), ds_load_b32(vdst=v[2], addr=v[1]), s_endpgm(),
@@ -719,6 +804,9 @@ EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
   "salu_saveexec": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU"), ("ALUEXEC", 5, "SALU")],
   "valu_independent": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 7, "VALU"), ("ALUEXEC", 8, "VALU")],
   "valu_simple_dependency": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 14, "VALU")],
+  "valu_nop4": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 14, "VALU")],
+  "valu_nop63": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 73, "VALU")],
+  "salu_nop63": [("ALUEXEC", 3, "SALU")],
   "valu_dependency": [("ALUEXEC", 10, "VALU"), ("ALUEXEC", 15, "VALU")],
   "valu_issue_limit": [("ALUEXEC", 10, "VALU"), ("ALUEXEC", 11, "VALU")],
   "valu_long_latency": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 10, "VALU")],
@@ -727,12 +815,21 @@ EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
   "valu_f64": [("ALUEXEC", 38, "VALU")],
   "vopd_dependency": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 14, "VALU")],
   "vinterp_independent": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 10, "VALU")],
+  "vinterp_dependency": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 15, "VALU")],
+  "vinterp_to_valu": [("ALUEXEC", 8, "VALU"), ("ALUEXEC", 13, "VALU")],
+  "valu_to_vinterp": [("ALUEXEC", 8, "VALU"), ("ALUEXEC", 14, "VALU")],
+  "const_to_vinterp": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 12, "VALU")],
   "wmma_same_block": [("ALUEXEC", 41, "VALU")],
   "wmma_two_blocks": [("ALUEXEC", 42, "VALU")],
   "wmma_independent": [("ALUEXEC", 43, "VALU"), ("ALUEXEC", 77, "VALU")],
   "wmma_dependency": [("ALUEXEC", 43, "VALU"), ("ALUEXEC", 77, "VALU")],
   "vinterp_wmma": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 44, "VALU"), ("ALUEXEC", 78, "VALU")],
   "wmma_vinterp_wmma": [("ALUEXEC", 43, "VALU"), ("ALUEXEC", 44, "VALU"), ("ALUEXEC", 79, "VALU")],
+  "delay_valu_dep1": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 11, "VALU")],
+  "delay_valu_dep4": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 7, "VALU"), ("ALUEXEC", 8, "VALU"),
+                      ("ALUEXEC", 9, "VALU"), ("ALUEXEC", 11, "VALU")],
+  "delay_trans_dep1": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 16, "VALU")],
+  "delay_second_next": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 7, "VALU"), ("ALUEXEC", 12, "VALU")],
   "lds_roundtrip": [("ALUEXEC", 9, "VALU"), ("VMEMEXEC", 21, "LDS"), ("VMEMEXEC", 23, "LDS")],
   "lds_waitcnt": [("VMEMEXEC", 3, "LDS"), ("ALUEXEC", 41, "VALU")],
   "lds_bpermute_dependency": [("VMEMEXEC", 3, "LDS"), ("ALUEXEC", 17, "VALU")],
@@ -787,6 +884,7 @@ class TestSQTTHardwareCycle(unittest.TestCase):
       with self.subTest(name=name):
         got = _timed_events(_run_hardware_trace(case))
         want = _timed_events(_run_mock_trace(case))
+        if case.normalize_exec_start: got, want = _normalize_exec_start(got), _normalize_exec_start(want)
         if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: self.fail(msg)
 
 if __name__ == "__main__":
