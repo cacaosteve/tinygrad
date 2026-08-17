@@ -242,6 +242,20 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(2, "INST", 0, 4, "SALU"), NormalizedSQTTEvent(2, "ALUEXEC", None, None, "SALU"),
     NormalizedSQTTEvent(4, "WAVEEND", 0, 8, None),
   ]),
+  "salu_mul_i32": (TraceCase("salu_mul_i32", [
+    s_mul_i32(s[0], s[1], s[2]), s_delay_alu(11), s_add_u32(s[3], s[0], 1), s_endpgm(),
+  ], local_size=32, normalize_exec_start=True), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "SALU"),
+    NormalizedSQTTEvent(2, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(4, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(6, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(7, "WAVEEND", 0, 12, None),
+  ]),
+  "salu_mul_hi": (TraceCase("salu_mul_hi", [
+    s_mul_hi_u32(s[0], s[1], s[2]), s_delay_alu(11), s_add_u32(s[3], s[0], 1), s_endpgm(),
+  ], local_size=32, normalize_exec_start=True), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "SALU"),
+    NormalizedSQTTEvent(2, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(4, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(6, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(7, "WAVEEND", 0, 12, None),
+  ]),
   "salu_saveexec": (TraceCase("salu_saveexec", [
     s_mov_b32(s[2], -1), s_and_saveexec_b32(s[0], s[2]), s_mov_b32(s[1], 1), s_endpgm(),
   ]), [
@@ -924,6 +938,8 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
 
 EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
   "salu_chain": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU")],
+  "salu_mul_i32": [("ALUEXEC", 3, "SALU"), ("ALUEXEC", 5, "SALU")],
+  "salu_mul_hi": [("ALUEXEC", 3, "SALU"), ("ALUEXEC", 5, "SALU")],
   "call_return": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 30, "SALU")],
   "salu_saveexec": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU"), ("ALUEXEC", 5, "SALU")],
   "valu_independent": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 7, "VALU"), ("ALUEXEC", 8, "VALU")],

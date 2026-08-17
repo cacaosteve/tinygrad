@@ -73,6 +73,7 @@ _VALUB_2_RE = re.compile(r"V_(LSHLREV|LSHRREV|ASHRREV)_(B|I)64")
 _VALUB_4_RE = re.compile(r"V_MAD_(U|I)64")
 _VALUB_16_RE = re.compile(r"V_\w+_F64")
 _DS_ATOMIC_RE = re.compile(r"DS_(ADD|SUB|RSUB|INC|DEC|MIN|MAX|AND|OR|XOR|MSKOR)(_|$)")
+_SALU_3_CYCLE = {"S_MUL_I32", "S_MULK_I32", "S_MUL_HI_I32", "S_MUL_HI_U32"}
 
 def _op_name(inst) -> str:
   if hasattr(inst, "opx"): return f"{inst.opx.name}_{inst.opy.name}"
@@ -339,7 +340,7 @@ class RDNA3SQTTTraceBuilder:
       writes_exec = _writes_exec(inst, op_name)
       salu_op = InstOp.SALU_WR_EXEC if writes_exec else InstOp.SALU
       return _TraceInfo(INST, {"op": salu_op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
-                        exec_latency=2, forward_latency=2,
+                        exec_latency=3 if op_name in _SALU_3_CYCLE else 2, forward_latency=2,
                         writes_scc_latency=9 if op_name.startswith("S_CMP") else None,
                         writes_vcc_latency=7 if _writes_vcc(inst) else None, writes_exec_latency=7 if writes_exec else None)
     if issubclass(inst_type, _VINTERP):
