@@ -5,10 +5,11 @@ from typing import Iterable
 
 from tinygrad.helpers import Context, Target, getenv
 from tinygrad.renderer.amd.sqtt import (ALUEXEC, IMMEDIATE, IMMEDIATE_MASK, INST, INST_RDNA4, TS_DELTA_OR_MARK, VALUINST, VMEMEXEC, WAVEEND,
-  WAVEEND_RDNA4, WAVERDY, WAVESTART, WAVESTART_RDNA4, InstOp, decode)
+  WAVEEND_RDNA4, WAVERDY, WAVESTART, WAVESTART_RDNA4, AluSrc, InstOp, decode)
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
 from tinygrad.runtime.autogen.amd.rdna3.enum import VOPDOp
 from test.mockgpu.amd.emu import run_asm, sqtt_traces
+from test.mockgpu.amd.sqtt import RDNA3SQTTTraceBuilder
 
 _RSRC2_WITH_LDS = 0x19c | (1 << 15)
 
@@ -154,6 +155,7 @@ def _asm_source(case: TraceCase) -> str:
   .amdhsa_next_free_vgpr {case.vgpr_count}
   .amdhsa_next_free_sgpr 16
   .amdhsa_wavefront_size32 1
+  .amdhsa_system_vgpr_workitem_id 0
   .amdhsa_kernarg_size 0
   .amdhsa_group_segment_fixed_size 65536
   .amdhsa_private_segment_fixed_size 0
@@ -583,6 +585,34 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(10, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(11, "VALUINST", 0, 8, None),
     NormalizedSQTTEvent(17, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(18, "WAVEEND", 0, 12, None),
   ]),
+  "delay_fma_accum": (TraceCase("delay_fma_accum", [
+    v_fmac_f32_e32(v[0], v[1], v[2]), s_delay_alu(8), v_fmac_f32_e32(v[0], v[3], v[4]), s_endpgm(),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(2, "VALUINST", 0, 8, None), NormalizedSQTTEvent(10, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(15, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(16, "WAVEEND", 0, 12, None),
+  ]),
+  "delay_salu_cycle1": (TraceCase("delay_salu_cycle1", [
+    s_mov_b32(s[0], 1), s_delay_alu(9), s_add_u32(s[1], s[0], 2), s_endpgm(),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "SALU"),
+    NormalizedSQTTEvent(3, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(3, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(5, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(6, "WAVEEND", 0, 12, None),
+  ]),
+  "delay_salu_cycle2": (TraceCase("delay_salu_cycle2", [
+    s_mov_b32(s[0], 1), s_delay_alu(10), s_add_u32(s[1], s[0], 2), s_endpgm(),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "SALU"),
+    NormalizedSQTTEvent(2, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(3, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(5, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(6, "WAVEEND", 0, 12, None),
+  ]),
+  "delay_salu_cycle3": (TraceCase("delay_salu_cycle3", [
+    s_mov_b32(s[0], 1), s_delay_alu(11), s_add_u32(s[1], s[0], 2), s_endpgm(),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "SALU"),
+    NormalizedSQTTEvent(2, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(3, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(5, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(6, "WAVEEND", 0, 12, None),
+  ]),
   "delay_second_next": (TraceCase("delay_second_next", [
     v_mov_b32_e32(v[0], 0), s_delay_alu(0x90), v_mov_b32_e32(v[1], 1), v_mov_b32_e32(v[2], 2), s_endpgm(),
   ]), [
@@ -856,6 +886,42 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
   ]),
 }
 
+COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
+  "compose_salu_valu": (TraceCase("compose_salu_valu", [
+    s_mov_b32(s[0], 1), v_mov_b32_e32(v[0], s[0]), v_add_f32_e32(v[1], v[0], v[0]), s_add_u32(s[1], s[0], 2),
+    v_rcp_f32_e32(v[2], v[1]), s_endpgm(),
+  ], local_size=32), [0, 1, 2, 2, 7, 7, 8, 11, 13, 18]),
+  "compose_alu_interleave": (TraceCase("compose_alu_interleave", [
+    v_mov_b32_e32(v[0], 0), s_mov_b32(s[0], 1), v_add_f32_e32(v[1], v[0], v[0]), s_add_u32(s[1], s[0], 2),
+    v_add_f32_e32(v[2], v[1], v[1]), s_endpgm(),
+  ], local_size=32), [0, 1, 2, 3, 3, 4, 5, 6, 12, 17]),
+  "compose_trans_chain": (TraceCase("compose_trans_chain", [
+    v_rcp_f32_e32(v[0], v[1]), v_add_f32_e32(v[2], v[0], v[0]), v_rcp_f32_e32(v[3], v[2]),
+    v_add_f32_e32(v[4], v[3], v[3]), s_endpgm(),
+  ], local_size=32), [0, 1, 4, 5, 9, 19, 24, 34]),
+  "compose_lds_no_wait": (TraceCase("compose_lds_no_wait", [
+    v_lshlrev_b32_e32(v[1], 2, v[0]), ds_store_b32(addr=v[1], data0=v[0]), ds_load_b32(vdst=v[2], addr=v[1]),
+    v_add_f32_e32(v[3], v[2], v[2]), v_rcp_f32_e32(v[4], v[3]), s_endpgm(),
+  ], local_size=32), [0, 9, 18, 19, 21, 23, 27, 28, 35, 40]),
+  "compose_wmma_salu": (TraceCase("compose_wmma_salu", [
+    v_wmma_f32_16x16x16_f16(vdst=v[0:7], src0=v[16:23], src1=v[24:31], src2=v[0:7]), s_mov_b32(s[0], 1),
+    v_add_f32_e32(v[8], v[9], v[9]), s_add_u32(s[1], s[0], 2),
+    v_wmma_f32_16x16x16_f16(vdst=v[32:39], src0=v[48:55], src1=v[56:63], src2=v[32:39]), s_endpgm(),
+  ], local_size=32, vgpr_count=64), [0, 1, 2, 3, 3, 4, 5, 43, 44, 79]),
+  "compose_interp_lds": (TraceCase("compose_interp_lds", [
+    v_interp_p10_f32(vdst=v[8], src0=v[9], src1=v[10], src2=v[11]), ds_store_b32(addr=v[0], data0=v[8]),
+    ds_load_b32(vdst=v[12], addr=v[0]), v_add_f32_e32(v[13], v[12], v[12]), s_endpgm(),
+  ], local_size=32), [0, 9, 18, 19, 21, 23, 27, 35]),
+  "compose_fmac_trans": (TraceCase("compose_fmac_trans", [
+    v_fmac_f32_e32(v[0], v[1], v[2]), s_delay_alu(8), v_fmac_f32_e32(v[0], v[3], v[4]),
+    v_rcp_f32_e32(v[5], v[0]), v_add_f32_e32(v[6], v[5], v[5]), s_endpgm(),
+  ], local_size=32), [0, 1, 2, 3, 9, 14, 19, 29]),
+  "compose_long_valu": (TraceCase("compose_long_valu", [
+    v_lshlrev_b64(v[2:3], 2, v[0:1]), v_add_f32_e32(v[4], v[2], v[2]), v_rcp_f32_e32(v[5], v[4]),
+    v_mov_b32_e32(v[6], 1), s_endpgm(),
+  ], local_size=32), [0, 2, 3, 4, 10, 15, 20, 21]),
+}
+
 EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
   "salu_chain": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU")],
   "call_return": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 30, "SALU")],
@@ -887,6 +953,10 @@ EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
   "delay_valu_dep4": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 7, "VALU"), ("ALUEXEC", 8, "VALU"),
                       ("ALUEXEC", 9, "VALU"), ("ALUEXEC", 11, "VALU")],
   "delay_trans_dep1": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 16, "VALU")],
+  "delay_fma_accum": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 14, "VALU")],
+  "delay_salu_cycle1": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU")],
+  "delay_salu_cycle2": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU")],
+  "delay_salu_cycle3": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU")],
   "delay_second_next": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 7, "VALU"), ("ALUEXEC", 12, "VALU")],
   "lds_roundtrip": [("ALUEXEC", 9, "VALU"), ("VMEMEXEC", 21, "LDS"), ("VMEMEXEC", 23, "LDS")],
   "lds_waitcnt": [("VMEMEXEC", 3, "LDS"), ("ALUEXEC", 41, "VALU")],
@@ -912,9 +982,23 @@ class TestSQTTCycleModel(unittest.TestCase):
         got = [(e.kind, e.time, e.op or "") for e in _timed_events(_run_mock_trace(CASES[name][0])) if e.kind in {"ALUEXEC", "VMEMEXEC"}]
         self.assertListEqual(got, expected)
 
+  def test_composition_timing(self):
+    for name, (case, expected) in COMPOSITION_CASES.items():
+      with self.subTest(name=name): self.assertListEqual([e.time for e in _timed_events(_run_mock_trace(case))], expected)
+
   def test_large_delta_packet(self):
     blob = _run_mock_blob(CASES["lds_roundtrip"][0])
     self.assertTrue(any(isinstance(pkt, TS_DELTA_OR_MARK) for pkt in decode(blob)))
+
+  def test_finalize_idempotent(self):
+    builder = RDNA3SQTTTraceBuilder()
+    instructions = [s_mov_b32(s[0], 1), v_mov_b32_e32(v[0], s[0])] + [v_mov_b32_e32(v[i], i) for i in range(1, 7)] + \
+                   [s_add_u32(s[1], s[2], 3)]
+    for inst in instructions: builder.emit(0, inst, None)
+    builder.finish(0)
+    first = builder.finalize()
+    self.assertTrue(any(isinstance(pkt, ALUEXEC) and pkt.src == AluSrc.VALU_SALU for pkt in decode(first)))
+    self.assertEqual(first, builder.finalize())
 
 @unittest.skipUnless(getenv("SQTT_CYCLE_HW", 0), "set SQTT_CYCLE_HW=1 to run hardware SQTT cycle comparisons")
 class TestSQTTHardwareCycle(unittest.TestCase):
@@ -927,7 +1011,9 @@ class TestSQTTHardwareCycle(unittest.TestCase):
     if not Device["AMD"].sqtt_enabled: raise unittest.SkipTest("hardware SQTT cycle tests require VIZ=2 or SQTT=1")
 
   def test_hardware_trace_order(self):
-    for name, (case, expected) in CASES.items():
+    cases = [(name, case, expected) for name, (case, expected) in CASES.items()] + \
+            [(name, case, _run_mock_trace(case)) for name, (case, _) in COMPOSITION_CASES.items()]
+    for name, case, expected in cases:
       with self.subTest(name=name):
         want = _instruction_events(expected)
         if case.local_size > 32: want = [e for e in want if e.wave == 0]
@@ -942,7 +1028,8 @@ class TestSQTTHardwareCycle(unittest.TestCase):
 
   def test_hardware_trace_cycles(self):
     if not getenv("SQTT_CYCLE_STRICT", 0): self.skipTest("set SQTT_CYCLE_STRICT=1 to require exact cycle timestamps")
-    for name, (case, _) in CASES.items():
+    cases = [(name, case) for name, (case, _) in CASES.items()] + [(name, case) for name, (case, _) in COMPOSITION_CASES.items()]
+    for name, case in cases:
       if case.local_size > 32: continue
       with self.subTest(name=name):
         want = _timed_events(_run_mock_trace(case))

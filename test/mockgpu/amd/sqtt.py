@@ -148,6 +148,7 @@ def _src_vgprs(inst) -> set[int]:
   for name in ("vsrc0", "vsrc1", "vsrc2", "vsrcx1", "vsrcy1", "data0", "data1", "addr"):
     if (off:=_field_offset(getattr(inst, name, None))) is not None:
       ret.add(off - (384 if off >= 384 else 256) if off >= 256 else off)
+  if "FMAC" in _op_name(inst) or "DOT2ACC" in _op_name(inst): ret.update(_vgpr_offsets(getattr(inst, "vdst", None)))
   return ret
 
 def _dst_vgprs(inst, op_name: str) -> set[int]:
@@ -163,7 +164,7 @@ def _dst_vgprs(inst, op_name: str) -> set[int]:
 
 def _src_sgprs(inst) -> set[int]:
   ret: set[int] = set()
-  for name in ("ssrc0", "ssrc1", "sbase", "soffset", "saddr"):
+  for name in ("src0", "src1", "src2", "ssrc0", "ssrc1", "sbase", "soffset", "saddr"):
     if (off:=_field_offset(getattr(inst, name, None))) is not None and off < 128: ret.add(off)
   return ret
 
@@ -216,6 +217,7 @@ class _WaveState:
   issue: int = 2
   salu_ready: int = 2
   valu_ready: int = 2
+  trans_ready: int = 2
   lds_ready: int = 2
   vmem_ready: int = 2
   control_ready: int = 2
@@ -231,11 +233,13 @@ class _WaveState:
   control_exec_ready: int = 2
   matrix_start_ready: int = 0
   matrix_interp_ready: int = 0
+  sgpr_valu_read_ready: int = 0
   trans_warm: bool = False
   had_lds: bool = False
   last_time: int = 1
   vgpr_ready: dict[int, int] = field(default_factory=dict)
   vgpr_lds_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_lds_pending: dict[int, bool] = field(default_factory=dict)
   vgpr_exec_ready: dict[int, int] = field(default_factory=dict)
   vgpr_forward_ready: dict[int, int] = field(default_factory=dict)
   vgpr_interp_ready: dict[int, int] = field(default_factory=dict)
@@ -395,6 +399,7 @@ class RDNA3SQTTTraceBuilder:
     if info.pkt_cls is None: return
     st, wave = self._wave(wave_id), wave_id & 0x1F
     src_vgprs, src_sgprs = _src_vgprs(inst), _src_sgprs(inst)
+    dst_vgprs, dst_sgprs = _dst_vgprs(inst, _op_name(inst)), _dst_sgprs(inst)
     vgpr_ready = st.vgpr_lds_ready if info.pipe == "lds" else st.vgpr_ready
     src_ready = max([vgpr_ready.get(r, st.vgpr_ready.get(r, 0)) for r in src_vgprs] +
                     [st.sgpr_ready.get(r, 0) for r in src_sgprs] +
@@ -402,10 +407,14 @@ class RDNA3SQTTTraceBuilder:
                     ([st.vcc_ready] if info.reads_vcc else []) + ([st.exec_ready] if info.reads_exec else []) +
                     ([st.lgkm_ready + info.wait_lgkm_extra] if info.wait_lgkm else []) + [0])
     pipe_ready = getattr(st, f"{info.pipe}_ready") if info.pipe else 0
+    if info.trans: pipe_ready = max(pipe_ready, st.trans_ready)
     immediate_ready = st.immediate_ready + info.immediate_delay if info.pkt_cls == IMMEDIATE and st.immediate_ready else 0
     active_delays = [dep for skip, dep in st.pending_delays if skip == 0]
     delay_ready = max([self._delay_ready(st, dep) for dep in active_delays] + [0])
-    issue = max(st.issue, pipe_ready, src_ready, immediate_ready, delay_ready)
+    base_issue = max(st.issue, pipe_ready, src_ready, immediate_ready, delay_ready)
+    sgpr_read_ready = st.sgpr_valu_read_ready if info.pipe == "salu" and (src_sgprs or dst_sgprs) else 0
+    salu_read_stall, issue = sgpr_read_ready > base_issue, max(base_issue, sgpr_read_ready)
+    lds_pending = info.pipe == "lds" and st.lgkm_ready > issue
     kwargs = {"wave": wave, **info.kwargs} if info.pkt_cls in (INST, IMMEDIATE, VALUINST) else info.kwargs
     self._add(issue, info.pkt_cls, **kwargs)
 
@@ -414,9 +423,10 @@ class RDNA3SQTTTraceBuilder:
       exec_ready = getattr(st, f"{info.pipe}_exec_ready")
       if info.pipe == "salu":
         dep_ready = max([st.sgpr_exec_ready.get(r, 0) + info.forward_latency for r in src_sgprs if r in st.sgpr_exec_ready] + [0])
-        exec_time = max(issue + info.exec_latency, exec_ready, dep_ready)
+        exec_time = max(issue + info.exec_latency + (2 if salu_read_stall and src_sgprs else 0), exec_ready, dep_ready)
       elif info.pipe == "valu":
         if not info.trans and src_vgprs and any(5 <= dep <= 7 for dep in active_delays): latency = 8
+        elif not info.trans and any(st.vgpr_lds_pending.get(r, False) for r in src_vgprs): latency = 8
         elif info.trans and st.trans_warm: latency = 7
         else: latency = info.vgpr_read_latency if src_vgprs and info.vgpr_read_latency is not None else info.exec_latency
         if not info.matrix: self._shift_cross_interp_producers(st, src_vgprs, info.interp)
@@ -425,7 +435,7 @@ class RDNA3SQTTTraceBuilder:
                     not st.vgpr_producer_trans.get(r, False) and st.vgpr_producer_shiftable.get(r, False)}
           self._shift_exec_events(st, events)
         interp_sources = any(st.vgpr_producer_interp.get(r, False) for r in src_vgprs)
-        if not info.interp and not info.matrix and interp_sources and st.matrix_start_ready > issue: st.matrix_start_ready += 4
+        if not info.interp and not info.matrix and st.matrix_start_ready > issue: st.matrix_start_ready += 4 if interp_sources else 2
         dep_map = st.vgpr_matrix_ready if info.matrix else (st.vgpr_interp_ready if info.interp else st.vgpr_forward_ready)
         dep_ready = max([dep_map.get(r, 0) for r in src_vgprs] + [0])
         if info.matrix:
@@ -446,13 +456,16 @@ class RDNA3SQTTTraceBuilder:
 
     if info.pipe:
       setattr(st, f"{info.pipe}_ready", issue + info.issue_latency)
+      if info.trans: st.trans_ready = issue + 4
       if info.pipe in {"valu", "lds", "vmem"}: st.immediate_ready = max(st.immediate_ready, issue + 3)
     ready = issue + (info.duration if info.dst_latency is None else info.dst_latency)
+    if lds_pending and info.dst_latency is not None: ready += 1
+    if info.pipe == "lds" and dst_vgprs: st.valu_ready = max(st.valu_ready, ready)
     natural_exec_latency = info.vgpr_read_latency if src_vgprs and info.vgpr_read_latency is not None else info.exec_latency
     producer_shiftable = (info.interp or (info.vgpr_read_latency is not None and bool(src_vgprs))) and exec_time == issue + natural_exec_latency
     producer_forward_latency = info.forward_latency + (1 if info.interp and not producer_shiftable else 0)
     if info.vgpr_read_latency is not None and not src_vgprs: producer_forward_latency += 1
-    for reg in _dst_vgprs(inst, _op_name(inst)):
+    for reg in dst_vgprs:
       st.vgpr_ready[reg] = ready
       st.vgpr_exec_ready[reg] = exec_time
       st.vgpr_forward_ready[reg] = exec_time + producer_forward_latency
@@ -464,7 +477,8 @@ class RDNA3SQTTTraceBuilder:
         st.vgpr_producer_trans[reg] = info.trans
         st.vgpr_producer_shiftable[reg] = producer_shiftable
       if info.pipe == "valu": st.vgpr_lds_ready[reg] = issue + 18
-    for reg in _dst_sgprs(inst):
+      st.vgpr_lds_pending[reg] = lds_pending
+    for reg in dst_sgprs:
       st.sgpr_ready[reg] = ready
       st.sgpr_exec_ready[reg] = exec_time
     if info.writes_scc_latency is not None: st.scc_ready = issue + info.writes_scc_latency
@@ -477,6 +491,7 @@ class RDNA3SQTTTraceBuilder:
         latency = info.lgkm_latency if info.lgkm_latency is not None else _lds_lgkm_latency(op, st.lgkm_ready > issue)
         st.lgkm_ready = max(st.lgkm_ready, issue + latency)
     if info.pipe == "valu" and info.exec_cls is not None:
+      if src_sgprs: st.sgpr_valu_read_ready = max(st.sgpr_valu_read_ready, exec_time)
       if info.trans: st.trans_exec_history.append((exec_time, st.trans_warm))
       else: st.valu_exec_history.append(exec_time)
     if info.pipe == "salu" and info.exec_cls is not None: st.salu_exec_history.append(exec_time)
@@ -492,7 +507,17 @@ class RDNA3SQTTTraceBuilder:
   def finalize(self) -> bytes:
     nibbles: list[int] = []
     current_time = 0
-    for event in sorted(self.events, key=lambda e: (e.time, e.pkt_cls in (ALUEXEC, VMEMEXEC), e.seq)):
+    events = list(self.events)
+    drop: set[int] = set()
+    alu_by_time: dict[int, dict[AluSrc, list[int]]] = {}
+    for i, event in enumerate(events):
+      if event.pkt_cls is ALUEXEC: alu_by_time.setdefault(event.time, {}).setdefault(event.kwargs["src"], []).append(i)
+    for slots in alu_by_time.values():
+      if len(slots.get(AluSrc.SALU, [])) == 1 and len(slots.get(AluSrc.VALU, [])) == 1:
+        salu, valu = slots[AluSrc.SALU][0], slots[AluSrc.VALU][0]
+        events[salu] = replace(events[salu], kwargs={"src": AluSrc.VALU_SALU})
+        drop.add(valu)
+    for event in sorted((e for i, e in enumerate(events) if i not in drop), key=lambda e: (e.time, e.pkt_cls in (ALUEXEC, VMEMEXEC), e.seq)):
       delta = event.time - current_time
       if delta < 0: raise RuntimeError("SQTT events must be timestamp sorted")
       max_delta = _max_delta(event.pkt_cls)
