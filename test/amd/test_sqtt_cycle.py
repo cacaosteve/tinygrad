@@ -934,6 +934,17 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
     v_lshlrev_b64(v[2:3], 2, v[0:1]), v_add_f32_e32(v[4], v[2], v[2]), v_rcp_f32_e32(v[5], v[4]),
     v_mov_b32_e32(v[6], 1), s_endpgm(),
   ], local_size=32), [0, 2, 3, 4, 10, 15, 20, 21]),
+  "compose_valub_backpressure": (TraceCase("compose_valub_backpressure", [
+    v_lshlrev_b64(v[2:3], 2, v[0:1]), v_add_f32_e32(v[4], v[2], v[2]), v_rcp_f32_e32(v[5], v[4]), v_mov_b32_e32(v[6], 1),
+  ] * 8 + [s_endpgm()], local_size=32),
+    [0, 2, 3, 4, 7, 9, 10, 10, 11, 14, 15, 16, 17, 18, 20, 21, 24, 25, 26, 27, 28, 29, 34, 35, 39, 39, 41, 42, 43, 43,
+     48, 49, 53, 53, 55, 56, 57, 57, 62, 63, 67, 67, 69, 70, 71, 71, 76, 77, 81, 81, 83, 84, 85, 85, 90, 91, 95, 99, 104, 105,
+     109, 113, 118, 119]),
+  "compose_valub_backpressure_no_move": (TraceCase("compose_valub_backpressure_no_move", [
+    v_lshlrev_b64(v[2:3], 2, v[0:1]), v_add_f32_e32(v[4], v[2], v[2]), v_rcp_f32_e32(v[5], v[4]),
+  ] * 8 + [s_endpgm()], local_size=32),
+    [0, 2, 3, 7, 9, 10, 10, 14, 15, 16, 17, 20, 21, 23, 24, 25, 29, 29, 31, 32, 34, 39, 43, 43,
+     45, 46, 48, 53, 57, 57, 59, 60, 62, 67, 71, 71, 73, 74, 76, 81, 85, 90, 95, 99, 104, 109, 113, 118]),
   "compose_valu_queue": (TraceCase("compose_valu_queue", [v_mov_b32_e32(v[0], 1)] + [
     v_add_f32_e32(v[i], v[i-1], v[i-1]) for i in range(1, 16)] + [s_endpgm()], local_size=32, vgpr_count=20),
     [0, 1, 2, 3, 4, 5, 6, 6, 7, 8, 9, 10, 11, 12, 12, 13, 16, 17, 21, 22, 27, 32, 37, 42, 47, 52, 57, 62, 67, 72, 77, 82]),

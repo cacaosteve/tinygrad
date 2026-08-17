@@ -74,7 +74,7 @@ _VALUB_4_RE = re.compile(r"V_MAD_(U|I)64")
 _VALUB_16_RE = re.compile(r"V_\w+_F64")
 _DS_ATOMIC_RE = re.compile(r"DS_(ADD|SUB|RSUB|INC|DEC|MIN|MAX|AND|OR|XOR|MSKOR)(_|$)")
 _SALU_3_CYCLE = {"S_MUL_I32", "S_MULK_I32", "S_MUL_HI_I32", "S_MUL_HI_U32"}
-_VALU_INFLIGHT_LIMIT, _TRANS_INFLIGHT_LIMIT, _VALU_READ_WARMUP = 12, 5, 7
+_VALU_INFLIGHT_LIMIT, _VALUB_INFLIGHT_LIMIT, _TRANS_INFLIGHT_LIMIT, _VALU_READ_WARMUP = 12, 8, 5, 7
 
 def _op_name(inst) -> str:
   if hasattr(inst, "opx"): return f"{inst.opx.name}_{inst.opy.name}"
@@ -218,6 +218,7 @@ class _TraceInfo:
 @dataclass(frozen=True)
 class _VALUQueueEntry:
   retire: int
+  exec_retire: int
   trans_retire: int|None
   chains: frozenset[int]
 
@@ -226,19 +227,34 @@ class _VALUInstructionBuffer:
   entries: list[_VALUQueueEntry] = field(default_factory=list)
   reg_chains: dict[int, frozenset[int]] = field(default_factory=dict)
   dependent_chains: set[int] = field(default_factory=set)
+  valub_chains: set[int] = field(default_factory=set)
   next_chain: int = 0
+  valub_warm: bool = False
+  valub_issued: int = 0
 
-  def chains_for(self, srcs: set[int]) -> frozenset[int]:
+  def chains_for(self, srcs: set[int], *, valub: bool) -> frozenset[int]:
     chains = frozenset(chain for reg in srcs for chain in self.reg_chains.get(reg, ()))
     if chains:
       self.dependent_chains.update(chains)
-      return chains
-    self.next_chain += 1
-    return frozenset((self.next_chain,))
+    else:
+      self.next_chain += 1
+      chains = frozenset((self.next_chain,))
+    if valub: self.valub_chains.update(chains)
+    return chains
 
-  def issue_ready(self, base_issue: int, *, chains: frozenset[int], trans: bool, trans_source_ready: list[int]) -> int:
+  def issue_ready(self, base_issue: int, *, chains: frozenset[int], valub: bool, trans: bool, trans_source_ready: list[int]) -> int:
+    if valub and self.valub_issued >= 3:
+      active_exec = [entry.exec_retire for entry in self.entries if entry.exec_retire > base_issue]
+      early_admit = False
+      if len(active_exec) >= _VALUB_INFLIGHT_LIMIT and not self.valub_warm:
+        self.valub_warm = True
+        if (early_release:=min(active_exec) - 1) > base_issue: base_issue, early_admit = early_release, True
+      if not early_admit:
+        while len(active_exec:=[entry.exec_retire for entry in self.entries if entry.exec_retire > base_issue]) >= _VALUB_INFLIGHT_LIMIT:
+          base_issue = min(active_exec)
+    if valub: self.valub_issued += 1
     active = [entry for entry in self.entries if entry.retire > base_issue]
-    active_chains = (frozenset(chain for entry in active for chain in entry.chains) | chains) & self.dependent_chains
+    active_chains = ((frozenset(chain for entry in active for chain in entry.chains) | chains) & self.dependent_chains) - self.valub_chains
     # The first dependency chain uses the base IB entry; each additional live chain reserves one more entry.
     limit = max(1, _VALU_INFLIGHT_LIMIT - max(0, len(active_chains) - 1))
     if len(active) >= limit:
@@ -250,7 +266,7 @@ class _VALUInstructionBuffer:
     return base_issue
 
   def record(self, exec_time: int, *, chains: frozenset[int], dsts: set[int], trans: bool) -> None:
-    self.entries.append(_VALUQueueEntry(exec_time - 1, exec_time if trans else None, chains))
+    self.entries.append(_VALUQueueEntry(exec_time - 1, exec_time, exec_time if trans else None, chains))
     for reg in dsts: self.reg_chains[reg] = chains
 
 @dataclass
@@ -459,9 +475,10 @@ class RDNA3SQTTTraceBuilder:
     base_issue = max(st.issue, pipe_ready, src_ready, immediate_ready, delay_ready)
     valu_chains: frozenset[int]|None = None
     if info.pipe == "valu" and not info.matrix:
-      valu_chains = st.valu_ib.chains_for(src_vgprs)
+      valub = info.trans_pipe and not info.trans
+      valu_chains = st.valu_ib.chains_for(src_vgprs, valub=valub)
       trans_source_ready = [st.vgpr_trans_issue_ready[r] for r in src_vgprs if st.vgpr_producer_trans.get(r, False)]
-      base_issue = st.valu_ib.issue_ready(base_issue, chains=valu_chains, trans=info.trans, trans_source_ready=trans_source_ready)
+      base_issue = st.valu_ib.issue_ready(base_issue, chains=valu_chains, valub=valub, trans=info.trans, trans_source_ready=trans_source_ready)
     sgpr_read_ready = st.sgpr_valu_read_ready if info.pipe == "salu" and (src_sgprs or dst_sgprs) else 0
     salu_read_stall, issue = sgpr_read_ready > base_issue, max(base_issue, sgpr_read_ready)
     lds_pending = info.pipe == "lds" and st.lgkm_ready > issue
