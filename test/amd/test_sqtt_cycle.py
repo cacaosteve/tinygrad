@@ -206,6 +206,13 @@ def _first_mismatch(got: list[NormalizedSQTTEvent], expected: list[NormalizedSQT
 def _instruction_events(events: Iterable[NormalizedSQTTEvent]) -> list[NormalizedSQTTEvent]:
   return [e for e in events if e.kind in {"INST", "VALUINST", "IMMEDIATE"}]
 
+def _timed_events(events: Iterable[NormalizedSQTTEvent]) -> list[NormalizedSQTTEvent]:
+  ret = [e for e in events if e.kind in {"INST", "VALUINST", "IMMEDIATE", "ALUEXEC", "VMEMEXEC"}]
+  return _rebase(ret)
+
+def _structural_events(events: Iterable[NormalizedSQTTEvent]) -> list[NormalizedSQTTEvent]:
+  return [e for e in events if e.kind not in {"ALUEXEC", "VMEMEXEC", "WAVEEND"}]
+
 CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
   "salu_chain": (TraceCase("salu_chain", [s_mov_b32(s[0], 1), s_add_u32(s[1], s[0], 2), s_endpgm()]), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
@@ -633,11 +640,34 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
   ]),
 }
 
+EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
+  "salu_chain": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU")],
+  "salu_saveexec": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU"), ("ALUEXEC", 5, "SALU")],
+  "valu_independent": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 7, "VALU"), ("ALUEXEC", 8, "VALU")],
+  "valu_simple_dependency": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 14, "VALU")],
+  "valu_dependency": [("ALUEXEC", 10, "VALU"), ("ALUEXEC", 15, "VALU")],
+  "valu_issue_limit": [("ALUEXEC", 10, "VALU"), ("ALUEXEC", 11, "VALU")],
+  "valu_long_latency": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 10, "VALU")],
+  "valu_transcendent_dependency": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 19, "VALU")],
+  "valu_mad64": [("ALUEXEC", 12, "VALU")],
+  "valu_f64": [("ALUEXEC", 38, "VALU")],
+  "lds_roundtrip": [("ALUEXEC", 9, "VALU"), ("VMEMEXEC", 21, "LDS"), ("VMEMEXEC", 23, "LDS")],
+  "lds_waitcnt": [("VMEMEXEC", 3, "LDS"), ("ALUEXEC", 41, "VALU")],
+  "lds_bpermute_dependency": [("VMEMEXEC", 3, "LDS"), ("ALUEXEC", 17, "VALU")],
+  "single_wave_barrier": [("ALUEXEC", 3, "SALU")],
+}
+
 class TestSQTTCycleModel(unittest.TestCase):
   def test_mock_trace_cases(self):
     for name, (case, expected) in CASES.items():
       with self.subTest(name=name):
         got = _run_mock_trace(case)
+        self.assertListEqual(_structural_events(got), _structural_events(expected))
+
+  def test_execution_timing(self):
+    for name, expected in EXEC_TIMES.items():
+      with self.subTest(name=name):
+        got = [(e.kind, e.time, e.op or "") for e in _timed_events(_run_mock_trace(CASES[name][0])) if e.kind in {"ALUEXEC", "VMEMEXEC"}]
         self.assertListEqual(got, expected)
 
   def test_large_delta_packet(self):
@@ -670,11 +700,11 @@ class TestSQTTHardwareCycle(unittest.TestCase):
 
   def test_hardware_trace_cycles(self):
     if not getenv("SQTT_CYCLE_STRICT", 0): self.skipTest("set SQTT_CYCLE_STRICT=1 to require exact cycle timestamps")
-    for name, (case, expected) in CASES.items():
+    for name, (case, _) in CASES.items():
       if case.local_size > 32: continue
       with self.subTest(name=name):
-        got = _rebase(_instruction_events(_run_hardware_trace(case)))
-        want = _rebase(_instruction_events(expected))
+        got = _timed_events(_run_hardware_trace(case))
+        want = _timed_events(_run_mock_trace(case))
         if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: self.fail(msg)
 
 if __name__ == "__main__":

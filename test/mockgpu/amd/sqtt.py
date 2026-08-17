@@ -175,6 +175,11 @@ class _TraceInfo:
   duration: int = 1
   issue_latency: int = 1
   dst_latency: int|None = None
+  exec_latency: int = 0
+  exec_release: int = 1
+  exec_block: int = 0
+  forward_latency: int = 0
+  vgpr_read_latency: int|None = None
   reads_scc_delay: int|None = None
   reads_vcc: bool = False
   reads_exec: bool = False
@@ -198,10 +203,17 @@ class _WaveState:
   exec_ready: int = 2
   lgkm_ready: int = 2
   immediate_ready: int = 2
+  salu_exec_ready: int = 2
+  valu_exec_ready: int = 2
+  lds_exec_ready: int = 2
+  vmem_exec_ready: int = 2
   last_time: int = 1
   vgpr_ready: dict[int, int] = field(default_factory=dict)
   vgpr_lds_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_exec_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_forward_ready: dict[int, int] = field(default_factory=dict)
   sgpr_ready: dict[int, int] = field(default_factory=dict)
+  sgpr_exec_ready: dict[int, int] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class _PacketEvent:
@@ -245,24 +257,31 @@ class RDNA3SQTTTraceBuilder:
         reads_exec = inst_op in {SOPPOp3.S_CBRANCH_EXECZ.value, SOPPOp3.S_CBRANCH_EXECNZ.value}
         return _TraceInfo(INST, {"op": InstOp.JUMP if branch_taken else InstOp.JUMP_NO}, pipe="salu",
                           issue_latency=10 if branch_taken else (3 if reads_vcc or reads_exec else 1),
+                          exec_block=14 if branch_taken and (getattr(inst, "simm16", 0) & 0x8000) else 0,
                           reads_scc_delay=None if reads_vcc or reads_exec else (0 if branch_taken else 1),
                           reads_vcc=reads_vcc, reads_exec=reads_exec)
       return _TraceInfo(INST, {"op": InstOp.SALU}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
-                        writes_scc_latency=9 if op_name.startswith("S_CMP") else None)
+                        exec_latency=2, forward_latency=2, writes_scc_latency=9 if op_name.startswith("S_CMP") else None)
     if issubclass(inst_type, _SALU):
       writes_exec = _writes_exec(inst, op_name)
       salu_op = InstOp.SALU_WR_EXEC if writes_exec else InstOp.SALU
       return _TraceInfo(INST, {"op": salu_op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
+                        exec_latency=2, forward_latency=2,
                         writes_scc_latency=9 if op_name.startswith("S_CMP") else None,
                         writes_vcc_latency=7 if _writes_vcc(inst) else None, writes_exec_latency=7 if writes_exec else None)
     if issubclass(inst_type, _VALU):
       valu_op = _valu_op(op_name)
       if valu_op is None:
         return _TraceInfo(VALUINST, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
+                          exec_latency=6, vgpr_read_latency=9, forward_latency=5,
                           writes_vcc_latency=18 if op_name.startswith("V_CMP") else None)
       duration, issue_latency, dst_latency = _valu_latencies(valu_op)
+      exec_latency = {InstOp.VALUT_4: 9, InstOp.VALUB_2: 10, InstOp.VALUB_4: 12, InstOp.VALUB_16: 38,
+                      InstOp.VALU1_WR_EXEC: 9}[valu_op]
       return _TraceInfo(INST, {"op": valu_op}, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
                         duration=duration, issue_latency=issue_latency, dst_latency=dst_latency,
+                        exec_latency=exec_latency, exec_release=4 if valu_op == InstOp.VALUB_16 else 1,
+                        forward_latency=10 if valu_op == InstOp.VALUT_4 else 5,
                         writes_exec_latency=18 if valu_op == InstOp.VALU1_WR_EXEC else None)
     if issubclass(inst_type, _SMEM):
       return _TraceInfo(INST, {"op": InstOp.SMEM_RD}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
@@ -283,7 +302,7 @@ class RDNA3SQTTTraceBuilder:
         (9 if is_rtn_atomic and mem_op == InstOp.LDS_WR_3 else (7 if mem_op == InstOp.LDS_RD else None))
       return _TraceInfo(INST, {"op": mem_op}, pipe="lds", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.LDS},
                         duration=3 if is_permute or is_2addr_load or wide_load else _lds_exec_latency(mem_op), dst_latency=lds_dst_latency,
-                        lgkm_latency=35 if is_permute else load_lgkm_latency)
+                        exec_latency=3, exec_release=2, lgkm_latency=35 if is_permute else load_lgkm_latency)
     if mem_op.name.startswith(("SGMEM", "FLAT")):
       return _TraceInfo(INST, {"op": mem_op}, pipe="vmem", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.VMEM}, duration=_op_duration(mem_op))
     return _TraceInfo(INST, {"op": mem_op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
@@ -292,10 +311,10 @@ class RDNA3SQTTTraceBuilder:
     info = self._classify(inst, branch_taken)
     if info.pkt_cls is None: return
     st, wave = self._wave(wave_id), wave_id & 0x1F
-    src_vgprs = _src_vgprs(inst)
+    src_vgprs, src_sgprs = _src_vgprs(inst), _src_sgprs(inst)
     vgpr_ready = st.vgpr_lds_ready if info.pipe == "lds" else st.vgpr_ready
     src_ready = max([vgpr_ready.get(r, st.vgpr_ready.get(r, 0)) for r in src_vgprs] +
-                    [st.sgpr_ready.get(r, 0) for r in _src_sgprs(inst)] +
+                    [st.sgpr_ready.get(r, 0) for r in src_sgprs] +
                     ([] if info.reads_scc_delay is None else [st.scc_ready + info.reads_scc_delay]) +
                     ([st.vcc_ready] if info.reads_vcc else []) + ([st.exec_ready] if info.reads_exec else []) +
                     ([st.lgkm_ready + info.wait_lgkm_extra] if info.wait_lgkm else []) + [0])
@@ -305,7 +324,20 @@ class RDNA3SQTTTraceBuilder:
     kwargs = {"wave": wave, **info.kwargs} if info.pkt_cls in (INST, IMMEDIATE, VALUINST) else info.kwargs
     self._add(issue, info.pkt_cls, **kwargs)
 
-    exec_time = issue + info.duration if info.pipe in {"valu", "lds", "vmem"} else issue
+    exec_time = issue
+    if info.exec_cls is not None and info.pipe is not None:
+      exec_ready = getattr(st, f"{info.pipe}_exec_ready")
+      if info.pipe == "salu":
+        dep_ready = max([st.sgpr_exec_ready.get(r, 0) + info.forward_latency for r in src_sgprs if r in st.sgpr_exec_ready] + [0])
+        exec_time = max(issue + info.exec_latency, exec_ready, dep_ready)
+      elif info.pipe == "valu":
+        latency = info.vgpr_read_latency if src_vgprs and info.vgpr_read_latency is not None else info.exec_latency
+        dep_ready = max([st.vgpr_forward_ready.get(r, 0) for r in src_vgprs] + [0])
+        exec_time = max(issue + latency, exec_ready, dep_ready)
+      else: exec_time = max(issue + info.exec_latency, exec_ready)
+      setattr(st, f"{info.pipe}_exec_ready", exec_time + info.exec_release)
+    if info.pipe is not None and info.exec_block:
+      setattr(st, f"{info.pipe}_exec_ready", max(getattr(st, f"{info.pipe}_exec_ready"), issue + info.exec_block))
     if info.exec_cls is not None: self._add(exec_time, info.exec_cls, **info.exec_kwargs)
     if info.barrier: self._add(issue + 1, WAVERDY, mask=1 << wave)
 
@@ -315,8 +347,12 @@ class RDNA3SQTTTraceBuilder:
     ready = issue + (info.duration if info.dst_latency is None else info.dst_latency)
     for reg in _dst_vgprs(inst, _op_name(inst)):
       st.vgpr_ready[reg] = ready
+      st.vgpr_exec_ready[reg] = exec_time
+      st.vgpr_forward_ready[reg] = exec_time + info.forward_latency
       if info.pipe == "valu": st.vgpr_lds_ready[reg] = issue + 18
-    for reg in _dst_sgprs(inst): st.sgpr_ready[reg] = ready
+    for reg in _dst_sgprs(inst):
+      st.sgpr_ready[reg] = ready
+      st.sgpr_exec_ready[reg] = exec_time
     if info.writes_scc_latency is not None: st.scc_ready = issue + info.writes_scc_latency
     if info.writes_vcc_latency is not None: st.vcc_ready = issue + info.writes_vcc_latency
     if info.writes_exec_latency is not None: st.exec_ready = issue + info.writes_exec_latency
@@ -335,7 +371,7 @@ class RDNA3SQTTTraceBuilder:
   def finalize(self) -> bytes:
     nibbles: list[int] = []
     current_time = 0
-    for event in sorted(self.events, key=lambda e: (e.time, e.seq)):
+    for event in sorted(self.events, key=lambda e: (e.time, e.pkt_cls in (ALUEXEC, VMEMEXEC), e.seq)):
       delta = event.time - current_time
       if delta < 0: raise RuntimeError("SQTT events must be timestamp sorted")
       max_delta = _max_delta(event.pkt_cls)
