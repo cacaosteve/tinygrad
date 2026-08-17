@@ -150,6 +150,15 @@ class TestForLoopParsing(unittest.TestCase):
 class TestDSPcodePatterns(unittest.TestCase):
   """Test DS instruction pcode patterns."""
 
+  def test_ds_swizzle_fft_parsing(self):
+    srcs = {'offset0': UOp.const(0, dtypes.uint8), 'offset1': UOp.const(0xe0, dtypes.uint8)}
+    for i in range(64):
+      srcs[f'thread_in@{i}'] = UOp.const(100 + i, dtypes.uint32)
+      srcs[f'thread_valid@{i}'] = UOp.const(i < 32)
+    pcode_vars, _ = parse_pcode(PCODE[DSOp.DS_SWIZZLE_B32], srcs)
+    expected_lanes = [0, 16, 8, 24, 4, 20, 12, 28]
+    self.assertEqual([pcode_vars[f'thread_out@{i}'].simplify().val for i in range(8)], [100 + i for i in expected_lanes])
+
   def test_global_atomic_add_f32_parsing(self):
     """Test GLOBAL_ATOMIC_ADD_F32 keeps memory values in float dtype."""
     vmem = UOp.param(2, dtypes.uint32, (1024,))

@@ -81,6 +81,12 @@ def _countbits(v: UOp) -> UOp:
   for i in range(_expr_bits(v)): out = out + ((vv >> _const(dt, i)) & _const(dt, 1)).cast(dtypes.uint32)
   return out
 
+def _reverse_bits(v: UOp) -> UOp:
+  bits, out = _expr_bits(v), _u32(0)
+  vv = v.cast(dtypes.uint32)
+  for i in range(bits): out = out | (((vv >> _u32(i)) & _u32(1)) << _u32(bits - i - 1))
+  return out
+
 def _set_bit(old, pos, val):
   mask = _u32(1) << pos
   return (old & (mask ^ _u32(0xFFFFFFFF))) | ((val.cast(dtypes.uint32) & _u32(1)) << pos)
@@ -366,7 +372,7 @@ _FUNCS: dict[str, Callable[..., UOp]] = {
   # System NOPs - these are scheduling hints, no effect on emulation
   'MIN': lambda a, b: (a < b).where(a, b),
   's_nop': lambda a: _u32(0),
-  'countbits': _countbits,
+  'countbits': _countbits, 'count_ones': _countbits, 'reverse_bits': _reverse_bits,
   # Address calculation for memory operations
   'CalcDsAddr': lambda a, o, *r: a.cast(dtypes.uint32) + o.cast(dtypes.uint32),
   'CalcGlobalAddr': lambda v, s, *r: v.cast(dtypes.uint64) + s.cast(dtypes.uint64),
@@ -1369,10 +1375,30 @@ def parse_block(lines: list[str], start: int, env: dict[str, VarVal], funcs: dic
 def parse_expr(expr: str, env: dict[str, VarVal], funcs: dict | None = None) -> UOp:
   return parse_tokens(tokenize(expr.strip().rstrip(';')), env, funcs)
 
+def _pcode_lines(pcode: str) -> list[str]:
+  raw_lines = [l.strip().rstrip(';') for l in pcode.split('\n') if l.strip() and not l.strip().startswith('//')]
+  lines: list[str] = []
+  c_blocks: list[str] = []
+  for line in raw_lines:
+    if line == '}':
+      if not c_blocks: raise RuntimeError('unexpected C-style pcode block close')
+      lines.append(f'end{c_blocks.pop()}')
+    elif (m:=re.fullmatch(r'if\s*\((.*)\)\s*\{', line)):
+      lines.append(f'if {m.group(1)} then')
+      c_blocks.append('if')
+    elif (m:=re.fullmatch(r'for\s*\((\w+)\s*=\s*(-?\d+)\s*;\s*\1\s*<\s*(-?\d+)\s*;\s*\1\+\+\s*\)\s*\{', line)):
+      lines.append(f'for {m.group(1)} in {m.group(2)} : {int(m.group(3)) - 1} do')
+      c_blocks.append('for')
+    elif (m:=re.fullmatch(r'(\w+\s*=\s*)(\w+)\s*:\s*(\w+)', line)):
+      lines.append(f'{m.group(1)}{{ {m.group(2)}, {m.group(3)} }}')
+    else: lines.append(line)
+  while c_blocks: lines.append(f'end{c_blocks.pop()}')
+  return lines
+
 def parse_pcode(pcode: str, srcs: dict[str, UOp | int] | None = None) -> tuple[dict, list]:
   env: dict = srcs.copy() if srcs else {}
   assigns: list[tuple[str, UOp]] = []
-  raw_lines = [l.strip().rstrip(';') for l in pcode.split('\n') if l.strip() and not l.strip().startswith('//')]
+  raw_lines = _pcode_lines(pcode)
   # TODO: pcode.py should tokenize full pcode string instead of line-by-line, then this hack can be removed
   lines: list[str] = []
   for l in raw_lines:
@@ -1389,4 +1415,3 @@ def parse_pcode(pcode: str, srcs: dict[str, UOp | int] | None = None) -> tuple[d
           break
       else: assigns.append((var, val))
   return env, assigns
-

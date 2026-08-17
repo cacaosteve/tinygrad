@@ -505,6 +505,15 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(36, "IMMEDIATE", 0, 8, None),
     NormalizedSQTTEvent(38, "WAVEEND", 0, 12, None),
   ]),
+  "lds_swizzle_waitcnt": (TraceCase("lds_swizzle_waitcnt", [
+    ds_swizzle_b32(vdst=v[2], addr=v[0], offset0=0, offset1=0xe0), s_waitcnt(simm16=0), s_endpgm(),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_RD"),
+    NormalizedSQTTEvent(2, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(32, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(34, "WAVEEND", 0, 12, None),
+  ]),
   "lds_bpermute_dependency": (TraceCase("lds_bpermute_dependency", [
     ds_bpermute_b32(vdst=v[2], addr=v[0], data0=v[1]), v_add_f32_e32(v[3], v[2], v[2]), s_endpgm(),
   ]), [
