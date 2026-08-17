@@ -88,6 +88,7 @@ def _mem_op(t: type, op_name: str) -> InstOp:
   is_store = "STORE" in op_name
   if issubclass(t, _DS):
     if not is_store: return InstOp.LDS_RD
+    if "_ADDTID" in op_name: return InstOp.LDS_WR_1
     if "_B128" in op_name: return InstOp.LDS_WR_5
     if "_B96" in op_name: return InstOp.LDS_WR_4
     if "_B64" in op_name: return InstOp.LDS_WR_3
@@ -109,6 +110,7 @@ def _valu_latencies(op: InstOp) -> tuple[int, int, int]:
 
 def _lds_lgkm_latency(op: InstOp, pending: bool) -> int:
   if op == InstOp.LDS_RD: return 34 if pending else 31
+  if op == InstOp.LDS_WR_1: return 31
   if op == InstOp.LDS_WR_2: return 33
   if op == InstOp.LDS_WR_3: return 35
   if op == InstOp.LDS_WR_4: return 38
@@ -116,7 +118,7 @@ def _lds_lgkm_latency(op: InstOp, pending: bool) -> int:
   return _op_duration(op)
 
 def _lds_exec_latency(op: InstOp) -> int:
-  if op in {InstOp.LDS_WR_3, InstOp.LDS_WR_4, InstOp.LDS_WR_5}: return 3
+  if op in {InstOp.LDS_WR_1, InstOp.LDS_WR_3, InstOp.LDS_WR_4, InstOp.LDS_WR_5}: return 3
   return _op_duration(op)
 
 def _field_offset(x: Any) -> int|None:

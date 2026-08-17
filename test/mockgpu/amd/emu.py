@@ -1575,15 +1575,22 @@ def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLA
   def make_srcs(lane: UOp) -> dict:
     addr = make_addr(lane)
     if is_lds:
-      if data_bits_mem <= 32:
-        data = {'DATA': ctx.rvgpr_dyn(vdata_reg, lane), 'DATA2': ctx.rvgpr_dyn(data1_reg, lane) if has_data1 else UOp.const(0, dtypes.uint32)}
-      elif data_bits_mem == 64:  # DATA/DATA2 are the 64-bit input registers, formed from VGPR pairs
-        data = {'DATA': _u64(ctx.rvgpr_dyn(vdata_reg, lane), ctx.rvgpr_dyn(vdata_reg + _c(1), lane)),
+      if data_bits_mem == 128:
+        data = {'DATA': ctx.rvgpr_dyn(vdata_reg, lane), 'DATA0': ctx.rvgpr_dyn(vdata_reg, lane), 'DATA1': ctx.rvgpr_dyn(vdata_reg + _c(1), lane),
+                'DATA2': ctx.rvgpr_dyn(vdata_reg + _c(2), lane), 'DATA3': ctx.rvgpr_dyn(vdata_reg + _c(3), lane)}
+      elif data_bits_mem == 96:
+        data = {'DATA': ctx.rvgpr_dyn(vdata_reg, lane), 'DATA0': ctx.rvgpr_dyn(vdata_reg, lane), 'DATA1': ctx.rvgpr_dyn(vdata_reg + _c(1), lane),
+                'DATA2': ctx.rvgpr_dyn(vdata_reg + _c(2), lane)}
+      elif data_bits_mem <= 32:
+        data0 = ctx.rvgpr_dyn(vdata_reg, lane)
+        data = {'DATA': data0, 'DATA0': data0, 'DATA2': ctx.rvgpr_dyn(data1_reg, lane) if has_data1 else UOp.const(0, dtypes.uint32)}
+      else:
+        data0 = _u64(ctx.rvgpr_dyn(vdata_reg, lane), ctx.rvgpr_dyn(vdata_reg + _c(1), lane))
+        data = {'DATA': data0, 'DATA0': data0,
                 'DATA2': _u64(ctx.rvgpr_dyn(data1_reg, lane), ctx.rvgpr_dyn(data1_reg + _c(1), lane)) if has_data1 else UOp.const(0, dtypes.uint64)}
-      else:  # 96/128-bit: one VGPR per dword
-        data = {'DATA': ctx.rvgpr_dyn(vdata_reg, lane), **{f'DATA{i}': ctx.rvgpr_dyn(vdata_reg + _c(i), lane) for i in range(1, data_bits_mem // 32)}}
       # RDNA3 uses ADDR/OFFSET, RDNA4 uses vgpr_a/offset (lowercase) + CalcDsAddr function
-      return {'ADDR': addr, 'ADDR_BASE': addr, 'OFFSET': offset, 'OFFSET0': offset0, 'OFFSET1': offset1, '_lds': mem, 'laneId': lane,
+      return {'ADDR': addr, 'ADDR_BASE': addr, 'OFFSET': offset, 'OFFSET0': offset0, 'OFFSET1': offset1, '_lds': mem,
+              'laneId': lane, 'laneID': lane,
               'vgpr_a': ctx.rvgpr_dyn(addr_reg, lane), 'offset': offset, 'offset0': offset0, 'offset1': offset1, **data}
     active = _lane_active(exec_mask, lane)
     # saddr < 124 means valid SGPR pair, otherwise use 0 (NULL means no saddr contribution)
@@ -1600,7 +1607,7 @@ def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLA
       atomic_data = _u64(ctx.rvgpr_dyn(vdata_reg, lane), ctx.rvgpr_dyn(vdata_reg + _c(1), lane)) \
         if data_bits_mem == 64 else ctx.rvgpr_dyn(vdata_reg, lane)
       return {'ADDR': addr, 'DATA': atomic_data, '_vmem': mem, '_active': active,
-              'laneId': lane, 'v_addr': vaddr_base, 's_saddr': saddr_base}
+              'laneId': lane, 'laneID': lane, 'v_addr': vaddr_base, 's_saddr': saddr_base}
     # acc bit: read/write ACCVGPR instead of VGPR for data operands
     _rvdata = (lambda r, l, *a: ctx.raccvgpr_dyn(r, l)) if use_acc else ctx.rvgpr_dyn
     vdata = _rvdata(vdata_reg, lane).cast(dtypes.uint64) if 'STORE' in op_name \
@@ -1608,7 +1615,7 @@ def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLA
     if 'STORE' in op_name and data_bits_mem >= 64:
       vdata = vdata | (_rvdata(vdata_reg + _c(1), lane).cast(dtypes.uint64) << UOp.const(32, dtypes.uint64))
     srcs = {'ADDR': addr, 'VDATA': vdata, '_vmem': mem, '_active': active,
-            'laneId': lane, 'v_addr': vaddr_base, 's_saddr': saddr_base, 'SADDR': saddr_base, 'OFFSET': offset}
+            'laneId': lane, 'laneID': lane, 'v_addr': vaddr_base, 's_saddr': saddr_base, 'SADDR': saddr_base, 'OFFSET': offset}
     for i in range(data_bits_mem // 32):
       srcs[f'VDATA{i}'] = _rvdata(vdata_reg + _c(i), lane) if 'STORE' in op_name else UOp.const(0, dtypes.uint32)
     return srcs

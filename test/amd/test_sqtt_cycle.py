@@ -307,6 +307,15 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(4, "ALUEXEC", None, None, "VALU"),
     NormalizedSQTTEvent(5, "WAVEEND", 0, 12, None),
   ]),
+  "valu_simple_dependency": (TraceCase("valu_simple_dependency", [
+    v_add_f32_e32(v[1], v[0], v[0]), v_add_f32_e32(v[2], v[1], v[1]), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(2, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(2, "VALUINST", 0, 4, None),
+    NormalizedSQTTEvent(3, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(4, "WAVEEND", 0, 8, None),
+  ]),
   "valu_sopp_delay": (TraceCase("valu_sopp_delay", [v_mov_b32_e32(v[0], 0), s_nop(simm16=0), s_endpgm()]), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
     NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
@@ -451,6 +460,20 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(3, "VMEMEXEC", None, None, "LDS"),
     NormalizedSQTTEvent(34, "IMMEDIATE", 0, 8, None),
     NormalizedSQTTEvent(36, "WAVEEND", 0, 12, None),
+  ]),
+  "lds_store_addtid_waitcnt": (TraceCase("lds_store_addtid_waitcnt", [ds_store_addtid_b32(), s_waitcnt(simm16=0), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_WR_1"),
+    NormalizedSQTTEvent(4, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(32, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(34, "WAVEEND", 0, 12, None),
+  ]),
+  "lds_load_addtid_waitcnt": (TraceCase("lds_load_addtid_waitcnt", [ds_load_addtid_b32(vdst=v[1]), s_waitcnt(simm16=0), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_RD"),
+    NormalizedSQTTEvent(2, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(32, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(34, "WAVEEND", 0, 12, None),
   ]),
   "lds_store_b64": (TraceCase("lds_store_b64", [ds_store_b64(addr=v[0], data0=v[1:2]), s_waitcnt(simm16=0), s_endpgm()]), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
