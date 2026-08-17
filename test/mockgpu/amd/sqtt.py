@@ -215,6 +215,28 @@ class _TraceInfo:
   immediate_delay: int = 0
   barrier: bool = False
 
+@dataclass(frozen=True)
+class _VALUQueueEntry:
+  retire: int
+  trans_retire: int|None
+
+@dataclass
+class _VALUInstructionBuffer:
+  entries: list[_VALUQueueEntry] = field(default_factory=list)
+
+  def issue_ready(self, base_issue: int, *, trans: bool, trans_source_ready: list[int]) -> int:
+    active = [entry for entry in self.entries if entry.retire > base_issue]
+    if len(active) >= _VALU_INFLIGHT_LIMIT:
+      base_issue = max(base_issue, max(trans_source_ready) if not trans and trans_source_ready else min(entry.retire for entry in active))
+    if trans:
+      active_trans = [entry for entry in self.entries if entry.trans_retire is not None and entry.trans_retire > base_issue]
+      if len(active_trans) >= _TRANS_INFLIGHT_LIMIT:
+        base_issue = max(base_issue, min(entry.trans_retire for entry in active_trans if entry.trans_retire is not None))
+    return base_issue
+
+  def record(self, exec_time: int, *, trans: bool) -> None:
+    self.entries.append(_VALUQueueEntry(exec_time - 1, exec_time if trans else None))
+
 @dataclass
 class _WaveState:
   issue: int = 2
@@ -257,8 +279,7 @@ class _WaveState:
   sgpr_exec_ready: dict[int, int] = field(default_factory=dict)
   valu_exec_history: list[int] = field(default_factory=list)
   trans_exec_history: list[tuple[int, bool]] = field(default_factory=list)
-  valu_inflight: list[int] = field(default_factory=list)
-  trans_inflight: list[int] = field(default_factory=list)
+  valu_ib: _VALUInstructionBuffer = field(default_factory=_VALUInstructionBuffer)
   salu_exec_history: list[int] = field(default_factory=list)
   pending_delays: list[tuple[int, int]] = field(default_factory=list)
 
@@ -420,14 +441,8 @@ class RDNA3SQTTTraceBuilder:
     delay_ready = max([self._delay_ready(st, dep) for dep in active_delays] + [0])
     base_issue = max(st.issue, pipe_ready, src_ready, immediate_ready, delay_ready)
     if info.pipe == "valu" and not info.matrix:
-      st.valu_inflight = [time for time in st.valu_inflight if time > base_issue]
-      if len(st.valu_inflight) >= _VALU_INFLIGHT_LIMIT:
-        if not info.trans and any(st.vgpr_producer_trans.get(r, False) for r in src_vgprs):
-          base_issue = max([base_issue] + [st.vgpr_trans_issue_ready.get(r, 0) for r in src_vgprs])
-        else: base_issue = max(base_issue, min(st.valu_inflight))
-    if info.trans:
-      st.trans_inflight = [time for time in st.trans_inflight if time > base_issue]
-      if len(st.trans_inflight) >= _TRANS_INFLIGHT_LIMIT: base_issue = max(base_issue, min(st.trans_inflight))
+      trans_source_ready = [st.vgpr_trans_issue_ready[r] for r in src_vgprs if st.vgpr_producer_trans.get(r, False)]
+      base_issue = st.valu_ib.issue_ready(base_issue, trans=info.trans, trans_source_ready=trans_source_ready)
     sgpr_read_ready = st.sgpr_valu_read_ready if info.pipe == "salu" and (src_sgprs or dst_sgprs) else 0
     salu_read_stall, issue = sgpr_read_ready > base_issue, max(base_issue, sgpr_read_ready)
     lds_pending = info.pipe == "lds" and st.lgkm_ready > issue
@@ -513,9 +528,8 @@ class RDNA3SQTTTraceBuilder:
       if src_sgprs: st.sgpr_valu_read_ready = max(st.sgpr_valu_read_ready, exec_time)
       if info.trans:
         st.trans_exec_history.append((exec_time, st.trans_warm))
-        st.trans_inflight.append(exec_time)
       else: st.valu_exec_history.append(exec_time)
-      if not info.matrix: st.valu_inflight.append(exec_time - 1)
+      if not info.matrix: st.valu_ib.record(exec_time, trans=info.trans)
     if info.pipe == "salu" and info.exec_cls is not None: st.salu_exec_history.append(exec_time)
     st.pending_delays = [(skip - 1, dep) for skip, dep in st.pending_delays if skip > 0]
     st.trans_warm = info.nop
