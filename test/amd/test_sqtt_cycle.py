@@ -298,10 +298,10 @@ class TestSQTTHardwareCycle(unittest.TestCase):
 
   def test_hardware_trace_order(self):
     for name, (case, expected) in CASES.items():
-      if case.local_size > 32: continue
       with self.subTest(name=name):
         got = _instruction_events(_run_hardware_trace(case))
         want = _instruction_events(expected)
+        if case.local_size > 32: want = [e for e in want if e.wave == 0]
         if (msg:=_first_mismatch(got, want, check_time=False, case=case)) is not None: self.fail(msg)
 
   def test_hardware_trace_lifecycle(self):
