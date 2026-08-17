@@ -47,6 +47,13 @@ def _pc_map(instructions: list) -> dict[int, object]:
     pc += inst.size()
   return ret
 
+def _trace_silent_inst(inst) -> bool:
+  return isinstance(inst, SOPP) and inst.op == SOPPOp.S_DELAY_ALU
+
+def _next_trace_pc(pc: int, pc_map: dict[int, object]) -> int:
+  while pc in pc_map and _trace_silent_inst(pc_map[pc]): pc += pc_map[pc].size()
+  return pc
+
 def _advance_pc(pc: int, inst, pkt: INST|VALUINST|IMMEDIATE) -> int:
   if isinstance(pkt, INST) and pkt.op == InstOp.JUMP:
     x = getattr(inst, "simm16") & 0xffff
@@ -70,17 +77,17 @@ def normalize_controlled_hardware_trace(blob: bytes, instructions: list) -> list
       for wave in range(16):
         if pkt.mask & (1 << wave): events.append(NormalizedSQTTEvent(pkt._time, "WAVERDY", wave, None, None))
     elif isinstance(pkt, (INST, INST_RDNA4)) and not pkt.op.name.startswith("OTHER_") and pkt.wave in wave_pc:
-      pc = wave_pc[pkt.wave]
+      pc = _next_trace_pc(wave_pc[pkt.wave], pc_map)
       events.append(NormalizedSQTTEvent(pkt._time, "INST", pkt.wave, pc, pkt.op.name))
       wave_pc[pkt.wave] = _advance_pc(pc, pc_map[pc], pkt)
     elif isinstance(pkt, (VALUINST, IMMEDIATE)) and pkt.wave in wave_pc:
-      pc = wave_pc[pkt.wave]
+      pc = _next_trace_pc(wave_pc[pkt.wave], pc_map)
       events.append(NormalizedSQTTEvent(pkt._time, type(pkt).__name__.removesuffix("_MASK"), pkt.wave, pc, None))
       wave_pc[pkt.wave] = _advance_pc(pc, pc_map[pc], pkt)
     elif isinstance(pkt, IMMEDIATE_MASK):
       for wave in range(16):
         if (pkt.mask & (1 << wave)) and wave in wave_pc:
-          pc = wave_pc[wave]
+          pc = _next_trace_pc(wave_pc[wave], pc_map)
           events.append(NormalizedSQTTEvent(pkt._time, "IMMEDIATE", wave, pc, None))
           wave_pc[wave] = _advance_pc(pc, pc_map[pc], pkt)
     elif isinstance(pkt, ALUEXEC):
@@ -101,11 +108,11 @@ def normalize_mock_trace(blob: bytes, instructions: list) -> list[NormalizedSQTT
       for wave in range(16):
         if pkt.mask & (1 << wave): events.append(NormalizedSQTTEvent(pkt._time, "WAVERDY", wave, None, None))
     elif isinstance(pkt, INST) and not pkt.op.name.startswith("OTHER_"):
-      pc = wave_pc[pkt.wave]
+      pc = _next_trace_pc(wave_pc[pkt.wave], pc_map)
       events.append(NormalizedSQTTEvent(pkt._time, "INST", pkt.wave, pc, pkt.op.name))
       wave_pc[pkt.wave] = _advance_pc(pc, pc_map[pc], pkt)
     elif isinstance(pkt, (VALUINST, IMMEDIATE)):
-      pc = wave_pc[pkt.wave]
+      pc = _next_trace_pc(wave_pc[pkt.wave], pc_map)
       events.append(NormalizedSQTTEvent(pkt._time, type(pkt).__name__, pkt.wave, pc, None))
       wave_pc[pkt.wave] = _advance_pc(pc, pc_map[pc], pkt)
     elif isinstance(pkt, ALUEXEC):
@@ -379,6 +386,14 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(1, "IMMEDIATE", 0, 0, None),
     NormalizedSQTTEvent(2, "IMMEDIATE", 0, 4, None),
     NormalizedSQTTEvent(4, "WAVEEND", 0, 8, None),
+  ]),
+  "sopp_delay_alu_skip": (TraceCase("sopp_delay_alu_skip", [
+    s_mov_b32(s[0], 1), s_delay_alu(simm16=0x3210), s_mov_b32(s[1], 2), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "SALU"), NormalizedSQTTEvent(1, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(2, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(2, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(4, "WAVEEND", 0, 12, None),
   ]),
   "lds_roundtrip": (TraceCase("lds_roundtrip", [
     v_lshlrev_b32_e32(v[1], 2, v[0]), ds_store_b32(addr=v[1], data0=v[0]), ds_load_b32(vdst=v[2], addr=v[1]), s_endpgm(),
