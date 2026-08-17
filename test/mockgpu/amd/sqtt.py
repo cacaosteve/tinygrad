@@ -74,7 +74,7 @@ _VALUB_4_RE = re.compile(r"V_MAD_(U|I)64")
 _VALUB_16_RE = re.compile(r"V_\w+_F64")
 _DS_ATOMIC_RE = re.compile(r"DS_(ADD|SUB|RSUB|INC|DEC|MIN|MAX|AND|OR|XOR|MSKOR)(_|$)")
 _SALU_3_CYCLE = {"S_MUL_I32", "S_MULK_I32", "S_MUL_HI_I32", "S_MUL_HI_U32"}
-_VALU_INFLIGHT_LIMIT, _TRANS_INFLIGHT_LIMIT = 12, 5
+_VALU_INFLIGHT_LIMIT, _TRANS_INFLIGHT_LIMIT, _VALU_READ_WARMUP = 12, 5, 7
 
 def _op_name(inst) -> str:
   if hasattr(inst, "opx"): return f"{inst.opx.name}_{inst.opy.name}"
@@ -440,7 +440,9 @@ class RDNA3SQTTTraceBuilder:
         if not info.trans and src_vgprs and any(5 <= dep <= 7 for dep in active_delays): latency = 8
         elif not info.trans and any(st.vgpr_lds_pending.get(r, False) for r in src_vgprs): latency = 8
         elif info.trans and st.trans_warm: latency = 7
-        else: latency = info.vgpr_read_latency if src_vgprs and info.vgpr_read_latency is not None else info.exec_latency
+        elif src_vgprs and info.vgpr_read_latency is not None:
+          latency = info.vgpr_read_latency - (len(st.valu_exec_history) >= _VALU_READ_WARMUP)
+        else: latency = info.exec_latency
         if not info.matrix: self._shift_cross_interp_producers(st, src_vgprs, info.interp)
         if info.trans and st.had_lds:
           events = {st.vgpr_exec_event[r] for r in src_vgprs if r in st.vgpr_exec_event and
