@@ -87,6 +87,7 @@ def _valu_op(op_name: str) -> InstOp|None:
 def _mem_op(t: type, op_name: str) -> InstOp:
   is_store = "STORE" in op_name
   if issubclass(t, _DS):
+    if "PERMUTE" in op_name: return InstOp.LDS_WR_2
     if not is_store: return InstOp.LDS_RD
     if "_ADDTID" in op_name: return InstOp.LDS_WR_1
     if "_B128" in op_name: return InstOp.LDS_WR_5
@@ -176,6 +177,7 @@ class _TraceInfo:
   writes_scc_latency: int|None = None
   writes_vcc_latency: int|None = None
   writes_exec_latency: int|None = None
+  lgkm_latency: int|None = None
   wait_lgkm: bool = False
   wait_lgkm_extra: int = 0
   barrier: bool = False
@@ -262,8 +264,11 @@ class RDNA3SQTTTraceBuilder:
       return _TraceInfo(INST, {"op": InstOp.SMEM_RD}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
     op = _mem_op(inst_type, op_name)
     if op.name.startswith("LDS"):
-      return _TraceInfo(INST, {"op": op}, pipe="lds", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.LDS}, duration=_lds_exec_latency(op),
-                        dst_latency=7 if op == InstOp.LDS_RD else None)
+      is_permute = "PERMUTE" in op_name
+      return _TraceInfo(INST, {"op": op}, pipe="lds", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.LDS},
+                        duration=3 if is_permute else _lds_exec_latency(op),
+                        dst_latency=8 if is_permute else (7 if op == InstOp.LDS_RD else None),
+                        lgkm_latency=35 if is_permute else None)
     if op.name.startswith(("SGMEM", "FLAT")):
       return _TraceInfo(INST, {"op": op}, pipe="vmem", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.VMEM}, duration=_op_duration(op))
     return _TraceInfo(INST, {"op": op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
@@ -302,7 +307,9 @@ class RDNA3SQTTTraceBuilder:
     if info.writes_exec_latency is not None: st.exec_ready = issue + info.writes_exec_latency
     if info.pipe == "lds":
       op = info.kwargs.get("op")
-      if isinstance(op, InstOp): st.lgkm_ready = max(st.lgkm_ready, issue + _lds_lgkm_latency(op, st.lgkm_ready > issue))
+      if isinstance(op, InstOp):
+        latency = info.lgkm_latency if info.lgkm_latency is not None else _lds_lgkm_latency(op, st.lgkm_ready > issue)
+        st.lgkm_ready = max(st.lgkm_ready, issue + latency)
     st.issue, st.last_time = issue + info.issue_latency, max(st.last_time, exec_time, ready)
 
   def finish(self, wave_id: int) -> None:

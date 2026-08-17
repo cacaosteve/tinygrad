@@ -475,6 +475,25 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(32, "IMMEDIATE", 0, 8, None),
     NormalizedSQTTEvent(34, "WAVEEND", 0, 12, None),
   ]),
+  "lds_permute_waitcnt": (TraceCase("lds_permute_waitcnt", [
+    ds_permute_b32(vdst=v[2], addr=v[0], data0=v[1]), s_waitcnt(simm16=0), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_WR_2"),
+    NormalizedSQTTEvent(4, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(36, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(38, "WAVEEND", 0, 12, None),
+  ]),
+  "lds_bpermute_dependency": (TraceCase("lds_bpermute_dependency", [
+    ds_bpermute_b32(vdst=v[2], addr=v[0], data0=v[1]), v_add_f32_e32(v[3], v[2], v[2]), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_WR_2"),
+    NormalizedSQTTEvent(4, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(9, "VALUINST", 0, 8, None),
+    NormalizedSQTTEvent(10, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(37, "WAVEEND", 0, 12, None),
+  ]),
   "lds_store_b64": (TraceCase("lds_store_b64", [ds_store_b64(addr=v[0], data0=v[1:2]), s_waitcnt(simm16=0), s_endpgm()]), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
     NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_WR_3"),
