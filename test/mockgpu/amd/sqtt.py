@@ -213,7 +213,8 @@ class RDNA3SQTTTraceBuilder:
       return _TraceInfo(INST, {"op": InstOp.SALU}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
                         writes_scc_latency=9 if op_name.startswith("S_CMP") else None)
     if issubclass(inst_type, _SALU):
-      return _TraceInfo(INST, {"op": InstOp.SALU}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
+      op = InstOp.SALU_WR_EXEC if ("SAVEEXEC" in op_name or "WREXEC" in op_name) else InstOp.SALU
+      return _TraceInfo(INST, {"op": op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
                         writes_scc_latency=9 if op_name.startswith("S_CMP") else None)
     if issubclass(inst_type, _VALU):
       op = _valu_op(op_name)
