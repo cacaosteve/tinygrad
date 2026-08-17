@@ -1530,20 +1530,20 @@ def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLA
 
   # DS_SWIZZLE: the addr operand is shuffled across the wave without accessing LDS.
   if is_lds and 'SWIZZLE' in op_name:
-    srcs = {'offset0': offset0.cast(dtypes.uint8), 'offset1': offset1.cast(dtypes.uint8)}
+    swizzle_srcs: dict[str, UOp|int] = {'offset0': offset0.cast(dtypes.uint8), 'offset1': offset1.cast(dtypes.uint8)}
     for i in range(64):
-      srcs[f'thread_in@{i}'] = ctx.rvgpr_dyn(addr_reg, _c(i)) if i < ctx.wave_size else _c(0)
-      srcs[f'thread_valid@{i}'] = _lane_active(exec_mask, _c(i)) if i < ctx.wave_size else UOp.const(False)
-    pcode_vars, _ = parse_pcode(pcode, srcs)
+      swizzle_srcs[f'thread_in@{i}'] = ctx.rvgpr_dyn(addr_reg, _c(i)) if i < ctx.wave_size else _c(0)
+      swizzle_srcs[f'thread_valid@{i}'] = _lane_active(exec_mask, _c(i)) if i < ctx.wave_size else UOp.const(False)
+    pcode_vars, _ = parse_pcode(pcode, swizzle_srcs)
     stores = [ctx.wvgpr_dyn(vdst_reg, _c(i), pcode_vars[f'thread_out@{i}'], exec_mask) for i in range(ctx.wave_size)]
     return UOp.sink(*stores, *ctx.inc_pc())
 
   # DS_PERMUTE/DS_BPERMUTE: cross-lane VGPR access via pcode
   if is_lds and 'PERMUTE' in op_name:
     pcode = get_pcode(inst.op)
-    srcs = {'ADDR': addr_reg, 'DATA0': vdata_reg, 'VDST': vdst_reg, 'OFFSET': offset,
-            'EXEC': exec_mask.cast(dtypes.uint64), '_vgpr': ctx.vgpr, '_wave_size': ctx.wave_size}
-    _, assigns = parse_pcode(pcode, srcs)
+    permute_srcs: dict[str, UOp|int] = {'ADDR': addr_reg, 'DATA0': vdata_reg, 'VDST': vdst_reg, 'OFFSET': offset,
+                                       'EXEC': exec_mask.cast(dtypes.uint64), '_vgpr': ctx.vgpr, '_wave_size': ctx.wave_size}
+    _, assigns = parse_pcode(pcode, permute_srcs)
     stores = [ctx.vgpr.index(val[0]).store(val[1].cast(dtypes.uint32)) for dest, val in assigns if dest.startswith('VGPR[')]
     return UOp.sink(*stores, *ctx.inc_pc())
 
