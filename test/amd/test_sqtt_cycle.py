@@ -206,6 +206,14 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(2, "INST", 0, 4, "SALU"), NormalizedSQTTEvent(2, "ALUEXEC", None, None, "SALU"),
     NormalizedSQTTEvent(4, "WAVEEND", 0, 8, None),
   ]),
+  "branch_unconditional": (TraceCase("branch_unconditional", [
+    s_branch(simm16=1), s_mov_b32(s[0], 2), s_mov_b32(s[1], 1), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "JUMP"),
+    NormalizedSQTTEvent(11, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(11, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(13, "WAVEEND", 0, 12, None),
+  ]),
   "branch_loop": (TraceCase("branch_loop", [
     s_mov_b32(s[0], 2), s_sub_u32(s[0], s[0], 1), s_cmp_lg_u32(s[0], 0), s_cbranch_scc1(simm16=-3), s_endpgm(),
   ]), [
