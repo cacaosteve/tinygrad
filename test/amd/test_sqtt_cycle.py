@@ -934,6 +934,26 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
     v_lshlrev_b64(v[2:3], 2, v[0:1]), v_add_f32_e32(v[4], v[2], v[2]), v_rcp_f32_e32(v[5], v[4]),
     v_mov_b32_e32(v[6], 1), s_endpgm(),
   ], local_size=32), [0, 2, 3, 4, 10, 15, 20, 21]),
+  "compose_valu_queue": (TraceCase("compose_valu_queue", [v_mov_b32_e32(v[0], 1)] + [
+    v_add_f32_e32(v[i], v[i-1], v[i-1]) for i in range(1, 16)] + [s_endpgm()], local_size=32, vgpr_count=20),
+    [0, 1, 2, 3, 4, 5, 6, 6, 7, 8, 9, 10, 11, 12, 12, 13, 16, 17, 21, 22, 27, 32, 37, 42, 47, 52, 57, 62, 67, 72, 77, 82]),
+  "compose_trans_queue": (TraceCase("compose_trans_queue", [
+    v_rcp_f32_e32(v[1], v[0]), v_add_f32_e32(v[2], v[1], v[1]),
+    v_rcp_f32_e32(v[3], v[2]), v_add_f32_e32(v[4], v[3], v[3]),
+    v_rcp_f32_e32(v[5], v[4]), v_add_f32_e32(v[6], v[5], v[5]),
+    v_rcp_f32_e32(v[7], v[6]), v_add_f32_e32(v[8], v[7], v[7]),
+    v_rcp_f32_e32(v[9], v[8]), v_add_f32_e32(v[10], v[9], v[9]),
+    v_rcp_f32_e32(v[11], v[10]), v_add_f32_e32(v[12], v[11], v[11]),
+    v_rcp_f32_e32(v[13], v[12]), v_add_f32_e32(v[14], v[13], v[13]),
+    v_rcp_f32_e32(v[15], v[14]), v_add_f32_e32(v[16], v[15], v[15]), s_endpgm(),
+  ], local_size=32, vgpr_count=20),
+    [0, 1, 4, 5, 8, 9, 9, 12, 13, 16, 17, 19, 20, 21, 24, 24, 25, 34, 39, 39, 40, 49, 54, 64, 69, 79, 84, 94, 99, 109, 114, 124]),
+  "compose_repeat_alu": (TraceCase("compose_repeat_alu", [
+    v_mov_b32_e32(v[0], 0), s_mov_b32(s[0], 1), v_add_f32_e32(v[1], v[0], v[0]), s_add_u32(s[1], s[0], 2),
+    v_add_f32_e32(v[2], v[1], v[1]),
+  ] * 4 + [s_endpgm()], local_size=32),
+    [0, 1, 2, 3, 3, 4, 5, 5, 6, 6, 7, 8, 8, 9, 10, 10, 11, 12, 12, 13, 13, 14, 15, 15, 16, 17, 17, 18, 18, 19, 20,
+     23, 28, 29, 34, 39, 40, 45, 50]),
 }
 
 EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
