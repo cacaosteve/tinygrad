@@ -86,7 +86,12 @@ def _valu_op(op_name: str) -> InstOp|None:
 
 def _mem_op(t: type, op_name: str) -> InstOp:
   is_store = "STORE" in op_name
-  if issubclass(t, _DS): return InstOp.LDS_WR_2 if is_store else InstOp.LDS_RD
+  if issubclass(t, _DS):
+    if not is_store: return InstOp.LDS_RD
+    if "_B128" in op_name: return InstOp.LDS_WR_5
+    if "_B96" in op_name: return InstOp.LDS_WR_4
+    if "_B64" in op_name: return InstOp.LDS_WR_3
+    return InstOp.LDS_WR_2
   if issubclass(t, _GLOBAL): return InstOp.SGMEM_WR_2 if is_store else InstOp.SGMEM_RD_1
   if issubclass(t, _FLAT): return InstOp.FLAT_WR_3 if is_store else InstOp.FLAT_RD_2
   if issubclass(t, _SCRATCH): return InstOp.FLAT_WR_3 if is_store else InstOp.FLAT_RD_2
@@ -104,7 +109,14 @@ def _valu_latencies(op: InstOp) -> tuple[int, int, int]:
 
 def _lds_lgkm_latency(op: InstOp, pending: bool) -> int:
   if op == InstOp.LDS_RD: return 34 if pending else 31
-  if op.name.startswith("LDS_WR"): return 33
+  if op == InstOp.LDS_WR_2: return 33
+  if op == InstOp.LDS_WR_3: return 35
+  if op == InstOp.LDS_WR_4: return 38
+  if op == InstOp.LDS_WR_5: return 39
+  return _op_duration(op)
+
+def _lds_exec_latency(op: InstOp) -> int:
+  if op in {InstOp.LDS_WR_3, InstOp.LDS_WR_4, InstOp.LDS_WR_5}: return 3
   return _op_duration(op)
 
 def _field_offset(x: Any) -> int|None:
@@ -226,7 +238,7 @@ class RDNA3SQTTTraceBuilder:
       return _TraceInfo(INST, {"op": InstOp.SMEM_RD}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
     op = _mem_op(inst_type, op_name)
     if op.name.startswith("LDS"):
-      return _TraceInfo(INST, {"op": op}, pipe="lds", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.LDS}, duration=_op_duration(op),
+      return _TraceInfo(INST, {"op": op}, pipe="lds", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.LDS}, duration=_lds_exec_latency(op),
                         dst_latency=7 if op == InstOp.LDS_RD else None)
     if op.name.startswith(("SGMEM", "FLAT")):
       return _TraceInfo(INST, {"op": op}, pipe="vmem", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.VMEM}, duration=_op_duration(op))

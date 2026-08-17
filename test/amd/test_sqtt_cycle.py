@@ -381,6 +381,27 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(34, "IMMEDIATE", 0, 8, None),
     NormalizedSQTTEvent(36, "WAVEEND", 0, 12, None),
   ]),
+  "lds_store_b64": (TraceCase("lds_store_b64", [ds_store_b64(addr=v[0], data0=v[1:2]), s_waitcnt(simm16=0), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_WR_3"),
+    NormalizedSQTTEvent(4, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(36, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(38, "WAVEEND", 0, 12, None),
+  ]),
+  "lds_store_b96": (TraceCase("lds_store_b96", [ds_store_b96(addr=v[0], data0=v[1:3]), s_waitcnt(simm16=0), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_WR_4"),
+    NormalizedSQTTEvent(4, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(39, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(41, "WAVEEND", 0, 12, None),
+  ]),
+  "lds_store_b128": (TraceCase("lds_store_b128", [ds_store_b128(addr=v[0], data0=v[1:4]), s_waitcnt(simm16=0), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_WR_5"),
+    NormalizedSQTTEvent(4, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(40, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(42, "WAVEEND", 0, 12, None),
+  ]),
   "single_wave_barrier": (TraceCase("single_wave_barrier", [s_barrier(), s_mov_b32(s[0], 1), s_endpgm()], local_size=32), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
     NormalizedSQTTEvent(1, "IMMEDIATE", 0, 0, None),
