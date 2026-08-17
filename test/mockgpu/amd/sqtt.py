@@ -88,6 +88,7 @@ def _mem_op(t: type, op_name: str) -> InstOp:
   is_store = "STORE" in op_name
   if issubclass(t, _DS):
     if "PERMUTE" in op_name: return InstOp.LDS_WR_2
+    if is_store and "_2ADDR" in op_name: return InstOp.LDS_WR_5 if "_B64" in op_name else InstOp.LDS_WR_3
     if not is_store: return InstOp.LDS_RD
     if "_ADDTID" in op_name: return InstOp.LDS_WR_1
     if "_B128" in op_name: return InstOp.LDS_WR_5
@@ -265,10 +266,11 @@ class RDNA3SQTTTraceBuilder:
     op = _mem_op(inst_type, op_name)
     if op.name.startswith("LDS"):
       is_permute = "PERMUTE" in op_name
+      is_2addr_load = "_2ADDR" in op_name and "LOAD" in op_name
       return _TraceInfo(INST, {"op": op}, pipe="lds", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.LDS},
-                        duration=3 if is_permute else _lds_exec_latency(op),
+                        duration=3 if is_permute or is_2addr_load else _lds_exec_latency(op),
                         dst_latency=8 if is_permute else (7 if op == InstOp.LDS_RD else None),
-                        lgkm_latency=35 if is_permute else None)
+                        lgkm_latency=35 if is_permute else (35 if is_2addr_load and "_B64" in op_name else 32 if is_2addr_load else None))
     if op.name.startswith(("SGMEM", "FLAT")):
       return _TraceInfo(INST, {"op": op}, pipe="vmem", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.VMEM}, duration=_op_duration(op))
     return _TraceInfo(INST, {"op": op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
