@@ -242,6 +242,24 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(5, "ALUEXEC", None, None, "VALU"),
     NormalizedSQTTEvent(6, "WAVEEND", 0, 8, None),
   ]),
+  "valu_exec_write": (TraceCase("valu_exec_write", [v_cmpx_eq_u32_e32(v[0], v[0]), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "VALU1_WR_EXEC"),
+    NormalizedSQTTEvent(2, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(3, "WAVEEND", 0, 4, None),
+  ]),
+  "valu_mad64": (TraceCase("valu_mad64", [v_mad_u64_u32(v[4:5], s[0], v[0], v[1], v[2:3]), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "VALUB_4"),
+    NormalizedSQTTEvent(5, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(6, "WAVEEND", 0, 8, None),
+  ]),
+  "valu_f64": (TraceCase("valu_f64", [v_add_f64(v[2:3], v[0:1], v[0:1]), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "VALUB_16"),
+    NormalizedSQTTEvent(17, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(18, "WAVEEND", 0, 8, None),
+  ]),
   "wait_immediate": (TraceCase("wait_immediate", [s_nop(simm16=0), s_waitcnt(simm16=0), s_endpgm()]), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
     NormalizedSQTTEvent(1, "IMMEDIATE", 0, 0, None),
