@@ -475,6 +475,27 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(32, "IMMEDIATE", 0, 8, None),
     NormalizedSQTTEvent(34, "WAVEEND", 0, 12, None),
   ]),
+  "lds_load_b64_waitcnt": (TraceCase("lds_load_b64_waitcnt", [ds_load_b64(vdst=v[2:3], addr=v[0]), s_waitcnt(simm16=0), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_RD"),
+    NormalizedSQTTEvent(4, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(34, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(36, "WAVEEND", 0, 12, None),
+  ]),
+  "lds_load_b96_waitcnt": (TraceCase("lds_load_b96_waitcnt", [ds_load_b96(vdst=v[2:4], addr=v[0]), s_waitcnt(simm16=0), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_RD"),
+    NormalizedSQTTEvent(4, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(37, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(39, "WAVEEND", 0, 12, None),
+  ]),
+  "lds_load_b128_waitcnt": (TraceCase("lds_load_b128_waitcnt", [ds_load_b128(vdst=v[2:5], addr=v[0]), s_waitcnt(simm16=0), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_RD"),
+    NormalizedSQTTEvent(4, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(38, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(40, "WAVEEND", 0, 12, None),
+  ]),
   "lds_permute_waitcnt": (TraceCase("lds_permute_waitcnt", [
     ds_permute_b32(vdst=v[2], addr=v[0], data0=v[1]), s_waitcnt(simm16=0), s_endpgm(),
   ]), [
@@ -530,6 +551,41 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(4, "VMEMEXEC", None, None, "LDS"),
     NormalizedSQTTEvent(36, "IMMEDIATE", 0, 8, None),
     NormalizedSQTTEvent(38, "WAVEEND", 0, 12, None),
+  ]),
+  "lds_add_u32_waitcnt": (TraceCase("lds_add_u32_waitcnt", [ds_add_u32(addr=v[0], data0=v[1]), s_waitcnt(simm16=0), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_WR_2"),
+    NormalizedSQTTEvent(3, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(34, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(36, "WAVEEND", 0, 12, None),
+  ]),
+  "lds_add_rtn_u32_dependency": (TraceCase("lds_add_rtn_u32_dependency", [
+    ds_add_rtn_u32(vdst=v[2], addr=v[0], data0=v[1]), v_add_f32_e32(v[3], v[2], v[2]), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_WR_2"),
+    NormalizedSQTTEvent(3, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(9, "VALUINST", 0, 8, None),
+    NormalizedSQTTEvent(10, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(35, "WAVEEND", 0, 12, None),
+  ]),
+  "lds_add_rtn_u64_waitcnt": (TraceCase("lds_add_rtn_u64_waitcnt", [
+    ds_add_rtn_u64(vdst=v[4:5], addr=v[0], data0=v[1:2]), s_waitcnt(simm16=0), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_WR_3"),
+    NormalizedSQTTEvent(4, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(37, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(39, "WAVEEND", 0, 12, None),
+  ]),
+  "lds_cmpstore_b64_waitcnt": (TraceCase("lds_cmpstore_b64_waitcnt", [
+    ds_cmpstore_b64(addr=v[0], data0=v[1:2], data1=v[3:4]), s_waitcnt(simm16=0), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_WR_5"),
+    NormalizedSQTTEvent(4, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(40, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(42, "WAVEEND", 0, 12, None),
   ]),
   "lds_store_b64": (TraceCase("lds_store_b64", [ds_store_b64(addr=v[0], data0=v[1:2]), s_waitcnt(simm16=0), s_endpgm()]), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),

@@ -71,6 +71,7 @@ _VALUT_4_RE = re.compile(r"V_(EXP|LOG|RCP|RSQ|SQRT|SIN|COS|CEIL|FLOOR|TRUNC|RNDN
 _VALUB_2_RE = re.compile(r"V_(LSHLREV|LSHRREV|ASHRREV)_(B|I)64")
 _VALUB_4_RE = re.compile(r"V_MAD_(U|I)64")
 _VALUB_16_RE = re.compile(r"V_\w+_F64")
+_DS_ATOMIC_RE = re.compile(r"DS_(ADD|SUB|RSUB|INC|DEC|MIN|MAX|AND|OR|XOR|MSKOR)(_|$)")
 
 def _op_name(inst) -> str:
   if hasattr(inst, "opx"): return f"{inst.opx.name}_{inst.opy.name}"
@@ -89,6 +90,8 @@ def _mem_op(t: type, op_name: str) -> InstOp:
   if issubclass(t, _DS):
     if "PERMUTE" in op_name: return InstOp.LDS_WR_2
     if is_store and "_2ADDR" in op_name: return InstOp.LDS_WR_5 if "_B64" in op_name else InstOp.LDS_WR_3
+    if "CMPSTORE" in op_name: return InstOp.LDS_WR_5 if ("_B64" in op_name or "_F64" in op_name) else InstOp.LDS_WR_3
+    if _DS_ATOMIC_RE.match(op_name): return InstOp.LDS_WR_3 if re.search(r"_(B|U|I|F)64", op_name) else InstOp.LDS_WR_2
     if not is_store: return InstOp.LDS_RD
     if "_ADDTID" in op_name: return InstOp.LDS_WR_1
     if "_B128" in op_name: return InstOp.LDS_WR_5
@@ -267,10 +270,20 @@ class RDNA3SQTTTraceBuilder:
     if op.name.startswith("LDS"):
       is_permute = "PERMUTE" in op_name
       is_2addr_load = "_2ADDR" in op_name and "LOAD" in op_name
+      is_rtn_atomic = _DS_ATOMIC_RE.match(op_name) is not None and "_RTN_" in op_name
+      load_lgkm_latency = None
+      if is_2addr_load: load_lgkm_latency = 35 if "_B64" in op_name else 32
+      elif "LOAD" in op_name:
+        if "_B128" in op_name: load_lgkm_latency = 37
+        elif "_B96" in op_name: load_lgkm_latency = 36
+        elif "_B64" in op_name: load_lgkm_latency = 33
+      if is_rtn_atomic and re.search(r"_(B|U|I|F)64", op_name): load_lgkm_latency = 36
+      wide_load = load_lgkm_latency is not None and "_B32" not in op_name
+      dst_latency = 8 if is_permute or (is_rtn_atomic and op == InstOp.LDS_WR_2) else \
+        (9 if is_rtn_atomic and op == InstOp.LDS_WR_3 else (7 if op == InstOp.LDS_RD else None))
       return _TraceInfo(INST, {"op": op}, pipe="lds", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.LDS},
-                        duration=3 if is_permute or is_2addr_load else _lds_exec_latency(op),
-                        dst_latency=8 if is_permute else (7 if op == InstOp.LDS_RD else None),
-                        lgkm_latency=35 if is_permute else (35 if is_2addr_load and "_B64" in op_name else 32 if is_2addr_load else None))
+                        duration=3 if is_permute or is_2addr_load or wide_load else _lds_exec_latency(op), dst_latency=dst_latency,
+                        lgkm_latency=35 if is_permute else load_lgkm_latency)
     if op.name.startswith(("SGMEM", "FLAT")):
       return _TraceInfo(INST, {"op": op}, pipe="vmem", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.VMEM}, duration=_op_duration(op))
     return _TraceInfo(INST, {"op": op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
