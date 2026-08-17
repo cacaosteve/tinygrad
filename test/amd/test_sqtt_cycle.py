@@ -242,6 +242,12 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(5, "ALUEXEC", None, None, "VALU"),
     NormalizedSQTTEvent(6, "WAVEEND", 0, 8, None),
   ]),
+  "wait_immediate": (TraceCase("wait_immediate", [s_nop(simm16=0), s_waitcnt(simm16=0), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "IMMEDIATE", 0, 0, None),
+    NormalizedSQTTEvent(2, "IMMEDIATE", 0, 4, None),
+    NormalizedSQTTEvent(4, "WAVEEND", 0, 8, None),
+  ]),
   "lds_roundtrip": (TraceCase("lds_roundtrip", [
     v_lshlrev_b32_e32(v[1], 2, v[0]), ds_store_b32(addr=v[1], data0=v[0]), ds_load_b32(vdst=v[2], addr=v[1]), s_endpgm(),
   ]), [
@@ -252,6 +258,12 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(20, "INST", 0, 12, "LDS_RD"),
     NormalizedSQTTEvent(21, "VMEMEXEC", None, None, "LDS"), NormalizedSQTTEvent(21, "VMEMEXEC", None, None, "LDS"),
     NormalizedSQTTEvent(22, "WAVEEND", 0, 20, None),
+  ]),
+  "single_wave_barrier": (TraceCase("single_wave_barrier", [s_barrier(), s_mov_b32(s[0], 1), s_endpgm()], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "IMMEDIATE", 0, 0, None),
+    NormalizedSQTTEvent(2, "INST", 0, 4, "SALU"), NormalizedSQTTEvent(2, "ALUEXEC", None, None, "SALU"),
+    NormalizedSQTTEvent(4, "WAVEEND", 0, 8, None),
   ]),
   "multi_wave_barrier": (TraceCase("multi_wave_barrier", [s_barrier(), s_mov_b32(s[0], 1), s_endpgm()], local_size=64), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(0, "WAVESTART", 1, None, None),

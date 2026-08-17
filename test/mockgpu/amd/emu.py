@@ -1915,7 +1915,7 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
 
   # Initialize SQTT encoder — emits packets inline as instructions execute (only when profiling)
   if PROFILE:
-    sqtt = RDNA3SQTTTraceBuilder()
+    sqtt = RDNA3SQTTTraceBuilder(max(1, (total_threads + wave_size - 1) // wave_size))
 
   def _ensure_compiled(pc: int) -> tuple[Callable, list[int], bool, Inst]:
     if pc not in program:

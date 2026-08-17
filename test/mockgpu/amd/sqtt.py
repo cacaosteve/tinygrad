@@ -162,10 +162,11 @@ class _PacketEvent:
   kwargs: dict[str, Any]
 
 class RDNA3SQTTTraceBuilder:
-  def __init__(self):
+  def __init__(self, workgroup_waves: int=1):
     self.events: list[_PacketEvent] = []
     self.waves: dict[int, _WaveState] = {}
     self.started: set[int] = set()
+    self.workgroup_waves = workgroup_waves
     self.seq = 0
     self._add(0, LAYOUT_HEADER, layout=3, sel_a=6)
 
@@ -185,7 +186,9 @@ class RDNA3SQTTTraceBuilder:
     if issubclass(inst_type, _SOPP):
       if inst_op in _SOPP_SKIP: return _TraceInfo(None)
       if inst_op in _SOPP_IMMEDIATE: return _TraceInfo(IMMEDIATE)
-      if inst_op in _SOPP_BARRIER: return _TraceInfo(INST, {"op": InstOp.BARRIER}, barrier=True)
+      if inst_op in _SOPP_BARRIER:
+        if self.workgroup_waves <= 1: return _TraceInfo(IMMEDIATE)
+        return _TraceInfo(INST, {"op": InstOp.BARRIER}, barrier=True)
       if inst_op in _SOPP_BRANCH:
         return _TraceInfo(INST, {"op": InstOp.JUMP if branch_taken else InstOp.JUMP_NO}, pipe="salu",
                           issue_latency=10 if branch_taken else 1, reads_scc_delay=0 if branch_taken else 1)
