@@ -179,7 +179,7 @@ amdhsa.kernels:
 .end_amdgpu_metadata
 """
 
-def _run_hardware_trace(case: TraceCase, require_instructions: bool=True) -> list[NormalizedSQTTEvent]:
+def _run_hardware_trace(case: TraceCase, require_instructions: bool=True, min_instructions: int=1) -> list[NormalizedSQTTEvent]:
   from tinygrad import Device
   from tinygrad.device import Compiled, ProfileDeviceEvent, ProfileProgramEvent, TinyELF
   from tinygrad.runtime.support.compiler_amd import HIPCompiler
@@ -205,7 +205,7 @@ def _run_hardware_trace(case: TraceCase, require_instructions: bool=True) -> lis
     if not traces: continue
     ret = max(traces, key=len)
     if len(ret) > len(best): best = ret
-    if not require_instructions or any(e.kind in {"INST", "VALUINST", "IMMEDIATE"} for e in ret): return ret
+    if not require_instructions or sum(e.kind in {"INST", "VALUINST", "IMMEDIATE"} for e in ret) >= min_instructions: return ret
   if not best:
     raise unittest.SkipTest("hardware SQTT produced no wave lifecycle trace; run single-process with DEV=AMD VIZ=2 and SQTT_LIMIT_SE=1")
   raise unittest.SkipTest("hardware SQTT captured wave lifecycle but no instruction packets on this driver/interface")
@@ -804,6 +804,42 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(40, "IMMEDIATE", 0, 8, None),
     NormalizedSQTTEvent(42, "WAVEEND", 0, 12, None),
   ]),
+  "mixed_alu": (TraceCase("mixed_alu", [
+    s_mov_b32(s[0], 3), v_mov_b32_e32(v[0], 0), v_add_f32_e32(v[1], v[0], v[0]), s_nop(4), v_rcp_f32_e32(v[2], v[1]),
+    s_delay_alu(5), v_add_f32_e32(v[3], v[2], v[2]), s_branch(1), s_mov_b32(s[1], 9), s_mov_b32(s[2], 2), s_endpgm(),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "SALU"),
+    NormalizedSQTTEvent(2, "VALUINST", 0, 4, None), NormalizedSQTTEvent(3, "VALUINST", 0, 8, None),
+    NormalizedSQTTEvent(3, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(8, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(10, "IMMEDIATE", 0, 12, None), NormalizedSQTTEvent(11, "INST", 0, 16, "VALUT_4"),
+    NormalizedSQTTEvent(14, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(19, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(21, "VALUINST", 0, 24, None), NormalizedSQTTEvent(22, "INST", 0, 28, "JUMP"),
+    NormalizedSQTTEvent(29, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(32, "INST", 0, 36, "SALU"),
+    NormalizedSQTTEvent(34, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(35, "WAVEEND", 0, 40, None),
+  ]),
+  "mixed_lds": (TraceCase("mixed_lds", [
+    v_lshlrev_b32_e32(v[1], 2, v[0]), ds_store_b32(addr=v[1], data0=v[0]), ds_load_b32(vdst=v[2], addr=v[1]), s_waitcnt(0),
+    v_add_f32_e32(v[3], v[2], v[2]), v_rcp_f32_e32(v[4], v[3]), s_endpgm(),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(10, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(19, "INST", 0, 4, "LDS_WR_2"),
+    NormalizedSQTTEvent(20, "INST", 0, 12, "LDS_RD"), NormalizedSQTTEvent(22, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(24, "VMEMEXEC", None, None, "LDS"), NormalizedSQTTEvent(54, "IMMEDIATE", 0, 20, None),
+    NormalizedSQTTEvent(55, "VALUINST", 0, 24, None), NormalizedSQTTEvent(56, "INST", 0, 28, "VALUT_4"),
+    NormalizedSQTTEvent(63, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(68, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(69, "WAVEEND", 0, 32, None),
+  ]),
+  "mixed_matrix": (TraceCase("mixed_matrix", [
+    v_wmma_f32_16x16x16_f16(vdst=v[0:7], src0=v[16:23], src1=v[24:31], src2=v[0:7]),
+    v_interp_p10_f32(vdst=v[8], src0=v[9], src1=v[10], src2=v[11]), v_add_f32_e32(v[12], v[8], v[8]),
+    v_wmma_f32_16x16x16_f16(vdst=v[32:39], src0=v[48:55], src1=v[56:63], src2=v[32:39]), s_endpgm(),
+  ], local_size=32, vgpr_count=64), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(2, "INST", 0, 8, "VINTERP"), NormalizedSQTTEvent(3, "VALUINST", 0, 16, None),
+    NormalizedSQTTEvent(4, "VALUINST", 0, 20, None), NormalizedSQTTEvent(44, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(45, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(51, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(84, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(85, "WAVEEND", 0, 28, None),
+  ]),
   "single_wave_barrier": (TraceCase("single_wave_barrier", [s_barrier(), s_mov_b32(s[0], 1), s_endpgm()], local_size=32), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
     NormalizedSQTTEvent(1, "IMMEDIATE", 0, 0, None),
@@ -855,6 +891,11 @@ EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
   "lds_roundtrip": [("ALUEXEC", 9, "VALU"), ("VMEMEXEC", 21, "LDS"), ("VMEMEXEC", 23, "LDS")],
   "lds_waitcnt": [("VMEMEXEC", 3, "LDS"), ("ALUEXEC", 41, "VALU")],
   "lds_bpermute_dependency": [("VMEMEXEC", 3, "LDS"), ("ALUEXEC", 17, "VALU")],
+  "mixed_alu": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 7, "VALU"), ("ALUEXEC", 13, "VALU"), ("ALUEXEC", 18, "VALU"),
+                ("ALUEXEC", 28, "VALU"), ("ALUEXEC", 33, "SALU")],
+  "mixed_lds": [("ALUEXEC", 9, "VALU"), ("VMEMEXEC", 21, "LDS"), ("VMEMEXEC", 23, "LDS"),
+                ("ALUEXEC", 62, "VALU"), ("ALUEXEC", 67, "VALU")],
+  "mixed_matrix": [("ALUEXEC", 43, "VALU"), ("ALUEXEC", 44, "VALU"), ("ALUEXEC", 50, "VALU"), ("ALUEXEC", 83, "VALU")],
   "single_wave_barrier": [("ALUEXEC", 3, "SALU")],
 }
 
@@ -888,9 +929,9 @@ class TestSQTTHardwareCycle(unittest.TestCase):
   def test_hardware_trace_order(self):
     for name, (case, expected) in CASES.items():
       with self.subTest(name=name):
-        got = _instruction_events(_run_hardware_trace(case))
         want = _instruction_events(expected)
         if case.local_size > 32: want = [e for e in want if e.wave == 0]
+        got = _instruction_events(_run_hardware_trace(case, min_instructions=len(want)))
         if (msg:=_first_mismatch(got, want, check_time=False, case=case)) is not None: self.fail(msg)
 
   def test_hardware_trace_lifecycle(self):
@@ -904,8 +945,8 @@ class TestSQTTHardwareCycle(unittest.TestCase):
     for name, (case, _) in CASES.items():
       if case.local_size > 32: continue
       with self.subTest(name=name):
-        got = _timed_events(_run_hardware_trace(case))
         want = _timed_events(_run_mock_trace(case))
+        got = _timed_events(_run_hardware_trace(case, min_instructions=len(_instruction_events(want))))
         if case.normalize_exec_start: got, want = _normalize_exec_start(got), _normalize_exec_start(want)
         if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: self.fail(msg)
 
