@@ -227,6 +227,13 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(4, "ALUEXEC", None, None, "VALU"),
     NormalizedSQTTEvent(5, "WAVEEND", 0, 12, None),
   ]),
+  "valu_sopp_delay": (TraceCase("valu_sopp_delay", [v_mov_b32_e32(v[0], 0), s_nop(simm16=0), s_endpgm()]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(2, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(4, "IMMEDIATE", 0, 4, None),
+    NormalizedSQTTEvent(6, "WAVEEND", 0, 8, None),
+  ]),
   "valu_dependency": (TraceCase("valu_dependency", [v_lshlrev_b64(v[2:3], 2, v[0:1]), v_add_f32_e32(v[4], v[2], v[2]), s_endpgm()]), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
     NormalizedSQTTEvent(1, "INST", 0, 0, "VALUB_2"),
@@ -319,6 +326,17 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(9, "ALUEXEC", None, None, "VALU"),
     NormalizedSQTTEvent(33, "WAVEEND", 0, 12, None),
   ]),
+  "lds_sopp_delay": (TraceCase("lds_sopp_delay", [
+    ds_load_b32(vdst=v[2], addr=v[0]), s_nop(simm16=0), v_add_f32_e32(v[3], v[2], v[2]), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_RD"),
+    NormalizedSQTTEvent(2, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(4, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(8, "VALUINST", 0, 12, None),
+    NormalizedSQTTEvent(9, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(33, "WAVEEND", 0, 16, None),
+  ]),
   "lds_waitcnt": (TraceCase("lds_waitcnt", [ds_load_b32(vdst=v[2], addr=v[0]), s_waitcnt(simm16=0), v_add_f32_e32(v[3], v[2], v[2]), s_endpgm()]), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
     NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_RD"),
@@ -327,6 +345,17 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(33, "VALUINST", 0, 12, None),
     NormalizedSQTTEvent(34, "ALUEXEC", None, None, "VALU"),
     NormalizedSQTTEvent(35, "WAVEEND", 0, 16, None),
+  ]),
+  "lds_wait_idle": (TraceCase("lds_wait_idle", [
+    ds_load_b32(vdst=v[2], addr=v[0]), s_wait_idle(), v_add_f32_e32(v[3], v[2], v[2]), s_endpgm(),
+  ]), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "LDS_RD"),
+    NormalizedSQTTEvent(2, "VMEMEXEC", None, None, "LDS"),
+    NormalizedSQTTEvent(33, "IMMEDIATE", 0, 8, None),
+    NormalizedSQTTEvent(34, "VALUINST", 0, 12, None),
+    NormalizedSQTTEvent(35, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(36, "WAVEEND", 0, 16, None),
   ]),
   "lds_store_waitcnt": (TraceCase("lds_store_waitcnt", [ds_store_b32(addr=v[0], data0=v[0]), s_waitcnt(simm16=0), s_endpgm()]), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),

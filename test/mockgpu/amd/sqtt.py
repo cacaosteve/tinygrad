@@ -152,6 +152,7 @@ class _TraceInfo:
   reads_scc_delay: int|None = None
   writes_scc_latency: int|None = None
   wait_lgkm: bool = False
+  wait_lgkm_extra: int = 0
   barrier: bool = False
 
 @dataclass
@@ -163,6 +164,7 @@ class _WaveState:
   vmem_ready: int = 2
   scc_ready: int = 2
   lgkm_ready: int = 2
+  immediate_ready: int = 2
   last_time: int = 1
   vgpr_ready: dict[int, int] = field(default_factory=dict)
   vgpr_lds_ready: dict[int, int] = field(default_factory=dict)
@@ -200,7 +202,8 @@ class RDNA3SQTTTraceBuilder:
     if issubclass(inst_type, _SOPP):
       if inst_op in _SOPP_SKIP: return _TraceInfo(None)
       if inst_op in _SOPP_IMMEDIATE:
-        return _TraceInfo(IMMEDIATE, wait_lgkm=inst_op in {SOPPOp3.S_WAITCNT.value, SOPPOp3.S_WAIT_IDLE.value} and getattr(inst, "simm16", 0) == 0)
+        waits_lgkm = inst_op in {SOPPOp3.S_WAITCNT.value, SOPPOp3.S_WAIT_IDLE.value} and getattr(inst, "simm16", 0) == 0
+        return _TraceInfo(IMMEDIATE, wait_lgkm=waits_lgkm, wait_lgkm_extra=1 if inst_op == SOPPOp3.S_WAIT_IDLE.value and waits_lgkm else 0)
       if inst_op in _SOPP_BARRIER:
         if self.workgroup_waves <= 1: return _TraceInfo(IMMEDIATE)
         return _TraceInfo(INST, {"op": InstOp.BARRIER}, barrier=True)
@@ -237,9 +240,10 @@ class RDNA3SQTTTraceBuilder:
     src_ready = max([vgpr_ready.get(r, st.vgpr_ready.get(r, 0)) for r in src_vgprs] +
                     [st.sgpr_ready.get(r, 0) for r in _src_sgprs(inst)] +
                     ([] if info.reads_scc_delay is None else [st.scc_ready + info.reads_scc_delay]) +
-                    ([st.lgkm_ready] if info.wait_lgkm else []) + [0])
+                    ([st.lgkm_ready + info.wait_lgkm_extra] if info.wait_lgkm else []) + [0])
     pipe_ready = getattr(st, f"{info.pipe}_ready") if info.pipe else 0
-    issue = max(st.issue, pipe_ready, src_ready)
+    immediate_ready = st.immediate_ready if info.pkt_cls == IMMEDIATE else 0
+    issue = max(st.issue, pipe_ready, src_ready, immediate_ready)
     kwargs = {"wave": wave, **info.kwargs} if info.pkt_cls in (INST, IMMEDIATE, VALUINST) else info.kwargs
     self._add(issue, info.pkt_cls, **kwargs)
 
@@ -247,7 +251,9 @@ class RDNA3SQTTTraceBuilder:
     if info.exec_cls is not None: self._add(exec_time, info.exec_cls, **info.exec_kwargs)
     if info.barrier: self._add(issue + 1, WAVERDY, mask=1 << wave)
 
-    if info.pipe: setattr(st, f"{info.pipe}_ready", issue + info.issue_latency)
+    if info.pipe:
+      setattr(st, f"{info.pipe}_ready", issue + info.issue_latency)
+      if info.pipe in {"valu", "lds", "vmem"}: st.immediate_ready = max(st.immediate_ready, issue + 3)
     ready = issue + (info.duration if info.dst_latency is None else info.dst_latency)
     for reg in _dst_vgprs(inst, _op_name(inst)):
       st.vgpr_ready[reg] = ready
