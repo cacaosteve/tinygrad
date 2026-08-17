@@ -46,6 +46,7 @@ _SMEM = (ir3.SMEM, ir4.SMEM, irc.SMEM)
 _VALU = (ir3.VOP1, ir3.VOP2, ir3.VOP3, ir3.VOP3P, ir3.VOPC, ir3.VOPD, ir3.VOP3SD, ir3.VOP3_SDST, ir3.VOP1_SDST,
          ir4.VOP1, ir4.VOP2, ir4.VOP3, ir4.VOP3P, ir4.VOPC, ir4.VOPD, ir4.VOP3SD, ir4.VOP3_SDST, ir4.VOP1_SDST,
          irc.VOP1, irc.VOP2, irc.VOP3, irc.VOP3P, irc.VOP3PX2, irc.VOPC, irc.VOP3SD, irc.VOP3_SDST)
+_VINTERP = (ir3.VINTERP, ir4.VINTERP)
 _DS = (ir3.DS, ir4.DS, irc.DS)
 _GLOBAL = (ir3.GLOBAL, ir4.VGLOBAL, irc.GLOBAL)
 _FLAT = (ir3.FLAT, ir4.VFLAT, irc.FLAT)
@@ -131,18 +132,32 @@ def _field_offset(x: Any) -> int|None:
   if hasattr(x, "offset"): return int(x.offset)
   return int(x) if isinstance(x, int) else None
 
+def _vgpr_offsets(x: Any) -> set[int]:
+  if (off:=_field_offset(x)) is None or off < 256: return set()
+  base = off - (384 if off >= 384 else 256)
+  return set(range(base, base + int(getattr(x, "sz", 1))))
+
+def _wmma_exec_latency(inst) -> int:
+  blocks = {_field_offset(getattr(inst, name, None)) for name in ("vdst", "src0", "src1", "src2")}
+  return min(43, 40 + len(blocks - {None}))
+
 def _src_vgprs(inst) -> set[int]:
   ret: set[int] = set()
-  for name in ("src0", "src1", "src2"):
-    if (off:=_field_offset(getattr(inst, name, None))) is not None and off >= 256: ret.add(off - (384 if off >= 384 else 256))
-  for name in ("vsrc0", "vsrc1", "vsrc2", "data0", "data1", "addr"):
+  for name in ("src0", "src1", "src2", "srcx0", "srcy0"):
+    ret.update(_vgpr_offsets(getattr(inst, name, None)))
+  for name in ("vsrc0", "vsrc1", "vsrc2", "vsrcx1", "vsrcy1", "data0", "data1", "addr"):
     if (off:=_field_offset(getattr(inst, name, None))) is not None:
       ret.add(off - (384 if off >= 384 else 256) if off >= 256 else off)
   return ret
 
 def _dst_vgprs(inst, op_name: str) -> set[int]:
   ret: set[int] = set()
-  if "STORE" not in op_name and (off:=_field_offset(getattr(inst, "vdst", None))) is not None: ret.add(off - 256 if off >= 256 else off)
+  if "STORE" not in op_name:
+    for name in ("vdst", "vdstx", "vdsty"):
+      x = getattr(inst, name, None)
+      if (off:=_field_offset(x)) is not None:
+        base = off - 256 if off >= 256 else off
+        ret.update(range(base, base + int(getattr(x, "sz", 1))))
   if "LOAD" in op_name and (off:=_field_offset(getattr(inst, "vdata", None))) is not None: ret.add(off)
   return ret
 
@@ -179,6 +194,8 @@ class _TraceInfo:
   exec_release: int = 1
   exec_block: int = 0
   forward_latency: int = 0
+  matrix: bool = False
+  interp: bool = False
   vgpr_read_latency: int|None = None
   reads_scc_delay: int|None = None
   reads_vcc: bool = False
@@ -207,11 +224,14 @@ class _WaveState:
   valu_exec_ready: int = 2
   lds_exec_ready: int = 2
   vmem_exec_ready: int = 2
+  matrix_start_ready: int = 0
+  matrix_interp_ready: int = 0
   last_time: int = 1
   vgpr_ready: dict[int, int] = field(default_factory=dict)
   vgpr_lds_ready: dict[int, int] = field(default_factory=dict)
   vgpr_exec_ready: dict[int, int] = field(default_factory=dict)
   vgpr_forward_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_matrix_ready: dict[int, int] = field(default_factory=dict)
   sgpr_ready: dict[int, int] = field(default_factory=dict)
   sgpr_exec_ready: dict[int, int] = field(default_factory=dict)
 
@@ -269,9 +289,15 @@ class RDNA3SQTTTraceBuilder:
                         exec_latency=2, forward_latency=2,
                         writes_scc_latency=9 if op_name.startswith("S_CMP") else None,
                         writes_vcc_latency=7 if _writes_vcc(inst) else None, writes_exec_latency=7 if writes_exec else None)
+    if issubclass(inst_type, _VINTERP):
+      return _TraceInfo(INST, {"op": InstOp.VINTERP}, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
+                        exec_latency=9, forward_latency=5, interp=True)
     if issubclass(inst_type, _VALU):
       valu_op = _valu_op(op_name)
       if valu_op is None:
+        if "WMMA" in op_name:
+          return _TraceInfo(VALUINST, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
+                            exec_latency=_wmma_exec_latency(inst), forward_latency=2, matrix=True)
         return _TraceInfo(VALUINST, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
                           exec_latency=6, vgpr_read_latency=9, forward_latency=5,
                           writes_vcc_latency=18 if op_name.startswith("V_CMP") else None)
@@ -332,8 +358,17 @@ class RDNA3SQTTTraceBuilder:
         exec_time = max(issue + info.exec_latency, exec_ready, dep_ready)
       elif info.pipe == "valu":
         latency = info.vgpr_read_latency if src_vgprs and info.vgpr_read_latency is not None else info.exec_latency
-        dep_ready = max([st.vgpr_forward_ready.get(r, 0) for r in src_vgprs] + [0])
-        exec_time = max(issue + latency, exec_ready, dep_ready)
+        dep_map = st.vgpr_matrix_ready if info.matrix else st.vgpr_forward_ready
+        dep_ready = max([dep_map.get(r, 0) for r in src_vgprs] + [0])
+        if info.matrix:
+          matrix_start = max(issue, st.matrix_start_ready)
+          exec_time = max(matrix_start + latency, dep_ready)
+          st.matrix_start_ready = matrix_start + 32 + latency - 41
+          st.matrix_interp_ready = matrix_start + 44
+        elif info.interp:
+          exec_time = max(issue + latency, exec_ready, dep_ready, st.matrix_interp_ready)
+          if st.matrix_start_ready > issue: st.matrix_start_ready += 2
+        else: exec_time = max(issue + latency, exec_ready, dep_ready)
       else: exec_time = max(issue + info.exec_latency, exec_ready)
       setattr(st, f"{info.pipe}_exec_ready", exec_time + info.exec_release)
     if info.pipe is not None and info.exec_block:
@@ -349,6 +384,7 @@ class RDNA3SQTTTraceBuilder:
       st.vgpr_ready[reg] = ready
       st.vgpr_exec_ready[reg] = exec_time
       st.vgpr_forward_ready[reg] = exec_time + info.forward_latency
+      if info.matrix: st.vgpr_matrix_ready[reg] = exec_time + 34
       if info.pipe == "valu": st.vgpr_lds_ready[reg] = issue + 18
     for reg in _dst_sgprs(inst):
       st.sgpr_ready[reg] = ready

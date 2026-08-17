@@ -7,6 +7,7 @@ from tinygrad.helpers import Context, Target, getenv
 from tinygrad.renderer.amd.sqtt import (ALUEXEC, IMMEDIATE, IMMEDIATE_MASK, INST, INST_RDNA4, TS_DELTA_OR_MARK, VALUINST, VMEMEXEC, WAVEEND,
   WAVEEND_RDNA4, WAVERDY, WAVESTART, WAVESTART_RDNA4, InstOp, decode)
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
+from tinygrad.runtime.autogen.amd.rdna3.enum import VOPDOp
 from test.mockgpu.amd.emu import run_asm, sqtt_traces
 
 _RSRC2_WITH_LDS = 0x19c | (1 << 15)
@@ -16,6 +17,7 @@ class TraceCase:
   name: str
   instructions: list
   local_size: int = 1
+  vgpr_count: int = 16
 
 @dataclass(frozen=True)
 class NormalizedSQTTEvent:
@@ -135,7 +137,7 @@ def _asm_source(case: TraceCase) -> str:
 .rodata
 .p2align 6
 .amdhsa_kernel {name}
-  .amdhsa_next_free_vgpr 16
+  .amdhsa_next_free_vgpr {case.vgpr_count}
   .amdhsa_next_free_sgpr 16
   .amdhsa_wavefront_size32 1
   .amdhsa_kernarg_size 0
@@ -157,7 +159,7 @@ amdhsa.kernels:
     .kernarg_segment_align: 8
     .wavefront_size: 32
     .sgpr_count: 16
-    .vgpr_count: 16
+    .vgpr_count: {case.vgpr_count}
     .max_flat_workgroup_size: 1024
 ...
 .end_amdgpu_metadata
@@ -396,6 +398,78 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(33, "VALUINST", 0, 8, None),
     NormalizedSQTTEvent(34, "ALUEXEC", None, None, "VALU"),
     NormalizedSQTTEvent(35, "WAVEEND", 0, 12, None),
+  ]),
+  "vopd_dependency": (TraceCase("vopd_dependency", [
+    VOPD(opx=VOPDOp.V_DUAL_MOV_B32, opy=VOPDOp.V_DUAL_MOV_B32, vdstx=v[0], srcx0=v[10], vsrcx1=v[10],
+         vdsty=v[1], srcy0=v[11], vsrcy1=v[11]),
+    VOPD(opx=VOPDOp.V_DUAL_MOV_B32, opy=VOPDOp.V_DUAL_MOV_B32, vdstx=v[2], srcx0=v[0], vsrcx1=v[0],
+         vdsty=v[3], srcy0=v[1], vsrcy1=v[1]), s_endpgm(),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "VALUINST", 0, 0, None), NormalizedSQTTEvent(2, "VALUINST", 0, 8, None),
+    NormalizedSQTTEvent(10, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(15, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(16, "WAVEEND", 0, 16, None),
+  ]),
+  "wmma_same_block": (TraceCase("wmma_same_block", [
+    v_wmma_f32_16x16x16_f16(vdst=v[0:7], src0=v[0:7], src1=v[0:7], src2=v[0:7]), s_endpgm(),
+  ], local_size=32, vgpr_count=8), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(42, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(43, "WAVEEND", 0, 8, None),
+  ]),
+  "wmma_two_blocks": (TraceCase("wmma_two_blocks", [
+    v_wmma_f32_16x16x16_f16(vdst=v[0:7], src0=v[8:15], src1=v[0:7], src2=v[0:7]), s_endpgm(),
+  ], local_size=32, vgpr_count=16), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "VALUINST", 0, 0, None),
+    NormalizedSQTTEvent(43, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(44, "WAVEEND", 0, 8, None),
+  ]),
+  "wmma_independent": (TraceCase("wmma_independent", [
+    v_wmma_f32_16x16x16_f16(vdst=v[0:7], src0=v[16:23], src1=v[24:31], src2=v[0:7]),
+    v_wmma_f32_16x16x16_f16(vdst=v[32:39], src0=v[48:55], src1=v[56:63], src2=v[32:39]), s_endpgm(),
+  ], local_size=32, vgpr_count=64), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "VALUINST", 0, 0, None), NormalizedSQTTEvent(2, "VALUINST", 0, 8, None),
+    NormalizedSQTTEvent(44, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(78, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(79, "WAVEEND", 0, 16, None),
+  ]),
+  "wmma_dependency": (TraceCase("wmma_dependency", [
+    v_wmma_f32_16x16x16_f16(vdst=v[0:7], src0=v[16:23], src1=v[24:31], src2=v[0:7]),
+    v_wmma_f32_16x16x16_f16(vdst=v[0:7], src0=v[0:7], src1=v[24:31], src2=v[0:7]), s_endpgm(),
+  ], local_size=32, vgpr_count=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "VALUINST", 0, 0, None), NormalizedSQTTEvent(2, "VALUINST", 0, 8, None),
+    NormalizedSQTTEvent(44, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(78, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(79, "WAVEEND", 0, 16, None),
+  ]),
+  "vinterp_independent": (TraceCase("vinterp_independent", [
+    v_interp_p10_f32(vdst=v[0], src0=v[1], src1=v[2], src2=v[3]),
+    v_interp_p10_f32(vdst=v[4], src0=v[5], src1=v[6], src2=v[7]), s_endpgm(),
+  ], local_size=32), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "VINTERP"), NormalizedSQTTEvent(2, "INST", 0, 8, "VINTERP"),
+    NormalizedSQTTEvent(10, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(11, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(12, "WAVEEND", 0, 16, None),
+  ]),
+  "vinterp_wmma": (TraceCase("vinterp_wmma", [
+    v_interp_p10_f32(vdst=v[8], src0=v[9], src1=v[10], src2=v[11]),
+    v_wmma_f32_16x16x16_f16(vdst=v[0:7], src0=v[16:23], src1=v[24:31], src2=v[0:7]),
+    v_wmma_f32_16x16x16_f16(vdst=v[32:39], src0=v[48:55], src1=v[56:63], src2=v[32:39]), s_endpgm(),
+  ], local_size=32, vgpr_count=64), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "INST", 0, 0, "VINTERP"), NormalizedSQTTEvent(2, "VALUINST", 0, 8, None),
+    NormalizedSQTTEvent(3, "VALUINST", 0, 16, None), NormalizedSQTTEvent(10, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(45, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(79, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(80, "WAVEEND", 0, 24, None),
+  ]),
+  "wmma_vinterp_wmma": (TraceCase("wmma_vinterp_wmma", [
+    v_wmma_f32_16x16x16_f16(vdst=v[0:7], src0=v[16:23], src1=v[24:31], src2=v[0:7]),
+    v_interp_p10_f32(vdst=v[8], src0=v[9], src1=v[10], src2=v[11]),
+    v_wmma_f32_16x16x16_f16(vdst=v[32:39], src0=v[48:55], src1=v[56:63], src2=v[32:39]), s_endpgm(),
+  ], local_size=32, vgpr_count=64), [
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
+    NormalizedSQTTEvent(1, "VALUINST", 0, 0, None), NormalizedSQTTEvent(2, "INST", 0, 8, "VINTERP"),
+    NormalizedSQTTEvent(3, "VALUINST", 0, 16, None), NormalizedSQTTEvent(44, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(45, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(80, "ALUEXEC", None, None, "VALU"),
+    NormalizedSQTTEvent(81, "WAVEEND", 0, 24, None),
   ]),
   "wait_immediate": (TraceCase("wait_immediate", [s_nop(simm16=0), s_waitcnt(simm16=0), s_endpgm()]), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None),
@@ -651,6 +725,14 @@ EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
   "valu_transcendent_dependency": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 19, "VALU")],
   "valu_mad64": [("ALUEXEC", 12, "VALU")],
   "valu_f64": [("ALUEXEC", 38, "VALU")],
+  "vopd_dependency": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 14, "VALU")],
+  "vinterp_independent": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 10, "VALU")],
+  "wmma_same_block": [("ALUEXEC", 41, "VALU")],
+  "wmma_two_blocks": [("ALUEXEC", 42, "VALU")],
+  "wmma_independent": [("ALUEXEC", 43, "VALU"), ("ALUEXEC", 77, "VALU")],
+  "wmma_dependency": [("ALUEXEC", 43, "VALU"), ("ALUEXEC", 77, "VALU")],
+  "vinterp_wmma": [("ALUEXEC", 9, "VALU"), ("ALUEXEC", 44, "VALU"), ("ALUEXEC", 78, "VALU")],
+  "wmma_vinterp_wmma": [("ALUEXEC", 43, "VALU"), ("ALUEXEC", 44, "VALU"), ("ALUEXEC", 79, "VALU")],
   "lds_roundtrip": [("ALUEXEC", 9, "VALU"), ("VMEMEXEC", 21, "LDS"), ("VMEMEXEC", 23, "LDS")],
   "lds_waitcnt": [("VMEMEXEC", 3, "LDS"), ("ALUEXEC", 41, "VALU")],
   "lds_bpermute_dependency": [("VMEMEXEC", 3, "LDS"), ("ALUEXEC", 17, "VALU")],
