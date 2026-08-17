@@ -251,23 +251,23 @@ class RDNA3SQTTTraceBuilder:
                         writes_scc_latency=9 if op_name.startswith("S_CMP") else None)
     if issubclass(inst_type, _SALU):
       writes_exec = _writes_exec(inst, op_name)
-      op = InstOp.SALU_WR_EXEC if writes_exec else InstOp.SALU
-      return _TraceInfo(INST, {"op": op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
+      salu_op = InstOp.SALU_WR_EXEC if writes_exec else InstOp.SALU
+      return _TraceInfo(INST, {"op": salu_op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
                         writes_scc_latency=9 if op_name.startswith("S_CMP") else None,
                         writes_vcc_latency=7 if _writes_vcc(inst) else None, writes_exec_latency=7 if writes_exec else None)
     if issubclass(inst_type, _VALU):
-      op = _valu_op(op_name)
-      if op is None:
+      valu_op = _valu_op(op_name)
+      if valu_op is None:
         return _TraceInfo(VALUINST, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
                           writes_vcc_latency=18 if op_name.startswith("V_CMP") else None)
-      duration, issue_latency, dst_latency = _valu_latencies(op)
-      return _TraceInfo(INST, {"op": op}, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
+      duration, issue_latency, dst_latency = _valu_latencies(valu_op)
+      return _TraceInfo(INST, {"op": valu_op}, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
                         duration=duration, issue_latency=issue_latency, dst_latency=dst_latency,
-                        writes_exec_latency=18 if op == InstOp.VALU1_WR_EXEC else None)
+                        writes_exec_latency=18 if valu_op == InstOp.VALU1_WR_EXEC else None)
     if issubclass(inst_type, _SMEM):
       return _TraceInfo(INST, {"op": InstOp.SMEM_RD}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
-    op = _mem_op(inst_type, op_name)
-    if op.name.startswith("LDS"):
+    mem_op = _mem_op(inst_type, op_name)
+    if mem_op.name.startswith("LDS"):
       is_permute = "PERMUTE" in op_name
       is_2addr_load = "_2ADDR" in op_name and "LOAD" in op_name
       is_rtn_atomic = _DS_ATOMIC_RE.match(op_name) is not None and "_RTN_" in op_name
@@ -279,14 +279,14 @@ class RDNA3SQTTTraceBuilder:
         elif "_B64" in op_name: load_lgkm_latency = 33
       if is_rtn_atomic and re.search(r"_(B|U|I|F)64", op_name): load_lgkm_latency = 36
       wide_load = load_lgkm_latency is not None and "_B32" not in op_name
-      dst_latency = 8 if is_permute or (is_rtn_atomic and op == InstOp.LDS_WR_2) else \
-        (9 if is_rtn_atomic and op == InstOp.LDS_WR_3 else (7 if op == InstOp.LDS_RD else None))
-      return _TraceInfo(INST, {"op": op}, pipe="lds", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.LDS},
-                        duration=3 if is_permute or is_2addr_load or wide_load else _lds_exec_latency(op), dst_latency=dst_latency,
+      lds_dst_latency: int|None = 8 if is_permute or (is_rtn_atomic and mem_op == InstOp.LDS_WR_2) else \
+        (9 if is_rtn_atomic and mem_op == InstOp.LDS_WR_3 else (7 if mem_op == InstOp.LDS_RD else None))
+      return _TraceInfo(INST, {"op": mem_op}, pipe="lds", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.LDS},
+                        duration=3 if is_permute or is_2addr_load or wide_load else _lds_exec_latency(mem_op), dst_latency=lds_dst_latency,
                         lgkm_latency=35 if is_permute else load_lgkm_latency)
-    if op.name.startswith(("SGMEM", "FLAT")):
-      return _TraceInfo(INST, {"op": op}, pipe="vmem", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.VMEM}, duration=_op_duration(op))
-    return _TraceInfo(INST, {"op": op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
+    if mem_op.name.startswith(("SGMEM", "FLAT")):
+      return _TraceInfo(INST, {"op": mem_op}, pipe="vmem", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.VMEM}, duration=_op_duration(mem_op))
+    return _TraceInfo(INST, {"op": mem_op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
 
   def emit(self, wave_id: int, inst, branch_taken: bool|None) -> None:
     info = self._classify(inst, branch_taken)
