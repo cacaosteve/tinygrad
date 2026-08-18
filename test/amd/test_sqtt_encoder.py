@@ -3,7 +3,7 @@ from tinygrad.helpers import Context
 from tinygrad.renderer.amd.sqtt import decode, LAYOUT_HEADER, WAVESTART, WAVEEND, INST, IMMEDIATE, VALUINST, InstOp
 from tinygrad.renderer.amd.dsl import NULL
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
-from test.mockgpu.amd.sqtt import _mem_op, _op_name
+from test.mockgpu.amd.sqtt import _dst_sgprs, _dst_vgprs, _mem_op, _op_name, _src_sgprs, _src_vgprs
 
 def _run_kernel(instructions: list, lx=1, ly=1, lz=1, gx=1, gy=1, gz=1, args_ptr=0) -> bytes:
   from test.mockgpu.amd.emu import run_asm, sqtt_traces
@@ -17,6 +17,26 @@ def _run_kernel(instructions: list, lx=1, ly=1, lz=1, gx=1, gy=1, gz=1, args_ptr
   return sqtt_traces.pop()
 
 class TestSQTTEncoder(unittest.TestCase):
+  def test_register_operands(self):
+    cases = [
+      (v_mov_b16_e32(v[0].h, 1), set(), {0}),
+      (v_cvt_f32_f16_e32(v[1], v[0].h), {0}, {1}),
+      (v_fmac_f32_e32(v[4], v[1], v[2]), {1, 2, 4}, {4}),
+      (ds_store_b128(addr=v[0], data0=v[2:5]), {0, 2, 3, 4, 5}, set()),
+      (global_store_b128(addr=v[0:1], data=v[2:5], saddr=NULL), {0, 1, 2, 3, 4, 5}, set()),
+      (global_load_b128(vdst=v[2:5], addr=v[0:1], saddr=NULL), {0, 1}, {2, 3, 4, 5}),
+    ]
+    for inst, srcs, dsts in cases:
+      with self.subTest(inst=inst):
+        self.assertEqual(_src_vgprs(inst), srcs)
+        self.assertEqual(_dst_vgprs(inst, _op_name(inst)), dsts)
+    inst = s_and_b64(s[2:3], s[4:5], s[6:7])
+    self.assertEqual(_src_sgprs(inst), {4, 5, 6, 7})
+    self.assertEqual(_dst_sgprs(inst), {2, 3})
+    inst = s_fmac_f32(s[3], s[1], s[2])
+    self.assertEqual(_src_sgprs(inst), {1, 2, 3})
+    self.assertEqual(_dst_sgprs(inst), {3})
+
   def test_memory_instruction_classes(self):
     cases = [
       (global_load_b32(vdst=v[2], addr=v[0], saddr=s[2:3]), InstOp.SGMEM_RD_1),

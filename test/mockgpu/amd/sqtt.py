@@ -144,6 +144,10 @@ def _vgpr_offsets(x: Any) -> set[int]:
   base = off - (384 if off >= 384 else 256)
   return set(range(base, base + int(getattr(x, "sz", 1))))
 
+def _sgpr_offsets(x: Any) -> set[int]:
+  if (off:=_field_offset(x)) is None or off >= 128: return set()
+  return set(range(off, min(128, off + int(getattr(x, "sz", 1)))))
+
 def _wmma_exec_latency(inst) -> int:
   blocks = {_field_offset(getattr(inst, name, None)) for name in ("vdst", "src0", "src1", "src2")}
   return min(43, 40 + len(blocks - {None}))
@@ -152,37 +156,31 @@ def _src_vgprs(inst) -> set[int]:
   ret: set[int] = set()
   for name in ("src0", "src1", "src2", "srcx0", "srcy0"):
     if _has_operand(inst, name): ret.update(_vgpr_offsets(getattr(inst, name, None)))
-  for name in ("vsrc0", "vsrc1", "vsrc2", "vsrcx1", "vsrcy1", "data0", "data1", "addr"):
-    if not _has_operand(inst, name): continue
-    if (off:=_field_offset(getattr(inst, name, None))) is not None:
-      ret.add(off - (384 if off >= 384 else 256) if off >= 256 else off)
-  if "FMAC" in _op_name(inst) or "DOT2ACC" in _op_name(inst): ret.update(_vgpr_offsets(getattr(inst, "vdst", None)))
+  for name in ("vsrc0", "vsrc1", "vsrc2", "vsrcx1", "vsrcy1", "data", "data0", "data1", "addr"):
+    if _has_operand(inst, name): ret.update(_vgpr_offsets(getattr(inst, name, None)))
+  if "FMAC" in _op_name(inst) or "DOT2ACC" in _op_name(inst):
+    for name in ("vdst", "vdstx", "vdsty"): ret.update(_vgpr_offsets(getattr(inst, name, None)))
   return ret
 
 def _dst_vgprs(inst, op_name: str) -> set[int]:
   ret: set[int] = set()
   if "STORE" not in op_name:
     for name in ("vdst", "vdstx", "vdsty"):
-      if not _has_operand(inst, name): continue
-      x = getattr(inst, name, None)
-      if (off:=_field_offset(x)) is not None:
-        base = off - 256 if off >= 256 else off
-        ret.update(range(base, base + int(getattr(x, "sz", 1))))
-  if "LOAD" in op_name and (off:=_field_offset(getattr(inst, "vdata", None))) is not None: ret.add(off)
+      if _has_operand(inst, name): ret.update(_vgpr_offsets(getattr(inst, name, None)))
+  if "LOAD" in op_name: ret.update(_vgpr_offsets(getattr(inst, "vdata", None)))
   return ret
 
 def _src_sgprs(inst) -> set[int]:
   ret: set[int] = set()
   for name in ("src0", "src1", "src2", "ssrc0", "ssrc1", "sbase", "soffset", "saddr"):
-    if not _has_operand(inst, name): continue
-    if (off:=_field_offset(getattr(inst, name, None))) is not None and off < 128: ret.add(off)
+    if _has_operand(inst, name): ret.update(_sgpr_offsets(getattr(inst, name, None)))
+  if _op_name(inst).startswith("S_FMAC"): ret.update(_sgpr_offsets(getattr(inst, "sdst", None)))
   return ret
 
 def _dst_sgprs(inst) -> set[int]:
   ret: set[int] = set()
   for name in ("sdst", "sdata"):
-    if not _has_operand(inst, name): continue
-    if (off:=_field_offset(getattr(inst, name, None))) is not None and off < 128: ret.add(off)
+    if _has_operand(inst, name): ret.update(_sgpr_offsets(getattr(inst, name, None)))
   return ret
 
 def _writes_vcc(inst) -> bool:
