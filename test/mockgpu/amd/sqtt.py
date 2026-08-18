@@ -1,9 +1,4 @@
-"""SQTT packet generation for the AMD mock GPU emulator.
-
-The mock emulator already executes decoded instructions. This helper emits the
-SQTT packets for that execution with a small deterministic timing model, so
-tests can compare instruction order and simple non-DRAM stalls.
-"""
+"""RDNA3 SQTT encoding and non-DRAM scheduling for the AMD mock GPU."""
 from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import re
@@ -18,7 +13,6 @@ from tinygrad.runtime.autogen.amd.rdna3.enum import SOPPOp as SOPPOp3
 from tinygrad.runtime.autogen.amd.rdna4 import ins as ir4
 from tinygrad.runtime.autogen.amd.rdna4.enum import SOPPOp as SOPPOp4
 
-# Global trace storage: populated by run_asm as raw SQTT blobs, consumed by amdgpu.py.
 sqtt_traces: list[bytes] = []
 
 _NIB_COUNTS: dict[type[PacketType], int] = {cls: nc for _, (cls, nc, *_) in _build_decode_tables(PACKET_TYPES_RDNA3)[0].items()}
@@ -346,8 +340,12 @@ class RDNA3SQTTTraceBuilder:
     self.workgroup_waves = workgroup_waves
     self.selected_simd = getenv("SQTT_SIMD_SEL", 0)
     self.selected_sa, self.selected_wgp = getenv("SQTT_SA_SEL", 0), getenv("SQTT_WGP_SEL", 0)
-    self.salu_ib, self.salu_exec_ready = _SALUInstructionBuffer(), 2
-    self.issue_ready = 2
+    self.salu_ib = {simd: _SALUInstructionBuffer() for simd in range(_CU_SIMDS)}
+    self.salu_exec_ready = {simd: 2 for simd in range(_CU_SIMDS)}
+    self.valu_exec_ready = {simd: 2 for simd in range(_CU_SIMDS)}
+    self.valu_started = {simd: False for simd in range(_CU_SIMDS)}
+    self.issue_ready = {simd: 2 for simd in range(_CU_SIMDS)}
+    self.lds_exec_ready = 2
     self.seq = 0
     self._add(0, LAYOUT_HEADER, layout=3, sel_a=6)
 
@@ -464,14 +462,15 @@ class RDNA3SQTTTraceBuilder:
         (9 if is_rtn_atomic and mem_op == InstOp.LDS_WR_3 else (7 if mem_op == InstOp.LDS_RD else None))
       return _TraceInfo(INST, {"op": mem_op}, pipe="lds", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.LDS},
                         duration=3 if is_permute or is_2addr_load or wide_load else _lds_exec_latency(mem_op), dst_latency=lds_dst_latency,
-                        exec_latency=3, exec_release=2, lgkm_latency=35 if is_permute else load_lgkm_latency)
+                        exec_latency=3, exec_release=1 if mem_op == InstOp.LDS_RD else 2,
+                        lgkm_latency=35 if is_permute else load_lgkm_latency)
     if mem_op.name.startswith(("SGMEM", "FLAT")):
       return _TraceInfo(INST, {"op": mem_op}, pipe="vmem", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.VMEM}, duration=_op_duration(mem_op))
     return _TraceInfo(INST, {"op": mem_op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
 
   def emit(self, wave_id: int, inst, branch_taken: bool|None) -> None:
     st = self._wave(wave_id)
-    if not self._traced_wave(wave_id): return
+    simd, traced = wave_id % _CU_SIMDS, self._traced_wave(wave_id)
     inst_op = inst.op.value if hasattr(inst, "op") else 0
     if isinstance(inst, _SOPP) and inst_op == SOPPOp3.S_DELAY_ALU.value:
       st.trans_warm = False
@@ -495,9 +494,9 @@ class RDNA3SQTTTraceBuilder:
     immediate_ready = st.immediate_ready + info.immediate_delay if info.pkt_cls == IMMEDIATE and st.immediate_ready else 0
     active_delays = [dep for skip, dep in st.pending_delays if skip == 0]
     delay_ready = max([self._delay_ready(st, dep) for dep in active_delays] + [0])
-    base_issue = max(st.issue, self.issue_ready, pipe_ready, src_ready, immediate_ready, delay_ready)
+    base_issue = max(st.issue, self.issue_ready[simd], pipe_ready, src_ready, immediate_ready, delay_ready)
     salu_alu = info.pipe == "salu" and info.exec_cls is ALUEXEC and info.exec_kwargs.get("src") == AluSrc.SALU
-    if salu_alu: base_issue = self.salu_ib.issue_ready(base_issue)
+    if salu_alu: base_issue = self.salu_ib[simd].issue_ready(base_issue)
     valu_chains: frozenset[int]|None = None
     if info.pipe == "valu" and not info.matrix:
       valub = info.trans_pipe and not info.trans
@@ -508,11 +507,13 @@ class RDNA3SQTTTraceBuilder:
     salu_read_stall, issue = sgpr_read_ready > base_issue, max(base_issue, sgpr_read_ready)
     lds_pending = info.pipe == "lds" and st.lgkm_ready > issue
     kwargs = {"wave": wave, **info.kwargs} if info.pkt_cls in (INST, IMMEDIATE, VALUINST) else info.kwargs
-    self._add(issue, info.pkt_cls, **kwargs)
+    if traced: self._add(issue, info.pkt_cls, **kwargs)
 
     exec_time = issue
     if info.exec_cls is not None and info.pipe is not None:
-      exec_ready = self.salu_exec_ready if info.pipe == "salu" else getattr(st, f"{info.pipe}_exec_ready")
+      exec_ready = self.salu_exec_ready[simd] if info.pipe == "salu" else \
+                   self.valu_exec_ready[simd] if info.pipe == "valu" else \
+                   self.lds_exec_ready if info.pipe == "lds" else getattr(st, f"{info.pipe}_exec_ready")
       if info.pipe == "salu":
         dep_ready = max([st.sgpr_exec_ready.get(r, 0) + info.forward_latency for r in src_sgprs if r in st.sgpr_exec_ready] + [0])
         exec_time = max(issue + info.exec_latency + (2 if salu_read_stall and src_sgprs else 0), exec_ready, dep_ready)
@@ -544,13 +545,16 @@ class RDNA3SQTTTraceBuilder:
           valub_ready = st.valub_exec_ready if info.trans_pipe and not info.trans else 0
           exec_time = max(issue + latency, exec_ready, dep_ready, valub_ready)
       else: exec_time = max(issue + info.exec_latency, exec_ready)
-      if info.pipe == "salu": self.salu_exec_ready = exec_time + info.exec_release
+      if info.pipe == "salu": self.salu_exec_ready[simd] = exec_time + info.exec_release
+      elif info.pipe == "valu": self.valu_exec_ready[simd] = exec_time + info.exec_release
+      elif info.pipe == "lds": self.lds_exec_ready = exec_time + info.exec_release
       else: setattr(st, f"{info.pipe}_exec_ready", exec_time + info.exec_release)
     if info.pipe is not None and info.exec_block:
-      if info.pipe == "salu": self.salu_exec_ready = max(self.salu_exec_ready, issue + info.exec_block)
+      if info.pipe == "salu": self.salu_exec_ready[simd] = max(self.salu_exec_ready[simd], issue + info.exec_block)
       else: setattr(st, f"{info.pipe}_exec_ready", max(getattr(st, f"{info.pipe}_exec_ready"), issue + info.exec_block))
-    exec_event = self._add(exec_time, info.exec_cls, **info.exec_kwargs) if info.exec_cls is not None else None
-    if info.barrier: self._add(issue + 1, WAVERDY, mask=1 << wave)
+    exec_kwargs = {"src": MemSrc.LDS_ALT} if not traced and info.pipe == "lds" else info.exec_kwargs
+    exec_event = self._add(exec_time, info.exec_cls, **exec_kwargs) if info.exec_cls is not None and (traced or info.pipe == "lds") else None
+    if info.barrier and traced: self._add(issue + 1, WAVERDY, mask=1 << wave)
 
     if info.pipe:
       setattr(st, f"{info.pipe}_ready", issue + info.issue_latency)
@@ -563,7 +567,7 @@ class RDNA3SQTTTraceBuilder:
     producer_shiftable = (info.interp or (info.vgpr_read_latency is not None and bool(src_vgprs))) and exec_time == issue + natural_exec_latency
     producer_forward_latency = info.forward_latency + (1 if info.interp and not producer_shiftable else 0)
     if info.trans_pipe and not info.trans and st.valu_exec_history: producer_forward_latency -= 1
-    if info.vgpr_read_latency is not None and not src_vgprs and not st.valu_exec_history: producer_forward_latency += 1
+    if info.vgpr_read_latency is not None and not src_vgprs and not self.valu_started[simd]: producer_forward_latency += 1
     for reg in dst_vgprs:
       st.vgpr_ready[reg] = ready
       st.vgpr_exec_ready[reg] = exec_time
@@ -591,6 +595,7 @@ class RDNA3SQTTTraceBuilder:
         latency = info.lgkm_latency if info.lgkm_latency is not None else _lds_lgkm_latency(op, st.lgkm_ready > issue)
         st.lgkm_ready = max(st.lgkm_ready, issue + latency)
     if info.pipe == "valu" and info.exec_cls is not None:
+      self.valu_started[simd] = True
       if src_sgprs: st.sgpr_valu_read_ready = max(st.sgpr_valu_read_ready, exec_time)
       if info.trans:
         st.trans_exec_history.append((exec_time, st.trans_warm))
@@ -601,10 +606,10 @@ class RDNA3SQTTTraceBuilder:
         st.valu_ib.record(exec_time, chains=valu_chains, dsts=dst_vgprs, trans=info.trans)
     if info.pipe == "salu" and info.exec_cls is not None:
       st.salu_exec_history.append(exec_time)
-      if salu_alu: self.salu_ib.record(exec_time)
+      if salu_alu: self.salu_ib[simd].record(exec_time)
     st.pending_delays = [(skip - 1, dep) for skip, dep in st.pending_delays if skip > 0]
     st.trans_warm = info.nop
-    self.issue_ready = issue + 1
+    self.issue_ready[simd] = issue + 1
     st.issue, st.last_time = issue + info.issue_latency, max(st.last_time, exec_time, ready)
 
   def finish(self, wave_id: int) -> None:

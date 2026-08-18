@@ -898,11 +898,13 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(2, "INST", 0, 4, "SALU"), NormalizedSQTTEvent(2, "ALUEXEC", None, None, "SALU"),
     NormalizedSQTTEvent(4, "WAVEEND", 0, 8, None),
   ]),
-  "multi_wave_barrier": (TraceCase("multi_wave_barrier", [s_barrier(), s_mov_b32(s[0], 1), s_endpgm()], local_size=64), [
+  "multi_wave_barrier": (TraceCase("multi_wave_barrier", [s_barrier(), s_mov_b32(s[0], 1), s_endpgm()], local_size=96), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "BARRIER"),
-    NormalizedSQTTEvent(2, "WAVERDY", 0, None, None),
-    NormalizedSQTTEvent(2, "INST", 0, 4, "SALU"), NormalizedSQTTEvent(2, "ALUEXEC", None, None, "SALU"),
-    NormalizedSQTTEvent(4, "WAVEEND", 0, 8, None),
+    NormalizedSQTTEvent(2, "WAVERDY", 0, None, None), NormalizedSQTTEvent(2, "WAVESTART", 1, None, None),
+    NormalizedSQTTEvent(2, "INST", 1, 0, "BARRIER"), NormalizedSQTTEvent(3, "WAVERDY", 1, None, None),
+    NormalizedSQTTEvent(3, "INST", 0, 4, "SALU"), NormalizedSQTTEvent(4, "INST", 1, 4, "SALU"),
+    NormalizedSQTTEvent(5, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(6, "WAVEEND", 0, 8, None),
+    NormalizedSQTTEvent(6, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(7, "WAVEEND", 1, 8, None),
   ]),
 }
 
@@ -910,6 +912,10 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
   "compose_salu_queue": (TraceCase("compose_salu_queue", [s_mov_b32(s[0], 1)] + [
     s_add_u32(s[0], s[0], 1) for _ in range(11)] + [s_endpgm()], local_size=32),
     [0, 1, 2, 2, 3, 4, 4, 5, 6, 6, 7, 8, 8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 22, 24]),
+  "compose_lds_read_queue": (TraceCase("compose_lds_read_queue", [
+    ds_load_b32(vdst=v[2+i], addr=v[0]) for i in range(4)] + [s_endpgm()], local_size=32), [0, 1, 2, 3, 3, 4, 5, 6]),
+  "compose_lds_write_queue": (TraceCase("compose_lds_write_queue", [
+    ds_store_b32(addr=v[0], data0=v[1]) for _ in range(4)] + [s_endpgm()], local_size=32), [0, 1, 2, 3, 3, 5, 7, 9]),
   "compose_salu_valu": (TraceCase("compose_salu_valu", [
     s_mov_b32(s[0], 1), v_mov_b32_e32(v[0], s[0]), v_add_f32_e32(v[1], v[0], v[0]), s_add_u32(s[1], s[0], 2),
     v_rcp_f32_e32(v[2], v[1]), s_endpgm(),
@@ -991,6 +997,14 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
 MULTIWAVE_CASES = {
   "multi_wave_salu": TraceCase("multi_wave_salu", [s_mov_b32(s[0], 1)] + [s_add_u32(s[0], s[0], 1) for _ in range(6)] + [s_endpgm()],
                                local_size=160),
+  "multi_wave_valu": TraceCase("multi_wave_valu", [v_mov_b32_e32(v[0], 1)] + [
+    v_add_f32_e32(v[0], v[0], v[0]) for _ in range(6)] + [s_endpgm()], local_size=96),
+  "multi_wave_lds": TraceCase("multi_wave_lds", [ds_load_b32(vdst=v[2+i], addr=v[0]) for i in range(4)] + [s_endpgm()], local_size=96),
+}
+
+MULTIWAVE_EXEC_TIMES = {
+  "multi_wave_valu": [6, 12, 17, 22, 27, 32, 37, 38, 43, 48, 53, 58, 63, 68],
+  "multi_wave_lds": list(range(3, 15)),
 }
 
 EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
@@ -1085,8 +1099,21 @@ class TestSQTTCycleModel(unittest.TestCase):
     self.assertFalse(_selected_trace_slot(packet(wgp=(selected["wgp"] + 1) % 8)))
 
   def test_multi_wave_selected_simd(self):
-    got = _instruction_events(_run_mock_trace(MULTIWAVE_CASES["multi_wave_salu"]))
-    self.assertEqual([event.wave for event in got], [0] * 7 + [1] * 7 + [2] * 7)
+    for name, expected in {"multi_wave_salu": [0] * 7 + [1] * 7 + [2] * 7,
+                           "multi_wave_valu": [0] * 7 + [1] * 7,
+                           "multi_wave_lds": [0] * 4 + [1] * 4}.items():
+      with self.subTest(name=name):
+        got = _instruction_events(_run_mock_trace(MULTIWAVE_CASES[name]))
+        self.assertEqual([event.wave for event in got], expected)
+
+  def test_multi_wave_execution(self):
+    for name, expected in MULTIWAVE_EXEC_TIMES.items():
+      with self.subTest(name=name):
+        trace = _run_mock_trace(MULTIWAVE_CASES[name])
+        base = _instruction_events(trace)[0].time
+        exec_events = [event for event in trace if event.kind in {"ALUEXEC", "VMEMEXEC"}]
+        self.assertEqual([event.time - base for event in exec_events], expected)
+        if name == "multi_wave_lds": self.assertEqual([event.op for event in exec_events], ["LDS"] * 4 + ["LDS_ALT"] * 4 + ["LDS"] * 4)
 
 @unittest.skipUnless(getenv("SQTT_CYCLE_HW", 0), "set SQTT_CYCLE_HW=1 to run hardware SQTT cycle comparisons")
 class TestSQTTHardwareCycle(unittest.TestCase):
@@ -1124,6 +1151,17 @@ class TestSQTTHardwareCycle(unittest.TestCase):
         got = _timed_events(_run_hardware_trace(case, min_instructions=len(_instruction_events(want))))
         if case.normalize_exec_start: got, want = _normalize_exec_start(got), _normalize_exec_start(want)
         if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: self.fail(msg)
+
+  def test_hardware_multi_wave_execution(self):
+    if not getenv("SQTT_CYCLE_STRICT", 0): self.skipTest("set SQTT_CYCLE_STRICT=1 to require exact cycle timestamps")
+    for name, expected in MULTIWAVE_EXEC_TIMES.items():
+      with self.subTest(name=name):
+        case = MULTIWAVE_CASES[name]
+        trace = _run_hardware_trace(case, min_instructions=len(_instruction_events(_run_mock_trace(case))))
+        base = _instruction_events(trace)[0].time
+        exec_events = [event for event in trace if event.kind in {"ALUEXEC", "VMEMEXEC"}]
+        self.assertEqual([event.time - base for event in exec_events], expected)
+        if name == "multi_wave_lds": self.assertEqual(sorted(event.op for event in exec_events), ["LDS"] * 8 + ["LDS_ALT"] * 4)
 
 if __name__ == "__main__":
   unittest.main()
