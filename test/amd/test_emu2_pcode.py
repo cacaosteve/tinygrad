@@ -147,6 +147,12 @@ class TestForLoopParsing(unittest.TestCase):
     _vrs, assigns = parse_pcode(pcode, {'S0': S0})
     self.assertEqual(len(assigns), 1)
 
+  def test_c_style_nested_blocks(self):
+    body = "if (1) {\nfor (i = 0; i < 2; i++) {\nD0 = D0 + 1;\n}\n"
+    for pcode in (body + "}\n", body):
+      env, _ = parse_pcode(pcode, {'D0': UOp.const(0, dtypes.uint32)})
+      self.assertEqual(env['D0'].simplify().val, 2)
+
 class TestDSPcodePatterns(unittest.TestCase):
   """Test DS instruction pcode patterns."""
 
