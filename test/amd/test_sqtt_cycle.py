@@ -915,6 +915,19 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
 
 COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
   "compose_salu_overlap": (TraceCase("compose_salu_overlap", [s_add_u32(s[0], s[0], 1), s_endpgm()], local_size=32), [0, 4]),
+  "compose_salu_warm_overlap": (TraceCase("compose_salu_warm_overlap", [
+    s_mov_b32(s[1], 1), s_add_u32(s[0], s[0], 1), s_endpgm()], local_size=32), [0, 1, 2, 5]),
+  "compose_salu_gap_overlap": (TraceCase("compose_salu_gap_overlap", [
+    s_mov_b32(s[0], 1), v_lshlrev_b64(v[8:9], 2, v[0:1]), s_add_u32(s[1], s[1], 1), s_endpgm()], local_size=32),
+    [0, 1, 2, 6, 10, 11]),
+  "compose_salu_anti_dependency": (TraceCase("compose_salu_anti_dependency", [
+    s_add_u32(s[0], s[1], 2), s_mov_b32(s[1], 1), s_endpgm()], local_size=32), [0, 1, 4, 5]),
+  "compose_salu_mul_startup": (TraceCase("compose_salu_mul_startup", [
+    s_mul_i32(s[1], s[3], s[0]), s_endpgm()], local_size=32), [0, 5]),
+  "compose_salu_mul_initialized": (TraceCase("compose_salu_mul_initialized", [
+    s_mov_b32(s[3], 1), s_mov_b32(s[0], 1), s_mul_i32(s[1], s[3], s[0]), s_endpgm()], local_size=32), [0, 1, 2, 2, 3, 6]),
+  "compose_interleaved_read_warmup": (TraceCase("compose_interleaved_read_warmup", [
+    v_mov_b32_e32(v[3], 2), s_mov_b32(s[1], 1), v_add_f32_e32(v[0], v[0], v[0]), s_endpgm()], local_size=32), [0, 1, 2, 3, 6, 10]),
   "compose_salu_overlap_wait": (TraceCase("compose_salu_overlap_wait", [
     s_add_u32(s[0], s[0], 1), s_waitcnt(simm16=0), s_endpgm()], local_size=32), [0, 3, 4]),
   "compose_salu_no_overlap_wait": (TraceCase("compose_salu_no_overlap_wait", [
@@ -943,6 +956,9 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
     v_rcp_f32_e32(v[0], v[1]), v_add_f32_e32(v[2], v[0], v[0]), v_rcp_f32_e32(v[3], v[2]),
     v_add_f32_e32(v[4], v[3], v[3]), s_endpgm(),
   ], local_size=32), [0, 1, 4, 5, 9, 19, 24, 34]),
+  "compose_trans_to_valub": (TraceCase("compose_trans_to_valub", [
+    v_rcp_f32_e32(v[0], v[1]), v_lshlrev_b64(v[8:9], 4, v[0:1]), s_endpgm(),
+  ], local_size=32), [0, 4, 9, 20]),
   "compose_lds_no_wait": (TraceCase("compose_lds_no_wait", [
     v_lshlrev_b32_e32(v[1], 2, v[0]), ds_store_b32(addr=v[1], data0=v[0]), ds_load_b32(vdst=v[2], addr=v[1]),
     v_add_f32_e32(v[3], v[2], v[2]), v_rcp_f32_e32(v[4], v[3]), s_endpgm(),
@@ -1024,8 +1040,8 @@ MULTIWAVE_EXEC_TIMES = {
 
 EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
   "salu_chain": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU")],
-  "salu_mul_i32": [("ALUEXEC", 3, "SALU"), ("ALUEXEC", 5, "SALU")],
-  "salu_mul_hi": [("ALUEXEC", 3, "SALU"), ("ALUEXEC", 5, "SALU")],
+  "salu_mul_i32": [("ALUEXEC", 5, "SALU"), ("ALUEXEC", 7, "SALU")],
+  "salu_mul_hi": [("ALUEXEC", 5, "SALU"), ("ALUEXEC", 7, "SALU")],
   "call_return": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 30, "SALU")],
   "salu_saveexec": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU"), ("ALUEXEC", 5, "SALU")],
   "valu_independent": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 7, "VALU"), ("ALUEXEC", 8, "VALU")],
