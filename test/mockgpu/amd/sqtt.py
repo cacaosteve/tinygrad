@@ -101,6 +101,7 @@ def _mem_op(inst, op_name: str) -> InstOp:
   data_words = max(1, (int(inst.canonical_op_bits.get("data", 32)) + 31) // 32)
   if issubclass(t, _GLOBAL):
     scalar_base = (saddr:=_field_offset(getattr(inst, "saddr", None))) is not None and saddr < 124
+    if "ATOMIC" in op_name: return InstOp.SGMEM_WR_6
     if not is_store: return InstOp.SGMEM_RD_1 if scalar_base else InstOp.SGMEM_RD_2
     return InstOp[f"SGMEM_WR_{data_words + (1 if scalar_base else 2)}"]
   if issubclass(t, _FLAT + _SCRATCH):

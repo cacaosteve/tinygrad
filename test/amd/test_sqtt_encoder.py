@@ -27,6 +27,7 @@ class TestSQTTEncoder(unittest.TestCase):
       (global_store_b64(addr=v[0:1], data=v[2:3], saddr=NULL), InstOp.SGMEM_WR_4),
       (global_store_b96(addr=v[0:1], data=v[2:4], saddr=NULL), InstOp.SGMEM_WR_5),
       (global_store_b128(addr=v[0:1], data=v[2:5], saddr=NULL), InstOp.SGMEM_WR_6),
+      (global_atomic_add_u32(addr=v[0], data=v[1], saddr=s[2:3]), InstOp.SGMEM_WR_6),
       (flat_load_b32(vdst=v[2], addr=v[0:1]), InstOp.FLAT_RD_2),
       (flat_store_b32(addr=v[0:1], data=v[2]), InstOp.FLAT_WR_3),
       (flat_store_b64(addr=v[0:1], data=v[2:3]), InstOp.FLAT_WR_4),
