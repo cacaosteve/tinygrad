@@ -84,7 +84,8 @@ def _valu_op(op_name: str) -> InstOp|None:
   if _VALUT_4_RE.search(op_name): return InstOp.VALUT_4
   return None
 
-def _mem_op(t: type, op_name: str) -> InstOp:
+def _mem_op(inst, op_name: str) -> InstOp:
+  t = type(inst)
   is_store = "STORE" in op_name
   if issubclass(t, _DS):
     if "PERMUTE" in op_name: return InstOp.LDS_WR_2
@@ -97,9 +98,13 @@ def _mem_op(t: type, op_name: str) -> InstOp:
     if "_B96" in op_name: return InstOp.LDS_WR_4
     if "_B64" in op_name: return InstOp.LDS_WR_3
     return InstOp.LDS_WR_2
-  if issubclass(t, _GLOBAL): return InstOp.SGMEM_WR_2 if is_store else InstOp.SGMEM_RD_1
-  if issubclass(t, _FLAT): return InstOp.FLAT_WR_3 if is_store else InstOp.FLAT_RD_2
-  if issubclass(t, _SCRATCH): return InstOp.FLAT_WR_3 if is_store else InstOp.FLAT_RD_2
+  data_words = max(1, (int(inst.canonical_op_bits.get("data", 32)) + 31) // 32)
+  if issubclass(t, _GLOBAL):
+    scalar_base = (saddr:=_field_offset(getattr(inst, "saddr", None))) is not None and saddr < 124
+    if not is_store: return InstOp.SGMEM_RD_1 if scalar_base else InstOp.SGMEM_RD_2
+    return InstOp[f"SGMEM_WR_{data_words + (1 if scalar_base else 2)}"]
+  if issubclass(t, _FLAT + _SCRATCH):
+    return InstOp[f"FLAT_WR_{data_words + 2}"] if is_store else InstOp.FLAT_RD_2
   return InstOp.SALU
 
 def _op_duration(op: InstOp|None) -> int:
@@ -482,7 +487,7 @@ class RDNA3SQTTTraceBuilder:
                         trans_pipe=valu_op.name.startswith(("VALUB_", "VALUT_")))
     if issubclass(inst_type, _SMEM):
       return _TraceInfo(INST, {"op": InstOp.SMEM_RD}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
-    mem_op = _mem_op(inst_type, op_name)
+    mem_op = _mem_op(inst, op_name)
     if mem_op.name.startswith("LDS"):
       is_permute = "PERMUTE" in op_name
       is_2addr_load = "_2ADDR" in op_name and "LOAD" in op_name

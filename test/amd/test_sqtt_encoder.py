@@ -1,7 +1,9 @@
 import ctypes, unittest
 from tinygrad.helpers import Context
 from tinygrad.renderer.amd.sqtt import decode, LAYOUT_HEADER, WAVESTART, WAVEEND, INST, IMMEDIATE, VALUINST, InstOp
+from tinygrad.renderer.amd.dsl import NULL
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
+from test.mockgpu.amd.sqtt import _mem_op, _op_name
 
 def _run_kernel(instructions: list, lx=1, ly=1, lz=1, gx=1, gy=1, gz=1, args_ptr=0) -> bytes:
   from test.mockgpu.amd.emu import run_asm, sqtt_traces
@@ -15,6 +17,26 @@ def _run_kernel(instructions: list, lx=1, ly=1, lz=1, gx=1, gy=1, gz=1, args_ptr
   return sqtt_traces.pop()
 
 class TestSQTTEncoder(unittest.TestCase):
+  def test_memory_instruction_classes(self):
+    cases = [
+      (global_load_b32(vdst=v[2], addr=v[0], saddr=s[2:3]), InstOp.SGMEM_RD_1),
+      (global_load_b32(vdst=v[2], addr=v[0:1], saddr=NULL), InstOp.SGMEM_RD_2),
+      (global_store_b32(addr=v[0], data=v[2], saddr=s[2:3]), InstOp.SGMEM_WR_2),
+      (global_store_b64(addr=v[0], data=v[2:3], saddr=s[2:3]), InstOp.SGMEM_WR_3),
+      (global_store_b32(addr=v[0:1], data=v[2], saddr=NULL), InstOp.SGMEM_WR_3),
+      (global_store_b64(addr=v[0:1], data=v[2:3], saddr=NULL), InstOp.SGMEM_WR_4),
+      (global_store_b96(addr=v[0:1], data=v[2:4], saddr=NULL), InstOp.SGMEM_WR_5),
+      (global_store_b128(addr=v[0:1], data=v[2:5], saddr=NULL), InstOp.SGMEM_WR_6),
+      (flat_load_b32(vdst=v[2], addr=v[0:1]), InstOp.FLAT_RD_2),
+      (flat_store_b32(addr=v[0:1], data=v[2]), InstOp.FLAT_WR_3),
+      (flat_store_b64(addr=v[0:1], data=v[2:3]), InstOp.FLAT_WR_4),
+      (flat_store_b96(addr=v[0:1], data=v[2:4]), InstOp.FLAT_WR_5),
+      (flat_store_b128(addr=v[0:1], data=v[2:5]), InstOp.FLAT_WR_6),
+      (scratch_store_b128(addr=v[0], data=v[2:5], saddr=NULL), InstOp.FLAT_WR_6),
+    ]
+    for inst, expected in cases:
+      with self.subTest(inst=inst): self.assertEqual(_mem_op(inst, _op_name(inst)), expected)
+
   def test_simple_salu(self):
     blob = _run_kernel([s_mov_b32(s[0], 42), s_endpgm()])
     packets = list(decode(blob))
