@@ -130,6 +130,9 @@ def _field_offset(x: Any) -> int|None:
   if hasattr(x, "offset"): return int(x.offset)
   return int(x) if isinstance(x, int) else None
 
+def _has_operand(inst, name: str) -> bool:
+  return not hasattr(inst, "op_bits") or not inst.op_bits or name in inst.op_bits
+
 def _vgpr_offsets(x: Any) -> set[int]:
   if (off:=_field_offset(x)) is None or off < 256: return set()
   base = off - (384 if off >= 384 else 256)
@@ -142,8 +145,9 @@ def _wmma_exec_latency(inst) -> int:
 def _src_vgprs(inst) -> set[int]:
   ret: set[int] = set()
   for name in ("src0", "src1", "src2", "srcx0", "srcy0"):
-    ret.update(_vgpr_offsets(getattr(inst, name, None)))
+    if _has_operand(inst, name): ret.update(_vgpr_offsets(getattr(inst, name, None)))
   for name in ("vsrc0", "vsrc1", "vsrc2", "vsrcx1", "vsrcy1", "data0", "data1", "addr"):
+    if not _has_operand(inst, name): continue
     if (off:=_field_offset(getattr(inst, name, None))) is not None:
       ret.add(off - (384 if off >= 384 else 256) if off >= 256 else off)
   if "FMAC" in _op_name(inst) or "DOT2ACC" in _op_name(inst): ret.update(_vgpr_offsets(getattr(inst, "vdst", None)))
@@ -153,6 +157,7 @@ def _dst_vgprs(inst, op_name: str) -> set[int]:
   ret: set[int] = set()
   if "STORE" not in op_name:
     for name in ("vdst", "vdstx", "vdsty"):
+      if not _has_operand(inst, name): continue
       x = getattr(inst, name, None)
       if (off:=_field_offset(x)) is not None:
         base = off - 256 if off >= 256 else off
@@ -163,12 +168,14 @@ def _dst_vgprs(inst, op_name: str) -> set[int]:
 def _src_sgprs(inst) -> set[int]:
   ret: set[int] = set()
   for name in ("src0", "src1", "src2", "ssrc0", "ssrc1", "sbase", "soffset", "saddr"):
+    if not _has_operand(inst, name): continue
     if (off:=_field_offset(getattr(inst, name, None))) is not None and off < 128: ret.add(off)
   return ret
 
 def _dst_sgprs(inst) -> set[int]:
   ret: set[int] = set()
   for name in ("sdst", "sdata"):
+    if not _has_operand(inst, name): continue
     if (off:=_field_offset(getattr(inst, name, None))) is not None and off < 128: ret.add(off)
   return ret
 
@@ -382,6 +389,7 @@ class RDNA3SQTTTraceBuilder:
         st.vgpr_exec_ready[reg] -= 1
         st.vgpr_forward_ready[reg] -= 1
         st.vgpr_interp_ready[reg] -= 1
+        if reg in st.vgpr_lds_ready: st.vgpr_lds_ready[reg] -= 1
 
   def _shift_cross_interp_producers(self, st: _WaveState, src_vgprs: set[int], interp: bool) -> None:
     events = {st.vgpr_exec_event[r] for r in src_vgprs if r in st.vgpr_exec_event and
@@ -483,6 +491,8 @@ class RDNA3SQTTTraceBuilder:
     wave = wave_id // _CU_SIMDS & 0x1F
     src_vgprs, src_sgprs = _src_vgprs(inst), _src_sgprs(inst)
     dst_vgprs, dst_sgprs = _dst_vgprs(inst, _op_name(inst)), _dst_sgprs(inst)
+    if info.pipe == "lds" or (info.pipe == "valu" and not info.matrix):
+      self._shift_cross_interp_producers(st, src_vgprs, info.interp if info.pipe == "valu" else False)
     vgpr_ready = st.vgpr_lds_ready if info.pipe == "lds" else st.vgpr_ready
     src_ready = max([vgpr_ready.get(r, st.vgpr_ready.get(r, 0)) for r in src_vgprs] +
                     [st.sgpr_ready.get(r, 0) for r in src_sgprs] +
@@ -516,7 +526,8 @@ class RDNA3SQTTTraceBuilder:
                    self.lds_exec_ready if info.pipe == "lds" else getattr(st, f"{info.pipe}_exec_ready")
       if info.pipe == "salu":
         dep_ready = max([st.sgpr_exec_ready.get(r, 0) + info.forward_latency for r in src_sgprs if r in st.sgpr_exec_ready] + [0])
-        exec_time = max(issue + info.exec_latency + (2 if salu_read_stall and src_sgprs else 0), exec_ready, dep_ready)
+        overlap_stall = 2 if any(r in dst_sgprs and r not in st.sgpr_exec_ready for r in src_sgprs) else 0
+        exec_time = max(issue + info.exec_latency + overlap_stall + (2 if salu_read_stall and src_sgprs else 0), exec_ready, dep_ready)
       elif info.pipe == "valu":
         if not info.trans and src_vgprs and any(5 <= dep <= 7 for dep in active_delays): latency = 8
         elif not info.trans and any(st.vgpr_lds_pending.get(r, False) for r in src_vgprs): latency = 8
@@ -524,7 +535,6 @@ class RDNA3SQTTTraceBuilder:
         elif src_vgprs and info.vgpr_read_latency is not None:
           latency = info.vgpr_read_latency - (len(st.valu_exec_history) >= _VALU_READ_WARMUP)
         else: latency = info.exec_latency
-        if not info.matrix: self._shift_cross_interp_producers(st, src_vgprs, info.interp)
         if info.trans and st.had_lds:
           events = {st.vgpr_exec_event[r] for r in src_vgprs if r in st.vgpr_exec_event and
                     not st.vgpr_producer_trans.get(r, False) and st.vgpr_producer_shiftable.get(r, False)}
@@ -559,7 +569,8 @@ class RDNA3SQTTTraceBuilder:
     if info.pipe:
       setattr(st, f"{info.pipe}_ready", issue + info.issue_latency)
       if info.trans_pipe: st.trans_ready = issue + info.duration
-      if info.pipe in {"valu", "lds", "vmem"}: st.immediate_ready = max(st.immediate_ready, issue + 3)
+      if info.trans_pipe and not info.trans: st.salu_ready = max(st.salu_ready, issue + 5)
+      if info.pipe in {"salu", "valu", "lds", "vmem"}: st.immediate_ready = max(st.immediate_ready, issue + 3)
     ready = issue + (info.duration if info.dst_latency is None else info.dst_latency)
     if lds_pending and info.dst_latency is not None: ready += 1
     if info.pipe == "lds" and dst_vgprs: st.valu_ready = max(st.valu_ready, ready)
