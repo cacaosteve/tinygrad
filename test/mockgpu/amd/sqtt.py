@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, replace
 import re
 from typing import Any
 
+from tinygrad.helpers import getenv
 from tinygrad.renderer.amd.sqtt import (ALUEXEC, IMMEDIATE, INST, LAYOUT_HEADER, PACKET_TYPES_RDNA3, TS_DELTA_OR_MARK, VALUINST,
   VMEMEXEC, WAVEEND, WAVERDY, WAVESTART, AluSrc, InstOp, MemSrc, PacketType, _build_decode_tables)
 from tinygrad.runtime.autogen.amd.cdna import ins as irc
@@ -74,7 +75,8 @@ _VALUB_4_RE = re.compile(r"V_MAD_(U|I)64")
 _VALUB_16_RE = re.compile(r"V_\w+_F64")
 _DS_ATOMIC_RE = re.compile(r"DS_(ADD|SUB|RSUB|INC|DEC|MIN|MAX|AND|OR|XOR|MSKOR)(_|$)")
 _SALU_3_CYCLE = {"S_MUL_I32", "S_MULK_I32", "S_MUL_HI_I32", "S_MUL_HI_U32"}
-_VALU_INFLIGHT_LIMIT, _VALUB_INFLIGHT_LIMIT, _TRANS_INFLIGHT_LIMIT, _VALU_READ_WARMUP = 12, 8, 5, 7
+_SALU_INFLIGHT_LIMIT, _VALU_INFLIGHT_LIMIT, _VALUB_INFLIGHT_LIMIT, _TRANS_INFLIGHT_LIMIT, _VALU_READ_WARMUP = 6, 12, 8, 5, 7
+_CU_SIMDS = 2
 
 def _op_name(inst) -> str:
   if hasattr(inst, "opx"): return f"{inst.opx.name}_{inst.opy.name}"
@@ -270,6 +272,19 @@ class _VALUInstructionBuffer:
     for reg in dsts: self.reg_chains[reg] = chains
 
 @dataclass
+class _SALUInstructionBuffer:
+  entries: list[int] = field(default_factory=list)
+
+  def issue_ready(self, base_issue: int) -> int:
+    active = [retire for retire in self.entries if retire > base_issue]
+    if len(active) >= _SALU_INFLIGHT_LIMIT: base_issue = min(active)
+    return base_issue
+
+  def record(self, exec_time: int) -> None:
+    # The retiring instruction remains resident through its ALU execution cycle.
+    self.entries.append(exec_time + 1)
+
+@dataclass
 class _WaveState:
   issue: int = 2
   salu_ready: int = 2
@@ -329,6 +344,10 @@ class RDNA3SQTTTraceBuilder:
     self.waves: dict[int, _WaveState] = {}
     self.started: set[int] = set()
     self.workgroup_waves = workgroup_waves
+    self.selected_simd = getenv("SQTT_SIMD_SEL", 0)
+    self.selected_sa, self.selected_wgp = getenv("SQTT_SA_SEL", 0), getenv("SQTT_WGP_SEL", 0)
+    self.salu_ib, self.salu_exec_ready = _SALUInstructionBuffer(), 2
+    self.issue_ready = 2
     self.seq = 0
     self._add(0, LAYOUT_HEADER, layout=3, sel_a=6)
 
@@ -340,9 +359,12 @@ class RDNA3SQTTTraceBuilder:
   def _wave(self, wave_id: int) -> _WaveState:
     if wave_id not in self.waves: self.waves[wave_id] = _WaveState()
     if wave_id not in self.started:
-      self._add(1, WAVESTART, simd=0, wgp=0, wave=wave_id & 0x1F, id7=wave_id)
+      simd, wave = wave_id % _CU_SIMDS, wave_id // _CU_SIMDS
+      self._add(wave_id + 1, WAVESTART, sa=self.selected_sa, simd=simd, wgp=self.selected_wgp, wave=wave & 0x1F, id7=wave_id)
       self.started.add(wave_id)
     return self.waves[wave_id]
+
+  def _traced_wave(self, wave_id: int) -> bool: return wave_id % _CU_SIMDS == self.selected_simd
 
   @staticmethod
   def _delay_ready(st: _WaveState, dep: int) -> int:
@@ -448,9 +470,10 @@ class RDNA3SQTTTraceBuilder:
     return _TraceInfo(INST, {"op": mem_op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
 
   def emit(self, wave_id: int, inst, branch_taken: bool|None) -> None:
+    st = self._wave(wave_id)
+    if not self._traced_wave(wave_id): return
     inst_op = inst.op.value if hasattr(inst, "op") else 0
     if isinstance(inst, _SOPP) and inst_op == SOPPOp3.S_DELAY_ALU.value:
-      st = self._wave(wave_id)
       st.trans_warm = False
       imm = getattr(inst, "simm16", 0)
       if (dep0:=imm & 0xF): st.pending_delays.append((0, dep0))
@@ -458,7 +481,7 @@ class RDNA3SQTTTraceBuilder:
       return
     info = self._classify(inst, branch_taken)
     if info.pkt_cls is None: return
-    st, wave = self._wave(wave_id), wave_id & 0x1F
+    wave = wave_id // _CU_SIMDS & 0x1F
     src_vgprs, src_sgprs = _src_vgprs(inst), _src_sgprs(inst)
     dst_vgprs, dst_sgprs = _dst_vgprs(inst, _op_name(inst)), _dst_sgprs(inst)
     vgpr_ready = st.vgpr_lds_ready if info.pipe == "lds" else st.vgpr_ready
@@ -472,7 +495,9 @@ class RDNA3SQTTTraceBuilder:
     immediate_ready = st.immediate_ready + info.immediate_delay if info.pkt_cls == IMMEDIATE and st.immediate_ready else 0
     active_delays = [dep for skip, dep in st.pending_delays if skip == 0]
     delay_ready = max([self._delay_ready(st, dep) for dep in active_delays] + [0])
-    base_issue = max(st.issue, pipe_ready, src_ready, immediate_ready, delay_ready)
+    base_issue = max(st.issue, self.issue_ready, pipe_ready, src_ready, immediate_ready, delay_ready)
+    salu_alu = info.pipe == "salu" and info.exec_cls is ALUEXEC and info.exec_kwargs.get("src") == AluSrc.SALU
+    if salu_alu: base_issue = self.salu_ib.issue_ready(base_issue)
     valu_chains: frozenset[int]|None = None
     if info.pipe == "valu" and not info.matrix:
       valub = info.trans_pipe and not info.trans
@@ -487,7 +512,7 @@ class RDNA3SQTTTraceBuilder:
 
     exec_time = issue
     if info.exec_cls is not None and info.pipe is not None:
-      exec_ready = getattr(st, f"{info.pipe}_exec_ready")
+      exec_ready = self.salu_exec_ready if info.pipe == "salu" else getattr(st, f"{info.pipe}_exec_ready")
       if info.pipe == "salu":
         dep_ready = max([st.sgpr_exec_ready.get(r, 0) + info.forward_latency for r in src_sgprs if r in st.sgpr_exec_ready] + [0])
         exec_time = max(issue + info.exec_latency + (2 if salu_read_stall and src_sgprs else 0), exec_ready, dep_ready)
@@ -519,9 +544,11 @@ class RDNA3SQTTTraceBuilder:
           valub_ready = st.valub_exec_ready if info.trans_pipe and not info.trans else 0
           exec_time = max(issue + latency, exec_ready, dep_ready, valub_ready)
       else: exec_time = max(issue + info.exec_latency, exec_ready)
-      setattr(st, f"{info.pipe}_exec_ready", exec_time + info.exec_release)
+      if info.pipe == "salu": self.salu_exec_ready = exec_time + info.exec_release
+      else: setattr(st, f"{info.pipe}_exec_ready", exec_time + info.exec_release)
     if info.pipe is not None and info.exec_block:
-      setattr(st, f"{info.pipe}_exec_ready", max(getattr(st, f"{info.pipe}_exec_ready"), issue + info.exec_block))
+      if info.pipe == "salu": self.salu_exec_ready = max(self.salu_exec_ready, issue + info.exec_block)
+      else: setattr(st, f"{info.pipe}_exec_ready", max(getattr(st, f"{info.pipe}_exec_ready"), issue + info.exec_block))
     exec_event = self._add(exec_time, info.exec_cls, **info.exec_kwargs) if info.exec_cls is not None else None
     if info.barrier: self._add(issue + 1, WAVERDY, mask=1 << wave)
 
@@ -572,15 +599,19 @@ class RDNA3SQTTTraceBuilder:
       if not info.matrix:
         assert valu_chains is not None
         st.valu_ib.record(exec_time, chains=valu_chains, dsts=dst_vgprs, trans=info.trans)
-    if info.pipe == "salu" and info.exec_cls is not None: st.salu_exec_history.append(exec_time)
+    if info.pipe == "salu" and info.exec_cls is not None:
+      st.salu_exec_history.append(exec_time)
+      if salu_alu: self.salu_ib.record(exec_time)
     st.pending_delays = [(skip - 1, dep) for skip, dep in st.pending_delays if skip > 0]
     st.trans_warm = info.nop
+    self.issue_ready = issue + 1
     st.issue, st.last_time = issue + info.issue_latency, max(st.last_time, exec_time, ready)
 
   def finish(self, wave_id: int) -> None:
     if wave_id not in self.started: return
-    st, wave = self.waves[wave_id], wave_id & 0x1F
-    self._add(max(st.issue, st.last_time + 1, st.lgkm_ready + 1), WAVEEND, simd=0, wgp=0, wave=wave)
+    st, simd, wave = self.waves[wave_id], wave_id % _CU_SIMDS, wave_id // _CU_SIMDS & 0x1F
+    self._add(max(wave_id + 2, st.issue, st.last_time + 1, st.lgkm_ready + 1), WAVEEND,
+              sa=self.selected_sa, simd=simd, wgp=self.selected_wgp, wave=wave)
 
   def finalize(self) -> bytes:
     nibbles: list[int] = []

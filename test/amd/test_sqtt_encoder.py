@@ -76,6 +76,9 @@ class TestSQTTEncoder(unittest.TestCase):
     packets = list(decode(blob))
     self.assertEqual(sum(1 for p in packets if isinstance(p, WAVESTART)), 2)
     self.assertEqual(sum(1 for p in packets if isinstance(p, WAVEEND)), 2)
+    self.assertEqual([p.wave for p in packets if isinstance(p, INST)], [0])
+    starts = {(p.simd, p.wave): p._time for p in packets if isinstance(p, WAVESTART)}
+    self.assertTrue(all(starts[(p.simd, p.wave)] < p._time for p in packets if isinstance(p, WAVEEND)))
 
   def test_branch_taken_and_not_taken(self):
     """A loop with s_cbranch_scc1 emits JUMP when taken, JUMP_NO on final iteration."""

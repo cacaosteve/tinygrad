@@ -75,14 +75,19 @@ def _rebase(events: Iterable[NormalizedSQTTEvent]) -> list[NormalizedSQTTEvent]:
   base = min((e.time for e in ret), default=0)
   return [NormalizedSQTTEvent(e.time - base, e.kind, e.wave, e.pc, e.op) for e in ret]
 
+def _selected_trace_slot(pkt) -> bool:
+  return pkt.simd == getenv("SQTT_SIMD_SEL", 0) and pkt.sa == getenv("SQTT_SA_SEL", 0) and pkt.wgp == getenv("SQTT_WGP_SEL", 0)
+
 def normalize_controlled_hardware_trace(blob: bytes, instructions: list) -> list[NormalizedSQTTEvent]:
   pc_map, wave_pc, wave_returns, events = _pc_map(instructions), {}, {}, []
   for pkt in decode(blob):
     if isinstance(pkt, (WAVESTART, WAVESTART_RDNA4)):
+      if not _selected_trace_slot(pkt): continue
       wave_pc[pkt.wave] = 0
       wave_returns[pkt.wave] = []
       events.append(NormalizedSQTTEvent(pkt._time, "WAVESTART", pkt.wave, None, None))
     elif isinstance(pkt, (WAVEEND, WAVEEND_RDNA4)):
+      if not _selected_trace_slot(pkt): continue
       events.append(NormalizedSQTTEvent(pkt._time, "WAVEEND", pkt.wave, wave_pc.pop(pkt.wave, None), None))
       wave_returns.pop(pkt.wave, None)
     elif isinstance(pkt, WAVERDY):
@@ -115,10 +120,12 @@ def normalize_mock_trace(blob: bytes, instructions: list) -> list[NormalizedSQTT
   pc_map, wave_pc, wave_returns, events = _pc_map(instructions), {}, {}, []
   for pkt in decode(blob):
     if isinstance(pkt, WAVESTART):
+      if not _selected_trace_slot(pkt): continue
       wave_pc[pkt.wave] = 0
       wave_returns[pkt.wave] = []
       events.append(NormalizedSQTTEvent(pkt._time, "WAVESTART", pkt.wave, None, None))
     elif isinstance(pkt, WAVEEND):
+      if not _selected_trace_slot(pkt): continue
       events.append(NormalizedSQTTEvent(pkt._time, "WAVEEND", pkt.wave, wave_pc.pop(pkt.wave), None))
       wave_returns.pop(pkt.wave)
     elif isinstance(pkt, WAVERDY):
@@ -155,6 +162,7 @@ def _asm_source(case: TraceCase) -> str:
   .amdhsa_next_free_vgpr {case.vgpr_count}
   .amdhsa_next_free_sgpr 16
   .amdhsa_wavefront_size32 1
+  .amdhsa_workgroup_processor_mode 0
   .amdhsa_system_vgpr_workitem_id 0
   .amdhsa_kernarg_size 0
   .amdhsa_group_segment_fixed_size 65536
@@ -891,16 +899,17 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
     NormalizedSQTTEvent(4, "WAVEEND", 0, 8, None),
   ]),
   "multi_wave_barrier": (TraceCase("multi_wave_barrier", [s_barrier(), s_mov_b32(s[0], 1), s_endpgm()], local_size=64), [
-    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(0, "WAVESTART", 1, None, None),
-    NormalizedSQTTEvent(1, "INST", 0, 0, "BARRIER"), NormalizedSQTTEvent(1, "INST", 1, 0, "BARRIER"),
-    NormalizedSQTTEvent(2, "WAVERDY", 0, None, None), NormalizedSQTTEvent(2, "WAVERDY", 1, None, None),
+    NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "BARRIER"),
+    NormalizedSQTTEvent(2, "WAVERDY", 0, None, None),
     NormalizedSQTTEvent(2, "INST", 0, 4, "SALU"), NormalizedSQTTEvent(2, "ALUEXEC", None, None, "SALU"),
-    NormalizedSQTTEvent(2, "INST", 1, 4, "SALU"), NormalizedSQTTEvent(2, "ALUEXEC", None, None, "SALU"),
-    NormalizedSQTTEvent(4, "WAVEEND", 0, 8, None), NormalizedSQTTEvent(4, "WAVEEND", 1, 8, None),
+    NormalizedSQTTEvent(4, "WAVEEND", 0, 8, None),
   ]),
 }
 
 COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
+  "compose_salu_queue": (TraceCase("compose_salu_queue", [s_mov_b32(s[0], 1)] + [
+    s_add_u32(s[0], s[0], 1) for _ in range(11)] + [s_endpgm()], local_size=32),
+    [0, 1, 2, 2, 3, 4, 4, 5, 6, 6, 7, 8, 8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 22, 24]),
   "compose_salu_valu": (TraceCase("compose_salu_valu", [
     s_mov_b32(s[0], 1), v_mov_b32_e32(v[0], s[0]), v_add_f32_e32(v[1], v[0], v[0]), s_add_u32(s[1], s[0], 2),
     v_rcp_f32_e32(v[2], v[1]), s_endpgm(),
@@ -977,6 +986,11 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
     v_add_f32_e32(v[i], v[i-1], v[i-1]) for i in range(1, 14)] + [
     v_rcp_f32_e32(v[14], v[13]), v_add_f32_e32(v[15], v[14], v[14]), s_endpgm()], local_size=32, vgpr_count=20),
     [0, 1, 2, 3, 4, 5, 6, 6, 7, 8, 9, 10, 11, 12, 12, 13, 16, 17, 21, 22, 27, 32, 37, 42, 47, 52, 57, 62, 67, 72, 77, 87]),
+}
+
+MULTIWAVE_CASES = {
+  "multi_wave_salu": TraceCase("multi_wave_salu", [s_mov_b32(s[0], 1)] + [s_add_u32(s[0], s[0], 1) for _ in range(6)] + [s_endpgm()],
+                               local_size=160),
 }
 
 EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
@@ -1059,6 +1073,21 @@ class TestSQTTCycleModel(unittest.TestCase):
     self.assertTrue(any(isinstance(pkt, ALUEXEC) and pkt.src == AluSrc.VALU_SALU for pkt in decode(first)))
     self.assertEqual(first, builder.finalize())
 
+  def test_selected_trace_slot(self):
+    selected = {"simd": getenv("SQTT_SIMD_SEL", 0), "sa": getenv("SQTT_SA_SEL", 0), "wgp": getenv("SQTT_WGP_SEL", 0)}
+    def packet(**fields):
+      raw = WAVESTART.encoding.default
+      for name, value in {**selected, "wave": 0, "id7": 0, **fields}.items(): raw = getattr(WAVESTART, name).set(raw, value)
+      return WAVESTART.from_raw(raw)
+    self.assertTrue(_selected_trace_slot(packet()))
+    self.assertFalse(_selected_trace_slot(packet(simd=(selected["simd"] + 1) % 4)))
+    self.assertFalse(_selected_trace_slot(packet(sa=1 - selected["sa"])))
+    self.assertFalse(_selected_trace_slot(packet(wgp=(selected["wgp"] + 1) % 8)))
+
+  def test_multi_wave_selected_simd(self):
+    got = _instruction_events(_run_mock_trace(MULTIWAVE_CASES["multi_wave_salu"]))
+    self.assertEqual([event.wave for event in got], [0] * 7 + [1] * 7 + [2] * 7)
+
 @unittest.skipUnless(getenv("SQTT_CYCLE_HW", 0), "set SQTT_CYCLE_HW=1 to run hardware SQTT cycle comparisons")
 class TestSQTTHardwareCycle(unittest.TestCase):
   @classmethod
@@ -1071,11 +1100,11 @@ class TestSQTTHardwareCycle(unittest.TestCase):
 
   def test_hardware_trace_order(self):
     cases = [(name, case, expected) for name, (case, expected) in CASES.items()] + \
-            [(name, case, _run_mock_trace(case)) for name, (case, _) in COMPOSITION_CASES.items()]
+            [(name, case, _run_mock_trace(case)) for name, (case, _) in COMPOSITION_CASES.items()] + \
+            [(name, case, _run_mock_trace(case)) for name, case in MULTIWAVE_CASES.items()]
     for name, case, expected in cases:
       with self.subTest(name=name):
         want = _instruction_events(expected)
-        if case.local_size > 32: want = [e for e in want if e.wave == 0]
         got = _instruction_events(_run_hardware_trace(case, min_instructions=len(want)))
         if (msg:=_first_mismatch(got, want, check_time=False, case=case)) is not None: self.fail(msg)
 
