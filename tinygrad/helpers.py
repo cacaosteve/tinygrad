@@ -1,9 +1,9 @@
 from __future__ import annotations
 import time
 START_TIME = time.perf_counter()
-import os, functools, platform, re, contextlib, operator, hashlib, pickle, sqlite3, tempfile, pathlib, string, ctypes, sys, gzip, getpass, gc
+import os, functools, re, contextlib, operator, hashlib, pickle, sqlite3, tempfile, pathlib, string, ctypes, sys, gzip, getpass, gc
 from collections import defaultdict
-import subprocess, shutil, math, types, copyreg, inspect, importlib, decimal, itertools, difflib
+import shutil, math, types, copyreg, inspect, importlib, decimal, itertools, difflib
 from dataclasses import dataclass, field, replace
 from typing import ClassVar, Iterable, Any, TypeVar, Callable, Sequence, TypeGuard, Iterator, Generic, Generator, cast, overload
 
@@ -13,8 +13,7 @@ U = TypeVar("U")
 def prod(x:Iterable[T]) -> T|int: return functools.reduce(operator.mul, x, 1)
 
 # NOTE: helpers is not allowed to import from anything else in tinygrad
-OSX, WIN = platform.system() == "Darwin", sys.platform == "win32"
-ARCH_X86 = any(x in platform.processor() for x in ("Intel", "i386", "x86_64"))
+OSX, WIN = sys.platform == "darwin", sys.platform == "win32"
 BASEDIR = pathlib.Path(__file__).parent
 
 # fix colors on Windows, https://stackoverflow.com/questions/12492810/python-how-can-i-make-the-ansi-escape-codes-to-work-also-in-windows
@@ -231,7 +230,7 @@ class _DEV(ContextVar):
 
 DEV, DEBUG, BEAM, NOOPT = _DEV("DEV", ""), ContextVar("DEBUG", 0), ContextVar("BEAM", 0), ContextVar("NOOPT", 0)
 IMAGE, FLOAT16, OPENPILOT_HACKS = ContextVar("IMAGE", 0), ContextVar("FLOAT16", 0), ContextVar("OPENPILOT_HACKS", 0)
-JIT, JIT_BATCH_SIZE = ContextVar("JIT", 2 if OSX and ARCH_X86 else 1), ContextVar("JIT_BATCH_SIZE", 32)
+JIT, JIT_BATCH_SIZE = ContextVar("JIT", 1), ContextVar("JIT_BATCH_SIZE", 32)
 CHUNK_SIZE = 2**20  # TinyFS content-addressed store: blob chunk + hash-tree node granularity
 WINO, CAPTURING, TRACEMETA, NO_COLOR = ContextVar("WINO", 0), ContextVar("CAPTURING", 1), ContextVar("TRACEMETA", 1), ContextVar("NO_COLOR", 0)
 TRAINING = ContextVar("TRAINING", 0)
@@ -454,9 +453,9 @@ def _ensure_downloads_dir() -> pathlib.Path:
   if pathlib.Path("/etc/tinybox-release").is_file():
     # try creating dir with sudo
     if not (downloads_dir := pathlib.Path("/raid/downloads")).exists():
-      subprocess.run(["sudo", "mkdir", "-p", downloads_dir], check=True)
-      subprocess.run(["sudo", "chown", "tiny:root", downloads_dir], check=True)
-      subprocess.run(["sudo", "chmod", "775", downloads_dir], check=True)
+      system(f"sudo mkdir -p {downloads_dir}")
+      system(f"sudo chown tiny:root {downloads_dir}")
+      system(f"sudo chmod 775 {downloads_dir}")
     return downloads_dir
   return pathlib.Path(cache_dir) / "downloads"
 
@@ -491,12 +490,13 @@ def fetch_fw(path:str, name:str, sha256:str) -> bytes:
   if sys.version_info >= (3,14) and (p:=pathlib.Path(f"/lib/firmware/{path}/{name}.zst")).is_file():
     from compression.zstd import decompress
     if hashlib.sha256(b:=decompress(p.read_bytes())).hexdigest() == sha256: return b
-  return fetch(f"https://gitlab.com/kernel-firmware/linux-firmware/-/raw/1e2c15348485939baf1b6d1f5a7a3b799d80703d/{path}/{name}",
+  return fetch(f"https://gitlab.com/kernel-firmware/linux-firmware/-/raw/0a6871b19abf5d6e024b5d208b101ae53e7fa0de/{path}/{name}",
                subdir="fw", sha256=sha256).read_bytes()
 
 # *** Exec helpers
 
 def system(cmd:str, **kwargs) -> str:
+  import subprocess
   st = time.perf_counter()
   try: ret = subprocess.check_output(cmd.split(), stderr=subprocess.STDOUT, **kwargs).decode().strip()
   except subprocess.CalledProcessError as e:

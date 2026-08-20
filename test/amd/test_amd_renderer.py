@@ -920,7 +920,7 @@ class TestAMDRenderer(unittest.TestCase):
     sinks = _software_sin_lowered_sinks()
     self.assertTrue(sinks)
     bad = [u for sink in sinks for u in sink.toposort()
-           if u.op in (Ops.CDIV, Ops.CMOD) and u.dtype.scalar() in (dtypes.long, dtypes.ulong)]
+           if u.op in (Ops.CDIV, Ops.CMOD) and u.dtype in (dtypes.long, dtypes.ulong)]
     self.assertEqual(bad, [], f"{len(bad)} raw 64-bit CDIV/CMOD survived lowering (would crash regalloc)")
 
   def test_custom_atomic_add_lowers_to_global_atomic(self):
@@ -2354,7 +2354,7 @@ class TestAMDRenderer(unittest.TestCase):
     prg = _multi_spill_program()
     _check_elf(self, prg)
     spill_ops = [u for u in _prg_lin(prg).src if u.op is Ops.INS and u.arg in (AMDOps.SPILL, AMDOps.FILL)]
-    slots = sorted({u.src[0].arg for u in spill_ops})
+    slots = sorted({amd_lib._const_int(u.src[0]) for u in spill_ops})
     self.assertGreaterEqual(len(slots), 2)
     self.assertGreaterEqual(_amd_desc(prg).private_segment_fixed_size, 8)
 

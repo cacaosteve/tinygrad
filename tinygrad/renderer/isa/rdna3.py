@@ -175,12 +175,16 @@ def _parallel_vmov(moves:list[tuple[Reg, Reg|int|float]]) -> list:
       pending = [(dst, TMP_VDATA if isinstance(s, Reg) and s == src else s) for dst,s in pending]
   return ret
 
+def _unwrap_const(x:UOp) -> UOp|None:
+  while x.op in (Ops.CAST, Ops.BITCAST) and len(x.src) == 1: x = x.src[0]
+  return x if x.op is Ops.CONST else None
+
 def _src(x:UOp):
   if x.op is Ops.AFTER: return _src(x.src[0])
-  if x.op is Ops.CONST:
-    if x.dtype is dtypes.float32: return float(x.arg)
-    if x.dtype is dtypes.float16: return struct.unpack("H", struct.pack("e", float(x.arg)))[0]
-    return int(x.arg)
+  if (c:=_unwrap_const(x)) is not None:
+    if x.dtype is dtypes.float32: return float(c.arg)
+    if x.dtype is dtypes.float16: return struct.unpack("H", struct.pack("e", float(c.arg)))[0]
+    return int(c.arg)
   if not isinstance(greg(x), Register): raise CompileError(f"expected reg src {x}")
   if _elem_count(x) > 1: return _reg_lane(greg(x), 0)
   return _reg_to_amd(greg(x), _reg_slots(x))
@@ -197,7 +201,7 @@ def _reg_chunk(reg:Register, off:int, slots:int) -> Reg:
   return _reg_to_amd(Register(reg.name, reg.index+off, _cons=reg.cons), slots)
 
 def _global_load_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
-  slots, sc = _reg_slots(u), u.dtype.scalar()
+  slots, sc = _reg_slots(u), u.dtype
   saddr = _src(u.src[0])
   off_kw = {"offset": byte_off} if 0 < byte_off <= 0xfff else {}
   if slots == 1:
@@ -258,7 +262,7 @@ class _StoreAddrCache:
 
 def _global_store_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
   val = u.src[2]
-  slots, sc = _reg_slots(val), val.dtype.scalar()
+  slots, sc = _reg_slots(val), val.dtype
   saddr = _src(u.src[0])
   # byte_off already clamped to 0..4095 by _apply_byte_off; larger went through v_lshl_add/v_add.
   off_kw = {"offset": byte_off} if 0 < byte_off <= 0xfff else {}
@@ -322,7 +326,7 @@ def _needs_vm_flush(u:UOp) -> bool:
   if u.arg in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV): return False
   if u.arg in (AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL,
                AMDOps.CMP_GE, AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ):
-    return u.dtype.scalar() not in dtypes.ints and u.dtype.scalar() is not dtypes.bool
+    return u.dtype not in dtypes.ints and u.dtype is not dtypes.bool
   return True
 
 _SCALAR_LOAD = {
@@ -355,7 +359,7 @@ def _mem_load(kind:int, dt:DType, n:int=1):
     nbytes = dt.itemsize * n
     # half×2 → B32; half×4/×8 → B64/B128 for global+LDS (PACK_F16 clobber fixed; gated stays scalar).
     # scratch stays half2 — no wide scratch half path yet.
-    if dt.scalar() is dtypes.float16:
+    if dt is dtypes.float16:
       if nbytes == 4: return (r3.global_load_b32, r3.scratch_load_b32, r3.ds_load_b32)[kind]
       if kind != 1 and nbytes in _WIDE_LOAD: return _WIDE_LOAD[nbytes][0 if kind == 0 else 1]
       return None
@@ -368,7 +372,7 @@ def _mem_load(kind:int, dt:DType, n:int=1):
 def _mem_store(kind:int, dt:DType, n:int=1):
   if n > 1:
     nbytes = dt.itemsize * n
-    if dt.scalar() is dtypes.float16:
+    if dt is dtypes.float16:
       if nbytes == 4: return (r3.global_store_b32, r3.scratch_store_b32, r3.ds_store_b32)[kind]
       if kind != 1 and nbytes in _WIDE_STORE: return _WIDE_STORE[nbytes][0 if kind == 0 else 1]
       return None
@@ -469,9 +473,9 @@ def _reg_mem_key(base:UOp, idx:UOp) -> tuple[UOp, int]|None:
   return buf, off
 
 def _is_zero_val(val:UOp) -> bool:
-  if val.op is Ops.CONST: return val.arg == 0
-  if val.op is Ops.INS and val.arg is AMDOps.MOV and val.src and val.src[0].op is Ops.CONST:
-    return val.src[0].arg == 0
+  if (c:=_unwrap_const(val)) is not None: return c.arg == 0
+  if val.op is Ops.INS and val.arg is AMDOps.MOV and val.src and (c:=_unwrap_const(val.src[0])) is not None:
+    return c.arg == 0
   return False
 
 def _is_identity_sload(val:UOp, key:tuple[UOp, int]) -> bool:
@@ -547,8 +551,8 @@ def _amd_fused_d16(ctx:PreRegAllocContext) -> set[UOp]:
   return ctx.scratch.get("fused_d16") or set()
 
 def _const_int(x:UOp) -> int|None:
-  if x.op is Ops.CONST: return int(x.arg)
-  if x.op is Ops.INS and x.arg is AMDOps.MOV and x.src and x.src[0].op is Ops.CONST: return int(x.src[0].arg)
+  if (c:=_unwrap_const(x)) is not None: return int(c.arg)
+  if x.op is Ops.INS and x.arg is AMDOps.MOV and x.src and (c:=_unwrap_const(x.src[0])) is not None: return int(c.arg)
   return None
 
 def _is_wmma_acc_reload_pack(cin:UOp, ctx:PreRegAllocContext|None=None) -> bool:
@@ -556,7 +560,7 @@ def _is_wmma_acc_reload_pack(cin:UOp, ctx:PreRegAllocContext|None=None) -> bool:
   if all(s.op is Ops.INS and s.arg is AMDOps.SLOAD for s in cin.src): return True
   # LDS product-16: cin is PACK of zero MOVs (register path uses SLOAD reload).
   if all(s.op is Ops.INS and s.arg is AMDOps.MOV and s.src and s.src[0].op is Ops.CONST and
-         s.src[0].dtype.scalar() is dtypes.float and float(s.src[0].arg) == 0.0 for s in cin.src):
+         s.src[0].dtype is dtypes.float and float(s.src[0].arg) == 0.0 for s in cin.src):
     return True
   # SLOAD may already have been rewritten to EXTRACT from the zero-init packs
   if ctx is not None and all(s.op is Ops.INS and s.arg is AMDOps.EXTRACT for s in cin.src):
@@ -702,7 +706,7 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
       for i in range(n)))
   count = _load_count_src(n)
   if _is_lds_ref(a.src[0]):
-    if _local_load(x.dtype, n) is None and not (x.dtype.scalar() is dtypes.half and n == 16):
+    if _local_load(x.dtype, n) is None and not (x.dtype is dtypes.half and n == 16):
       raise CompileError(f"no lds load {x.dtype} x{n}")
     idx, off = _peel_add_imm(a.src[1], _mem_itemsize(x.dtype))
     src = (a.src[0], idx, count) if off == 0 else (a.src[0], idx, count, UOp.const(off, dtypes.int32).rtag())
@@ -710,11 +714,11 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
   if _is_scratch_ref(a.src[0]):
     if _scratch_load(x.dtype, n) is None: raise CompileError(f"no scratch load {x.dtype} x{n}")
     return x.ins(AMDOps.SLOAD, dtype=x.dtype, src=(a.src[0], a.src[1], count))
-  if _global_load(x.dtype, n) is None and not (x.dtype.scalar() is dtypes.half and n == 16):
+  if _global_load(x.dtype, n) is None and not (x.dtype is dtypes.half and n == 16):
     raise CompileError(f"no global load {x.dtype} x{n}")
   # Compact B: peel to per-k page idx + rem≤4095 GLOBAL offset (LLVM @N≥2048). Else full-imm
   # v_lshl_add into dest (AMD_B_LSHL_ADD) — keeps dest-as-addr s_clause.
-  if n == 1 and x.dtype.scalar() is dtypes.half:
+  if n == 1 and x.dtype is dtypes.half:
     itemsize = _mem_itemsize(x.dtype)
     if getenv("AMD_B_COMPACT", 1):
       base, total = _peel_add_imm(a.src[1], itemsize, max_byte=0x7fffffff, deep=True)
@@ -750,8 +754,8 @@ def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
   return try_store(_global_store, AMDOps.STORE, peel=True, max_byte=0x7fffffff, deep=True)
 
 def _lane_const(x:UOp) -> int|None:
-  if x.op is Ops.CONST: return x.arg
-  if x.op is Ops.INS and x.arg is AMDOps.MOV and len(x.src) == 1 and x.src[0].op is Ops.CONST: return x.src[0].arg
+  if (c:=_unwrap_const(x)) is not None: return c.arg
+  if x.op is Ops.INS and x.arg is AMDOps.MOV and len(x.src) == 1 and (c:=_unwrap_const(x.src[0])) is not None: return c.arg
   return None
 
 def _extract_vec_lane(x:UOp) -> UOp|None:
@@ -761,7 +765,7 @@ def _extract_vec_lane(x:UOp) -> UOp|None:
   n = _elem_count(x.src[0])
   if n == 1 and lane == 0 and x.src[0].addrspace in (None, AddrSpace.ALU): return x.src[0]
   if n == 1: return None
-  sc = x.src[0].dtype.scalar()
+  sc = x.src[0].dtype
   if sc not in (dtypes.float32, dtypes.float16): raise CompileError(f"no extract from {x.src[0].dtype}")
   if not 0 <= lane < n: raise CompileError(f"lane {lane} oob for {x.src[0].dtype} x{n}")
   return UOp(Ops.INS, sc, (x.src[0], UOp.const(lane, dtypes.int32).rtag()), AMDOps.EXTRACT)
@@ -815,7 +819,7 @@ def _wmma_ab_vec_loads(elems:tuple[UOp, ...]) -> tuple[UOp, ...]|None:
 
 def _wmma_stack_operand(src:UOp, idx:int) -> UOp:
   # Coalesced half×16 frag may arrive as Ops.LOAD (STACK folded) or STACK of INDEX.
-  if idx < 2 and src.dtype.scalar() is dtypes.half and src.max_numel() == 16 and src.op is Ops.LOAD:
+  if idx < 2 and src.dtype is dtypes.half and src.max_numel() == 16 and src.op is Ops.LOAD:
     return UOp(Ops.INS, dtypes.half, (src,), AMDOps.PACK_F16)
   if idx < 2 and src.op is Ops.INS and src.arg is AMDOps.LOAD and _elem_count(src) == 16:
     return UOp(Ops.INS, dtypes.half, (src,), AMDOps.PACK_F16)
@@ -845,7 +849,7 @@ def _isel_wmma(ctx:IselContext, x:UOp) -> UOp:
   return UOp(Ops.INS, dtypes.float if x.dtype is dtypes.float else x.dtype, (c, a, b), AMDOps.WMMA, x.tag)
 
 def _wmma_inst(u:UOp):
-  dt_in, dt_out = u.src[1].dtype.scalar(), u.dtype.scalar()
+  dt_in, dt_out = u.src[1].dtype, u.dtype
   if dt_in is dtypes.half and dt_out is dtypes.float: return r3.v_wmma_f32_16x16x16_f16
   raise CompileError(f"no wmma {dt_in} -> {dt_out}")
 
@@ -869,7 +873,7 @@ def _pack_f16_d16_hi_pair(lo:UOp, hi:UOp) -> bool:
   if not getenv("AMD_D16_HI", 0): return False
   if not (lo.op is Ops.INS and lo.arg is AMDOps.LOAD and hi.op is Ops.INS and hi.arg is AMDOps.LOAD): return False
   if _elem_count(lo) != 1 or _elem_count(hi) != 1: return False
-  if lo.dtype.scalar() is not dtypes.half or hi.dtype.scalar() is not dtypes.half: return False
+  if lo.dtype is not dtypes.half or hi.dtype is not dtypes.half: return False
   if _is_lds_ref(lo.src[0]) or _is_scratch_ref(lo.src[0]): return False
   if _is_lds_ref(hi.src[0]) or _is_scratch_ref(hi.src[0]): return False
   return True
@@ -932,7 +936,7 @@ def _atomic_add_ins(x:UOp) -> UOp|None:
   if x.arg != AMD_ATOMIC_ADD: return None
   if len(x.src) != 2 or x.src[0].op is not Ops.INDEX: raise CompileError(f"bad atomic {x}")
   a, val = x.src
-  if val.dtype.scalar() is not dtypes.float32: raise CompileError(f"f32 atomic only, got {val.dtype}")
+  if val.dtype is not dtypes.float32: raise CompileError(f"f32 atomic only, got {val.dtype}")
   if _is_lds_ref(a.src[0]) or _is_scratch_ref(a.src[0]): raise CompileError("global atomic only")
   return x.ins(AMDOps.ATOMIC_ADD, src=(a.src[0], a.src[1], val))
 
@@ -1026,8 +1030,8 @@ def _u32_divmod(n:UOp, d:UOp) -> tuple[UOp, UOp]:
   return q, r
 
 def _var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
-  if x.dtype != d.dtype or x.dtype.scalar() not in (dtypes.int32, dtypes.uint32): return None
-  if x.dtype.scalar() is dtypes.uint32:
+  if x.dtype != d.dtype or x.dtype not in (dtypes.int32, dtypes.uint32): return None
+  if x.dtype is dtypes.uint32:
     q, r = _u32_divmod(x, d)
     return q if op.op is Ops.CDIV else r
   zero = UOp.const(0, dtypes.int32)
@@ -1038,8 +1042,8 @@ def _var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
   return xneg.where(zero - r, r) if op.op is Ops.CMOD else (xneg ^ dneg).where(zero - q, q)
 
 def _narrow_var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
-  if x.dtype != d.dtype or x.dtype.scalar() not in dtypes.ints or x.dtype.itemsize >= 4: return None
-  wide = dtypes.int32 if x.dtype.scalar() in dtypes.sints else dtypes.uint32
+  if x.dtype != d.dtype or x.dtype not in dtypes.ints or x.dtype.itemsize >= 4: return None
+  wide = dtypes.int32 if x.dtype in dtypes.sints else dtypes.uint32
   return UOp(op.op, wide, (x.cast(wide), d.cast(wide))).cast(x.dtype)
 
 def _cmp_bool_const(x:UOp, m:UOp, c:UOp) -> UOp:
@@ -1079,6 +1083,9 @@ def _int_cast(y:UOp, x:UOp) -> UOp|None:
   return x.ins(AMDOps.CAST, src=(y,))
 
 pre_isel_matcher = PatternMatcher([
+  # Renderer legalization runs after the spec check. Canonical constants now arrive as
+  # CAST(CONST(weak)); recover a typed bare CONST so the existing immediate isel paths apply.
+  (UPat.cvar("c").cast(name="x"), lambda c,x: UOp.const(c.val, x.dtype)),
   (UPat(Ops.INDEX, name="addr").load(UPat.var("alt"), UPat.var("gate", dtype=dtypes.bool), name="x"), _gated_load),
   (UPat((Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.TRUNC, Ops.SIN), dtype=dtypes.float16, src=(UPat.var("d"),), name="x"),
    _promote_f16_unary),
@@ -1104,8 +1111,13 @@ pre_isel_matcher = PatternMatcher([
 
 def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Register, ...]=VGPR) -> PatternMatcher:
   return PatternMatcher([
+    # Regalloc creates canonical CAST(CONST(weak)) stack offsets after pre-isel has run.
+    (UPat((Ops.ADD, Ops.SUB), src=(UPat(Ops.INS, arg=AMDOps.SCRATCH_BASE), UPat.cvar("size").cast())),
+     lambda size: UOp(Ops.INS, dtypes.void, (size,), AMDOps.SCRATCH_SIZE)),
     (UPat((Ops.ADD, Ops.SUB), src=(UPat(Ops.INS, arg=AMDOps.SCRATCH_BASE), UPat.cvar()), name="x"),
      lambda x: UOp(Ops.INS, dtypes.void, (x.src[1],), AMDOps.SCRATCH_SIZE)),
+    (UPat(Ops.INDEX, src=(UPat(Ops.INS, arg=AMDOps.SCRATCH_BASE), UPat.cvar("off").cast())),
+     lambda off: UOp(Ops.INS, dtypes.uint32, (off,), AMDOps.SCRATCH_ADDR)),
     (UPat(Ops.INDEX, src=(UPat(Ops.INS, arg=AMDOps.SCRATCH_BASE), UPat.cvar("off")), name="x"),
      lambda off,x: UOp(Ops.INS, dtypes.uint32, (off,), AMDOps.SCRATCH_ADDR)),
     (UPat(Ops.RANGE, src=(UPat.cvar("c"),), allow_any_len=True, name="x"), lambda c,x:
@@ -1310,7 +1322,7 @@ _ALU2: dict[AMDOps, tuple] = {
 def _alu2(u:UOp):
   f16, f32, sgpr, vint = _ALU2[u.arg]
   d = _dst(u)
-  sc = u.dtype.scalar()
+  sc = u.dtype
   if sc is dtypes.float16: return [f16(d, _src(u.src[0]), _src(u.src[1]))]
   if sc is dtypes.float32: return [f32(d, _src(u.src[0]), _src(u.src[1]))]
   if greg(u).index < 256: return [sgpr(d, _src(u.src[0]), _src(u.src[1]))]
@@ -1319,7 +1331,7 @@ def _alu2(u:UOp):
   return pre + [vint(d, a, _src(u.src[1]))]
 def _max(u:UOp):
   d = _dst(u)
-  sc = u.dtype.scalar()
+  sc = u.dtype
   pre, a = _vgpr_data(TMP_VDATA, u.src[0])
   b = _src(u.src[1])
   if sc is dtypes.float16: return pre + [r3.v_max_f16_e32(d, a, b)]
@@ -1328,7 +1340,7 @@ def _max(u:UOp):
   return pre + [r3.v_max_u32_e64(d, a, b)]
 def _cmp_lt(u:UOp):
   pre, a = _vgpr_data(TMP_VDATA, u.src[0])
-  sc = u.src[0].dtype.scalar()
+  sc = u.src[0].dtype
   if sc is dtypes.float16: cmp = r3.v_cmp_gt_f16_e32
   elif sc is dtypes.float32: cmp = r3.v_cmp_gt_f32_e32
   elif sc in dtypes.sints: cmp = r3.v_cmp_gt_i32_e32
@@ -1336,13 +1348,13 @@ def _cmp_lt(u:UOp):
   return pre + [cmp(_src(u.src[1]), a)]
 def _cmp_ne(u:UOp):
   pre, b = _vgpr_data(TMP_VDATA, u.src[1])
-  sc = u.src[0].dtype.scalar()
+  sc = u.src[0].dtype
   if sc is dtypes.float16: return pre + [r3.v_cmp_neq_f16_e32(_src(u.src[0]), b)]
   if sc is dtypes.float32: return pre + [r3.v_cmp_neq_f32_e32(_src(u.src[0]), b)]
   return pre + [r3.v_cmp_ne_u32_e32(_src(u.src[0]), b)]
 def _cmp_eq(u:UOp):
   pre, b = _vgpr_data(TMP_VDATA, u.src[1])
-  sc = u.src[0].dtype.scalar()
+  sc = u.src[0].dtype
   if sc is dtypes.float16: return pre + [r3.v_cmp_eq_f16_e32(_src(u.src[0]), b)]
   if sc is dtypes.float32: return pre + [r3.v_cmp_eq_f32_e32(_src(u.src[0]), b)]
   return pre + [r3.v_cmp_eq_u32_e32(_src(u.src[0]), b)]
@@ -1387,7 +1399,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       lane = u.src[1].arg
       src = u.src[0]
       if not isinstance(greg(src), Register): raise CompileError(f"expected vec reg src {u}")
-      sc = src.dtype.scalar()
+      sc = src.dtype
       if sc is dtypes.float32:
         lane_src = _reg_lane(greg(src), lane)
         return [] if isinstance(greg(u), Register) and greg(u).index == greg(src).index+lane else [r3.v_mov_b32_e32(_dst(u), lane_src)]
@@ -1405,41 +1417,41 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
     case AMDOps.ADD | AMDOps.SUB | AMDOps.MUL:
       return _alu2(u)
     case AMDOps.MULACC:
-      if u.dtype.scalar() is dtypes.float16: return [r3.v_fma_f16(_dst(u), _src(u.src[0]), _src(u.src[1]), _src(u.src[2]))]
-      if u.dtype.scalar() is dtypes.float32: return [r3.v_fma_f32(_dst(u), _src(u.src[0]), _src(u.src[1]), _src(u.src[2]))]
+      if u.dtype is dtypes.float16: return [r3.v_fma_f16(_dst(u), _src(u.src[0]), _src(u.src[1]), _src(u.src[2]))]
+      if u.dtype is dtypes.float32: return [r3.v_fma_f32(_dst(u), _src(u.src[0]), _src(u.src[1]), _src(u.src[2]))]
       raise CompileError(f"f16/f32 mulacc only, got {u.dtype}")
     case AMDOps.CAST:
       pre, cast_src = _vgpr_data(TMP_VDATA, u.src[0])
-      if u.dtype.scalar() in dtypes.ints and u.src[0].dtype.scalar() in dtypes.ints:
+      if u.dtype in dtypes.ints and u.src[0].dtype in dtypes.ints:
         if u.dtype.itemsize > 4 or u.src[0].dtype.itemsize > 4: raise CompileError(f"no cast {u.src[0].dtype} -> {u.dtype}")
         narrow = u.src[0].dtype if u.src[0].dtype.itemsize <= u.dtype.itemsize else u.dtype
-        if narrow.scalar() in dtypes.uints: return pre + [r3.v_and_b32_e32(_dst(u), (1 << (narrow.itemsize * 8)) - 1, cast_src)]
+        if narrow in dtypes.uints: return pre + [r3.v_and_b32_e32(_dst(u), (1 << (narrow.itemsize * 8)) - 1, cast_src)]
         shift = 32 - narrow.itemsize * 8
         return pre + [r3.v_lshlrev_b32_e64(_dst(u), shift, cast_src), r3.v_ashrrev_i32_e64(_dst(u), shift, _dst(u))]
-      if u.dtype.scalar() is dtypes.float32 and u.src[0].dtype.scalar() is dtypes.float16:
+      if u.dtype is dtypes.float32 and u.src[0].dtype is dtypes.float16:
         return pre + [r3.v_cvt_f32_f16_e32(_dst(u), cast_src)]
-      if u.src[0].dtype.scalar() is dtypes.float32 and u.dtype.scalar() is dtypes.float16:
+      if u.src[0].dtype is dtypes.float32 and u.dtype is dtypes.float16:
         return pre + [r3.v_cvt_f16_f32_e32(_dst(u), cast_src)]
-      if u.dtype.scalar() is dtypes.float32 and u.src[0].dtype.scalar() in dtypes.ints:
-        cast_op = r3.v_cvt_f32_i32_e32 if u.src[0].dtype.scalar() in dtypes.sints else r3.v_cvt_f32_u32_e32
+      if u.dtype is dtypes.float32 and u.src[0].dtype in dtypes.ints:
+        cast_op = r3.v_cvt_f32_i32_e32 if u.src[0].dtype in dtypes.sints else r3.v_cvt_f32_u32_e32
         return pre + [cast_op(_dst(u), cast_src)]
-      if u.src[0].dtype.scalar() is dtypes.float32 and u.dtype.scalar() in dtypes.ints:
-        cast_op = r3.v_cvt_i32_f32_e32 if u.dtype.scalar() in dtypes.sints else r3.v_cvt_u32_f32_e32
+      if u.src[0].dtype is dtypes.float32 and u.dtype in dtypes.ints:
+        cast_op = r3.v_cvt_i32_f32_e32 if u.dtype in dtypes.sints else r3.v_cvt_u32_f32_e32
         return pre + [cast_op(_dst(u), cast_src)]
       raise CompileError(f"no cast {u.src[0].dtype} -> {u.dtype}")
     case AMDOps.RECIPROCAL:
-      if u.dtype.scalar() is not dtypes.float32: raise CompileError(f"f32 rcp only, got {u.dtype}")
+      if u.dtype is not dtypes.float32: raise CompileError(f"f32 rcp only, got {u.dtype}")
       pre, val = _vgpr_data(TMP_VDATA, u.src[0])
       dst = _dst(u)
       return pre + [r3.v_rcp_f32_e32(TMP_VADDR, val), r3.v_mul_f32_e32(dst, val, TMP_VADDR),
                     r3.v_sub_f32_e32(dst, 1.0, dst), r3.v_fma_f32(dst, TMP_VADDR, dst, TMP_VADDR),
                     r3.v_cmp_eq_f32_e32(dst, dst), r3.v_cndmask_b32_e32(dst, TMP_VADDR, dst)]
     case AMDOps.EXP2 | AMDOps.LOG2 | AMDOps.SQRT | AMDOps.TRUNC:
-      if u.dtype.scalar() is not dtypes.float32: raise CompileError(f"f32 {u.arg.name} only, got {u.dtype}")
+      if u.dtype is not dtypes.float32: raise CompileError(f"f32 {u.arg.name} only, got {u.dtype}")
       pre, val = _vgpr_data(TMP_VDATA, u.src[0])
       return pre + [_F32_UNARY[u.arg](_dst(u), val)]
     case AMDOps.SIN:
-      if u.dtype.scalar() is not dtypes.float32: raise CompileError(f"f32 sin only, got {u.dtype}")
+      if u.dtype is not dtypes.float32: raise CompileError(f"f32 sin only, got {u.dtype}")
       val = _src(u.src[0])
       pre = [] if isinstance(val, Reg) and val == TMP_VADDR else [r3.v_mov_b32_e32(TMP_VADDR, val)]
       return pre + [r3.v_mul_f32_e32(TMP_VDATA, 0.15915494309189535, TMP_VADDR),
@@ -1459,7 +1471,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       return pre + [r3.v_lshlrev_b32_e64(_dst(u), _src(u.src[1]), a)]
     case AMDOps.SHR:
       pre, a = _vgpr_data(TMP_VDATA, u.src[0])
-      if u.dtype.scalar() in dtypes.sints: return pre + [r3.v_ashrrev_i32_e64(_dst(u), _src(u.src[1]), a)]
+      if u.dtype in dtypes.sints: return pre + [r3.v_ashrrev_i32_e64(_dst(u), _src(u.src[1]), a)]
       return pre + [r3.v_lshrrev_b32_e64(_dst(u), _src(u.src[1]), a)]
     case AMDOps.AND:
       pre, b = _vgpr_data(TMP_VDATA, u.src[1])
@@ -1535,7 +1547,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       pre, addr = _local_addr(u.src[0], u.src[1], _mem_itemsize(u.dtype))
       pre, addr = _masked_addr(pre, addr, masked)
       off = _lds_byte_off(u)
-      if slots == 8 and u.dtype.scalar() is dtypes.half:
+      if slots == 8 and u.dtype is dtypes.half:
         return pre + [r3.ds_load_b128(vdst=_reg_chunk(greg(u), 0, 4), addr=addr, **_ds_off(off)),
                       r3.ds_load_b128(vdst=_reg_chunk(greg(u), 4, 4), addr=addr, **_ds_off(off + 16))]
       if (local_load:=_local_load(u.dtype, _elem_count(u))) is None: raise CompileError(f"no lds load {u.dtype}")
@@ -1573,27 +1585,31 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
     case AMDOps.FILL:
       if greg(u).index < 256: raise CompileError("no sgpr scratch fill")
       slots = _reg_slots(u)
-      if u.src[0].arg + (slots-1)*4 >= 4096: raise CompileError("scratch fill oob")
+      if (disp_uop:=_unwrap_const(u.src[0])) is None: raise CompileError("non-constant scratch fill offset")
+      disp = int(disp_uop.arg)
+      if disp + (slots-1)*4 >= 4096: raise CompileError("scratch fill oob")
       if slots > 1:
         # raw VGPR lanes (f32 packs or half2 LDS loads)
-        loads = [r3.scratch_load_b32(addr=TMP_VADDR, vdst=_reg_lane(greg(u), i), offset=u.src[0].arg + i*4, sve=1)
+        loads = [r3.scratch_load_b32(addr=TMP_VADDR, vdst=_reg_lane(greg(u), i), offset=disp + i*4, sve=1)
                  for i in range(slots)]
         return [r3.v_mov_b32_e32(TMP_VADDR, 0)] + loads
       if (scratch_load:=_scratch_load(u.dtype)) is None: raise CompileError(f"no scratch fill {u.dtype}")
-      return [r3.v_mov_b32_e32(TMP_VADDR, 0), scratch_load(addr=TMP_VADDR, vdst=_dst(u), offset=u.src[0].arg, sve=1)]
+      return [r3.v_mov_b32_e32(TMP_VADDR, 0), scratch_load(addr=TMP_VADDR, vdst=_dst(u), offset=disp, sve=1)]
     case AMDOps.SPILL:
       if greg(u.src[1]).index < 256: raise CompileError("no sgpr scratch spill")
       slots = _reg_slots(u.src[1])
-      if u.src[0].arg + (slots-1)*4 >= 4096: raise CompileError("scratch spill oob")
+      if (disp_uop:=_unwrap_const(u.src[0])) is None: raise CompileError("non-constant scratch spill offset")
+      disp = int(disp_uop.arg)
+      if disp + (slots-1)*4 >= 4096: raise CompileError("scratch spill oob")
       if slots > 1:
         # raw VGPR lanes (f32 packs or half2 LDS loads)
         return [r3.v_mov_b32_e32(TMP_VADDR, 0)] + \
-               [r3.scratch_store_b32(addr=TMP_VADDR, data=_reg_lane(greg(u.src[1]), i), offset=u.src[0].arg + i*4, sve=1)
+               [r3.scratch_store_b32(addr=TMP_VADDR, data=_reg_lane(greg(u.src[1]), i), offset=disp + i*4, sve=1)
                 for i in range(slots)] + \
                [r3.s_waitcnt_vscnt(sdst=NULL, simm16=0)]
       if (scratch_store:=_scratch_store(u.src[1].dtype)) is None:
         raise CompileError(f"no scratch spill {u.src[1].dtype}")
-      return [r3.v_mov_b32_e32(TMP_VADDR, 0), scratch_store(addr=TMP_VADDR, data=_src(u.src[1]), offset=u.src[0].arg, sve=1),
+      return [r3.v_mov_b32_e32(TMP_VADDR, 0), scratch_store(addr=TMP_VADDR, data=_src(u.src[1]), offset=disp, sve=1),
               r3.s_waitcnt_vscnt(sdst=NULL, simm16=0)]
     case AMDOps.CMP_GE:
       pre0, a = _sgpr_data(TMP_SDATA0, u.src[0])
@@ -1666,7 +1682,7 @@ def _sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
       if v.op is not Ops.INS or v.arg not in _SINKABLE_PAST_WMMA: break
       # Keep tile-local schedule: don't sink past scalar half A loads. Otherwise all A packs
       # first and B B128 lands after a full wait — loses A/B VMEM overlap vs LLVM.
-      if v.arg is AMDOps.LOAD and v.dtype.scalar() is dtypes.half and _elem_count(v) == 1: break
+      if v.arg is AMDOps.LOAD and v.dtype is dtypes.half and _elem_count(v) == 1: break
       # Don't sink past scalar B packs — that forces wait on the prefetched next B tile before
       # WMMA0, killing the VMEM overlap _prefetch_next_bu16_before_pack set up.
       if v.arg is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(v): break
@@ -1690,7 +1706,7 @@ def _sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
 def _is_addr_alu(u:UOp) -> bool:
   return (u.op is Ops.INS and u.arg in (AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR,
                                         AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.MOV) and
-          u.dtype.scalar() in dtypes.ints)
+          u.dtype in dtypes.ints)
 
 def _hoist_b_between_a_and_pack(ops:list[UOp]) -> list[UOp]:
   """Issue wide B (B128) while scalar A U16 loads are still in flight.
@@ -1705,7 +1721,7 @@ def _hoist_b_between_a_and_pack(ops:list[UOp]) -> list[UOp]:
   i = 0
   while i < len(out):
     u = out[i]
-    if not (u.op is Ops.INS and u.arg is AMDOps.LOAD and u.dtype.scalar() is dtypes.half and _elem_count(u) >= 8):
+    if not (u.op is Ops.INS and u.arg is AMDOps.LOAD and u.dtype is dtypes.half and _elem_count(u) >= 8):
       i += 1
       continue
     start = i
@@ -1726,7 +1742,7 @@ def _hoist_b_between_a_and_pack(ops:list[UOp]) -> list[UOp]:
     pack_a_i = j
     k = pack_a_i - 1
     while k >= 0 and out[k].op is Ops.INS and out[k].arg is AMDOps.LOAD and \
-          out[k].dtype.scalar() is dtypes.half and _elem_count(out[k]) == 1:
+          out[k].dtype is dtypes.half and _elem_count(out[k]) == 1:
       k -= 1
     if k + 1 >= pack_a_i:
       i += 1
@@ -1772,7 +1788,7 @@ def _prefetch_next_a_b128_before_pack(ops:list[UOp]) -> list[UOp]:
     j = i + 1
     while j < len(out):
       v = out[j]
-      if v.op is Ops.INS and v.arg is AMDOps.LOAD and v.dtype.scalar() is dtypes.half and _elem_count(v) >= 8:
+      if v.op is Ops.INS and v.arg is AMDOps.LOAD and v.dtype is dtypes.half and _elem_count(v) >= 8:
         break
       if v.op is Ops.INS and v.arg in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.STORE,
                                        AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER):
@@ -1834,7 +1850,7 @@ def _prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
     # Require a preceding scalar half load streak (current B tile).
     k = insert_at - 1
     while k >= 0 and out[k].op is Ops.INS and out[k].arg is AMDOps.LOAD and \
-          out[k].dtype.scalar() is dtypes.half and _elem_count(out[k]) == 1:
+          out[k].dtype is dtypes.half and _elem_count(out[k]) == 1:
       k -= 1
     if k + 1 >= insert_at:
       i += 1
@@ -1846,7 +1862,7 @@ def _prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
     while j < len(out) and _is_addr_alu(out[j]): j += 1
     load0 = j
     while j < len(out) and out[j].op is Ops.INS and out[j].arg is AMDOps.LOAD and \
-          out[j].dtype.scalar() is dtypes.half and _elem_count(out[j]) == 1:
+          out[j].dtype is dtypes.half and _elem_count(out[j]) == 1:
       j += 1
     if j == load0:
       i += 1
@@ -1857,7 +1873,7 @@ def _prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
     j2 = end
     while j2 < len(out) and _is_addr_alu(out[j2]): j2 += 1
     if j2 < len(out) and out[j2].op is Ops.INS and out[j2].arg is AMDOps.LOAD and \
-       out[j2].dtype.scalar() is dtypes.half and _elem_count(out[j2]) >= 8:
+       out[j2].dtype is dtypes.half and _elem_count(out[j2]) >= 8:
       end = j2 + 1
     mid, chunk = out[insert_at:start], out[start:end]
     mid_set, chunk_set = set(mid), set(chunk)
@@ -1886,7 +1902,7 @@ def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
       continue
     # Only hoist wide B (half×8+) / vec-load packs above WMMA — not scalar A loads.
     # Hoisting scalar A above prior WMMA collapsed the schedule to all-A-then-B (no A/B overlap).
-    if u.arg is AMDOps.LOAD and u.dtype.scalar() is dtypes.half and _elem_count(u) == 1:
+    if u.arg is AMDOps.LOAD and u.dtype is dtypes.half and _elem_count(u) == 1:
       i += 1
       continue
     if u.arg is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(u):
@@ -1898,7 +1914,7 @@ def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
       p = out[start - 1]
       if p.op is Ops.INS and p.arg in (AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR,
                                        AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.MOV) and \
-         p.dtype.scalar() in dtypes.ints:
+         p.dtype in dtypes.ints:
         start -= 1
         continue
       break
@@ -1954,12 +1970,12 @@ def _tmp_vaddr_clause_safe(scales:list, loads:list) -> bool:
 def _clauseable_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   # Scalar half global LOAD with dest-as-addr (no mask/TMP). Streak → hoist scales + s_clause.
   if u in skip or mask_depth or u.op is not Ops.INS or u.arg is not AMDOps.LOAD: return False
-  return _reg_slots(u) == 1 and u.dtype.scalar() is dtypes.half
+  return _reg_slots(u) == 1 and u.dtype is dtypes.half
 
 def _clauseable_wide_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   # Contiguous half×8+ global LOAD (A B128 pairs). Streak → one s_clause over all B128s.
   if u in skip or mask_depth or u.op is not Ops.INS or u.arg is not AMDOps.LOAD: return False
-  return u.dtype.scalar() is dtypes.half and _elem_count(u) >= 8 and not _is_lds_ref(u.src[0]) and \
+  return u.dtype is dtypes.half and _elem_count(u) >= 8 and not _is_lds_ref(u.src[0]) and \
          not _is_scratch_ref(u.src[0])
 
 def _order_d16_lo_before_hi(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp]:
@@ -2325,7 +2341,7 @@ def _bounce_tid_wide(ab:UOp, i:int, coop:list[UOp], frag:list[UOp], tile:list[UO
   if t_per_k < 1 or block != t_per_k * ept_n or threads != _WMMA_TC * t_per_k: return None
   k, n_base = tid // t_per_k, (tid % t_per_k) * ept_n
   # Flat (n,k) row-major: addr = n*16+k. One base + j*16 peels to ds_store offset.
-  local = UOp.placeholder((block * _WMMA_TC,), ab.dtype.scalar(), slot=100 + i, addrspace=AddrSpace.LOCAL)
+  local = UOp.placeholder((block * _WMMA_TC,), ab.dtype, slot=100 + i, addrspace=AddrSpace.LOCAL)
   elems, stores = [], []
   # ept_n==vec (default 2×2): no chunk range — keeps addr math short-lived (avoids spills).
   if ept_n == vec:
@@ -2433,7 +2449,7 @@ def stage_wmma_ab_tid(wmma:UOp, coop:list[UOp]) -> UOp|None:
       if ept_n % 8 or t_per_k < 1 or block != t_per_k * ept_n or threads != _WMMA_TC * t_per_k: return None
       vec = 8
       k, n_base = tid // t_per_k, (tid % t_per_k) * ept_n
-      local = UOp.placeholder((block * _WMMA_TC,), ab.dtype.scalar(), slot=100 + i, addrspace=AddrSpace.LOCAL)
+      local = UOp.placeholder((block * _WMMA_TC,), ab.dtype, slot=100 + i, addrspace=AddrSpace.LOCAL)
       elems, stores = [], []
       if ept_n == vec:
         base = n_base * _WMMA_TC + k
@@ -2580,7 +2596,7 @@ def isa_float4_coalesce(uops, ctx):
   from collections import defaultdict
   f4 = ctx.float4_dtypes if isinstance(ctx, ISARenderer) else None
   if f4 is None: return None, True, False, None
-  if any(u.dtype.scalar() in (dtypes.bfloat16, *dtypes.fp8s) for u in uops): return f4, True, True, None
+  if any(u.dtype in (dtypes.bfloat16, *dtypes.fp8s) for u in uops): return f4, True, True, None
   uses = defaultdict(list)
   for u in uops:
     for su in u.src: uses[su].append(u)
@@ -2589,12 +2605,12 @@ def isa_float4_coalesce(uops, ctx):
     buf = u.src[0].src[0]
     if buf.addrspace is AddrSpace.REG: continue  # weakfloat ACC stores must not disable global half B128
     value_dtype = u.src[1].dtype if u.op is Ops.STORE else u.dtype
-    if buf.dtype.scalar() not in f4 or value_dtype.scalar() not in (*f4, dtypes.weakfloat): return f4, False, False, uses
+    if buf.dtype not in f4 or value_dtype not in (*f4, dtypes.weakfloat): return f4, False, False, uses
   return f4, True, False, uses
 
 def isa_float4_mem_ok(f4, float4_safe, buf, value_dtype, u, uses, valid) -> bool:
   if f4 is None: return True
-  if not float4_safe or buf.dtype.scalar() != value_dtype.scalar(): return False
+  if not float4_safe or buf.dtype != value_dtype: return False
   if u.op is Ops.LOAD and any(v.op in {Ops.CAST, Ops.BITCAST} for v in uses[u]): return False
   if u.op is Ops.STORE and u.src[1].op is Ops.BITCAST: return False
   return bool(valid.op is Ops.CONST and valid.val is True)
@@ -2730,7 +2746,7 @@ class AMDRenderer(ISARenderer):
     return x.arg is AMDOps.PACK_F16 and _pack_f16_is_vec_load(x) and len(x.src) == 1
   def prefer_phys(self, x:UOp, src_phys:list) -> Register|None:
     # Float EXTRACT from a multi-VGPR pack/WMMA → alias onto pack+lane (kill C-store movs).
-    if x.op is not Ops.INS or x.arg is not AMDOps.EXTRACT or x.dtype.scalar() is not dtypes.float32: return None
+    if x.op is not Ops.INS or x.arg is not AMDOps.EXTRACT or x.dtype is not dtypes.float32: return None
     if not src_phys or src_phys[0] is None or not isinstance(x.tag, tuple): return None
     if (lane := _lane_const(x.src[1])) is None: return None
     want = src_phys[0].index + int(lane)
@@ -2756,7 +2772,7 @@ class AMDRenderer(ISARenderer):
     store_cast: dict[UOp, UOp] = {}  # store -> cast
     for u in lst:
       if u.op is not Ops.INS or u.arg is not AMDOps.CAST: continue
-      if u.dtype.scalar() is not dtypes.float16 or not u.src or u.src[0].dtype.scalar() is not dtypes.float32: continue
+      if u.dtype is not dtypes.float16 or not u.src or u.src[0].dtype is not dtypes.float32: continue
       us = uses.get(u, [])
       if len(us) == 1 and us[0].op is Ops.INS and us[0].arg is AMDOps.STORE and len(us[0].src) > 2 and us[0].src[2] is u:
         store_cast[us[0]] = u
@@ -2771,7 +2787,7 @@ class AMDRenderer(ISARenderer):
     return _order_d16_lo_before_hi(lst, _d16_hi_lo_map(lst))
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True
-    if x.op is not Ops.INS or x.dtype.scalar() not in (dtypes.int32, dtypes.uint32): return False
+    if x.op is not Ops.INS or x.dtype not in (dtypes.int32, dtypes.uint32): return False
     if x.arg is AMDOps.MOV and x.src: return self._pure_addr(x.src[0])
     if x.arg in (AMDOps.ADD, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR):
       return all(self._pure_addr(s) for s in x.src)
@@ -2782,13 +2798,13 @@ class AMDRenderer(ISARenderer):
     # Address remat defaults ON under LDS — EXTRACT-only leaves addr spills / wrong mock.
     # AMD_REMAT_ADDR=0 opts out.
     if getenv("TC_LDS_AB", 0) and getenv("AMD_REMAT", 1):
-      if (x.arg is AMDOps.EXTRACT and x.dtype.scalar() is dtypes.half and x.src and
+      if (x.arg is AMDOps.EXTRACT and x.dtype is dtypes.half and x.src and
           x.src[0].op is Ops.INS and x.src[0].arg is AMDOps.LLOAD):
         return True
-      if getenv("ALLOW_UPCAST16", 0) and x.arg is AMDOps.LLOAD and x.dtype.scalar() is dtypes.half:
+      if getenv("ALLOW_UPCAST16", 0) and x.arg is AMDOps.LLOAD and x.dtype is dtypes.half:
         return True
     if not getenv("AMD_REMAT_ADDR", 1 if getenv("TC_LDS_AB", 0) else 0): return False
-    if x.dtype.scalar() not in (dtypes.int32, dtypes.uint32): return False
+    if x.dtype not in (dtypes.int32, dtypes.uint32): return False
     return x.arg is not AMDOps.MOV and self._pure_addr(x)
   def keep_remat(self, x:UOp) -> bool:
     # Pure-addr remats under TC_LDS: without sticky, SHR/AND remat ~60× and SHL/ADD flood the loop.

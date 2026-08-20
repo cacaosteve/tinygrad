@@ -26,7 +26,7 @@ def _drop_valid_stmts(valid:UOp, idx:UOp, height:int, width:int) -> list[UOp]:
     # check if idx is out of bound when X is on the wrong side of the bound: X in [c+1, vmax] or [vmin, c-1]
     lo, hi = (c + 1, X.vmax) if is_upper_bound else (X.vmin, c - 1)
     if lo <= hi:
-      fake = UOp.variable(f"fake{i}", lo, hi, X.dtype)
+      fake = UOp.variable(f"fake{i}", lo, hi, X.dtype, param=True)
       subs = [{X: fake}]
       # idx may not have X itself, so also substitute a term of X: v -> fake - (X - v)
       terms = list(X.split_uop(Ops.ADD))
@@ -148,7 +148,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       pass
     elif is_image_shape(buf._shape):
       lengths = [4]
-    elif ctx is not None and ctx.supports_float4 and (f4 is None or buf.dtype.scalar() in f4):
+    elif ctx is not None and ctx.supports_float4 and (f4 is None or buf.dtype in f4):
       if vec_lengths is not None and (L:=vec_lengths(buf, f4)) is not None: lengths = L
       else: lengths = [8,4,2] if buf.dtype == dtypes.half and getenv("ALLOW_HALF8") else [4,2]
     lengths.append(1)  # worst case, it's not folded
@@ -159,7 +159,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
         length = [l for l in lengths if l <= len(full_grp) and (not must_divide or offset.divides(l) is not None)][0]
         grp = full_grp[:length]
         offset = offset.valid(valid) if valid is not None else offset
-        idx = UOp(Ops.SHRINK, src=(buf, offset, UOp.const(len(grp)))) if len(grp) > 1 else buf.index(offset)
+        idx = UOp(Ops.SHRINK, src=(buf, offset, UOp.const(len(grp)))) if len(grp) > 1 else buf.index(offset, dtype=offsets[grp[0]][0].src[0].dtype)
         if op == Ops.STORE:
           datas = [offsets[g][0].src[1] for g in grp]
           assert all(len(offsets[g]) == 1 for g in grp)

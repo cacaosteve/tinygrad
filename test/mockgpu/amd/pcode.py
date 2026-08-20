@@ -229,7 +229,7 @@ def _signext_from_bit(val: UOp, w: UOp) -> UOp:
 def _f16_via_f32(op: Ops):
   # Mock infra: half transcendentals via f32. Avoids clang-18 SIGSEGV on dense half soft-float (CI gfx950).
   def f(a: UOp) -> UOp:
-    if a.dtype.scalar() == dtypes.half:
+    if a.dtype == dtypes.half:
       return UOp(op, src=(a.cast(dtypes.float32),)).cast(dtypes.half)
     return UOp(op, src=(a,))
   return f
