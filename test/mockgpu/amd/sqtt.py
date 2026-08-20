@@ -70,6 +70,7 @@ _VALUB_16_RE = re.compile(r"V_\w+_F64")
 _DS_ATOMIC_RE = re.compile(r"DS_(ADD|SUB|RSUB|INC|DEC|MIN|MAX|AND|OR|XOR|MSKOR)(_|$)")
 _SALU_3_CYCLE = {"S_MUL_I32", "S_MULK_I32", "S_MUL_HI_I32", "S_MUL_HI_U32"}
 _SALU_INFLIGHT_LIMIT, _VALU_INFLIGHT_LIMIT, _VALUB_INFLIGHT_LIMIT, _TRANS_INFLIGHT_LIMIT, _VALU_READ_WARMUP = 6, 12, 8, 5, 7
+_VALU_READ_RING, _SALU_DUPLICATE_READ_WARMUP = 8, 5
 _CU_SIMDS = 2
 
 def _op_name(inst) -> str:
@@ -460,6 +461,38 @@ class RDNA3SQTTTraceBuilder:
       last_time = self.events[previous.event_idx].time
       self.salu_exec_delayed[simd] = not previous.long and last_time > previous.issue + 2
 
+  def _long_salu_read_ready(self, st: _WaveState, simd: int, issue: int, exec_ready: int,
+                            srcs: tuple[int, ...], dsts: set[int]) -> int:
+    operand_ready = [st.sgpr_exec_ready[reg] for reg in srcs]
+    stale = [i for i, ready in enumerate(operand_ready) if ready + 1 < issue]
+    read_ready = max(issue + 3, max(operand_ready) + 3)
+    records, previous = self.salu_exec_records[simd], self.salu_exec_records[simd][-1] if self.salu_exec_records[simd] else None
+    if stale:
+      previous_produces_first = previous is not None and srcs[0] in previous.dsts
+      ordered_collision = 0 not in stale and 1 in stale and \
+        ((not self.salu_exec_delayed[simd] and operand_ready[0] == operand_ready[1] + 1) or
+         (operand_ready[0] > issue + 1 and previous_produces_first))
+      reverse_collision = 0 in stale and 1 not in stale and issue == st.last_salu_issue + 1 and previous is not None and previous.long and \
+        srcs[0] in previous.srcs and srcs[1] in dsts and srcs[1] in previous.dsts
+      previous_long_producer = previous is not None and previous.long and srcs[0] in dsts and srcs[0] in previous.dsts
+      duplicate_read_warm = len(st.valu_exec_history) >= _SALU_DUPLICATE_READ_WARMUP and srcs[0] == srcs[1] and srcs[0] in dsts and \
+        previous is not None and not previous.long and srcs[0] not in previous.dsts and issue - self.events[previous.event_idx].time <= 7
+      if not duplicate_read_warm:
+        read_ready = max(read_ready, issue + 5 + max(ordered_collision * (1 + previous_long_producer), reverse_collision))
+    first_producer_age = next((age for age, record in enumerate(reversed(records)) if srcs[0] in record.dsts), len(records))
+    delayed_refill = 0 not in stale and 1 in stale and operand_ready[0] > issue and self.salu_exec_delayed[simd] and \
+      first_producer_age >= 3 and not set(srcs) & dsts and exec_ready > read_ready
+    return max(read_ready, exec_ready + delayed_refill)
+
+  def _side_operand_refill(self, st: _WaveState, simd: int, issue: int, srcs: set[int]) -> bool:
+    records = self.salu_exec_records[simd]
+    if issue != st.last_salu_issue + 1 or len(records) < 3: return False
+    normal, first_long, second_long = records[-3:]
+    return not normal.long and first_long.long and second_long.long and \
+      bool(second_long.srcs & second_long.dsts & first_long.dsts) and bool(srcs & (second_long.srcs - second_long.dsts)) and \
+      self.events[first_long.event_idx].time == self.events[normal.event_idx].time + 2 and \
+      self.events[second_long.event_idx].time == self.events[first_long.event_idx].time + 3
+
   def _classify(self, inst, branch_taken: bool|None) -> _TraceInfo:
     inst_type, inst_op, op_name = type(inst), inst.op.value if hasattr(inst, "op") else 0, _op_name(inst)
     if issubclass(inst_type, _SOPP):
@@ -606,21 +639,11 @@ class RDNA3SQTTTraceBuilder:
         stale_read_stall = 2 if not long_salu and any(st.sgpr_exec_ready.get(r, issue) + 1 < issue for r in src_sgprs) else 0
         read_stall = max(overlap_stall, stale_read_stall, 2 if not long_salu and 0 in initial_src_sgprs else 0,
                          2 if salu_read_stall and src_sgprs else 0)
-        if long_salu and src_sgpr_operands and all(r in st.sgpr_exec_ready for r in src_sgpr_operands):
-          operand_ready = [st.sgpr_exec_ready[r] for r in src_sgpr_operands]
-          stale_operands = [i for i, ready in enumerate(operand_ready) if ready + 1 < issue]
-          read_ready = max(issue + 3, max(operand_ready) + 3)
-          if stale_operands:
-            ordered_collision = 0 not in stale_operands and 1 in stale_operands and \
-              (operand_ready[0] == operand_ready[1] + 1 or operand_ready[0] > issue)
-            previous_long_producer = bool(self.salu_exec_records[simd] and self.salu_exec_records[simd][-1].long and
-                                          src_sgpr_operands[0] in dst_sgprs and
-                                          src_sgpr_operands[0] in self.salu_exec_records[simd][-1].dsts)
-            refill_collision = ordered_collision * (1 + previous_long_producer)
-            read_ready = max(read_ready, issue + 5 + refill_collision)
-          exec_time = max(read_ready, exec_ready)
+        if long_salu and len(src_sgpr_operands) >= 2 and all(r in st.sgpr_exec_ready for r in src_sgpr_operands):
+          exec_time = self._long_salu_read_ready(st, simd, issue, exec_ready, src_sgpr_operands, dst_sgprs)
         else:
-          exec_time = max(issue + exec_latency + read_stall, exec_ready, dep_ready)
+          side_operand_refill = not long_salu and bool(stale_read_stall) and self._side_operand_refill(st, simd, issue, src_sgprs)
+          exec_time = max(issue + exec_latency + read_stall, exec_ready + side_operand_refill, dep_ready)
       elif info.pipe == "valu":
         if info.trans_pipe and not info.trans and self.valu_last_plain[simd]: exec_ready += 1
         order_read_warm = st.valu_read_order_warm or 0 <= st.last_valu_issue < st.last_salu_issue
@@ -629,10 +652,11 @@ class RDNA3SQTTTraceBuilder:
         source_free_read_warm = st.valu_read_warm or (len(st.valu_exec_history) >= 2 and not st.valu_source_read)
         trans_read_warm = len(st.valu_exec_history) >= 2 or \
           bool(st.salu_exec_history and (st.valu_exec_history or st.valu_source_read))
+        trans_ring_warm = len(st.valu_exec_history) >= 9 and len(st.valu_exec_history) % _VALU_READ_RING not in (4, 5)
         if not info.trans and src_vgprs and any(5 <= dep <= 7 for dep in active_delays): latency = 8
         elif not info.trans and any(st.vgpr_lds_pending.get(r, False) for r in src_vgprs): latency = 8
         elif info.trans and st.trans_warm: latency = 7
-        elif info.trans and trans_read_warm: latency = 7 if src_vgprs & st.valu_read_regs else 8
+        elif info.trans and trans_read_warm: latency = 7 if src_vgprs & st.valu_read_regs or trans_ring_warm else 8
         elif info.trans_pipe and not info.trans and (order_read_warm or source_free_read_warm):
           latency = info.exec_latency - 1 - (order_read_warm and st.last_valu_valub and len(st.valu_exec_history) >= 2)
         elif src_vgprs and info.vgpr_read_latency is not None:

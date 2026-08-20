@@ -34,6 +34,16 @@ def _arithmetic_corpus_case(seed: int) -> TraceCase:
     else: instructions.append(v_rcp_f32_e32(v[rng.randrange(8)], v[rng.randrange(8)]))
   return TraceCase(f"arithmetic_corpus_{seed}", instructions + [s_endpgm()], local_size=32)
 
+def _initialized_salu_corpus_case(seed: int) -> TraceCase:
+  rng = random.Random(seed)
+  instructions = [s_mov_b32(s[i], i+1) for i in range(4)]
+  for _ in range(8):
+    op = rng.randrange(3)
+    if op == 0: instructions.append(s_mov_b32(s[rng.randrange(4)], rng.randrange(1, 32)))
+    elif op == 1: instructions.append(s_add_u32(s[rng.randrange(4)], s[rng.randrange(4)], rng.randrange(1, 4)))
+    else: instructions.append(s_mul_i32(s[rng.randrange(4)], s[rng.randrange(4)], s[rng.randrange(4)]))
+  return TraceCase(f"initialized_salu_corpus_{seed}", instructions + [s_endpgm()], local_size=32)
+
 @dataclass(frozen=True)
 class NormalizedSQTTEvent:
   time: int
@@ -959,6 +969,23 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
     s_mov_b32(s[3], 1), s_mov_b32(s[8], 2), s_mov_b32(s[9], 3), s_mul_i32(s[2], s[3], s[3]),
     s_mul_i32(s[2], s[2], s[3]), s_add_u32(s[0], s[3], 1), s_endpgm()], local_size=32),
     [0, 1, 2, 2, 3, 3, 4, 4, 5, 6, 11, 12]),
+  "compose_salu_mul_delayed_refill": (TraceCase("compose_salu_mul_delayed_refill", [
+    s_mov_b32(s[i], i+1) for i in range(4)] + [s_add_u32(s[3], s[3], 1), s_mul_i32(s[1], s[2], s[1]), s_endpgm()], local_size=32),
+    [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 7, 10]),
+  "compose_salu_mul_reverse_refill": (TraceCase("compose_salu_mul_reverse_refill", [
+    s_mov_b32(s[i], i+1) for i in range(4)] + [s_mov_b32(s[1], 17), s_mul_i32(s[1], s[3], s[2]),
+    s_mul_i32(s[1], s[2], s[1]), s_endpgm()], local_size=32), [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 12]),
+  "compose_salu_mul_side_refill": (TraceCase("compose_salu_mul_side_refill", [
+    s_mov_b32(s[i], i+1) for i in range(4)] + [s_mov_b32(s[1], 15), s_mul_i32(s[2], s[3], s[3]),
+    s_mul_i32(s[2], s[2], s[3]), s_add_u32(s[3], s[3], 3), s_endpgm()], local_size=32),
+    [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 8, 11, 13]),
+  "compose_salu_mul_duplicate_cold": (TraceCase("compose_salu_mul_duplicate_cold", [
+    s_mov_b32(s[i], i+1) for i in range(4)] + [s_mul_i32(s[0], s[0], s[0]), s_endpgm()], local_size=32),
+    [0, 1, 2, 2, 3, 3, 4, 4, 5, 9]),
+  "compose_salu_mul_duplicate_warm": (TraceCase("compose_salu_mul_duplicate_warm", [s_mov_b32(s[2], 3)] + [
+    v_mov_b32_e32(v[i], i+1) for i in range(3)] + [s_add_u32(s[3], s[3], 1), v_mov_b32_e32(v[6], 30),
+    v_mov_b32_e32(v[7], 31), s_mul_i32(s[2], s[2], s[2]), s_endpgm()], local_size=32),
+    [0, 1, 2, 2, 3, 4, 5, 6, 7, 7, 8, 9, 10, 11, 12]),
   "compose_salu_mul_after_delayed": (TraceCase("compose_salu_mul_after_delayed", [
     s_add_u32(s[8], s[8], 1), s_mul_i32(s[9], s[4], s[5]), s_endpgm()], local_size=32), [0, 1, 4, 6]),
   "compose_salu_mul_pipelined": (TraceCase("compose_salu_mul_pipelined", [
@@ -1099,6 +1126,12 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
     v_add_f32_e32(v[i], v[i-1], v[i-1]) for i in range(1, 14)] + [
     v_rcp_f32_e32(v[14], v[13]), v_add_f32_e32(v[15], v[14], v[14]), s_endpgm()], local_size=32, vgpr_count=20),
     [0, 1, 2, 3, 4, 5, 6, 6, 7, 8, 9, 10, 11, 12, 12, 13, 16, 17, 21, 22, 27, 32, 37, 42, 47, 52, 57, 62, 67, 72, 77, 87]),
+  "compose_trans_read_ring_warm": (TraceCase("compose_trans_read_ring_warm", [
+    v_mov_b32_e32(v[i%8], i+1) for i in range(9)] + [v_rcp_f32_e32(v[4], v[5]), s_endpgm()], local_size=32),
+    [0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 11, 12, 13, 14, 16]),
+  "compose_trans_read_ring_cold": (TraceCase("compose_trans_read_ring_cold", [
+    v_mov_b32_e32(v[i%8], i+1) for i in range(12)] + [v_rcp_f32_e32(v[4], v[5]), s_endpgm()], local_size=32),
+    [0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 14, 15, 16, 17, 20]),
   "compose_trans_waw": (TraceCase("compose_trans_waw", [
     v_rcp_f32_e32(v[3], v[5]), v_mov_b32_e32(v[3], 1), s_endpgm()], local_size=32), [0, 1, 9, 15]),
 }
@@ -1118,6 +1151,13 @@ _ARITHMETIC_CORPUS_TIMES: dict[int, list[int]] = {
 for _seed, _times in _ARITHMETIC_CORPUS_TIMES.items():
   _case = _arithmetic_corpus_case(_seed)
   COMPOSITION_CASES[_case.name] = (_case, _times)
+
+EXEC_COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
+  "compose_salu_mul_aged_refill": (TraceCase("compose_salu_mul_aged_refill", [
+    s_mov_b32(s[i], i+1) for i in range(4)] + [s_mul_i32(s[1], s[1], s[3]), s_mul_i32(s[3], s[2], s[1]),
+    s_mov_b32(s[3], 2), s_add_u32(s[0], s[2], 3), s_mov_b32(s[2], 16), s_mov_b32(s[3], 16), s_mov_b32(s[3], 10),
+    s_mul_i32(s[2], s[0], s[1]), s_endpgm()], local_size=32), [2, 3, 4, 5, 8, 11, 12, 13, 14, 15, 16, 19]),
+}
 
 MULTIWAVE_CASES = {
   "multi_wave_salu": TraceCase("multi_wave_salu", [s_mov_b32(s[0], 1)] + [s_add_u32(s[0], s[0], 1) for _ in range(6)] + [s_endpgm()],
@@ -1204,6 +1244,11 @@ class TestSQTTCycleModel(unittest.TestCase):
     for name, (case, expected) in COMPOSITION_CASES.items():
       with self.subTest(name=name): self.assertListEqual([e.time for e in _timed_events(_run_mock_trace(case))], expected)
 
+  def test_exec_composition_timing(self):
+    for name, (case, expected) in EXEC_COMPOSITION_CASES.items():
+      with self.subTest(name=name):
+        self.assertListEqual([e.time for e in _timed_events(_run_mock_trace(case)) if e.kind in {"ALUEXEC", "VMEMEXEC"}], expected)
+
   def test_large_delta_packet(self):
     blob = _run_mock_blob(CASES["lds_roundtrip"][0])
     self.assertTrue(any(isinstance(pkt, TS_DELTA_OR_MARK) for pkt in decode(blob)))
@@ -1259,6 +1304,7 @@ class TestSQTTHardwareCycle(unittest.TestCase):
   def test_hardware_trace_order(self):
     cases = [(name, case, expected) for name, (case, expected) in CASES.items()] + \
             [(name, case, _run_mock_trace(case)) for name, (case, _) in COMPOSITION_CASES.items()] + \
+            [(name, case, _run_mock_trace(case)) for name, (case, _) in EXEC_COMPOSITION_CASES.items()] + \
             [(name, case, _run_mock_trace(case)) for name, case in MULTIWAVE_CASES.items()]
     for name, case, expected in cases:
       with self.subTest(name=name):
@@ -1292,6 +1338,24 @@ class TestSQTTHardwareCycle(unittest.TestCase):
       got = _timed_events(_run_hardware_trace(case, min_instructions=len(_instruction_events(want))))
       if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: mismatches.append(msg)
     if mismatches: self.fail(f"{len(mismatches)}/{count} arithmetic traces mismatched\n{mismatches[0]}")
+
+  def test_hardware_initialized_salu_corpus(self):
+    if (count:=getenv("SQTT_CYCLE_SALU_CORPUS_COUNT", 0)) <= 0:
+      self.skipTest("set SQTT_CYCLE_SALU_CORPUS_COUNT to run the initialized SALU corpus")
+    start, mismatches = getenv("SQTT_CYCLE_SALU_CORPUS_START", 20000), []
+    for seed in range(start, start + count):
+      case = _initialized_salu_corpus_case(seed)
+      want = [e for e in _timed_events(_run_mock_trace(case)) if e.kind == "ALUEXEC"]
+      got = [e for e in _timed_events(_run_hardware_trace(case, min_instructions=len(case.instructions)-1)) if e.kind == "ALUEXEC"]
+      if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: mismatches.append(msg)
+    if mismatches: self.fail(f"{len(mismatches)}/{count} initialized SALU traces mismatched\n{mismatches[0]}")
+
+  def test_hardware_exec_composition_cycles(self):
+    if not getenv("SQTT_CYCLE_STRICT", 0): self.skipTest("set SQTT_CYCLE_STRICT=1 to require exact cycle timestamps")
+    for name, (case, expected) in EXEC_COMPOSITION_CASES.items():
+      with self.subTest(name=name):
+        got = _timed_events(_run_hardware_trace(case, min_instructions=len(_instruction_events(_run_mock_trace(case)))))
+        self.assertListEqual([e.time for e in got if e.kind in {"ALUEXEC", "VMEMEXEC"}], expected)
 
   def test_hardware_multi_wave_execution(self):
     if not getenv("SQTT_CYCLE_STRICT", 0): self.skipTest("set SQTT_CYCLE_STRICT=1 to require exact cycle timestamps")
