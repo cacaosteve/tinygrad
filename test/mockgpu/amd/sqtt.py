@@ -611,8 +611,12 @@ class RDNA3SQTTTraceBuilder:
           stale_operands = [i for i, ready in enumerate(operand_ready) if ready + 1 < issue]
           read_ready = max(issue + 3, max(operand_ready) + 3)
           if stale_operands:
-            refill_collision = 0 not in stale_operands and 1 in stale_operands and \
+            ordered_collision = 0 not in stale_operands and 1 in stale_operands and \
               (operand_ready[0] == operand_ready[1] + 1 or operand_ready[0] > issue)
+            previous_long_producer = bool(self.salu_exec_records[simd] and self.salu_exec_records[simd][-1].long and
+                                          src_sgpr_operands[0] in dst_sgprs and
+                                          src_sgpr_operands[0] in self.salu_exec_records[simd][-1].dsts)
+            refill_collision = ordered_collision * (1 + previous_long_producer)
             read_ready = max(read_ready, issue + 5 + refill_collision)
           exec_time = max(read_ready, exec_ready)
         else:

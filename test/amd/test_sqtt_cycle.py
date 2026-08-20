@@ -955,6 +955,10 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
     s_mov_b32(s[i], i+1) for i in range(4)] + [s_add_u32(s[2], s[3], 3), s_add_u32(s[0], s[3], 3),
     s_add_u32(s[2], s[2], 2), s_mul_i32(s[3], s[2], s[3]), s_endpgm()], local_size=32),
     [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 7, 8, 9, 13]),
+  "compose_salu_mul_refill_chain": (TraceCase("compose_salu_mul_refill_chain", [
+    s_mov_b32(s[3], 1), s_mov_b32(s[8], 2), s_mov_b32(s[9], 3), s_mul_i32(s[2], s[3], s[3]),
+    s_mul_i32(s[2], s[2], s[3]), s_add_u32(s[0], s[3], 1), s_endpgm()], local_size=32),
+    [0, 1, 2, 2, 3, 3, 4, 4, 5, 6, 11, 12]),
   "compose_salu_mul_after_delayed": (TraceCase("compose_salu_mul_after_delayed", [
     s_add_u32(s[8], s[8], 1), s_mul_i32(s[9], s[4], s[5]), s_endpgm()], local_size=32), [0, 1, 4, 6]),
   "compose_salu_mul_pipelined": (TraceCase("compose_salu_mul_pipelined", [
