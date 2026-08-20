@@ -572,7 +572,8 @@ class RDNA3SQTTTraceBuilder:
         dep_forward = 3 if long_salu else info.forward_latency
         dep_ready = max([st.sgpr_exec_ready.get(r, 0) + dep_forward for r in src_sgprs if r in st.sgpr_exec_ready] + [0])
         long_cold = 0 in initial_src_sgprs or bool(initial_src_sgprs & dst_sgprs)
-        exec_latency = info.exec_latency + (2 if long_salu and long_cold else 0)
+        long_stale = long_salu and any(st.sgpr_exec_ready.get(r, issue) + 1 <= issue for r in src_sgprs if r in st.sgpr_exec_ready)
+        exec_latency = info.exec_latency + (2 if long_salu and (long_cold or long_stale) else 0)
         overlap_stall = 2 if not long_salu and (not st.salu_exec_history or issue != st.salu_exec_history[-1]) and \
           any(r in dst_sgprs and r not in st.sgpr_exec_ready for r in src_sgprs) else 0
         # A retired SGPR stays on the forwarding path through the following cycle, then requires a read refill.
@@ -594,7 +595,8 @@ class RDNA3SQTTTraceBuilder:
         elif info.trans_pipe and not info.trans and order_read_warm: latency = info.exec_latency - 1
         elif src_vgprs and info.vgpr_read_latency is not None:
           read_warm = len(st.valu_exec_history) >= _VALU_READ_WARMUP or mixed_read_warm or order_read_warm
-          bank_conflict = len({reg % 4 for reg in src_vgprs}) < len(src_vgprs)
+          bank_conflict = len({reg % 4 for reg in src_vgprs}) < len(src_vgprs) and \
+            not any(st.vgpr_producer_shiftable.get(r, False) for r in dst_vgprs)
           latency = info.vgpr_read_latency - read_warm + bank_conflict
         else: latency = info.exec_latency
         if info.trans and st.had_lds:
