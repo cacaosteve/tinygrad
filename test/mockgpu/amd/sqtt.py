@@ -357,6 +357,7 @@ class _SALUExecRecord:
   event_idx: int
   wave_id: int
   issue: int
+  srcs: frozenset[int]
   dsts: frozenset[int]
   history_idx: int
   ib_idx: int
@@ -426,10 +427,15 @@ class RDNA3SQTTTraceBuilder:
   def _resolve_initial_sgpr_reads(self, st: _WaveState, simd: int, dsts: set[int]) -> None:
     affected = {record_idx for reg in dsts for record_idx in st.initial_sgpr_reads.pop(reg, [])}
     if not affected: return
-    floor = 0
+    floor, long_floor = 0, 0
+    producer_time: dict[tuple[int, int], int] = {}
+    previous: _SALUExecRecord|None = None
     for record_idx, record in enumerate(self.salu_exec_records[simd]):
       event, wave_st = self.events[record.event_idx], self.waves[record.wave_id]
-      new_time = max(event.time, floor, record.issue + (5 if record.long else 4) if record_idx in affected else 0)
+      dep_ready = max([producer_time.get((record.wave_id, reg), 0) + (3 if record.long else 2) for reg in record.srcs] + [0])
+      delayed_normal = previous is not None and record.long and not previous.long and floor - 1 > previous.issue + 2
+      new_time = max(event.time, floor + delayed_normal, long_floor if record.long else 0, dep_ready,
+                     record.issue + (5 if record.long else 4) if record_idx in affected else 0)
       if new_time != event.time:
         old_time = event.time
         self.events[record.event_idx] = replace(event, time=new_time)
@@ -439,7 +445,14 @@ class RDNA3SQTTTraceBuilder:
         self.salu_ib[simd].entries[record.ib_idx] = new_time + 1
         wave_st.last_time = max(wave_st.last_time, new_time)
       floor = new_time + 1
+      if record.long: long_floor = new_time + 2
+      for reg in record.dsts: producer_time[(record.wave_id, reg)] = new_time
+      previous = record
     self.salu_exec_ready[simd] = max(self.salu_exec_ready[simd], floor)
+    self.salu_long_exec_ready[simd] = max(self.salu_long_exec_ready[simd], long_floor)
+    if previous is not None:
+      last_time = self.events[previous.event_idx].time
+      self.salu_exec_delayed[simd] = not previous.long and last_time > previous.issue + 2
 
   def _classify(self, inst, branch_taken: bool|None) -> _TraceInfo:
     inst_type, inst_op, op_name = type(inst), inst.op.value if hasattr(inst, "op") else 0, _op_name(inst)
@@ -719,7 +732,8 @@ class RDNA3SQTTTraceBuilder:
       if salu_alu: self.salu_ib[simd].record(exec_time)
       if salu_alu and exec_event is not None:
         record_idx = len(self.salu_exec_records[simd])
-        self.salu_exec_records[simd].append(_SALUExecRecord(exec_event, wave_id, issue, frozenset(dst_sgprs), history_idx, ib_idx, long_salu))
+        self.salu_exec_records[simd].append(_SALUExecRecord(exec_event, wave_id, issue, frozenset(src_sgprs), frozenset(dst_sgprs),
+                                                            history_idx, ib_idx, long_salu))
         for reg in initial_src_sgprs - dst_sgprs: st.initial_sgpr_reads.setdefault(reg, []).append(record_idx)
     st.pending_delays = [(skip - 1, dep) for skip, dep in st.pending_delays if skip > 0]
     st.trans_warm = info.nop

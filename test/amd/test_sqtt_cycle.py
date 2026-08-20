@@ -960,6 +960,10 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
   "compose_salu_mul_stale": (TraceCase("compose_salu_mul_stale", [
     s_mov_b32(s[1], 2), s_mov_b32(s[2], 3), v_mov_b32_e32(v[0], 1), v_mov_b32_e32(v[1], 2),
     s_mul_i32(s[0], s[1], s[2]), s_endpgm()], local_size=32), [0, 1, 2, 2, 3, 3, 4, 8, 9]),
+  "compose_salu_reschedule_forwarding": (TraceCase("compose_salu_reschedule_forwarding", [
+    s_mov_b32(s[2], 1), s_mul_i32(s[2], s[2], s[1]), s_mul_i32(s[3], s[2], s[0]), s_add_u32(s[3], s[3], 1),
+    s_mul_i32(s[3], s[2], s[2]), s_add_u32(s[1], s[1], 1), s_endpgm()], local_size=32),
+    [0, 1, 2, 2, 3, 4, 5, 6, 9, 11, 13, 14]),
   "compose_interleaved_read_warmup": (TraceCase("compose_interleaved_read_warmup", [
     v_mov_b32_e32(v[3], 2), s_mov_b32(s[1], 1), v_add_f32_e32(v[0], v[0], v[0]), s_endpgm()], local_size=32), [0, 1, 2, 3, 6, 10]),
   "compose_valu_bank_conflict": (TraceCase("compose_valu_bank_conflict", [
