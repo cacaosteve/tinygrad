@@ -1223,6 +1223,16 @@ class TestSQTTHardwareCycle(unittest.TestCase):
         if case.normalize_exec_start: got, want = _normalize_exec_start(got), _normalize_exec_start(want)
         if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: self.fail(msg)
 
+  def test_hardware_arithmetic_corpus(self):
+    if (count:=getenv("SQTT_CYCLE_CORPUS_COUNT", 0)) <= 0: self.skipTest("set SQTT_CYCLE_CORPUS_COUNT to run the arithmetic corpus")
+    start, mismatches = getenv("SQTT_CYCLE_CORPUS_START", 0), []
+    for seed in range(start, start + count):
+      case = _arithmetic_corpus_case(seed)
+      want = _timed_events(_run_mock_trace(case))
+      got = _timed_events(_run_hardware_trace(case, min_instructions=len(_instruction_events(want))))
+      if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: mismatches.append(msg)
+    if mismatches: self.fail(f"{len(mismatches)}/{count} arithmetic traces mismatched\n{mismatches[0]}")
+
   def test_hardware_multi_wave_execution(self):
     if not getenv("SQTT_CYCLE_STRICT", 0): self.skipTest("set SQTT_CYCLE_STRICT=1 to require exact cycle timestamps")
     for name, expected in MULTIWAVE_EXEC_TIMES.items():
