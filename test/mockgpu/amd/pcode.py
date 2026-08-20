@@ -1376,7 +1376,9 @@ def parse_expr(expr: str, env: dict[str, VarVal], funcs: dict | None = None) -> 
   return parse_tokens(tokenize(expr.strip().rstrip(';')), env, funcs)
 
 def _pcode_lines(pcode: str) -> list[str]:
-  raw_lines = [l.strip().rstrip(';') for l in pcode.split('\n') if l.strip() and not l.strip().startswith('//')]
+  raw_lines: list[str] = []
+  for raw_line in pcode.split('\n'):
+    if (line:=raw_line.split('//', 1)[0].strip().rstrip(';')): raw_lines.append(line)
   lines: list[str] = []
   c_blocks: list[str] = []
   for line in raw_lines:
