@@ -44,6 +44,27 @@ def _initialized_salu_corpus_case(seed: int) -> TraceCase:
     else: instructions.append(s_mul_i32(s[rng.randrange(4)], s[rng.randrange(4)], s[rng.randrange(4)]))
   return TraceCase(f"initialized_salu_corpus_{seed}", instructions + [s_endpgm()], local_size=32)
 
+def _initialized_mixed_corpus_case(seed: int) -> TraceCase:
+  rng = random.Random(seed)
+  instructions = [s_mov_b32(s[i], i+1) for i in range(4)] + [v_mov_b32_e32(v[i], i+1) for i in range(10)]
+  for _ in range(10):
+    op = rng.randrange(7)
+    if op == 0: instructions.append(s_mov_b32(s[rng.randrange(4)], rng.randrange(1, 32)))
+    elif op == 1: instructions.append(s_add_u32(s[rng.randrange(4)], s[rng.randrange(4)], rng.randrange(1, 4)))
+    elif op == 2: instructions.append(s_mul_i32(s[rng.randrange(4)], s[rng.randrange(4)], s[rng.randrange(4)]))
+    elif op == 3: instructions.append(v_mov_b32_e32(v[rng.randrange(8)], rng.randrange(1, 32)))
+    elif op == 4: instructions.append(v_add_f32_e32(v[rng.randrange(8)], v[rng.randrange(8)], v[rng.randrange(8)]))
+    elif op == 5: instructions.append(v_lshlrev_b64(v[8:9], rng.randrange(1, 8), v[0:1]))
+    else: instructions.append(v_rcp_f32_e32(v[rng.randrange(8)], v[rng.randrange(8)]))
+  return TraceCase(f"initialized_mixed_corpus_{seed}", instructions + [s_endpgm()], local_size=32)
+
+def _salu_refill_forward_case(name: str, second_src: int) -> TraceCase:
+  instructions = [s_mov_b32(s[i], i+1) for i in range(4)] + [v_mov_b32_e32(v[i], i+1) for i in range(10)] + [
+    v_add_f32_e32(v[6], v[1], v[5]), v_rcp_f32_e32(v[7], v[0]), s_add_u32(s[1], s[0], 1), s_add_u32(s[1], s[1], 1),
+    s_add_u32(s[3], s[3], 1), v_rcp_f32_e32(v[0], v[1]), s_add_u32(s[3], s[1], 1), v_mov_b32_e32(v[7], 1),
+    v_rcp_f32_e32(v[4], v[3]), s_mul_i32(s[0], s[3], s[second_src]), s_endpgm()]
+  return TraceCase(name, instructions, local_size=32)
+
 @dataclass(frozen=True)
 class NormalizedSQTTEvent:
   time: int
@@ -1021,6 +1042,12 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
     s_mov_b32(s[0], 23), s_mul_i32(s[0], s[2], s[0]), s_mov_b32(s[2], 16), v_rcp_f32_e32(v[5], v[1]),
     s_mov_b32(s[2], 22), v_lshlrev_b64(v[8:9], 7, v[0:1]), s_add_u32(s[3], s[1], 1), s_endpgm()], local_size=32),
     [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 8, 9, 10, 10, 11, 11, 12, 13, 14, 15, 15, 16, 18, 20, 24]),
+  "compose_salu_aligned_refill": (_salu_refill_forward_case("compose_salu_aligned_refill", 2),
+    [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16,
+     17, 17, 18, 18, 19, 19, 20, 20, 21, 22, 23, 23, 24, 24, 27, 29, 31]),
+  "compose_salu_aligned_refill_collision": (_salu_refill_forward_case("compose_salu_aligned_refill_collision", 1),
+    [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16,
+     17, 17, 18, 18, 19, 19, 20, 20, 21, 22, 23, 23, 24, 24, 27, 29, 31]),
   "compose_salu_mul_after_delayed": (TraceCase("compose_salu_mul_after_delayed", [
     s_add_u32(s[8], s[8], 1), s_mul_i32(s[9], s[4], s[5]), s_endpgm()], local_size=32), [0, 1, 4, 6]),
   "compose_salu_mul_pipelined": (TraceCase("compose_salu_mul_pipelined", [
@@ -1170,6 +1197,14 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
   "compose_valub_read_warmup_short": (TraceCase("compose_valub_read_warmup_short", [
     v_mov_b32_e32(v[2], 1), v_mov_b32_e32(v[3], 1), v_lshlrev_b64(v[8:9], 2, v[0:1]),
     v_lshlrev_b64(v[8:9], 2, v[0:1]), s_endpgm()], local_size=32), [0, 1, 2, 4, 6, 7, 11, 13]),
+  "compose_valub_all_sources_reused": (TraceCase("compose_valub_all_sources_reused", [
+    v_mov_b32_e32(v[i], i+1) for i in range(10)] + [v_lshlrev_b64(v[8:9], 7, v[0:1]), s_mov_b32(s[0], 1),
+    v_mov_b32_e32(v[5], 19), v_lshlrev_b64(v[8:9], 1, v[0:1]), s_endpgm()], local_size=32, vgpr_count=12),
+    [0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 12, 13, 14, 15, 15, 16, 17, 17, 19, 22, 25]),
+  "compose_valub_partial_source_reuse": (TraceCase("compose_valub_partial_source_reuse", [
+    v_mov_b32_e32(v[i], i+1) for i in range(10)] + [v_lshlrev_b64(v[8:9], 7, v[0:1]), s_mov_b32(s[0], 1),
+    v_mov_b32_e32(v[5], 19), v_lshlrev_b64(v[8:9], 1, v[1:2]), s_endpgm()], local_size=32, vgpr_count=12),
+    [0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 12, 13, 14, 15, 15, 16, 17, 17, 19, 22, 26]),
   "compose_valub_order_warmup": (TraceCase("compose_valub_order_warmup", [
     v_lshlrev_b64(v[8:9], 2, v[0:1]), s_mov_b32(s[20], 1), s_mov_b32(s[21], 1),
     v_lshlrev_b64(v[8:9], 3, v[0:1]), s_endpgm()], local_size=32), [0, 5, 6, 7, 7, 8, 10, 16]),
@@ -1412,6 +1447,17 @@ class TestSQTTHardwareCycle(unittest.TestCase):
       got = [e for e in _timed_events(_run_hardware_trace(case, min_instructions=len(case.instructions)-1)) if e.kind == "ALUEXEC"]
       if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: mismatches.append(msg)
     if mismatches: self.fail(f"{len(mismatches)}/{count} initialized SALU traces mismatched\n{mismatches[0]}")
+
+  def test_hardware_initialized_mixed_corpus(self):
+    if (count:=getenv("SQTT_CYCLE_MIXED_CORPUS_COUNT", 0)) <= 0:
+      self.skipTest("set SQTT_CYCLE_MIXED_CORPUS_COUNT to run the initialized mixed corpus")
+    start, mismatches = getenv("SQTT_CYCLE_MIXED_CORPUS_START", 30000), []
+    for seed in range(start, start + count):
+      case = _initialized_mixed_corpus_case(seed)
+      want = [e for e in _timed_events(_run_mock_trace(case)) if e.kind == "ALUEXEC"]
+      got = [e for e in _timed_events(_run_hardware_trace(case, min_instructions=len(case.instructions)-1)) if e.kind == "ALUEXEC"]
+      if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: mismatches.append(f"seed {seed}\n{msg}")
+    if mismatches: self.fail(f"{len(mismatches)}/{count} initialized mixed traces mismatched\n{mismatches[0]}")
 
   def test_hardware_exec_composition_cycles(self):
     if not getenv("SQTT_CYCLE_STRICT", 0): self.skipTest("set SQTT_CYCLE_STRICT=1 to require exact cycle timestamps")
