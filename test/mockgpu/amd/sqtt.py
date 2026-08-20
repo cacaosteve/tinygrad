@@ -70,7 +70,7 @@ _VALUB_16_RE = re.compile(r"V_\w+_F64")
 _DS_ATOMIC_RE = re.compile(r"DS_(ADD|SUB|RSUB|INC|DEC|MIN|MAX|AND|OR|XOR|MSKOR)(_|$)")
 _SALU_3_CYCLE = {"S_MUL_I32", "S_MULK_I32", "S_MUL_HI_I32", "S_MUL_HI_U32"}
 _SALU_INFLIGHT_LIMIT, _VALU_INFLIGHT_LIMIT, _VALUB_INFLIGHT_LIMIT, _TRANS_INFLIGHT_LIMIT, _VALU_READ_WARMUP = 6, 12, 8, 5, 7
-_VALU_READ_RING, _SALU_DUPLICATE_READ_WARMUP = 8, 5
+_SALU_DUPLICATE_READ_WARMUP = 5
 _CU_SIMDS = 2
 
 def _op_name(inst) -> str:
@@ -332,12 +332,16 @@ class _WaveState:
   vgpr_exec_event: dict[int, int] = field(default_factory=dict)
   vgpr_producer_interp: dict[int, bool] = field(default_factory=dict)
   vgpr_producer_trans: dict[int, bool] = field(default_factory=dict)
+  vgpr_valu_issue: dict[int, int] = field(default_factory=dict)
   vgpr_trans_issue_ready: dict[int, int] = field(default_factory=dict)
   vgpr_producer_shiftable: dict[int, bool] = field(default_factory=dict)
   vgpr_read_after_write: dict[int, bool] = field(default_factory=dict)
   shifted_exec_events: set[int] = field(default_factory=set)
   sgpr_ready: dict[int, int] = field(default_factory=dict)
   sgpr_exec_ready: dict[int, int] = field(default_factory=dict)
+  sgpr_read_regs: set[int] = field(default_factory=set)
+  sgpr_read_refill: int = 0
+  valu_since_salu: int = 0
   valu_exec_history: list[int] = field(default_factory=list)
   trans_exec_history: list[tuple[int, bool]] = field(default_factory=list)
   valu_source_read: bool = False
@@ -484,14 +488,17 @@ class RDNA3SQTTTraceBuilder:
       first_producer_age >= 3 and not set(srcs) & dsts and exec_ready > read_ready
     return max(read_ready, exec_ready + delayed_refill)
 
-  def _side_operand_refill(self, st: _WaveState, simd: int, issue: int, srcs: set[int]) -> bool:
+  def _side_operand_refill(self, st: _WaveState, simd: int, issue: int, srcs: set[int]) -> int:
     records = self.salu_exec_records[simd]
-    if issue != st.last_salu_issue + 1 or len(records) < 3: return False
+    if issue != st.last_salu_issue + 1 or len(records) < 2 or not records[-1].long: return 0
+    producer, previous = records[-2:]
+    if not producer.long and bool(srcs & producer.dsts) and self.events[previous.event_idx].time == previous.issue + 3: return 2
+    if len(records) < 3: return 0
     normal, first_long, second_long = records[-3:]
-    return not normal.long and first_long.long and second_long.long and \
+    return int(not normal.long and first_long.long and second_long.long and \
       bool(second_long.srcs & second_long.dsts & first_long.dsts) and bool(srcs & (second_long.srcs - second_long.dsts)) and \
       self.events[first_long.event_idx].time == self.events[normal.event_idx].time + 2 and \
-      self.events[second_long.event_idx].time == self.events[first_long.event_idx].time + 3
+      self.events[second_long.event_idx].time == self.events[first_long.event_idx].time + 3)
 
   def _classify(self, inst, branch_taken: bool|None) -> _TraceInfo:
     inst_type, inst_op, op_name = type(inst), inst.op.value if hasattr(inst, "op") else 0, _op_name(inst)
@@ -636,7 +643,10 @@ class RDNA3SQTTTraceBuilder:
         overlap_stall = 2 if not long_salu and (not st.salu_exec_history or issue != st.salu_exec_history[-1]) and \
           any(r in dst_sgprs and r not in st.sgpr_exec_ready for r in src_sgprs) else 0
         # A retired SGPR stays on the forwarding path through the following cycle, then requires a read refill.
-        stale_read_stall = 2 if not long_salu and any(st.sgpr_exec_ready.get(r, issue) + 1 < issue for r in src_sgprs) else 0
+        stale_sgprs = {r for r in src_sgprs if st.sgpr_exec_ready.get(r, issue) + 1 < issue}
+        stale_read_stall = 0
+        if not long_salu and stale_sgprs:
+          stale_read_stall = 2 - st.sgpr_read_refill if stale_sgprs <= st.sgpr_read_regs else 2
         read_stall = max(overlap_stall, stale_read_stall, 2 if not long_salu and 0 in initial_src_sgprs else 0,
                          2 if salu_read_stall and src_sgprs else 0)
         if long_salu and len(src_sgpr_operands) >= 2 and all(r in st.sgpr_exec_ready for r in src_sgpr_operands):
@@ -652,19 +662,23 @@ class RDNA3SQTTTraceBuilder:
         source_free_read_warm = st.valu_read_warm or (len(st.valu_exec_history) >= 2 and not st.valu_source_read)
         trans_read_warm = len(st.valu_exec_history) >= 2 or \
           bool(st.salu_exec_history and (st.valu_exec_history or st.valu_source_read))
-        trans_ring_warm = len(st.valu_exec_history) >= 9 and len(st.valu_exec_history) % _VALU_READ_RING not in (4, 5)
+        recent_valu_regs = {r for r in src_vgprs if 4 <= issue - st.vgpr_valu_issue.get(r, issue) <= 6}
+        trans_forward_regs = {r for r in src_vgprs if st.vgpr_producer_trans.get(r, False) and
+                              3 <= issue - st.vgpr_exec_ready.get(r, issue) <= 5}
+        warm_valu_regs = st.valu_read_regs | recent_valu_regs | trans_forward_regs
         if not info.trans and src_vgprs and any(5 <= dep <= 7 for dep in active_delays): latency = 8
         elif not info.trans and any(st.vgpr_lds_pending.get(r, False) for r in src_vgprs): latency = 8
         elif info.trans and st.trans_warm: latency = 7
-        elif info.trans and trans_read_warm: latency = 7 if src_vgprs & st.valu_read_regs or trans_ring_warm else 8
+        elif info.trans and trans_read_warm: latency = 7 if src_vgprs & warm_valu_regs else 8
         elif info.trans_pipe and not info.trans and (order_read_warm or source_free_read_warm):
           latency = info.exec_latency - 1 - (order_read_warm and st.last_valu_valub and len(st.valu_exec_history) >= 2)
         elif src_vgprs and info.vgpr_read_latency is not None:
           read_warm = len(st.valu_exec_history) >= _VALU_READ_WARMUP or mixed_read_warm or order_read_warm or \
             source_free_read_warm
           bank_conflict = len({reg % 4 for reg in src_vgprs}) < len(src_vgprs) and \
+            not any(3 <= issue - st.vgpr_valu_issue.get(r, issue) <= 5 for r in src_vgprs) and \
             not any(st.vgpr_producer_shiftable.get(r, False) for r in dst_vgprs)
-          latency = info.vgpr_read_latency - read_warm + bank_conflict
+          latency = info.vgpr_read_latency - read_warm - (src_vgprs <= warm_valu_regs) + bank_conflict
         else: latency = info.exec_latency
         if info.trans and st.had_lds:
           events = {st.vgpr_exec_event[r] for r in src_vgprs if r in st.vgpr_exec_event and
@@ -734,6 +748,8 @@ class RDNA3SQTTTraceBuilder:
         if info.trans: st.vgpr_trans_issue_ready[reg] = issue + 5
         st.vgpr_producer_shiftable[reg] = producer_shiftable
         st.vgpr_read_after_write[reg] = False
+      if info.pipe == "valu": st.vgpr_valu_issue[reg] = issue
+      else: st.vgpr_valu_issue.pop(reg, None)
       if info.pipe == "valu": st.vgpr_lds_ready[reg] = issue + 18
       st.vgpr_lds_pending[reg] = lds_pending
     for reg in dst_sgprs:
@@ -779,6 +795,20 @@ class RDNA3SQTTTraceBuilder:
         self.salu_exec_records[simd].append(_SALUExecRecord(exec_event, wave_id, issue, frozenset(src_sgprs), frozenset(dst_sgprs),
                                                             history_idx, ib_idx, long_salu))
         for reg in initial_src_sgprs - dst_sgprs: st.initial_sgpr_reads.setdefault(reg, []).append(record_idx)
+    if info.pipe == "valu":
+      if src_vgprs:
+        st.sgpr_read_refill = max(st.sgpr_read_refill, 2 if info.trans_pipe and not info.trans else min(2, st.valu_since_salu))
+      st.valu_since_salu += 1
+    elif info.pipe == "salu":
+      # VALU issue slots refill retained SGPR reads; cross-bank long reads also retain ready adjacent registers.
+      st.sgpr_read_regs.difference_update(dst_sgprs)
+      if len(st.valu_exec_history) >= 2:
+        st.sgpr_read_regs.update(src_sgprs - dst_sgprs)
+        if _op_name(inst) in _SALU_3_CYCLE and dst_sgprs & src_sgprs and len(src_sgpr_operands) >= 2 and \
+           src_sgpr_operands[0] // 2 % 2 != src_sgpr_operands[1] // 2 % 2:
+          siblings = {src_sgpr_operands[0] ^ 1, src_sgpr_operands[1] ^ 1} - dst_sgprs
+          st.sgpr_read_regs.update(r for r in siblings if r in st.sgpr_exec_ready and st.sgpr_exec_ready[r] + 1 < issue)
+      st.sgpr_read_refill, st.valu_since_salu = 0, 0
     st.pending_delays = [(skip - 1, dep) for skip, dep in st.pending_delays if skip > 0]
     st.trans_warm = info.nop
     self.issue_ready[simd] = issue + 1
