@@ -177,6 +177,12 @@ def _src_sgprs(inst) -> set[int]:
   if _op_name(inst).startswith("S_FMAC"): ret.update(_sgpr_offsets(getattr(inst, "sdst", None)))
   return ret
 
+def _src_sgpr_operands(inst) -> tuple[int, ...]:
+  ret: list[int] = []
+  for name in ("ssrc0", "ssrc1", "src0", "src1", "src2"):
+    if _has_operand(inst, name): ret.extend(sorted(_sgpr_offsets(getattr(inst, name, None))))
+  return tuple(ret)
+
 def _dst_sgprs(inst) -> set[int]:
   ret: set[int] = set()
   for name in ("sdst", "sdata"):
@@ -548,6 +554,7 @@ class RDNA3SQTTTraceBuilder:
     if info.pkt_cls is None: return
     wave = wave_id // _CU_SIMDS & 0x1F
     src_vgprs, src_sgprs = _src_vgprs(inst), _src_sgprs(inst)
+    src_sgpr_operands = _src_sgpr_operands(inst)
     dst_vgprs, dst_sgprs = _dst_vgprs(inst, _op_name(inst)), _dst_sgprs(inst)
     initial_src_sgprs = {reg for reg in src_sgprs if reg not in st.sgpr_exec_ready}
     self._resolve_initial_sgpr_reads(st, simd, dst_sgprs)
@@ -599,8 +606,17 @@ class RDNA3SQTTTraceBuilder:
         stale_read_stall = 2 if not long_salu and any(st.sgpr_exec_ready.get(r, issue) + 1 < issue for r in src_sgprs) else 0
         read_stall = max(overlap_stall, stale_read_stall, 2 if not long_salu and 0 in initial_src_sgprs else 0,
                          2 if salu_read_stall and src_sgprs else 0)
-        exec_time = max(issue + exec_latency + read_stall,
-                        exec_ready, dep_ready)
+        if long_salu and src_sgpr_operands and all(r in st.sgpr_exec_ready for r in src_sgpr_operands):
+          operand_ready = [st.sgpr_exec_ready[r] for r in src_sgpr_operands]
+          stale_operands = [i for i, ready in enumerate(operand_ready) if ready + 1 < issue]
+          read_ready = max(issue + 3, max(operand_ready) + 3)
+          if stale_operands:
+            refill_collision = 0 not in stale_operands and 1 in stale_operands and \
+              (operand_ready[0] == operand_ready[1] + 1 or operand_ready[0] > issue)
+            read_ready = max(read_ready, issue + 5 + refill_collision)
+          exec_time = max(read_ready, exec_ready)
+        else:
+          exec_time = max(issue + exec_latency + read_stall, exec_ready, dep_ready)
       elif info.pipe == "valu":
         if info.trans_pipe and not info.trans and self.valu_last_plain[simd]: exec_ready += 1
         order_read_warm = st.valu_read_order_warm or 0 <= st.last_valu_issue < st.last_salu_issue
