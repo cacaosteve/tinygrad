@@ -91,6 +91,16 @@ def _rebase(events: Iterable[NormalizedSQTTEvent]) -> list[NormalizedSQTTEvent]:
 def _selected_trace_slot(pkt) -> bool:
   return pkt.simd == getenv("SQTT_SIMD_SEL", 0) and pkt.sa == getenv("SQTT_SA_SEL", 0) and pkt.wgp == getenv("SQTT_WGP_SEL", 0)
 
+def _filter_exec_to_wave_lifetimes(events: list[NormalizedSQTTEvent]) -> list[NormalizedSQTTEvent]:
+  starts, lifetimes = {}, []
+  for event in events:
+    if event.kind == "WAVESTART" and event.wave is not None: starts[event.wave] = event.time
+    elif event.kind == "WAVEEND" and event.wave is not None and event.wave in starts:
+      lifetimes.append((starts.pop(event.wave), event.time))
+  if not lifetimes: return events
+  return [event for event in events if event.kind not in {"ALUEXEC", "VMEMEXEC"} or
+          any(start <= event.time <= end for start, end in lifetimes)]
+
 def normalize_controlled_hardware_trace(blob: bytes, instructions: list) -> list[NormalizedSQTTEvent]:
   pc_map, wave_pc, wave_returns, events = _pc_map(instructions), {}, {}, []
   for pkt in decode(blob):
@@ -127,7 +137,7 @@ def normalize_controlled_hardware_trace(blob: bytes, instructions: list) -> list
       events.append(NormalizedSQTTEvent(pkt._time, "ALUEXEC", None, None, pkt.src.name))
     elif isinstance(pkt, VMEMEXEC):
       events.append(NormalizedSQTTEvent(pkt._time, "VMEMEXEC", None, None, pkt.src.name))
-  return _rebase(events)
+  return _rebase(_filter_exec_to_wave_lifetimes(events))
 
 def normalize_mock_trace(blob: bytes, instructions: list) -> list[NormalizedSQTTEvent]:
   pc_map, wave_pc, wave_returns, events = _pc_map(instructions), {}, {}, []
@@ -1160,6 +1170,12 @@ EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
 }
 
 class TestSQTTCycleModel(unittest.TestCase):
+  def test_exec_lifetime_filter(self):
+    events = [NormalizedSQTTEvent(1, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(2, "WAVESTART", 0, None, None),
+              NormalizedSQTTEvent(3, "ALUEXEC", None, None, "VALU"), NormalizedSQTTEvent(4, "WAVEEND", 0, 4, None),
+              NormalizedSQTTEvent(5, "VMEMEXEC", None, None, "LDS")]
+    self.assertEqual(_filter_exec_to_wave_lifetimes(events), events[1:4])
+
   def test_mock_trace_cases(self):
     for name, (case, expected) in CASES.items():
       with self.subTest(name=name):
