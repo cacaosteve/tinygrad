@@ -605,20 +605,21 @@ class RDNA3SQTTTraceBuilder:
         if not info.interp and not info.matrix and st.matrix_start_ready > issue: st.matrix_start_ready += 4 if interp_sources else 2
         dep_map = st.vgpr_matrix_ready if info.matrix else (st.vgpr_interp_ready if info.interp else st.vgpr_forward_ready)
         dep_ready = max([dep_map.get(r, 0) for r in src_vgprs] + [0])
+        waw_ready = max([st.vgpr_exec_ready[r] + 6 for r in dst_vgprs if st.vgpr_producer_trans.get(r, False) and not info.trans] + [0])
         if info.matrix:
           matrix_start = max(issue, st.matrix_start_ready)
-          exec_time = max(matrix_start + latency, dep_ready)
+          exec_time = max(matrix_start + latency, dep_ready, waw_ready)
           st.matrix_start_ready = matrix_start + 32 + latency - 41
           st.matrix_interp_ready = matrix_start + 44
         elif info.interp:
-          exec_time = max(issue + latency, exec_ready, dep_ready, st.matrix_interp_ready)
+          exec_time = max(issue + latency, exec_ready, dep_ready, waw_ready, st.matrix_interp_ready)
           if st.matrix_start_ready > issue: st.matrix_start_ready += 2
         else:
           valub_ready = st.valub_exec_ready if info.trans_pipe and not info.trans else 0
           if info.trans_pipe and not info.trans:
             # VALUB adds one cycle for a produced operand and one more after that value has already been read.
             dep_ready = max([dep_map.get(r, 0) + (r in dep_map) + st.vgpr_read_after_write.get(r, False) for r in src_vgprs] + [0])
-          exec_time = max(issue + latency, exec_ready, dep_ready, valub_ready)
+          exec_time = max(issue + latency, exec_ready, dep_ready, waw_ready, valub_ready)
           # Issue spacing does not preserve the VALUT initiation interval when an earlier execution stalls.
           if info.trans and st.trans_exec_history: exec_time = max(exec_time, st.trans_exec_history[-1][0] + 4)
       else: exec_time = max(issue + info.exec_latency, exec_ready)
