@@ -941,6 +941,10 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
     s_mul_i32(s[1], s[3], s[0]), s_endpgm()], local_size=32), [0, 5]),
   "compose_salu_mul_initialized": (TraceCase("compose_salu_mul_initialized", [
     s_mov_b32(s[3], 1), s_mov_b32(s[0], 1), s_mul_i32(s[1], s[3], s[0]), s_endpgm()], local_size=32), [0, 1, 2, 2, 3, 6]),
+  "compose_salu_mul_after_delayed": (TraceCase("compose_salu_mul_after_delayed", [
+    s_add_u32(s[8], s[8], 1), s_mul_i32(s[9], s[4], s[5]), s_endpgm()], local_size=32), [0, 1, 4, 6]),
+  "compose_salu_mul_pipelined": (TraceCase("compose_salu_mul_pipelined", [
+    s_mul_i32(s[8], s[4], s[5]), s_mul_i32(s[9], s[4], s[5]), s_endpgm()], local_size=32), [0, 1, 3, 5]),
   "compose_salu_mul_throughput": (TraceCase("compose_salu_mul_throughput", [
     s_mul_i32(s[i], s[4+i*2], s[5+i*2]) for i in range(4)] + [s_endpgm()], local_size=32), [0, 1, 2, 3, 3, 5, 7, 9]),
   "compose_salu_mul_stale": (TraceCase("compose_salu_mul_stale", [
@@ -1048,6 +1052,27 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
   "compose_valu_read_warmup": (TraceCase("compose_valu_read_warmup", [v_mov_b32_e32(v[0], 1)] + [
     v_mov_b32_e32(v[2+i], i) for i in range(6)] + [v_add_f32_e32(v[1], v[0], v[0]), s_endpgm()], local_size=32),
     [0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 9, 10, 11, 12, 15]),
+  "compose_valu_read_warmup_short": (TraceCase("compose_valu_read_warmup_short", [
+    v_mov_b32_e32(v[2], 1), v_mov_b32_e32(v[3], 1), v_add_f32_e32(v[6], v[4], v[5]),
+    v_add_f32_e32(v[7], v[4], v[5]), s_endpgm()], local_size=32), [0, 1, 2, 3, 6, 7, 10, 11]),
+  "compose_valub_read_warmup_short": (TraceCase("compose_valub_read_warmup_short", [
+    v_mov_b32_e32(v[2], 1), v_mov_b32_e32(v[3], 1), v_lshlrev_b64(v[8:9], 2, v[0:1]),
+    v_lshlrev_b64(v[8:9], 2, v[0:1]), s_endpgm()], local_size=32), [0, 1, 2, 4, 6, 7, 11, 13]),
+  "compose_valub_order_warmup": (TraceCase("compose_valub_order_warmup", [
+    v_lshlrev_b64(v[8:9], 2, v[0:1]), s_mov_b32(s[20], 1), s_mov_b32(s[21], 1),
+    v_lshlrev_b64(v[8:9], 3, v[0:1]), s_endpgm()], local_size=32), [0, 5, 6, 7, 7, 8, 10, 16]),
+  "compose_valub_order_warmup_occupied": (TraceCase("compose_valub_order_warmup_occupied", [
+    v_mov_b32_e32(v[10], 1), v_lshlrev_b64(v[8:9], 2, v[0:1]), s_mov_b32(s[20], 1), s_mov_b32(s[21], 1),
+    v_lshlrev_b64(v[8:9], 3, v[0:1]), s_endpgm()], local_size=32), [0, 1, 6, 6, 7, 8, 8, 9, 11, 16]),
+  "compose_plain_to_valub": (TraceCase("compose_plain_to_valub", [
+    v_mov_b32_e32(v[7], 15), v_add_f32_e32(v[3], v[2], v[7]), v_lshlrev_b64(v[8:9], 5, v[0:1]), s_endpgm()], local_size=32),
+    [0, 1, 2, 6, 12, 14]),
+  "compose_trans_read_cold": (TraceCase("compose_trans_read_cold", [
+    v_add_f32_e32(v[10], v[6], v[7]), s_mov_b32(s[20], 1), s_mov_b32(s[21], 1),
+    v_rcp_f32_e32(v[3], v[4]), s_endpgm()], local_size=32), [0, 1, 2, 3, 3, 4, 9, 11]),
+  "compose_trans_read_reuse": (TraceCase("compose_trans_read_reuse", [
+    v_add_f32_e32(v[10], v[6], v[7]), s_mov_b32(s[20], 1), s_mov_b32(s[21], 1),
+    v_rcp_f32_e32(v[3], v[6]), s_endpgm()], local_size=32), [0, 1, 2, 3, 3, 4, 9, 10]),
   "compose_trans_full_queue": (TraceCase("compose_trans_full_queue", [v_mov_b32_e32(v[0], 1)] + [
     v_add_f32_e32(v[i], v[i-1], v[i-1]) for i in range(1, 14)] + [
     v_rcp_f32_e32(v[14], v[13]), v_add_f32_e32(v[15], v[14], v[14]), s_endpgm()], local_size=32, vgpr_count=20),
