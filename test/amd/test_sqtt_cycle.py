@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import ctypes, os, re, unittest
+import ctypes, os, random, re, unittest
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -20,6 +20,19 @@ class TraceCase:
   local_size: int = 1
   vgpr_count: int = 16
   normalize_exec_start: bool = False
+
+def _arithmetic_corpus_case(seed: int) -> TraceCase:
+  rng, instructions = random.Random(seed), []
+  for _ in range(10):
+    op = rng.randrange(7)
+    if op == 0: instructions.append(s_mov_b32(s[rng.randrange(4)], rng.randrange(1, 32)))
+    elif op == 1: instructions.append(s_add_u32(s[rng.randrange(4)], s[rng.randrange(4)], rng.randrange(1, 4)))
+    elif op == 2: instructions.append(s_mul_i32(s[rng.randrange(4)], s[rng.randrange(4)], s[rng.randrange(4)]))
+    elif op == 3: instructions.append(v_mov_b32_e32(v[rng.randrange(8)], rng.randrange(1, 32)))
+    elif op == 4: instructions.append(v_add_f32_e32(v[rng.randrange(8)], v[rng.randrange(8)], v[rng.randrange(8)]))
+    elif op == 5: instructions.append(v_lshlrev_b64(v[8:9], rng.randrange(1, 8), v[0:1]))
+    else: instructions.append(v_rcp_f32_e32(v[rng.randrange(8)], v[rng.randrange(8)]))
+  return TraceCase(f"arithmetic_corpus_{seed}", instructions + [s_endpgm()], local_size=32)
 
 @dataclass(frozen=True)
 class NormalizedSQTTEvent:
@@ -257,14 +270,14 @@ CASES: dict[str, tuple[TraceCase, list[NormalizedSQTTEvent]]] = {
   ]),
   "salu_mul_i32": (TraceCase("salu_mul_i32", [
     s_mul_i32(s[0], s[1], s[2]), s_delay_alu(11), s_add_u32(s[3], s[0], 1), s_endpgm(),
-  ], local_size=32, normalize_exec_start=True), [
+  ], local_size=32), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "SALU"),
     NormalizedSQTTEvent(2, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(4, "ALUEXEC", None, None, "SALU"),
     NormalizedSQTTEvent(6, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(7, "WAVEEND", 0, 12, None),
   ]),
   "salu_mul_hi": (TraceCase("salu_mul_hi", [
     s_mul_hi_u32(s[0], s[1], s[2]), s_delay_alu(11), s_add_u32(s[3], s[0], 1), s_endpgm(),
-  ], local_size=32, normalize_exec_start=True), [
+  ], local_size=32), [
     NormalizedSQTTEvent(0, "WAVESTART", 0, None, None), NormalizedSQTTEvent(1, "INST", 0, 0, "SALU"),
     NormalizedSQTTEvent(2, "INST", 0, 8, "SALU"), NormalizedSQTTEvent(4, "ALUEXEC", None, None, "SALU"),
     NormalizedSQTTEvent(6, "ALUEXEC", None, None, "SALU"), NormalizedSQTTEvent(7, "WAVEEND", 0, 12, None),
@@ -922,12 +935,23 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
     [0, 1, 2, 6, 10, 11]),
   "compose_salu_anti_dependency": (TraceCase("compose_salu_anti_dependency", [
     s_add_u32(s[0], s[1], 2), s_mov_b32(s[1], 1), s_endpgm()], local_size=32), [0, 1, 4, 5]),
+  "compose_salu_mul_anti_dependency": (TraceCase("compose_salu_mul_anti_dependency", [
+    s_mul_i32(s[0], s[2], s[3]), s_mov_b32(s[3], 1), s_mov_b32(s[2], 1), s_endpgm()], local_size=32), [0, 1, 2, 5, 6, 7]),
   "compose_salu_mul_startup": (TraceCase("compose_salu_mul_startup", [
     s_mul_i32(s[1], s[3], s[0]), s_endpgm()], local_size=32), [0, 5]),
   "compose_salu_mul_initialized": (TraceCase("compose_salu_mul_initialized", [
     s_mov_b32(s[3], 1), s_mov_b32(s[0], 1), s_mul_i32(s[1], s[3], s[0]), s_endpgm()], local_size=32), [0, 1, 2, 2, 3, 6]),
+  "compose_salu_mul_throughput": (TraceCase("compose_salu_mul_throughput", [
+    s_mul_i32(s[i], s[4+i*2], s[5+i*2]) for i in range(4)] + [s_endpgm()], local_size=32), [0, 1, 2, 3, 3, 5, 7, 9]),
   "compose_interleaved_read_warmup": (TraceCase("compose_interleaved_read_warmup", [
     v_mov_b32_e32(v[3], 2), s_mov_b32(s[1], 1), v_add_f32_e32(v[0], v[0], v[0]), s_endpgm()], local_size=32), [0, 1, 2, 3, 6, 10]),
+  "compose_valu_bank_conflict": (TraceCase("compose_valu_bank_conflict", [
+    v_add_f32_e32(v[0], v[3], v[7]), s_endpgm()], local_size=32), [0, 10]),
+  "compose_valu_read_order": (TraceCase("compose_valu_read_order", [
+    v_mov_b32_e32(v[1], 1), s_mov_b32(s[4], 1), v_add_f32_e32(v[2], v[4], v[5]), s_endpgm()], local_size=32), [0, 1, 2, 3, 6, 10]),
+  "compose_valub_read_order": (TraceCase("compose_valub_read_order", [
+    v_mov_b32_e32(v[2], 1), s_mov_b32(s[4], 1)] + [v_lshlrev_b64(v[8:9], 2, v[0:1]) for _ in range(3)] + [s_endpgm()],
+    local_size=32), [0, 1, 2, 3, 4, 6, 6, 11, 13, 15]),
   "compose_salu_overlap_wait": (TraceCase("compose_salu_overlap_wait", [
     s_add_u32(s[0], s[0], 1), s_waitcnt(simm16=0), s_endpgm()], local_size=32), [0, 3, 4]),
   "compose_salu_no_overlap_wait": (TraceCase("compose_salu_no_overlap_wait", [
@@ -1025,6 +1049,22 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
     [0, 1, 2, 3, 4, 5, 6, 6, 7, 8, 9, 10, 11, 12, 12, 13, 16, 17, 21, 22, 27, 32, 37, 42, 47, 52, 57, 62, 67, 72, 77, 87]),
 }
 
+_ARITHMETIC_CORPUS_TIMES: dict[int, list[int]] = {
+  0: [0, 1, 2, 3, 3, 4, 5, 6, 6, 9, 9, 11, 12, 19, 20, 21, 31, 33, 34, 44],
+  1: [0, 1, 2, 2, 4, 5, 7, 8, 9, 12, 12, 13, 14, 17, 17, 18, 18, 19, 20, 24],
+  2: [0, 1, 2, 3, 3, 4, 5, 6, 7, 7, 9, 9, 10, 11, 14, 15, 20, 21, 22, 23],
+  3: [0, 1, 2, 2, 3, 4, 4, 5, 6, 7, 7, 8, 11, 12, 12, 13, 15, 19, 20],
+  4: [0, 1, 2, 3, 4, 4, 5, 5, 7, 8, 9, 9, 10, 12, 12, 13, 14, 16, 27],
+  5: [0, 1, 5, 9, 10, 10, 11, 12, 12, 15, 15, 17, 18, 19, 22, 29, 35, 36, 37, 41],
+  6: [0, 4, 5, 6, 7, 8, 9, 9, 12, 13, 13, 14, 14, 16, 17, 20, 23, 24, 27, 31],
+  7: [0, 1, 2, 3, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 11, 16, 17],
+  8: [0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 9, 9, 10, 16, 17, 18, 19],
+  9: [0, 1, 2, 3, 4, 5, 6, 6, 11, 12, 12, 13, 13, 15, 16, 17, 19, 21, 22, 26],
+}
+for _seed, _times in _ARITHMETIC_CORPUS_TIMES.items():
+  _case = _arithmetic_corpus_case(_seed)
+  COMPOSITION_CASES[_case.name] = (_case, _times)
+
 MULTIWAVE_CASES = {
   "multi_wave_salu": TraceCase("multi_wave_salu", [s_mov_b32(s[0], 1)] + [s_add_u32(s[0], s[0], 1) for _ in range(6)] + [s_endpgm()],
                                local_size=160),
@@ -1040,8 +1080,8 @@ MULTIWAVE_EXEC_TIMES = {
 
 EXEC_TIMES: dict[str, list[tuple[str, int, str]]] = {
   "salu_chain": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU")],
-  "salu_mul_i32": [("ALUEXEC", 5, "SALU"), ("ALUEXEC", 7, "SALU")],
-  "salu_mul_hi": [("ALUEXEC", 5, "SALU"), ("ALUEXEC", 7, "SALU")],
+  "salu_mul_i32": [("ALUEXEC", 3, "SALU"), ("ALUEXEC", 5, "SALU")],
+  "salu_mul_hi": [("ALUEXEC", 3, "SALU"), ("ALUEXEC", 5, "SALU")],
   "call_return": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 30, "SALU")],
   "salu_saveexec": [("ALUEXEC", 2, "SALU"), ("ALUEXEC", 4, "SALU"), ("ALUEXEC", 5, "SALU")],
   "valu_independent": [("ALUEXEC", 6, "VALU"), ("ALUEXEC", 7, "VALU"), ("ALUEXEC", 8, "VALU")],

@@ -327,11 +327,16 @@ class _WaveState:
   vgpr_producer_trans: dict[int, bool] = field(default_factory=dict)
   vgpr_trans_issue_ready: dict[int, int] = field(default_factory=dict)
   vgpr_producer_shiftable: dict[int, bool] = field(default_factory=dict)
+  vgpr_read_after_write: dict[int, bool] = field(default_factory=dict)
   shifted_exec_events: set[int] = field(default_factory=set)
   sgpr_ready: dict[int, int] = field(default_factory=dict)
   sgpr_exec_ready: dict[int, int] = field(default_factory=dict)
   valu_exec_history: list[int] = field(default_factory=list)
   trans_exec_history: list[tuple[int, bool]] = field(default_factory=list)
+  valu_source_read: bool = False
+  valu_read_order_warm: bool = False
+  last_valu_issue: int = -1
+  last_salu_issue: int = -1
   valu_ib: _VALUInstructionBuffer = field(default_factory=_VALUInstructionBuffer)
   salu_exec_history: list[int] = field(default_factory=list)
   initial_sgpr_reads: dict[int, list[int]] = field(default_factory=dict)
@@ -352,6 +357,7 @@ class _SALUExecRecord:
   dsts: frozenset[int]
   history_idx: int
   ib_idx: int
+  long: bool
 
 class RDNA3SQTTTraceBuilder:
   def __init__(self, workgroup_waves: int=1):
@@ -364,6 +370,7 @@ class RDNA3SQTTTraceBuilder:
     self.salu_ib = {simd: _SALUInstructionBuffer() for simd in range(_CU_SIMDS)}
     self.salu_exec_records: dict[int, list[_SALUExecRecord]] = {simd: [] for simd in range(_CU_SIMDS)}
     self.salu_exec_ready = {simd: 2 for simd in range(_CU_SIMDS)}
+    self.salu_long_exec_ready = {simd: 2 for simd in range(_CU_SIMDS)}
     self.valu_exec_ready = {simd: 2 for simd in range(_CU_SIMDS)}
     self.valu_started = {simd: False for simd in range(_CU_SIMDS)}
     self.issue_ready = {simd: 2 for simd in range(_CU_SIMDS)}
@@ -417,7 +424,7 @@ class RDNA3SQTTTraceBuilder:
     floor = 0
     for record_idx, record in enumerate(self.salu_exec_records[simd]):
       event, wave_st = self.events[record.event_idx], self.waves[record.wave_id]
-      new_time = max(event.time, floor, record.issue + 4 if record_idx in affected else 0)
+      new_time = max(event.time, floor, record.issue + (5 if record.long else 4) if record_idx in affected else 0)
       if new_time != event.time:
         old_time = event.time
         self.events[record.event_idx] = replace(event, time=new_time)
@@ -560,19 +567,35 @@ class RDNA3SQTTTraceBuilder:
                    self.valu_exec_ready[simd] if info.pipe == "valu" else \
                    self.lds_exec_ready if info.pipe == "lds" else getattr(st, f"{info.pipe}_exec_ready")
       if info.pipe == "salu":
-        dep_ready = max([st.sgpr_exec_ready.get(r, 0) + info.forward_latency for r in src_sgprs if r in st.sgpr_exec_ready] + [0])
         long_salu = _op_name(inst) in _SALU_3_CYCLE
-        exec_latency = info.exec_latency + (2 if long_salu and initial_src_sgprs else (1 if long_salu else 0))
+        if long_salu: exec_ready = max(exec_ready, self.salu_long_exec_ready[simd])
+        dep_forward = 3 if long_salu else info.forward_latency
+        dep_ready = max([st.sgpr_exec_ready.get(r, 0) + dep_forward for r in src_sgprs if r in st.sgpr_exec_ready] + [0])
+        long_cold = 0 in initial_src_sgprs or bool(initial_src_sgprs & dst_sgprs)
+        exec_latency = info.exec_latency + (2 if long_salu and long_cold else 0)
         overlap_stall = 2 if not long_salu and (not st.salu_exec_history or issue != st.salu_exec_history[-1]) and \
           any(r in dst_sgprs and r not in st.sgpr_exec_ready for r in src_sgprs) else 0
-        exec_time = max(issue + exec_latency + overlap_stall + (2 if salu_read_stall and src_sgprs else 0), exec_ready, dep_ready)
+        # A retired SGPR stays on the forwarding path through the following cycle, then requires a read refill.
+        stale_read_stall = 2 if not long_salu and any(st.sgpr_exec_ready.get(r, issue) + 1 < issue for r in src_sgprs) else 0
+        read_stall = max(overlap_stall, stale_read_stall, 2 if not long_salu and 0 in initial_src_sgprs else 0,
+                         2 if salu_read_stall and src_sgprs else 0)
+        exec_time = max(issue + exec_latency + read_stall,
+                        exec_ready, dep_ready)
       elif info.pipe == "valu":
+        order_read_warm = st.valu_read_order_warm or 0 <= st.last_valu_issue < st.last_salu_issue
+        mixed_read_warm = bool(st.salu_exec_history) and \
+          (st.valu_source_read or (0 in src_vgprs and bool(st.valu_exec_history)))
+        trans_read_warm = len(st.valu_exec_history) >= 2 or \
+          bool(st.salu_exec_history and (st.valu_exec_history or st.valu_source_read))
         if not info.trans and src_vgprs and any(5 <= dep <= 7 for dep in active_delays): latency = 8
         elif not info.trans and any(st.vgpr_lds_pending.get(r, False) for r in src_vgprs): latency = 8
         elif info.trans and st.trans_warm: latency = 7
+        elif info.trans and trans_read_warm: latency = 8
+        elif info.trans_pipe and not info.trans and order_read_warm: latency = info.exec_latency - 1
         elif src_vgprs and info.vgpr_read_latency is not None:
-          read_warm = len(st.valu_exec_history) >= _VALU_READ_WARMUP or bool(st.valu_exec_history and st.salu_exec_history)
-          latency = info.vgpr_read_latency - read_warm
+          read_warm = len(st.valu_exec_history) >= _VALU_READ_WARMUP or mixed_read_warm or order_read_warm
+          bank_conflict = len({reg % 4 for reg in src_vgprs}) < len(src_vgprs)
+          latency = info.vgpr_read_latency - read_warm + bank_conflict
         else: latency = info.exec_latency
         if info.trans and st.had_lds:
           events = {st.vgpr_exec_event[r] for r in src_vgprs if r in st.vgpr_exec_event and
@@ -593,10 +616,15 @@ class RDNA3SQTTTraceBuilder:
         else:
           valub_ready = st.valub_exec_ready if info.trans_pipe and not info.trans else 0
           if info.trans_pipe and not info.trans:
-            dep_ready = max([dep_map.get(r, 0) + st.vgpr_producer_trans.get(r, False) for r in src_vgprs] + [0])
+            # VALUB adds one cycle for a produced operand and one more after that value has already been read.
+            dep_ready = max([dep_map.get(r, 0) + (r in dep_map) + st.vgpr_read_after_write.get(r, False) for r in src_vgprs] + [0])
           exec_time = max(issue + latency, exec_ready, dep_ready, valub_ready)
+          # Issue spacing does not preserve the VALUT initiation interval when an earlier execution stalls.
+          if info.trans and st.trans_exec_history: exec_time = max(exec_time, st.trans_exec_history[-1][0] + 4)
       else: exec_time = max(issue + info.exec_latency, exec_ready)
-      if info.pipe == "salu": self.salu_exec_ready[simd] = exec_time + info.exec_release
+      if info.pipe == "salu":
+        self.salu_exec_ready[simd] = exec_time + info.exec_release
+        if long_salu: self.salu_long_exec_ready[simd] = exec_time + 2
       elif info.pipe == "valu": self.valu_exec_ready[simd] = exec_time + info.exec_release
       elif info.pipe == "lds": self.lds_exec_ready = exec_time + info.exec_release
       else: setattr(st, f"{info.pipe}_exec_ready", exec_time + info.exec_release)
@@ -632,6 +660,7 @@ class RDNA3SQTTTraceBuilder:
         st.vgpr_producer_trans[reg] = info.trans
         if info.trans: st.vgpr_trans_issue_ready[reg] = issue + 5
         st.vgpr_producer_shiftable[reg] = producer_shiftable
+        st.vgpr_read_after_write[reg] = False
       if info.pipe == "valu": st.vgpr_lds_ready[reg] = issue + 18
       st.vgpr_lds_pending[reg] = lds_pending
     for reg in dst_sgprs:
@@ -647,22 +676,31 @@ class RDNA3SQTTTraceBuilder:
         latency = info.lgkm_latency if info.lgkm_latency is not None else _lds_lgkm_latency(op, st.lgkm_ready > issue)
         st.lgkm_ready = max(st.lgkm_ready, issue + latency)
     if info.pipe == "valu" and info.exec_cls is not None:
+      st.valu_read_order_warm |= order_read_warm
+      st.last_valu_issue = issue
       self.valu_started[simd] = True
       if src_sgprs: st.sgpr_valu_read_ready = max(st.sgpr_valu_read_ready, exec_time)
       if info.trans:
         st.trans_exec_history.append((exec_time, st.trans_warm))
         st.valub_exec_ready = max(st.valub_exec_ready, exec_time + 5)
-      else: st.valu_exec_history.append(exec_time)
+      else:
+        st.valu_exec_history.append(exec_time)
+        if info.trans_pipe: st.valub_exec_ready = max(st.valub_exec_ready, exec_time + min(info.duration, 4))
       if not info.matrix:
         assert valu_chains is not None
         st.valu_ib.record(exec_time, chains=valu_chains, dsts=dst_vgprs, trans=info.trans)
+      if src_vgprs:
+        st.valu_source_read = True
+        for reg in src_vgprs:
+          if reg in st.vgpr_exec_event: st.vgpr_read_after_write[reg] = True
     if info.pipe == "salu" and info.exec_cls is not None:
+      st.last_salu_issue = issue
       history_idx, ib_idx = len(st.salu_exec_history), len(self.salu_ib[simd].entries)
       st.salu_exec_history.append(exec_time)
       if salu_alu: self.salu_ib[simd].record(exec_time)
       if salu_alu and exec_event is not None:
         record_idx = len(self.salu_exec_records[simd])
-        self.salu_exec_records[simd].append(_SALUExecRecord(exec_event, wave_id, issue, frozenset(dst_sgprs), history_idx, ib_idx))
+        self.salu_exec_records[simd].append(_SALUExecRecord(exec_event, wave_id, issue, frozenset(dst_sgprs), history_idx, ib_idx, long_salu))
         for reg in initial_src_sgprs - dst_sgprs: st.initial_sgpr_reads.setdefault(reg, []).append(record_idx)
     st.pending_delays = [(skip - 1, dep) for skip, dep in st.pending_delays if skip > 0]
     st.trans_warm = info.nop
