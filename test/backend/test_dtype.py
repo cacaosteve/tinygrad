@@ -276,6 +276,11 @@ class TestInt8DType(TestDType):
     a = Tensor([72, -90, 27, 40, -53, 70, 96, 51], dtype=dtypes.int8).bitcast(dtypes.short)
     self.assertListEqual(a.tolist(), [-22968, 10267, 18123, 13152])
 
+  def test_unsigned_bitcast_to_signed_float(self):
+    # Exercises backends that keep sub-32-bit integers in full-width registers.
+    a = Tensor([0, 127, 128, 255], dtype=dtypes.uint8).bitcast(dtypes.int8).cast(dtypes.float32)
+    np.testing.assert_equal(a.numpy(), [0., 127., -128., -1.])
+
 class TestUint8DType(TestDType):
   DTYPE = dtypes.uint8
   @unittest.skipIf(Device.DEFAULT == "CUDA" or isinstance(Device[Device.DEFAULT].renderer, PTXRenderer), "cuda saturation works differently")

@@ -1439,6 +1439,14 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if u.src[0].dtype is dtypes.float32 and u.dtype is dtypes.float16:
         return pre + [r3.v_cvt_f16_f32_e32(_dst(u), cast_src)]
       if u.dtype is dtypes.float32 and u.src[0].dtype in dtypes.ints:
+        if u.src[0].dtype in dtypes.sints and u.src[0].dtype.itemsize < 4:
+          # Narrow signed values normally arrive sign-extended from i8/i16 loads, but a
+          # BITCAST from u8/u16 is a register no-op and leaves the high bits clear.
+          # Canonicalize the source before using the i32 conversion instruction.
+          shift = 32 - u.src[0].dtype.itemsize * 8
+          return pre + [r3.v_lshlrev_b32_e64(_dst(u), shift, cast_src),
+                        r3.v_ashrrev_i32_e64(_dst(u), shift, _dst(u)),
+                        r3.v_cvt_f32_i32_e32(_dst(u), _dst(u))]
         cast_op = r3.v_cvt_f32_i32_e32 if u.src[0].dtype in dtypes.sints else r3.v_cvt_f32_u32_e32
         return pre + [cast_op(_dst(u), cast_src)]
       if u.src[0].dtype is dtypes.float32 and u.dtype in dtypes.ints:
@@ -2688,6 +2696,11 @@ class AMDRenderer(ISARenderer):
   float4_dtypes = (dtypes.float32, dtypes.half)
   wide_regalloc = True
   preferred_reduce_group = 16
+  # Large fused elementwise graphs can exceed the linear scan's safe spill pressure.
+  # Small vector kernels retain generic upcasting; tensor-core and matvec kernels use
+  # their dedicated optimization paths before this guard.
+  elementwise_upcast_limit = 1
+  elementwise_upcast_complexity_threshold = 32
   global_max = (0x8fffffff, 0x8fffffff, 0x8fffffff)
   # 2D locals (WARP=lidx0 → e.g. (32,4,1)); needs gfx1100 USER_SGPR=15 (elf.py).
   local_max = (1024, 1024, 64)

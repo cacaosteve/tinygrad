@@ -95,6 +95,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # **** below this line need to be optional and benchmarked ****
 
+  # Some ISA renderers have a lower safe elementwise upcast ceiling than source renderers.
+  # Explicit, BEAM, tensor-core, and matvec opts take their own paths above this point.
+  elementwise_upcast_limit: int|None = getattr(k.ren, "elementwise_upcast_limit", None)
+  if (complexity_threshold:=getattr(k.ren, "elementwise_upcast_complexity_threshold", None)) is not None and \
+     len(k.ast.backward_slice) <= complexity_threshold: elementwise_upcast_limit = None
+
   # if there are small dims with lots of valid masks, upcast them (they might be from Tensor.stack)
   to_upcast: list[int] = []
   where_gate_rngs = {r for u in k.ast.backward_slice if u.op is Ops.WHERE for r in u.src[0].ranges}
@@ -102,7 +108,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   for axis in k.upcastable_dims:
     # for Schedule, we check if the range is used in INDEX gates or WHERE gates
     is_masked = k.rngs[axis] in where_gate_rngs
-    if k.full_shape[axis] <= 7 and is_masked and prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis] <= 7 * 7:
+    next_upcast = prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis]
+    if k.full_shape[axis] <= 7 and is_masked and next_upcast <= 7 * 7 and \
+       (elementwise_upcast_limit is None or next_upcast <= elementwise_upcast_limit):
       # upcasting a masked global axis moves that range out of the launch grid into each work-item
       # under IMAGE, skip the upcast unless enough global work-items remain after it to hide memory latency
       if IMAGE and k.axis_types[axis] is AxisType.GLOBAL:
@@ -116,12 +124,14 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # potentially do more upcasts of non reduce axes based on a heuristic
   is_dsp = k.ren is not None and k.ren.target.device == "DSP"
   upcasted_axis: set[int] = set()
-  while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
+  while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32) and \
+        (elementwise_upcast_limit is None or k.upcast_size() < elementwise_upcast_limit):
     xb_choices = []
     # consider all upcastable axes with 3 or 4 upcast (128 on the DSP)
     for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
-      if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
+      if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0 or \
+         (elementwise_upcast_limit is not None and k.upcast_size() * upcast_amount > elementwise_upcast_limit): continue
       rng = k.rngs[axis]
       if any(rng not in b.src[1].get_idx().backward_slice and all(r2 in b.src[1].get_idx().backward_slice
           for r2 in k.ranges_of(AxisType.UPCAST, AxisType.UNROLL)) for b in k.bufs):
@@ -159,7 +169,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # if nothing at all is upcasted and it's easy to, do an upcast
   for splits in [4]:
-    if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
+    if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0 and \
+       (elementwise_upcast_limit is None or splits <= elementwise_upcast_limit):
       k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
 
   # **** local groups ****

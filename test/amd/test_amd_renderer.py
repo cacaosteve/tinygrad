@@ -741,6 +741,15 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(prg.src[0].arg.applied_opts, (Opt(OptOps.GROUP, 0, 16),))
     self.assertEqual(prg.arg.local_size, (16, 1, 1))
 
+  def test_complex_elementwise_schedule_avoids_upcast_spill_pressure(self):
+    with Context(DEV="MOCKKFD+AMD:AMD", BEAM=0):
+      out = Tensor.empty(1024)
+      for _ in range(40): out = out.sin()
+      ast = out.schedule_linear().src[-1].src[0]
+    sink = full_rewrite_to_sink(ast, _REN, optimize=True)
+    self.assertGreater(len(sink.backward_slice), _REN.elementwise_upcast_complexity_threshold)
+    self.assertFalse(any(opt.op is OptOps.UPCAST for opt in sink.arg.applied_opts))
+
   def test_to_program_assembles_elf(self):
     prg = _simple_add_program()
     self.assertIs(_prg_src(prg).op, Ops.SOURCE)
