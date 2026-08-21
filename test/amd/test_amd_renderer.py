@@ -670,6 +670,18 @@ def _custom_renderer_spill(out:UOp, inp:UOp) -> UOp:
   sink = out.base.index(idx).store(acc).sink(idx, arg=KernelInfo(name="amd_asm_hw_spill"))
   return _program_for_custom_kernel(sink, TinyVGPRAMDRenderer(Target("AMD", arch=Device["AMD"].arch)))
 
+def _custom_renderer_long_lived_spills(out:UOp, inp:UOp) -> UOp:
+  out, inp = out.flatten(), inp.flatten()
+  lidx0, lidx1 = UOp.special(8, "lidx0"), UOp.special(8, "lidx1")
+  idx = lidx0 + lidx1 * UOp.const(8, dtypes.uint32)
+  vals = [inp.base.index(idx + UOp.const(i * 64, dtypes.uint32)).load() + UOp.const(float(i + 1), dtypes.float32) for i in range(64)]
+  # Keep independent values live together, then consume each after the pressure point.
+  gate = UOp(Ops.NOOP, dtypes.void, tuple(vals))
+  stores = tuple(out.base.index(idx + UOp.const(i * 64, dtypes.uint32)).store(
+    vals[i].bitcast(dtypes.uint32).after(gate).bitcast(dtypes.float32)) for i in range(64))
+  sink = UOp(Ops.SINK, dtypes.void, stores + (lidx0, lidx1), arg=KernelInfo(name="amd_asm_hw_long_lived_spills"))
+  return _program_for_custom_kernel(sink, FourVGPRAMDRenderer(Target("AMD", arch=Device["AMD"].arch)))
+
 def _custom_renderer_lds(out:UOp) -> UOp:
   out = out.flatten()
   idx = UOp.special(out.numel(), "lidx0")
@@ -2851,6 +2863,13 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(16, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     out = Tensor.custom_kernel(out, inp, fxn=_custom_renderer_spill)[0].realize()
     self.assertEqual(out.tolist(), [6*x + 15 for x in range(16)])
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_long_lived_spills(self):
+    inp = Tensor([float(x) for x in range(4096)], dtype=dtypes.float32, device="AMD").contiguous().realize()
+    out = Tensor.empty(4096, dtype=dtypes.float32, device="AMD").contiguous().realize()
+    out = Tensor.custom_kernel(out, inp, fxn=_custom_renderer_long_lived_spills)[0].realize()
+    self.assertEqual(out.tolist(), [float(x + x // 64 + 1) for x in range(4096)])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_lds_smoke(self):

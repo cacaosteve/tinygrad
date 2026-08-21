@@ -1,5 +1,6 @@
 from __future__ import annotations
 import struct
+from bisect import bisect_left
 
 from tinygrad.device import CompileError
 from tinygrad.dtype import dtypes, DType, AddrSpace
@@ -2872,11 +2873,15 @@ class AMDRenderer(ISARenderer):
 # ***** wide (AMD) linear-scan helpers *****
 def wide_alloc(cons, i, nslots, allowed, live, lr, uops_len, slots_fn, pinned=frozenset()):
   allowed_idxs = {r.index for r in allowed}
-  live_span = {vr: set(range(r.index, r.index + slots_fn(vr))) for vr, r in live.items()}
+  occupied: dict[int, list[Register]] = {}
+  for vr, r in live.items():
+    for idx in range(r.index, r.index + slots_fn(vr)): occupied.setdefault(idx, []).append(vr)
   def blockers(reg):
-    occupied = set(range(reg.index, reg.index+nslots))
-    return tuple(vr for vr, sp in live_span.items() if occupied & sp)
-  def next_use(vr): return next((j-i for j in lr[vr] if j >= i), uops_len)
+    return tuple(dict.fromkeys(vr for idx in range(reg.index, reg.index+nslots) for vr in occupied.get(idx, ())))
+  def next_use(vr):
+    uses = lr[vr]
+    pos = bisect_left(uses, i)
+    return uses[pos] - i if pos < len(uses) else uops_len
   candidates = [(r, blockers(r)) for r in cons
                 if all(x in allowed_idxs for x in range(r.index, r.index+nslots))
                 and not (set(range(r.index, r.index+nslots)) & pinned)]
