@@ -483,6 +483,18 @@ def _multi_spill_program():
   to_program_cache.clear()
   return to_program(sink, OneVGPRAMDRenderer(_GFX11))
 
+def _bitcast_spill_program():
+  out = UOp.placeholder((64,), dtypes.float32, 0)
+  inp = UOp.placeholder((64,), dtypes.uint16, 1)
+  idx = UOp.special(16, "lidx0")
+  raws = [inp.index(idx + UOp.const(i * 16, dtypes.uint32)).load() for i in range(4)]
+  gate = UOp(Ops.NOOP, dtypes.void, tuple(raws))
+  vals = [raw.bitcast(dtypes.float16).after(gate).cast(dtypes.float32) for raw in raws]
+  stores = tuple(out.index(idx + UOp.const(i * 16, dtypes.uint32)).store(vals[i]) for i in range(4))
+  sink = UOp(Ops.SINK, dtypes.void, stores + (idx,), arg=KernelInfo(name="amd_asm_bitcast_spill"))
+  to_program_cache.clear()
+  return to_program(sink, TinyVGPRAMDRenderer(_GFX11))
+
 def _range_program():
   out = UOp.placeholder((8,), dtypes.uint32, 0)
   rng = UOp.range(8, 0, AxisType.LOOP)
@@ -752,15 +764,6 @@ class TestAMDRenderer(unittest.TestCase):
     prg = to_program(ast, _REN)
     self.assertEqual(prg.src[0].arg.applied_opts, (Opt(OptOps.GROUP, 0, 16),))
     self.assertEqual(prg.arg.local_size, (16, 1, 1))
-
-  def test_complex_elementwise_schedule_avoids_upcast_spill_pressure(self):
-    with Context(DEV="MOCKKFD+AMD:AMD", BEAM=0):
-      out = Tensor.empty(1024)
-      for _ in range(40): out = out.sin()
-      ast = out.schedule_linear().src[-1].src[0]
-    sink = full_rewrite_to_sink(ast, _REN, optimize=True)
-    self.assertGreater(len(sink.backward_slice), _REN.elementwise_upcast_complexity_threshold)
-    self.assertFalse(any(opt.op is OptOps.UPCAST for opt in sink.arg.applied_opts))
 
   def test_to_program_assembles_elf(self):
     prg = _simple_add_program()
@@ -2419,6 +2422,14 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertGreaterEqual(len(slots), 2)
     self.assertGreaterEqual(_amd_desc(prg).private_segment_fixed_size, 8)
 
+  def test_vgpr_spill_preserves_bitcast_use_dtype(self):
+    prg = _bitcast_spill_program()
+    _check_elf(self, prg)
+    self.assertIn(AMDOps.SPILL, _lin_ops(prg))
+    names = _amd_inst_names(prg)
+    self.assertEqual(names.count("V_CVT_F32_F16_E32"), 4)
+    self.assertNotIn("V_CVT_F32_U32_E32", names)
+
   def test_vgpr_spill_uses_explicit_zero_scratch_addr(self):
     prg = _spill_program()
     renderer = TinyVGPRAMDRenderer(_GFX11)
@@ -2870,6 +2881,15 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(4096, dtype=dtypes.float32, device="AMD").contiguous().realize()
     out = Tensor.custom_kernel(out, inp, fxn=_custom_renderer_long_lived_spills)[0].realize()
     self.assertEqual(out.tolist(), [float(x + x // 64 + 1) for x in range(4096)])
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_bitcast_spill(self):
+    raw = [0x3c00] * 16 + [0xc000] * 16 + [0x3800] * 16 + [0x4200] * 16
+    inp = Tensor(raw, dtype=dtypes.uint16, device="AMD").contiguous().realize()
+    out = Tensor.empty(64, dtype=dtypes.float32, device="AMD").contiguous().realize()
+    bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _bitcast_spill_program()
+    _amd_rt(prg)(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    self.assertEqual(out.tolist(), [1.0] * 16 + [-2.0] * 16 + [0.5] * 16 + [3.0] * 16)
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_lds_smoke(self):

@@ -2697,11 +2697,6 @@ class AMDRenderer(ISARenderer):
   float4_dtypes = (dtypes.float32, dtypes.half)
   wide_regalloc = True
   preferred_reduce_group = 16
-  # Large fused elementwise graphs can exceed the linear scan's safe spill pressure.
-  # Small vector kernels retain generic upcasting; tensor-core and matvec kernels use
-  # their dedicated optimization paths before this guard.
-  elementwise_upcast_limit = 1
-  elementwise_upcast_complexity_threshold = 32
   global_max = (0x8fffffff, 0x8fffffff, 0x8fffffff)
   # 2D locals (WARP=lidx0 → e.g. (32,4,1)); needs gfx1100 USER_SGPR=15 (elf.py).
   local_max = (1024, 1024, 64)
@@ -2913,8 +2908,9 @@ def wide_regalloc_rewrite(ctx, x:UOp):
     vr = greg(ctx.uops[i].src[j]) if i in ctx.reals else None
     if isinstance(vr, Register) and vr in ctx.remat:
       # Actual remat runs in `before` via insert_before; source is just a bind to that phys.
-      nsrc.append(ctx.ren.bind(ctx.vdef(vr).dtype, ctx.reals[i][vr]))
-    elif isinstance(vr, Register) and vr in ctx.spills: nsrc.append(ctx.ren.fill(ctx.spills[vr], ctx.vdef(vr), ctx.reals[i][vr]))
+      # Preserve the use dtype: no-op BITCASTs can share a vreg with a differently typed definition.
+      nsrc.append(ctx.ren.bind(su.dtype, ctx.reals[i][vr]))
+    elif isinstance(vr, Register) and vr in ctx.spills: nsrc.append(ctx.ren.fill(ctx.spills[vr], su, ctx.reals[i][vr]))
     else: nsrc.append(su)
   ndefs = tuple(ctx.reals[i][vr] for vr in x.tag) if isinstance(x.tag, tuple) else x.tag
   if x.op is Ops.BUFFER: nx = ctx.ren.isel_matcher.rewrite(ctx.ren.stack_pointer().index(ctx.locals[x], tag=ndefs))
