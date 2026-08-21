@@ -320,13 +320,15 @@ def _store_src_regs(u:UOp) -> set[int]:
   return set()
 
 def _needs_vm_flush(u:UOp) -> bool:
-  # Packs/extracts and int addr ALU can run with VMEM still in flight.
+  # Packs/extracts have their own emitted-instruction dependency check below. General
+  # ALU must enter flush_regs: independent address ALU still overlaps VMEM, while an
+  # integer consumer of a dest-as-address LOAD must wait before reading that VGPR.
   if u.op is not Ops.INS: return False
   if u.arg in (AMDOps.WMMA, AMDOps.STORE, AMDOps.ATOMIC_ADD, AMDOps.SSTORE, AMDOps.SPILL): return True
   if u.arg in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV): return False
   if u.arg in (AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL,
                AMDOps.CMP_GE, AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ):
-    return u.dtype not in dtypes.ints and u.dtype is not dtypes.bool
+    return True
   return True
 
 _SCALAR_LOAD = {

@@ -953,6 +953,16 @@ class TestAMDRenderer(unittest.TestCase):
     last_load = max(i for i,n in enumerate(inst_names) if n == "GLOBAL_LOAD_B32")
     self.assertGreater(inst_names.index("S_WAITCNT_VMCNT"), last_load)
 
+  def test_integer_load_consumer_waits_vmcnt(self):
+    # GLOBAL_LOAD reuses its address VGPR as the destination. Integer ALU must not
+    # consume the old byte address while VMEM is still in flight.
+    inst_names = _amd_inst_names(_uint_var_mul_program())
+    load_i = inst_names.index("GLOBAL_LOAD_B32")
+    wait_i = inst_names.index("S_WAITCNT_VMCNT", load_i)
+    mul_i = next(i for i,n in enumerate(inst_names[load_i:], load_i) if "MUL" in n)
+    self.assertLess(load_i, wait_i)
+    self.assertLess(wait_i, mul_i)
+
   def test_matmul_reg_accumulators_promote_off_scratch(self):
     prg = _matmul64_program()
     linear_ops = _lin_ops(prg)
