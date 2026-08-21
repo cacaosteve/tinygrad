@@ -1658,6 +1658,21 @@ class TestAMDRenderer(unittest.TestCase):
     out = _REN.after_pre_regalloc([acc0, acc1, c0, c1, s0, s1])
     self.assertEqual(out, [acc0, acc1, c0, s0, c1, s1])
 
+  def test_store_addr_cache_invalidates_on_reused_index_reg(self):
+    # Regalloc may assign two different store indices to the same VGPR. The second
+    # index must rescale TMP_VADDR instead of reusing the first store's cached base.
+    buf = UOp(Ops.INS, dtypes.ulong, (), AMDOps.MOV, (Register("s6", 6),))
+    idx_reg = Register("v3", 259)
+    idx0 = UOp(Ops.INS, dtypes.int, (UOp.const(0, dtypes.int).rtag(),), AMDOps.MOV, (idx_reg,))
+    idx1 = UOp(Ops.INS, dtypes.int, (UOp.const(1, dtypes.int).rtag(),), AMDOps.MOV, (idx_reg,))
+    val0 = UOp(Ops.INS, dtypes.int, (UOp.const(10, dtypes.int).rtag(),), AMDOps.MOV, (Register("v4", 260),))
+    val1 = UOp(Ops.INS, dtypes.int, (UOp.const(20, dtypes.int).rtag(),), AMDOps.MOV, (Register("v5", 261),))
+    st0 = UOp(Ops.INS, dtypes.void, (buf, idx0, val0), AMDOps.STORE)
+    st1 = UOp(Ops.INS, dtypes.void, (buf, idx1, val1), AMDOps.STORE)
+    lin = UOp(Ops.LINEAR, dtypes.void, (idx0, val0, st0, idx1, val1, st1))
+    names = [getattr(i, "op_name", "") for i in _REN._insts_from_linear(lin)]
+    self.assertEqual(names.count("V_LSHLREV_B32_E64"), 2)
+
   def test_half_matmul_epilogue_cast_adjacent_to_store(self):
     # Default half GEMM keeps CAST glued to STORE in the final linear list + emits cvt+b16.
     import os

@@ -245,7 +245,10 @@ class _StoreAddrCache:
   def clear(self): self.key, self.page = None, None
   def addr(self, idx:UOp, itemsize:int, byte_off:int) -> tuple[list, Reg, int]:
     src = _src(idx)
-    key = (getattr(src, "offset", id(src)), itemsize)
+    # Key by the logical index, not its allocated register. Regalloc can reuse one
+    # VGPR for different indices between stores; treating that as the same base
+    # reuses a stale TMP_VADDR and writes the later value to the wrong element.
+    key = (id(idx), itemsize)
     page, rem = divmod(max(byte_off, 0), 0x1000)
     if self.key == key and self.page == page: return [], TMP_VADDR, rem
     if itemsize == 1:
