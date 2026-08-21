@@ -697,6 +697,15 @@ def _multi_dim_program():
   sink = out.index(idx).store(idx).sink(arg=KernelInfo(name="amd_asm_multi_dim"))
   return _to_prg(sink)
 
+def _multi_dim_five_buffer_program():
+  out = UOp.placeholder((128,), dtypes.uint32, 0)
+  ins = [UOp.placeholder((128,), dtypes.uint32, i) for i in range(1, 5)]
+  lidx0, lidx1 = UOp.special(8, "lidx0"), UOp.special(4, "lidx1")
+  idx = lidx0 + (lidx1 << 3) + (UOp.special(4, "gidx0") << 5)
+  val = ins[0].index(idx).load()
+  for inp in ins[1:]: val = val + inp.index(idx).load()
+  return _to_prg(out.index(idx).store(val).sink(arg=KernelInfo(name="amd_asm_multi_dim_five_buffer")))
+
 def _z_dim_program():
   out = UOp.placeholder((256,), dtypes.uint32, 0)
   lidx2 = UOp.special(4, "lidx2")
@@ -824,6 +833,12 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(kernarg_bases, sorted(kernarg_bases))
     for a, b in zip(kernarg_bases, kernarg_bases[1:]):
       self.assertGreaterEqual(b - a, 2)
+
+  def test_multidim_wgid_does_not_overlap_kernarg_pairs(self):
+    prg = _multi_dim_five_buffer_program()
+    kernarg_regs = set().union(*(set(range(greg(u).index, greg(u).index + 2)) for u in _prg_lin(prg).src
+                                 if u.op is Ops.INS and u.arg is AMDOps.KERNARG and u.dtype.itemsize == 8))
+    self.assertFalse(kernarg_regs & {15, 16, 17})
 
   def test_linear_has_no_explicit_end_op(self):
     for prg in (_simple_add_program(), _range_program(), _nested_range_program(), _var_range_program()):

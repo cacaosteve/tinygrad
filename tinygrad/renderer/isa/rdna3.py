@@ -22,8 +22,9 @@ _PREFETCH_NEXT_A = False
 KERNARG_REG = s[0:1]
 WGID = tuple(Register(f"s{i}", i) for i in range(2, 5))  # 1D default; 2D uses s15+ via _wgid_reg
 LID = tuple(Register(f"v{i}", 256+i) for i in range(3))
-# Skip s16 — reserved as WGID_Y when USER_SGPR=15 (gfx1100 2D locals).
-SGPR = tuple(Register(f"s{i}", i) for i in range(6, 104, 2) if i != 16)
+# USER_SGPR=15 places WGID_X/Y/Z in s15:s17. SGPRs are allocated as even
+# 64-bit pairs, so reserve both s14:s15 and s16:s17 from the general pool.
+SGPR = tuple(Register(f"s{i}", i) for i in range(6, 104, 2) if i not in (14, 16))
 VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
 # B gathers factor as k*4096+{0,32,64,96} for large N. AMD_B_COMPACT (default on): isel CSE
 # per-k page idx + in-place <<1 once + GLOBAL offset rem — keeps s_clause, cuts addr ALU.
