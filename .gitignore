@@ -69,9 +69,9 @@ mutants
 dagre/
 graphlib/
 uv.lock
-
 # local agent / session notes (not for upstream)
 .cursor/*
 !.cursor/rules/
 !.cursor/rules/no-tinygrad-prs.mdc
 notes/
+pi_session_window0.jsonl
