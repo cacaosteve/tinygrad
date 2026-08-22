@@ -472,6 +472,20 @@ def _spill_program():
   # One VGPR: sequential reduce still spills because each load+acc needs a second temp.
   return to_program(sink, OneVGPRAMDRenderer(_GFX11))
 
+def _paged_bitcast_spill_program():
+  base, page_base = _bitcast_spill_program(), 15400
+  frame_size = max(amd_lib._const_int(u.src[0]) for u in base.src[1].src
+                   if u.op is Ops.INS and u.arg is AMDOps.SCRATCH_SIZE)
+  shifted = []
+  for u in base.src[1].src:
+    if u.op is Ops.INS and u.arg in (AMDOps.SPILL, AMDOps.FILL):
+      u = u.replace(src=(UOp.const(page_base + amd_lib._const_int(u.src[0]), dtypes.int32),) + u.src[1:])
+    elif u.op is Ops.INS and u.arg is AMDOps.SCRATCH_SIZE:
+      u = u.replace(src=(UOp.const(page_base + frame_size, dtypes.uint32),))
+    shifted.append(u)
+  to_program_cache.clear()
+  return to_program(UOp(Ops.PROGRAM, src=(base.src[0], UOp(Ops.LINEAR, src=tuple(shifted))), arg=base.arg), TinyVGPRAMDRenderer(_GFX11))
+
 def _multi_spill_program():
   out = UOp.placeholder((16,), dtypes.uint32, 0)
   inps = [UOp.placeholder((16,), dtypes.uint32, i+1) for i in range(4)]
@@ -502,6 +516,19 @@ def _range_program():
              (UOp(Ops.END, dtypes.void, (out.index(rng).store(rng.cast(dtypes.uint32) + UOp.const(1, dtypes.uint32)), rng)),),
              arg=KernelInfo(name="amd_asm_range"), tag=1)
   return _to_prg(sink)
+
+def _long_branch_program():
+  base, loop, exit_label = _range_program(), ".HW_LONG_LOOP", ".HW_LONG_EXIT"
+  prefix = (UOp(Ops.INS, arg=amd_lib.r3.s_mov_b32(amd_lib.s[100], 0)),
+            UOp(Ops.INS, arg=AMDOps.LABEL, tag=loop),
+            UOp(Ops.INS, arg=amd_lib.r3.s_add_u32(amd_lib.s[100], amd_lib.s[100], 1)),
+            UOp(Ops.INS, arg=amd_lib.r3.s_cmp_eq_u32(amd_lib.s[100], 2)),
+            UOp(Ops.INS, arg=AMDOps.CBRANCH_SCC1, tag=exit_label))
+  padding = tuple(UOp(Ops.INS, arg=amd_lib.r3.s_nop(0)) for _ in range(0x8001))
+  suffix = (UOp(Ops.INS, arg=AMDOps.BRANCH, tag=loop), UOp(Ops.INS, arg=AMDOps.LABEL, tag=exit_label))
+  lin = UOp(Ops.LINEAR, src=prefix + padding + suffix + base.src[1].src)
+  to_program_cache.clear()
+  return to_program(UOp(Ops.PROGRAM, src=(base.src[0], lin), arg=base.arg), _REN)
 
 def _nested_range_program():
   out = UOp.placeholder((32,), dtypes.uint32, 0)
@@ -2443,6 +2470,28 @@ class TestAMDRenderer(unittest.TestCase):
           scratch = next(i for i in insts if type(i).__name__ == "SCRATCH")
           self.assertEqual(scratch.addr, amd_lib.TMP_VADDR)
 
+  def test_vgpr_spill_pages_at_signed_scratch_offset_boundary(self):
+    renderer = TinyVGPRAMDRenderer(_GFX11)
+    disp = UOp.const(4096, dtypes.int32)
+    src = UOp(Ops.INS, dtypes.float32, (), AMDOps.MOV, (Register("v3", 259),))
+    spill = UOp(Ops.INS, dtypes.void, (disp, src), AMDOps.SPILL)
+    fill = UOp(Ops.INS, dtypes.float32, (disp, UOp.const(1, dtypes.int32).rtag()), AMDOps.FILL, (Register("v4", 260),))
+    for insts in (renderer._insts_for_uop(spill), renderer._insts_for_uop(fill)):
+      self.assertEqual(insts[0].op_name, "V_MOV_B32_E32")
+      self.assertEqual(insts[0].literal, 4096)
+      self.assertEqual(next(i for i in insts if type(i).__name__ == "SCRATCH").offset, 0)
+
+  def test_vgpr_spill_pages_offsets_beyond_scratch_immediate(self):
+    renderer = TinyVGPRAMDRenderer(_GFX11)
+    disp = UOp.const(15400, dtypes.int32)
+    src = UOp(Ops.INS, dtypes.float32, (), AMDOps.MOV, (Register("v3", 259),))
+    spill = UOp(Ops.INS, dtypes.void, (disp, src), AMDOps.SPILL)
+    fill = UOp(Ops.INS, dtypes.float32, (disp, UOp.const(1, dtypes.int32).rtag()), AMDOps.FILL, (Register("v4", 260),))
+    for insts in (renderer._insts_for_uop(spill), renderer._insts_for_uop(fill)):
+      self.assertEqual(insts[0].op_name, "V_MOV_B32_E32")
+      self.assertEqual(insts[0].literal, 12288)
+      self.assertEqual(next(i for i in insts if type(i).__name__ == "SCRATCH").offset, 3112)
+
   def test_vector_vgpr_spill_expands_to_scalar_scratch_lanes(self):
     renderer = _REN
     disp = UOp.const(64, dtypes.int32)
@@ -2472,6 +2521,20 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(len(branches), 2)
     self.assertGreater(branches[0], 0)
     self.assertLess(branches[1], 0)
+
+  def test_long_range_loop_branches_use_getpc_trampolines(self):
+    start, end = ".LONG_START", ".LONG_END"
+    label0 = UOp(Ops.INS, dtypes.void, arg=AMDOps.LABEL, tag=start)
+    cbranch = UOp(Ops.INS, dtypes.void, arg=AMDOps.CBRANCH_SCC1, tag=end)
+    padding = tuple(UOp(Ops.INS, dtypes.void, arg=amd_lib.r3.s_nop(0)) for _ in range(0x8001))
+    branch = UOp(Ops.INS, dtypes.void, arg=AMDOps.BRANCH, tag=start)
+    label1 = UOp(Ops.INS, dtypes.void, arg=AMDOps.LABEL, tag=end)
+    insts = _REN._insts_from_linear(UOp(Ops.LINEAR, src=(label0, cbranch) + padding + (branch, label1)))
+    names = [getattr(i, "op_name", "") for i in insts]
+    self.assertEqual(names.count("S_GETPC_B64"), 2)
+    self.assertEqual(names.count("S_SETPC_B64"), 2)
+    self.assertEqual(names.count("S_CBRANCH_SCC0"), 1)
+    self.assertNotIn("S_CBRANCH_SCC1", names)
 
   def test_loop_compare_scalarizes_vgpr_bound(self):
     acc = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.MOV, tag=(Register("s6", 6),))
@@ -2726,6 +2789,13 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(out.tolist(), list(range(1, 9)))
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_long_branches(self):
+    out = Tensor.empty(8, dtype=dtypes.uint32, device="AMD").contiguous().realize()
+    buf, prg = out._buffer().ensure_allocated(), _long_branch_program()
+    _amd_rt(prg)(buf.get_buf("AMD"), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    self.assertEqual(out.tolist(), list(range(1, 9)))
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_two_alu_params_smoke(self):
     inp = Tensor(list(range(16)), dtype=dtypes.uint32, device="AMD").contiguous().realize()
     out = Tensor.empty(16, dtype=dtypes.uint32, device="AMD").contiguous().realize()
@@ -2874,6 +2944,15 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(16, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     out = Tensor.custom_kernel(out, inp, fxn=_custom_renderer_spill)[0].realize()
     self.assertEqual(out.tolist(), [6*x + 15 for x in range(16)])
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_paged_spills(self):
+    raw = [0x3c00] * 16 + [0xc000] * 16 + [0x3800] * 16 + [0x4200] * 16
+    inp = Tensor(raw, dtype=dtypes.uint16, device="AMD").contiguous().realize()
+    out = Tensor.empty(64, dtype=dtypes.float32, device="AMD").contiguous().realize()
+    bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _paged_bitcast_spill_program()
+    _amd_rt(prg)(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    self.assertEqual(out.tolist(), [1.0] * 16 + [-2.0] * 16 + [0.5] * 16 + [3.0] * 16)
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_long_lived_spills(self):

@@ -25,7 +25,7 @@ WGID = tuple(Register(f"s{i}", i) for i in range(2, 5))  # 1D default; 2D uses s
 LID = tuple(Register(f"v{i}", 256+i) for i in range(3))
 # USER_SGPR=15 places WGID_X/Y/Z in s15:s17. SGPRs are allocated as even
 # 64-bit pairs, so reserve both s14:s15 and s16:s17 from the general pool.
-SGPR = tuple(Register(f"s{i}", i) for i in range(6, 104, 2) if i not in (14, 16))
+SGPR = tuple(Register(f"s{i}", i) for i in range(6, 104, 2) if i not in (14, 16, 102))
 VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
 # B gathers factor as k*4096+{0,32,64,96} for large N. AMD_B_COMPACT (default on): isel CSE
 # per-k page idx + in-place <<1 once + GLOBAL offset rem — keeps s_clause, cuts addr ALU.
@@ -37,8 +37,9 @@ LLOAD_VGPR = VGPR[:120]        # v3..v122
 PACK_F16_VGPR = VGPR[187:246]  # v190..v248 (default)
 PACK_F16_VGPR_UP16 = VGPR[61:123]  # v64..v125 — below ACC when WMMA=16
 LLOAD_VGPR_UP16 = VGPR[:61]        # v3..v63
-# v254/v255: per-instruction VGPR scratch; s104:105: EXEC save/restore or SALU compare scratch.
+# v254/v255: per-instruction VGPR scratch; s102:103: long branch; s104:105: EXEC save/restore or SALU compare scratch.
 TMP_VDATA, TMP_VADDR = v[254], v[255]
+TMP_BRANCH = s[102:103]
 TMP_EXEC = s[104:105]
 TMP_SDATA0, TMP_SDATA1 = s[104], s[105]
 
@@ -1602,29 +1603,44 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       slots = _reg_slots(u)
       if (disp_uop:=_unwrap_const(u.src[0])) is None: raise CompileError("non-constant scratch fill offset")
       disp = int(disp_uop.arg)
-      if disp + (slots-1)*4 >= 4096: raise CompileError("scratch fill oob")
+      if disp < 0 or disp + (slots-1)*4 > 0xffffffff: raise CompileError(f"scratch fill oob: offset={disp}, slots={slots}")
       if slots > 1:
         # raw VGPR lanes (f32 packs or half2 LDS loads)
-        loads = [r3.scratch_load_b32(addr=TMP_VADDR, vdst=_reg_lane(greg(u), i), offset=disp + i*4, sve=1)
-                 for i in range(slots)]
-        return [r3.v_mov_b32_e32(TMP_VADDR, 0)] + loads
+        loads: list[Inst] = []
+        fill_page: int|None = None
+        for i in range(slots):
+          scratch_addr = disp + i*4
+          # SCRATCH's 13-bit immediate is signed, so page before its sign bit (0x1000).
+          if (new_page:=scratch_addr & ~0xfff) != fill_page:
+            fill_page = new_page
+            loads.append(r3.v_mov_b32_e32(TMP_VADDR, new_page))
+          loads.append(r3.scratch_load_b32(addr=TMP_VADDR, vdst=_reg_lane(greg(u), i), offset=scratch_addr & 0xfff, sve=1))
+        return loads
       if (scratch_load:=_scratch_load(u.dtype)) is None: raise CompileError(f"no scratch fill {u.dtype}")
-      return [r3.v_mov_b32_e32(TMP_VADDR, 0), scratch_load(addr=TMP_VADDR, vdst=_dst(u), offset=disp, sve=1)]
+      return [r3.v_mov_b32_e32(TMP_VADDR, disp & ~0xfff),
+              scratch_load(addr=TMP_VADDR, vdst=_dst(u), offset=disp & 0xfff, sve=1)]
     case AMDOps.SPILL:
       if greg(u.src[1]).index < 256: raise CompileError("no sgpr scratch spill")
       slots = _reg_slots(u.src[1])
       if (disp_uop:=_unwrap_const(u.src[0])) is None: raise CompileError("non-constant scratch spill offset")
       disp = int(disp_uop.arg)
-      if disp + (slots-1)*4 >= 4096: raise CompileError("scratch spill oob")
+      if disp < 0 or disp + (slots-1)*4 > 0xffffffff: raise CompileError(f"scratch spill oob: offset={disp}, slots={slots}")
       if slots > 1:
         # raw VGPR lanes (f32 packs or half2 LDS loads)
-        return [r3.v_mov_b32_e32(TMP_VADDR, 0)] + \
-               [r3.scratch_store_b32(addr=TMP_VADDR, data=_reg_lane(greg(u.src[1]), i), offset=disp + i*4, sve=1)
-                for i in range(slots)] + \
-               [r3.s_waitcnt_vscnt(sdst=NULL, simm16=0)]
+        stores: list[Inst] = []
+        spill_page: int|None = None
+        for i in range(slots):
+          scratch_addr = disp + i*4
+          # SCRATCH's 13-bit immediate is signed, so page before its sign bit (0x1000).
+          if (new_page:=scratch_addr & ~0xfff) != spill_page:
+            spill_page = new_page
+            stores.append(r3.v_mov_b32_e32(TMP_VADDR, new_page))
+          stores.append(r3.scratch_store_b32(addr=TMP_VADDR, data=_reg_lane(greg(u.src[1]), i), offset=scratch_addr & 0xfff, sve=1))
+        return stores + [r3.s_waitcnt_vscnt(sdst=NULL, simm16=0)]
       if (scratch_store:=_scratch_store(u.src[1].dtype)) is None:
         raise CompileError(f"no scratch spill {u.src[1].dtype}")
-      return [r3.v_mov_b32_e32(TMP_VADDR, 0), scratch_store(addr=TMP_VADDR, data=_src(u.src[1]), offset=disp, sve=1),
+      return [r3.v_mov_b32_e32(TMP_VADDR, disp & ~0xfff),
+              scratch_store(addr=TMP_VADDR, data=_src(u.src[1]), offset=disp & 0xfff, sve=1),
               r3.s_waitcnt_vscnt(sdst=NULL, simm16=0)]
     case AMDOps.CMP_GE:
       pre0, a = _sgpr_data(TMP_SDATA0, u.src[0])
@@ -2037,15 +2053,13 @@ def insts_from_linear(lin:UOp):
   # (PACK_F16 can emit 16 loads; treating that as 1 desyncs vmcnt → MMU faults).
   pending_vm: list[tuple[set[int], int]] = []
   pending: dict[str, set[int]] = {"lgkm": set(), "vs": set()}
-  items, targets, byte = [], {}, 0
+  items, targets = [], {}
   store_addr_cache = _StoreAddrCache()
   _B_PAGE_IDX.clear()
   # Compact B: page-idx UOps already shifted to bytes (in-place <<1 once per idx UOp).
   byte_scaled: set[int]|None = set() if getenv("AMD_B_COMPACT", 1) else None
   def emit(inst):
-    nonlocal byte
     items.append(inst)
-    byte += len(inst.to_bytes())
   def wait_vm(allow:int=0):
     total = sum(n for _, n in pending_vm)
     if not total: return
@@ -2084,15 +2098,14 @@ def insts_from_linear(lin:UOp):
     if u.op is Ops.INS and u.arg is AMDOps.LABEL:
       flush("vm", "lgkm", "vs")
       store_addr_cache.clear()
-      targets[u.tag] = byte
+      targets[u.tag] = len(items)
       oi += 1
       continue
     if u.op is Ops.INS and u.arg in (AMDOps.BRANCH, AMDOps.CBRANCH_SCC1):
       flush("vm", "lgkm", "vs")
       store_addr_cache.clear()
       inst = r3.s_branch(0) if u.arg is AMDOps.BRANCH else r3.s_cbranch_scc1(0)
-      items.append((inst, u.tag, byte))
-      byte += len(inst.to_bytes())
+      items.append((inst, u.tag))
       oi += 1
       continue
     if _needs_vm_flush(u):
@@ -2226,16 +2239,45 @@ def insts_from_linear(lin:UOp):
     oi += 1
   # Drain outstanding global stores before s_endpgm (appended by the renderer).
   flush("vs")
-  insts = []
-  for item in items:
-    if isinstance(item, tuple):
-      inst, target, branch_byte = item
+  # Relax out-of-range SOPP branches into a fixed-width getpc/add/setpc sequence. Keep
+  # long forms fixed at 24 bytes (28 with the inverted conditional) so label layout is stable.
+  long_branches: set[int] = set()
+  while True:
+    sizes = [(28 if getattr(item[0], "op_name", "") == "S_CBRANCH_SCC1" else 24) if i in long_branches else
+             (4 if isinstance(item, tuple) else len(item.to_bytes())) for i,item in enumerate(items)]
+    positions = [0]
+    for sz in sizes: positions.append(positions[-1] + sz)
+    new_long = set(long_branches)
+    for i,item in enumerate(items):
+      if not isinstance(item, tuple): continue
+      _, target = item
       if target not in targets: raise CompileError(f"missing branch {target}")
-      delta = (targets[target] - (branch_byte + len(inst.to_bytes()))) // 4
-      if not -0x8000 <= delta <= 0x7fff: raise CompileError(f"branch oob {target}")
-      inst.simm16 = delta & 0xffff
-    else: inst = item
-    insts.append(inst)
+      delta = (positions[targets[target]] - (positions[i] + 4)) // 4
+      if not -0x8000 <= delta <= 0x7fff: new_long.add(i)
+    if new_long == long_branches: break
+    long_branches = new_long
+  insts = []
+  for i,item in enumerate(items):
+    if not isinstance(item, tuple):
+      insts.append(item)
+      continue
+    inst, target = item
+    target_byte = positions[targets[target]]
+    if i not in long_branches:
+      inst.simm16 = ((target_byte - (positions[i] + 4)) // 4) & 0xffff
+      insts.append(inst)
+      continue
+    conditional = getattr(inst, "op_name", "") == "S_CBRANCH_SCC1"
+    getpc_byte = positions[i] + (4 if conditional else 0)
+    delta = (target_byte - (getpc_byte + 4)) & 0xffffffffffffffff
+    long = [r3.s_getpc_b64(TMP_BRANCH),
+            r3.s_add_u32(TMP_BRANCH[0], TMP_BRANCH[0], delta & 0xffffffff),
+            r3.s_addc_u32(TMP_BRANCH[1], TMP_BRANCH[1], delta >> 32)]
+    while sum(len(x.to_bytes()) for x in long) < 20: long.append(r3.s_nop(0))
+    long.append(r3.s_setpc_b64(ssrc0=TMP_BRANCH))
+    if sum(len(x.to_bytes()) for x in long) != 24: raise CompileError("invalid long branch size")
+    if conditional: insts.append(r3.s_cbranch_scc0(sum(len(x.to_bytes()) for x in long) // 4))
+    insts.extend(long)
   return insts
 
 # ***** TC_LDS_AB staging (codegen hooks via AMDRenderer.pm_stage_wmma_ab) *****
