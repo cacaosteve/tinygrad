@@ -389,6 +389,8 @@ class _SALUExecRecord:
   wave_id: int
   issue: int
   srcs: frozenset[int]
+  src_operands: tuple[int, ...]
+  src_ready: tuple[int, ...]
   dsts: frozenset[int]
   history_idx: int
   ib_idx: int
@@ -493,6 +495,18 @@ class RDNA3SQTTTraceBuilder:
     read_ready = max(issue + 3, max(operand_ready) + 3)
     records, previous = self.salu_exec_records[simd], self.salu_exec_records[simd][-1] if self.salu_exec_records[simd] else None
     first_producer_age = next((age for age, record in enumerate(reversed(records)) if srcs[0] in record.dsts), len(records))
+    if previous is not None and len(previous.src_operands) == 2 and previous.src_operands[0] == previous.src_operands[1] and \
+       previous.src_ready[0] + 1 == previous.issue and self.events[previous.event_idx].time == previous.issue + 3 and \
+       any(srcs[i] // 2 == previous.src_operands[0] // 2 for i in stale):
+      read_ready = max(read_ready, self.events[previous.event_idx].time + 4)
+    if previous is not None and previous.src_ready and min(previous.src_ready) >= previous.issue - 1 and \
+       max(previous.src_ready) == previous.issue and self.events[previous.event_idx].time == previous.issue + 3 and \
+       srcs[0] == srcs[1] and stale:
+      read_ready = max(read_ready, self.events[previous.event_idx].time + 3)
+    if previous is not None and previous.src_operands and self.events[previous.event_idx].time == previous.issue + 5 and len(srcs) == 2 and \
+       srcs[0] % 2 == 0 and srcs[1] == srcs[0] + 1 and previous.src_operands[0] == srcs[0] and \
+       all(reg // 2 == srcs[0] // 2 for reg in previous.src_operands) and len(stale) == 2:
+      read_ready = max(read_ready, self.events[previous.event_idx].time + 3)
     if stale:
       first_source_collision = previous is not None and srcs[0] in previous.dsts and (not self.salu_exec_delayed[simd] or \
         (st.valu_since_salu == 0 and bool(previous.srcs & previous.dsts)) or \
@@ -501,7 +515,8 @@ class RDNA3SQTTTraceBuilder:
       adjacent_refill_collision = previous is not None and not previous.long and not previous.srcs and \
         srcs[0] ^ 1 == srcs[1] and operand_ready[0] == issue + 1 and first_producer_age < 3
       ordered_collision = (0 not in stale and 1 in stale and \
-        ((not self.salu_exec_delayed[simd] and operand_ready[0] == operand_ready[1] + 1) or first_source_collision or adjacent_refill_collision)) or \
+        ((not self.salu_exec_delayed[simd] and operand_ready[0] == operand_ready[1] + 1 and srcs[0] // 2 == srcs[1] // 2) or \
+         first_source_collision or adjacent_refill_collision)) or \
         (0 in stale and 1 in stale and srcs[0] in dsts and srcs[0] in st.sgpr_read_regs and srcs[1] not in st.sgpr_read_regs and \
          previous is not None and issue - 2 <= self.events[previous.event_idx].time < issue)
       reverse_collision = 0 in stale and 1 not in stale and issue == st.last_salu_issue + 1 and previous is not None and previous.long and \
@@ -562,7 +577,10 @@ class RDNA3SQTTTraceBuilder:
     records = self.salu_exec_records[simd]
     if issue != st.last_salu_issue + 1 or len(records) < 2 or not records[-1].long: return 0
     producer, previous = records[-2:]
-    if not producer.long and bool(srcs & producer.dsts) and self.events[previous.event_idx].time == previous.issue + 3: return 2
+    previous_exec = self.events[previous.event_idx].time
+    if srcs and len(previous.src_operands) == 2 and previous.src_operands[0] == previous.src_operands[1] and \
+       previous_exec == previous.issue + 3 and all(reg // 2 == previous.src_operands[0] // 2 and reg not in previous.dsts for reg in srcs): return 2
+    if not producer.long and bool(srcs & producer.dsts) and previous_exec == previous.issue + 3: return 2
     if producer.long and bool(srcs & producer.dsts) and not srcs & (previous.srcs | previous.dsts): return 2
     if len(records) < 3: return 0
     normal, first_long, second_long = records[-3:]
@@ -694,6 +712,7 @@ class RDNA3SQTTTraceBuilder:
       base_issue = st.valu_ib.issue_ready(base_issue, chains=valu_chains, valub=valub, trans=info.trans, trans_source_ready=trans_source_ready)
     sgpr_read_ready = st.sgpr_valu_read_ready if info.pipe == "salu" and (src_sgprs or dst_sgprs) else 0
     salu_read_stall, issue = sgpr_read_ready > base_issue, max(base_issue, sgpr_read_ready)
+    src_sgpr_exec_ready = tuple(st.sgpr_exec_ready.get(reg, issue) for reg in src_sgpr_operands)
     lds_pending = info.pipe == "lds" and st.lgkm_ready > issue
     kwargs = {"wave": wave, **info.kwargs} if info.pkt_cls in (INST, IMMEDIATE, VALUINST) else info.kwargs
     if traced: self._add(issue, info.pkt_cls, **kwargs)
@@ -905,8 +924,8 @@ class RDNA3SQTTTraceBuilder:
       if salu_alu: self.salu_ib[simd].record(exec_time, src_sgprs, dst_sgprs, long=long_salu)
       if salu_alu and exec_event is not None:
         record_idx = len(self.salu_exec_records[simd])
-        self.salu_exec_records[simd].append(_SALUExecRecord(exec_event, wave_id, issue, frozenset(src_sgprs), frozenset(dst_sgprs),
-                                                            history_idx, ib_idx, long_salu))
+        self.salu_exec_records[simd].append(_SALUExecRecord(exec_event, wave_id, issue, frozenset(src_sgprs), src_sgpr_operands,
+                                                            src_sgpr_exec_ready, frozenset(dst_sgprs), history_idx, ib_idx, long_salu))
         for reg in initial_src_sgprs - dst_sgprs: st.initial_sgpr_reads.setdefault(reg, []).append(record_idx)
     if info.pipe == "valu":
       if src_vgprs:
