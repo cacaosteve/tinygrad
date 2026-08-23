@@ -529,6 +529,10 @@ class RDNA3SQTTTraceBuilder:
         prior is not None and not previous.long and not previous.srcs and not prior.long and not prior.srcs and \
         srcs[0] in prior.dsts and srcs[0] ^ 1 == srcs[1] and \
         any(reg // 4 == srcs[0] // 4 and reg // 2 != srcs[0] // 2 for reg in previous.dsts)
+      normal_pair_turn = len(stale) == 2 and issue == st.last_salu_issue + 1 and previous is not None and not previous.long and \
+        previous.src_operands == (srcs[0],) and first_producer_age == 4 and srcs[0] % 2 == 0 and srcs[1] == srcs[0] + 1 and \
+        not (st.valu_exec_history or st.trans_exec_history) and \
+        any(reg // 4 == srcs[0] // 4 and reg // 2 != srcs[0] // 2 for reg in previous.dsts)
       ordered_collision = (0 not in stale and 1 in stale and \
         ((not self.salu_exec_delayed[simd] and operand_ready[0] == operand_ready[1] + 1 and srcs[0] // 2 == srcs[1] // 2) or \
          (first_source_collision and srcs[0] // 2 == srcs[1] // 2) or adjacent_refill_collision or same_pair_forward_collision)) or \
@@ -587,7 +591,7 @@ class RDNA3SQTTTraceBuilder:
         cold_read_latency = 4 if duplicate_after_fast_long or (reused_duplicate_destination and st.valu_since_salu == 1) else 5
         read_ready = max(read_ready, issue + cold_read_latency +
                          max(ordered_collision * (1 + previous_long_producer + previous_long_side_read), reverse_collision,
-                             bank_edge_refill, bank_pair_turn))
+                             bank_edge_refill, bank_pair_turn, normal_pair_turn))
     delayed_refill = 0 not in stale and 1 in stale and operand_ready[0] > issue and self.salu_exec_delayed[simd] and \
       first_producer_age >= 3 and not set(srcs) & dsts and exec_ready > read_ready
     return max(read_ready, exec_ready + delayed_refill)
@@ -602,6 +606,12 @@ class RDNA3SQTTTraceBuilder:
     if not producer.long and bool(srcs & producer.dsts) and previous_exec == previous.issue + 3: return 2
     if producer.long and bool(srcs & producer.dsts) and not srcs & (previous.srcs | previous.dsts): return 2
     if len(records) < 3: return 0
+    first, second, third = records[-3:]
+    if not (st.valu_exec_history or st.trans_exec_history) and first.long and second.long and third.long and \
+       len(first.src_operands) == 2 and first.src_operands[0] == first.src_operands[1] and \
+       second.src_operands == (first.src_operands[0] + 1,) * 2 and set(third.src_operands) == set(first.src_operands + second.src_operands) and \
+       first.src_operands[0] % 2 == 0 and first.dsts == second.dsts == third.dsts and first.src_operands[0] in first.dsts and \
+       first.src_operands[0] + 1 in srcs: return 1
     normal, first_long, second_long = records[-3:]
     return int(not normal.long and first_long.long and second_long.long and \
       bool(second_long.srcs & second_long.dsts & first_long.dsts) and bool(srcs & (second_long.srcs - second_long.dsts)) and \
