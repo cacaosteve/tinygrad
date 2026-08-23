@@ -792,6 +792,14 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(prg.src[0].arg.applied_opts, (Opt(OptOps.GROUP, 0, 16),))
     self.assertEqual(prg.arg.local_size, (16, 1, 1))
 
+  def test_scheduler_skips_complex_reduce_unroll(self):
+    with Context(BEAM=0):
+      x = Tensor.empty(4096, 32, device="AMD")
+      for _ in range(32): x = x.sin() + x
+      ast = x.sum(axis=1).schedule_linear().src[-1].src[0]
+    opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
+    self.assertFalse(any(o.op is OptOps.UNROLL for o in opts))
+
   def test_to_program_assembles_elf(self):
     prg = _simple_add_program()
     self.assertIs(_prg_src(prg).op, Ops.SOURCE)

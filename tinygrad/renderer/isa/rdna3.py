@@ -2758,6 +2758,11 @@ class AMDRenderer(ISARenderer):
     super().__init__(target)
     self.tensor_cores = [x for x in tc.get_amd(target.arch) if (x.dtype_in, x.dtype_out) == (dtypes.half, dtypes.float)]
 
+  def get_reduce_unroll(self, size:int, ast:UOp) -> int|None:
+    # Full unroll on complex quantized reductions explodes native ISA and register allocation.
+    if size <= 3 or len(ast.toposort()) <= 64: return 0
+    return None
+
   def apply_tc_hand_opts(self, tk, rngs):
     apply_tc_hand_opts(tk, rngs)
 

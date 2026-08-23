@@ -77,6 +77,7 @@ class Renderer:
 
   def __init__(self, target:Target): self.target = target
   def __reduce__(self): return self.__class__, (self.target,)
+  def get_reduce_unroll(self, size:int, ast:UOp) -> int|None: return 0  # 0 fully unrolls; None skips unrolling
   def render(self, uops:list[UOp]) -> str: raise NotImplementedError("needs a renderer")
   def asm(self, prg:UOp, lin:UOp) -> bytes: raise NotImplementedError("needs an assembler")
   def supported_dtypes(self) -> set[DType]:

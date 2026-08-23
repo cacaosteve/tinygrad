@@ -146,10 +146,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   try:
     if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
-        k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
-        # if it's small, upcast a second reduce dimension too
-        if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
-          k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
+        unroll = k.ren.get_reduce_unroll(s, k.ast)
+        if unroll is not None:
+          k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, unroll))
+          # if it's small, upcast a second reduce dimension too
+          if unroll == 0 and k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
+            k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
       else:
         for splits in [4]:
           if k.full_shape[axis:=k.unrollable_dims[-1]]%splits == 0:
