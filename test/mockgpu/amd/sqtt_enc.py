@@ -514,9 +514,11 @@ class RDNA3SQTTTraceBuilder:
         (operand_ready[0] > issue + 1 or (operand_ready[0] == issue + 1 and srcs[0] in dsts and (bool(previous.srcs) or bool(st.valu_exec_history))))
       adjacent_refill_collision = previous is not None and not previous.long and not previous.srcs and \
         srcs[0] ^ 1 == srcs[1] and operand_ready[0] == issue + 1 and first_producer_age < 3
+      same_pair_forward_collision = previous is not None and srcs[0] in previous.dsts and srcs[0] // 2 == srcs[1] // 2 and \
+        operand_ready[0] >= issue + 1
       ordered_collision = (0 not in stale and 1 in stale and \
         ((not self.salu_exec_delayed[simd] and operand_ready[0] == operand_ready[1] + 1 and srcs[0] // 2 == srcs[1] // 2) or \
-         first_source_collision or adjacent_refill_collision)) or \
+         (first_source_collision and srcs[0] // 2 == srcs[1] // 2) or adjacent_refill_collision or same_pair_forward_collision)) or \
         (0 in stale and 1 in stale and srcs[0] in dsts and srcs[0] in st.sgpr_read_regs and srcs[1] not in st.sgpr_read_regs and \
          previous is not None and issue - 2 <= self.events[previous.event_idx].time < issue)
       reverse_collision = 0 in stale and 1 not in stale and issue == st.last_salu_issue + 1 and previous is not None and previous.long and \

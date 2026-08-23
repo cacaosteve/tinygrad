@@ -1005,6 +1005,12 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
   "compose_salu_ordered_pair_cold": (TraceCase("compose_salu_ordered_pair_cold", [
     s_mov_b32(s[i], i+1) for i in range(4)] + [s_mul_i32(s[4], s[0], s[0]), s_mul_i32(s[5], s[0], s[1]), s_endpgm()], local_size=32),
     [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 9, 12]),
+  "compose_salu_same_pair_forward_refill": (TraceCase("compose_salu_same_pair_forward_refill", [
+    s_mov_b32(s[i], i+1) for i in range(4)] + [s_add_u32(s[0], s[1], 1), s_mul_i32(s[2], s[0], s[1]), s_endpgm()], local_size=32),
+    [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 11]),
+  "compose_salu_cross_pair_forward_refill": (TraceCase("compose_salu_cross_pair_forward_refill", [
+    s_mov_b32(s[i], i+1) for i in range(4)] + [s_add_u32(s[2], s[1], 1), s_mul_i32(s[0], s[2], s[0]), s_endpgm()], local_size=32),
+    [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 10]),
   "compose_salu_mul_reverse_refill": (TraceCase("compose_salu_mul_reverse_refill", [
     s_mov_b32(s[i], i+1) for i in range(4)] + [s_mov_b32(s[1], 17), s_mul_i32(s[1], s[3], s[2]),
     s_mul_i32(s[1], s[2], s[1]), s_endpgm()], local_size=32), [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 12]),
