@@ -1445,7 +1445,7 @@ class TestSQTTHardwareCycle(unittest.TestCase):
       case = _initialized_salu_corpus_case(seed)
       want = [e for e in _timed_events(_run_mock_trace(case)) if e.kind == "ALUEXEC"]
       got = [e for e in _timed_events(_run_hardware_trace(case, min_instructions=len(case.instructions)-1)) if e.kind == "ALUEXEC"]
-      if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: mismatches.append(msg)
+      if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: mismatches.append(f"seed {seed}\n{msg}")
     if mismatches: self.fail(f"{len(mismatches)}/{count} initialized SALU traces mismatched\n{mismatches[0]}")
 
   def test_hardware_initialized_mixed_corpus(self):
