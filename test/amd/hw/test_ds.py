@@ -833,6 +833,27 @@ class TestDsPermute(unittest.TestCase):
       src_lane = lane ^ 1
       expected = src_lane + 100
       self.assertEqual(st.vgpr[lane][2], expected, f"lane {lane}: expected v[1] from lane {src_lane} = {expected}, got {st.vgpr[lane][2]}")
+
+  def test_ds_swizzle_b32_fft(self):
+    instructions = [
+      v_mov_b32_e32(v[0], v[255]),
+      ds_swizzle_b32(vdst=v[2], addr=v[0], offset0=0, offset1=0xe0),
+      s_waitcnt_lgkmcnt(sdst=NULL, simm16=0),
+    ]
+    st = run_program(instructions, n_lanes=32)
+    for lane in range(32):
+      expected = int(f'{lane:05b}'[::-1], 2)
+      self.assertEqual(st.vgpr[lane][2], expected)
+
+  def test_ds_swizzle_b32_identity(self):
+    instructions = [
+      v_mov_b32_e32(v[0], v[255]),
+      ds_swizzle_b32(vdst=v[2], addr=v[0], offset0=0x1f, offset1=0xe0),
+      s_waitcnt_lgkmcnt(sdst=NULL, simm16=0),
+    ]
+    st = run_program(instructions, n_lanes=32)
+    self.assertEqual([st.vgpr[lane][2] for lane in range(32)], list(range(32)))
+
 class TestDSSubDword(unittest.TestCase):
   """Tests for sub-dword DS operations (ds_store_b16, ds_store_b16_d16_hi)."""
 

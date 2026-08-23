@@ -17,6 +17,12 @@ def _srcs():
 class TestBasicParsing(unittest.TestCase):
   """Test basic pcode parsing for common instruction patterns."""
 
+  def test_inline_comment(self):
+    srcs = _srcs() | {'S0': UOp.const(7, dtypes.uint32)}
+    _, assigns = parse_pcode('D0.u32 = S0.u32; // source value', srcs)
+    self.assertEqual(assigns[0][0], 'D0.u32')
+    self.assertEqual(assigns[0][1].simplify().val, 7)
+
   def test_v_add_f32(self):
     """Test parsing V_ADD_F32 pcode."""
     _, assigns = parse_pcode(PCODE[VOP2Op.V_ADD_F32_E32], _srcs())
@@ -147,8 +153,23 @@ class TestForLoopParsing(unittest.TestCase):
     _vrs, assigns = parse_pcode(pcode, {'S0': S0})
     self.assertEqual(len(assigns), 1)
 
+  def test_c_style_nested_blocks(self):
+    body = "if (1) {\nfor (i = 0; i < 2; i++) {\nD0 = D0 + 1;\n}\n"
+    for pcode in (body + "}\n", body):
+      env, _ = parse_pcode(pcode, {'D0': UOp.const(0, dtypes.uint32)})
+      self.assertEqual(env['D0'].simplify().val, 2)
+
 class TestDSPcodePatterns(unittest.TestCase):
   """Test DS instruction pcode patterns."""
+
+  def test_ds_swizzle_fft_parsing(self):
+    srcs = {'offset0': UOp.const(0, dtypes.uint8), 'offset1': UOp.const(0xe0, dtypes.uint8)}
+    for i in range(64):
+      srcs[f'thread_in@{i}'] = UOp.const(100 + i, dtypes.uint32)
+      srcs[f'thread_valid@{i}'] = UOp.const(i < 32)
+    pcode_vars, _ = parse_pcode(PCODE[DSOp.DS_SWIZZLE_B32], srcs)
+    expected_lanes = [0, 16, 8, 24, 4, 20, 12, 28]
+    self.assertEqual([pcode_vars[f'thread_out@{i}'].simplify().val for i in range(8)], [100 + i for i in expected_lanes])
 
   def test_global_atomic_add_f32_parsing(self):
     """Test GLOBAL_ATOMIC_ADD_F32 keeps memory values in float dtype."""
@@ -331,10 +352,11 @@ class TestAllPcode(unittest.TestCase):
     """Create dummy source variables for pcode parsing."""
     u32, u64 = lambda v=0: UOp.const(v, dtypes.uint32), lambda v=0: UOp.const(v, dtypes.uint64)
     lds = UOp.param(3, dtypes.uint32, (16384,))
-    return {'laneId': u32(), 'laneID': u32(), 'S0': u32(), 'S1': u32(), 'S2': u32(), 'S3': u32(), 'SRC0': u32(),
+    return {'laneId': u32(), 'laneID': u32(), 'S0': u32(), 'S1': u32(), 'S2': u32(), 'S3': u32(), 'SRC0': u32(), 'SRC2': u32(),
             'D0': u32(), 'D1': u32(), 'DST': u32(), 'VDST': u32(), 'SDST': u32(),
             'VCC': u64(), 'VCCZ': u32(), 'EXEC': u64(), 'EXEC_LO': u32(), 'EXECZ': u32(), 'SCC': u32(),
-            'SIMM16': u32(), 'SIMM32': u32(), 'OFFSET': u32(), 'OFFSET0': u32(), 'OFFSET1': u32(), 'offset1': u32(),
+            'SIMM16': u32(), 'SIMM32': u32(), 'OFFSET': u32(), 'OFFSET0': u32(), 'OFFSET1': u32(),
+            'offset': u32(), 'offset0': u32(), 'offset1': u32(),
             'ADDR': u32(), 'ADDR_BASE': u32(), 'TADDR': u32(), 'DATA': u32(), 'DATA0': u32(), 'DATA1': u32(), 'DATA2': u32(),
             'VDATA': u32(), 'VDATA0': u32(), 'VDATA1': u32(), 'VDATA2': u32(), 'VDATA3': u32(),
             'OPSEL': u32(), 'OPSEL_HI': u32(), 'NEG': u32(), 'NEG_HI': u32(), 'CLAMP': u32(),

@@ -542,10 +542,17 @@ class _Ctx:
   def compile_sop_pcode(self, op, srcs: dict[str, UOp | int], sdst_reg: UOp, sdst_size: int) -> UOp:
     """Compile a scalar instruction with dynamic destination register."""
     pcode = get_pcode(op)
-    srcs.update(self.base_srcs(self.rexec()), VCC=self.rmask(_c(VCC_LO.offset)))
+    srcs.update(self.base_srcs(self.rexec()), VCC=self.rmask(_c(VCC_LO.offset)), PC=self.rpc().cast(dtypes.int64))
     if 'D0' not in srcs: srcs['D0'] = self.rsgpr_dyn(sdst_reg)  # D0 is current dest value for read-modify-write ops
     _, assigns = parse_pcode(pcode, srcs)
-    return UOp.sink(*self.scalar_stores(assigns, sdst_reg, sdst_size), *self.inc_pc())
+    pc_stores: list[UOp] = []
+    scalar_assigns: list[tuple[str, UOp]] = []
+    for dest, val in assigns:
+      if dest == 'PC' or dest.startswith('PC.'):
+        lo, hi = _split64(val.cast(dtypes.uint64))
+        pc_stores.extend([self.wsgpr_dyn(_c(PC_LO_IDX), lo), self.wsgpr_dyn(_c(PC_HI_IDX), hi)])
+      else: scalar_assigns.append((dest, val))
+    return UOp.sink(*self.scalar_stores(scalar_assigns, sdst_reg, sdst_size), *pc_stores, *([] if pc_stores else self.inc_pc()))
 
   def compile_lane_pcode(self, op, inst) -> UOp:
     """Compile cross-lane ops (READLANE/WRITELANE/PERMLANE) using pcode parser."""
@@ -730,7 +737,7 @@ def _compile_sop(inst: ir3.SOP1|ir3.SOP2|ir3.SOPC|ir3.SOPK|ir4.SOP1|ir4.SOP2|ir4
     elif isinstance(inst, irc.SOPK) and 'CMPK' not in op_name and 'SETREG' not in op_name: s0 = simm16_sext
     else: s0 = ctx.rsgpr_dyn(sdst_off)
     srcs: dict[str, UOp|int] = {'S0': s0, 'S1': simm16_sext, 'SIMM16': simm16_sext, 'D0': ctx.rsgpr_dyn(sdst_off)}
-    dst_off, dst_size = sdst_off, 1
+    dst_off, dst_size = sdst_off, bits['d'] // 32
     # S_GETREG_B32: extract bits from HW register. Handle as special case since HW_REGISTERS is not a normal variable.
     # HW register values are stored at SGPR[SGPR_COUNT-16 + hwRegId] by _init_wave.
     if 'GETREG' in op_name:
@@ -1557,12 +1564,22 @@ def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLA
   has_data1 = is_lds and hasattr(inst, 'data1') and inst.data1 is not None
   data1_reg = ctx.inst_field(type(inst).data1) if is_lds else _c(0)  # type: ignore[union-attr]
 
+  # DS_SWIZZLE: the addr operand is shuffled across the wave without accessing LDS.
+  if is_lds and 'SWIZZLE' in op_name:
+    swizzle_srcs: dict[str, UOp|int] = {'offset0': offset0.cast(dtypes.uint8), 'offset1': offset1.cast(dtypes.uint8)}
+    for i in range(64):
+      swizzle_srcs[f'thread_in@{i}'] = ctx.rvgpr_dyn(addr_reg, _c(i)) if i < ctx.wave_size else _c(0)
+      swizzle_srcs[f'thread_valid@{i}'] = _lane_active(exec_mask, _c(i)) if i < ctx.wave_size else UOp.const(False)
+    pcode_vars, _ = parse_pcode(pcode, swizzle_srcs)
+    stores = [ctx.wvgpr_dyn(vdst_reg, _c(i), pcode_vars[f'thread_out@{i}'], exec_mask) for i in range(ctx.wave_size)]
+    return UOp.sink(*stores, *ctx.inc_pc())
+
   # DS_PERMUTE/DS_BPERMUTE: cross-lane VGPR access via pcode
   if is_lds and 'PERMUTE' in op_name:
     pcode = get_pcode(inst.op)
-    srcs = {'ADDR': addr_reg, 'DATA0': vdata_reg, 'VDST': vdst_reg, 'OFFSET': offset,
-            'EXEC': exec_mask.cast(dtypes.uint64), '_vgpr': ctx.vgpr, '_wave_size': ctx.wave_size}
-    _, assigns = parse_pcode(pcode, srcs)
+    permute_srcs: dict[str, UOp|int] = {'ADDR': addr_reg, 'DATA0': vdata_reg, 'VDST': vdst_reg, 'OFFSET': offset,
+                                       'EXEC': exec_mask.cast(dtypes.uint64), '_vgpr': ctx.vgpr, '_wave_size': ctx.wave_size}
+    _, assigns = parse_pcode(pcode, permute_srcs)
     stores = [ctx.vgpr.index(val[0]).store(val[1].cast(dtypes.uint32)) for dest, val in assigns if dest.startswith('VGPR[')]
     return UOp.sink(*stores, *ctx.inc_pc())
 
@@ -1618,8 +1635,10 @@ def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLA
                 'DATA2': _u64(ctx.rvgpr_dyn(data1_reg, lane), ctx.rvgpr_dyn(data1_reg + _c(1), lane)) if has_data1 else UOp.const(0, dtypes.uint64)}
       else:  # 96/128-bit: one VGPR per dword
         data = {'DATA': ctx.rvgpr_dyn(vdata_reg, lane), **{f'DATA{i}': ctx.rvgpr_dyn(vdata_reg + _c(i), lane) for i in range(1, data_bits_mem // 32)}}
+      data['DATA0'] = data['DATA']
       # RDNA3 uses ADDR/OFFSET, RDNA4 uses vgpr_a/offset (lowercase) + CalcDsAddr function
-      return {'ADDR': addr, 'ADDR_BASE': addr, 'OFFSET': offset, 'OFFSET0': offset0, 'OFFSET1': offset1, '_lds': mem, 'laneId': lane,
+      return {'ADDR': addr, 'ADDR_BASE': addr, 'OFFSET': offset, 'OFFSET0': offset0, 'OFFSET1': offset1, '_lds': mem,
+              'laneId': lane, 'laneID': lane,
               'vgpr_a': ctx.rvgpr_dyn(addr_reg, lane), 'offset': offset, 'offset0': offset0, 'offset1': offset1, **data}
     active = _lane_active(exec_mask, lane)
     # saddr < 124 means valid SGPR pair, otherwise use 0 (NULL means no saddr contribution)
@@ -1636,7 +1655,7 @@ def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLA
       atomic_data = _u64(ctx.rvgpr_dyn(vdata_reg, lane), ctx.rvgpr_dyn(vdata_reg + _c(1), lane)) \
         if data_bits_mem == 64 else ctx.rvgpr_dyn(vdata_reg, lane)
       return {'ADDR': addr, 'DATA': atomic_data, '_vmem': mem, '_active': active,
-              'laneId': lane, 'v_addr': vaddr_base, 's_saddr': saddr_base}
+              'laneId': lane, 'laneID': lane, 'v_addr': vaddr_base, 's_saddr': saddr_base}
     # acc bit: read/write ACCVGPR instead of VGPR for data operands
     _rvdata = (lambda r, l, *a: ctx.raccvgpr_dyn(r, l)) if use_acc else ctx.rvgpr_dyn
     vdata = _rvdata(vdata_reg, lane).cast(dtypes.uint64) if 'STORE' in op_name \
@@ -1644,7 +1663,7 @@ def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLA
     if 'STORE' in op_name and data_bits_mem >= 64:
       vdata = vdata | (_rvdata(vdata_reg + _c(1), lane).cast(dtypes.uint64) << UOp.const(32, dtypes.uint64))
     srcs = {'ADDR': addr, 'VDATA': vdata, '_vmem': mem, '_active': active,
-            'laneId': lane, 'v_addr': vaddr_base, 's_saddr': saddr_base, 'SADDR': saddr_base, 'OFFSET': offset}
+            'laneId': lane, 'laneID': lane, 'v_addr': vaddr_base, 's_saddr': saddr_base, 'SADDR': saddr_base, 'OFFSET': offset}
     for i in range(data_bits_mem // 32):
       srcs[f'VDATA{i}'] = _rvdata(vdata_reg + _c(i), lane) if 'STORE' in op_name else UOp.const(0, dtypes.uint32)
     return srcs
@@ -1951,7 +1970,7 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
 
   # Initialize SQTT encoder — emits packets inline as instructions execute (only when profiling)
   if PROFILE:
-    sqtt_emit, sqtt_finish, sqtt_finalize = _make_sqtt_encoder()
+    sqtt_emit, sqtt_finish, sqtt_finalize = _make_sqtt_encoder(max(1, (total_threads + wave_size - 1) // wave_size))
 
   def _ensure_compiled(pc: int) -> tuple[Callable, list[int], bool, Inst]:
     if pc not in program:
