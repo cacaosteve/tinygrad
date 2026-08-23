@@ -1011,6 +1011,9 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
   "compose_salu_cross_pair_forward_refill": (TraceCase("compose_salu_cross_pair_forward_refill", [
     s_mov_b32(s[i], i+1) for i in range(4)] + [s_add_u32(s[2], s[1], 1), s_mul_i32(s[0], s[2], s[0]), s_endpgm()], local_size=32),
     [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 10]),
+  "compose_salu_bank_edge_refill": (TraceCase("compose_salu_bank_edge_refill", [
+    s_mov_b32(s[4+i], i+1) for i in range(4)] + [s_add_u32(s[12], s[7], 1), s_mov_b32(s[13], 1),
+    s_mul_i32(s[14], s[7], s[6]), s_endpgm()], local_size=32), [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 12]),
   "compose_salu_mul_reverse_refill": (TraceCase("compose_salu_mul_reverse_refill", [
     s_mov_b32(s[i], i+1) for i in range(4)] + [s_mov_b32(s[1], 17), s_mul_i32(s[1], s[3], s[2]),
     s_mul_i32(s[1], s[2], s[1]), s_endpgm()], local_size=32), [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 12]),
