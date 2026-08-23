@@ -507,7 +507,8 @@ class RDNA3SQTTTraceBuilder:
       read_ready = max(read_ready, self.events[previous.event_idx].time + 3)
     cross_pair_destination_refill = prior is not None and previous is not None and not prior.long and not prior.srcs and \
       len(prior_dst_pairs) == 1 and {reg // 2 for reg in previous.dsts} == prior_dst_pairs and srcs[0] // 2 not in prior_dst_pairs
-    if previous is not None and previous.src_operands and self.events[previous.event_idx].time == previous.issue + 5 and len(srcs) == 2 and \
+    if previous is not None and previous.long and previous.src_operands and \
+       self.events[previous.event_idx].time == previous.issue + 5 and len(srcs) == 2 and \
        srcs[0] % 2 == 0 and srcs[1] == srcs[0] + 1 and previous.src_operands[0] == srcs[0] and \
        all(reg // 2 == srcs[0] // 2 for reg in previous.src_operands) and len(stale) == 2 and not cross_pair_destination_refill:
       read_ready = max(read_ready, self.events[previous.event_idx].time + 3)

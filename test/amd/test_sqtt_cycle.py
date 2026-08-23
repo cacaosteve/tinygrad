@@ -1020,6 +1020,10 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
   "compose_salu_cross_pair_duplicate_release": (TraceCase("compose_salu_cross_pair_duplicate_release", [
     s_mov_b32(s[4+i], i+1) for i in range(4)] + [s_mov_b32(s[6], 10), s_mul_i32(s[7], s[4], s[4]),
     s_mul_i32(s[7], s[4], s[5]), s_endpgm()], local_size=32), [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 10, 12]),
+  "compose_salu_normal_releases_pair": (TraceCase("compose_salu_normal_releases_pair", [
+    s_mov_b32(s[i], i+1) for i in range(4)] + [s_mov_b32(s[2], 10), s_mul_i32(s[3], s[0], s[0]),
+    s_add_u32(s[2], s[0], 2), s_mul_i32(s[3], s[0], s[1]), s_endpgm()], local_size=32),
+    [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 10, 11, 13]),
   "compose_salu_forward_edge_reverse": (TraceCase("compose_salu_forward_edge_reverse", [
     s_mov_b32(s[i], i+1) for i in range(4)] + [s_mul_i32(s[3], s[2], s[2]), s_mul_i32(s[3], s[1], s[3]), s_endpgm()], local_size=32),
     [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 7, 10]),
