@@ -494,6 +494,8 @@ class RDNA3SQTTTraceBuilder:
     stale = [i for i, ready in enumerate(operand_ready) if ready + 1 < issue]
     read_ready = max(issue + 3, max(operand_ready) + 3)
     records, previous = self.salu_exec_records[simd], self.salu_exec_records[simd][-1] if self.salu_exec_records[simd] else None
+    prior = records[-2] if len(records) >= 2 else None
+    prior_dst_pairs = {reg // 2 for reg in prior.dsts} if prior is not None else set()
     first_producer_age = next((age for age, record in enumerate(reversed(records)) if srcs[0] in record.dsts), len(records))
     if previous is not None and len(previous.src_operands) == 2 and previous.src_operands[0] == previous.src_operands[1] and \
        previous.src_ready[0] + 1 == previous.issue and self.events[previous.event_idx].time == previous.issue + 3 and \
@@ -503,9 +505,11 @@ class RDNA3SQTTTraceBuilder:
        max(previous.src_ready) == previous.issue and self.events[previous.event_idx].time == previous.issue + 3 and \
        srcs[0] == srcs[1] and stale:
       read_ready = max(read_ready, self.events[previous.event_idx].time + 3)
+    cross_pair_destination_refill = prior is not None and previous is not None and not prior.long and not prior.srcs and \
+      len(prior_dst_pairs) == 1 and {reg // 2 for reg in previous.dsts} == prior_dst_pairs and srcs[0] // 2 not in prior_dst_pairs
     if previous is not None and previous.src_operands and self.events[previous.event_idx].time == previous.issue + 5 and len(srcs) == 2 and \
        srcs[0] % 2 == 0 and srcs[1] == srcs[0] + 1 and previous.src_operands[0] == srcs[0] and \
-       all(reg // 2 == srcs[0] // 2 for reg in previous.src_operands) and len(stale) == 2:
+       all(reg // 2 == srcs[0] // 2 for reg in previous.src_operands) and len(stale) == 2 and not cross_pair_destination_refill:
       read_ready = max(read_ready, self.events[previous.event_idx].time + 3)
     if stale:
       first_source_collision = previous is not None and srcs[0] in previous.dsts and (not self.salu_exec_delayed[simd] or \
@@ -516,11 +520,14 @@ class RDNA3SQTTTraceBuilder:
         srcs[0] ^ 1 == srcs[1] and operand_ready[0] == issue + 1 and first_producer_age < 3
       same_pair_forward_collision = previous is not None and srcs[0] in previous.dsts and srcs[0] // 2 == srcs[1] // 2 and \
         operand_ready[0] >= issue + 1
-      prior = records[-2] if len(records) >= 2 else None
       inward_pair = (srcs[0] % 4 == 0 and srcs[1] == srcs[0] + 1) or (srcs[0] % 4 == 3 and srcs[1] == srcs[0] - 1)
       bank_edge_refill = 1 in stale and issue == st.last_salu_issue + 1 and previous is not None and not previous.long and not previous.srcs and \
         prior is not None and not prior.long and inward_pair and \
         any(reg // 4 == srcs[0] // 4 and reg % 4 in {0, srcs[0] % 4} for reg in prior.srcs)
+      bank_pair_turn = 0 not in stale and 1 in stale and issue == st.last_salu_issue + 1 and previous is not None and \
+        prior is not None and not previous.long and not previous.srcs and not prior.long and not prior.srcs and \
+        srcs[0] in prior.dsts and srcs[0] ^ 1 == srcs[1] and \
+        any(reg // 4 == srcs[0] // 4 and reg // 2 != srcs[0] // 2 for reg in previous.dsts)
       ordered_collision = (0 not in stale and 1 in stale and \
         ((not self.salu_exec_delayed[simd] and operand_ready[0] == operand_ready[1] + 1 and srcs[0] // 2 == srcs[1] // 2) or \
          (first_source_collision and srcs[0] // 2 == srcs[1] // 2) or adjacent_refill_collision or same_pair_forward_collision)) or \
@@ -578,7 +585,8 @@ class RDNA3SQTTTraceBuilder:
           issue == st.last_salu_issue + 1 and self.events[previous.event_idx].time == previous.issue + 3
         cold_read_latency = 4 if duplicate_after_fast_long or (reused_duplicate_destination and st.valu_since_salu == 1) else 5
         read_ready = max(read_ready, issue + cold_read_latency +
-                         max(ordered_collision * (1 + previous_long_producer + previous_long_side_read), reverse_collision, bank_edge_refill))
+                         max(ordered_collision * (1 + previous_long_producer + previous_long_side_read), reverse_collision,
+                             bank_edge_refill, bank_pair_turn))
     delayed_refill = 0 not in stale and 1 in stale and operand_ready[0] > issue and self.salu_exec_delayed[simd] and \
       first_producer_age >= 3 and not set(srcs) & dsts and exec_ready > read_ready
     return max(read_ready, exec_ready + delayed_refill)

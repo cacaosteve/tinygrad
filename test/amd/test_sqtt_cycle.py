@@ -1014,6 +1014,12 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
   "compose_salu_bank_edge_refill": (TraceCase("compose_salu_bank_edge_refill", [
     s_mov_b32(s[4+i], i+1) for i in range(4)] + [s_add_u32(s[12], s[7], 1), s_mov_b32(s[13], 1),
     s_mul_i32(s[14], s[7], s[6]), s_endpgm()], local_size=32), [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 12]),
+  "compose_salu_source_free_bank_turn": (TraceCase("compose_salu_source_free_bank_turn", [
+    s_mov_b32(s[4+i], i+1) for i in range(4)] + [s_mov_b32(s[4], 17), s_mov_b32(s[7], 29),
+    s_mul_i32(s[7], s[4], s[5]), s_endpgm()], local_size=32), [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 12]),
+  "compose_salu_cross_pair_duplicate_release": (TraceCase("compose_salu_cross_pair_duplicate_release", [
+    s_mov_b32(s[4+i], i+1) for i in range(4)] + [s_mov_b32(s[6], 10), s_mul_i32(s[7], s[4], s[4]),
+    s_mul_i32(s[7], s[4], s[5]), s_endpgm()], local_size=32), [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 10, 12]),
   "compose_salu_forward_edge_reverse": (TraceCase("compose_salu_forward_edge_reverse", [
     s_mov_b32(s[i], i+1) for i in range(4)] + [s_mul_i32(s[3], s[2], s[2]), s_mul_i32(s[3], s[1], s[3]), s_endpgm()], local_size=32),
     [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 7, 10]),
