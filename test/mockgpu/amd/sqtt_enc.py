@@ -1,100 +1,956 @@
-# SQTT trace encoder for the emulator (the decoder lives in tinygrad/renderer/amd/sqtt.py).
-# run_asm emits packets inline as instructions execute; finished traces end up in emu.sqtt_traces.
+"""RDNA3 SQTT encoding and non-DRAM scheduling for the AMD mock GPU."""
 from __future__ import annotations
-from tinygrad.renderer.amd.dsl import Inst
-from tinygrad.renderer.amd.sqtt import (_build_decode_tables, PACKET_TYPES_RDNA3, PacketType, InstOp,
-                                        LAYOUT_HEADER, WAVESTART, WAVEEND, INST, IMMEDIATE, VALUINST)
+from dataclasses import dataclass, field, replace
+import re
+from typing import Any
 
-_NIB_COUNTS = {cls: nc for _, (cls, nc, *_) in _build_decode_tables(PACKET_TYPES_RDNA3)[0].items()}
+from tinygrad.helpers import getenv
+from tinygrad.renderer.amd.sqtt import (ALUEXEC, IMMEDIATE, INST, LAYOUT_HEADER, PACKET_TYPES_RDNA3, TS_DELTA_OR_MARK, VALUINST,
+  VMEMEXEC, WAVEEND, WAVERDY, WAVESTART, AluSrc, InstOp, MemSrc, PacketType, _build_decode_tables)
+from tinygrad.runtime.autogen.amd.cdna import ins as irc
+from tinygrad.runtime.autogen.amd.rdna3 import ins as ir3
+from tinygrad.runtime.autogen.amd.rdna3.enum import SOPPOp as SOPPOp3
+from tinygrad.runtime.autogen.amd.rdna4 import ins as ir4
+from tinygrad.runtime.autogen.amd.rdna4.enum import SOPPOp as SOPPOp4
 
-def _emit_nibbles(nibbles: list[int], pkt_cls: type[PacketType], **kwargs):
+_NIB_COUNTS: dict[type[PacketType], int] = {cls: nc for _, (cls, nc, *_) in _build_decode_tables(PACKET_TYPES_RDNA3)[0].items()}
+
+def _encode_raw(pkt_cls: type[PacketType], **kwargs) -> tuple[int, int]:
   raw = pkt_cls.encoding.default
   for k, v in kwargs.items(): raw = pkt_cls.__dict__[k].set(raw, v)
-  nibbles.extend((raw >> (i * 4)) & 0xF for i in range(_NIB_COUNTS[pkt_cls]))
+  return raw, _NIB_COUNTS[pkt_cls]
 
-def make_encoder():
-  """Build an SQTT trace encoder for the emulator. Returns (emit, finish, finalize)."""
-  from tinygrad.runtime.autogen.amd.rdna3.enum import SOPPOp as SOPPOp3
-  from tinygrad.runtime.autogen.amd.rdna4.enum import SOPPOp as SOPPOp4
-  from tinygrad.runtime.autogen.amd.rdna3 import ins as ir3
-  from tinygrad.runtime.autogen.amd.rdna4 import ins as ir4
-  from tinygrad.runtime.autogen.amd.cdna import ins as irc
-  import re
+def _emit_nibbles(nibbles: list[int], pkt_cls: type[PacketType], **kwargs) -> None:
+  raw, nc = _encode_raw(pkt_cls, **kwargs)
+  for i in range(nc): nibbles.append((raw >> (i * 4)) & 0xF)
 
-  def _kinds(*names: str) -> tuple[type[Inst], ...]:
-    return tuple(getattr(m, n) for m in (ir3, ir4, irc) for n in names if hasattr(m, n))
-  _SOPP, _SMEM, _DS = _kinds('SOPP'), _kinds('SMEM'), _kinds('DS')
-  _GLOBAL, _FLAT, _SCRATCH = _kinds('GLOBAL', 'VGLOBAL'), _kinds('FLAT', 'VFLAT'), _kinds('SCRATCH', 'VSCRATCH')
-  _VALU = _kinds('VOP1', 'VOP2', 'VOP3', 'VOP3P', 'VOP3PX2', 'VOPC', 'VOPD', 'VOP3SD', 'VOP3_SDST', 'VOP1_SDST')
+def _nibbles_to_bytes(nibbles: list[int]) -> bytes:
+  result = bytearray()
+  for i in range(0, len(nibbles), 2): result.append(nibbles[i] | ((nibbles[i + 1] if i + 1 < len(nibbles) else 0) << 4))
+  return bytes(result)
 
-  # SOPP classification sets
-  _SOPP_SKIP = {SOPPOp3.S_ENDPGM.value, SOPPOp3.S_ENDPGM_SAVED.value, SOPPOp3.S_ENDPGM_ORDERED_PS_DONE.value, SOPPOp3.S_DELAY_ALU.value}
-  _SOPP_IMMEDIATE = {SOPPOp3.S_NOP.value, SOPPOp3.S_CLAUSE.value, SOPPOp3.S_WAITCNT.value, SOPPOp3.S_WAITCNT_DEPCTR.value,
-                     SOPPOp3.S_WAIT_IDLE.value, SOPPOp3.S_WAIT_EVENT.value, SOPPOp3.S_SLEEP.value, SOPPOp3.S_SET_INST_PREFETCH_DISTANCE.value}
-  for _op in (SOPPOp4.S_WAIT_ALU, SOPPOp4.S_WAIT_LOADCNT, SOPPOp4.S_WAIT_STORECNT, SOPPOp4.S_WAIT_SAMPLECNT,
-              SOPPOp4.S_WAIT_BVHCNT, SOPPOp4.S_WAIT_EXPCNT, SOPPOp4.S_WAIT_DSCNT, SOPPOp4.S_WAIT_KMCNT,
-              SOPPOp4.S_WAIT_LOADCNT_DSCNT, SOPPOp4.S_WAIT_STORECNT_DSCNT):
-    _SOPP_IMMEDIATE.add(_op.value)
-  _SOPP_BARRIER = {SOPPOp3.S_BARRIER.value}
-  if hasattr(SOPPOp4, 'S_BARRIER_WAIT'): _SOPP_BARRIER.add(SOPPOp4.S_BARRIER_WAIT.value)
-  if hasattr(SOPPOp4, 'S_BARRIER_LEAVE'): _SOPP_BARRIER.add(SOPPOp4.S_BARRIER_LEAVE.value)
-  _SOPP_BRANCH = {SOPPOp3.S_BRANCH.value, SOPPOp3.S_CBRANCH_SCC0.value, SOPPOp3.S_CBRANCH_SCC1.value,
-                  SOPPOp3.S_CBRANCH_VCCZ.value, SOPPOp3.S_CBRANCH_VCCNZ.value,
-                  SOPPOp3.S_CBRANCH_EXECZ.value, SOPPOp3.S_CBRANCH_EXECNZ.value}
+def _max_delta(pkt_cls: type[PacketType]) -> int:
+  delta_field = getattr(pkt_cls, "delta", None)
+  return 0 if delta_field is None else (1 << (delta_field.hi - delta_field.lo + 1)) - 1
 
-  # VALU sub-classification patterns
-  _VALUT_4_RE = re.compile(r'V_(EXP|LOG|RCP|RSQ|SQRT|SIN|COS|CEIL|FLOOR|TRUNC|RNDNE|FRACT|FREXP)_')
-  _VALUB_2_RE = re.compile(r'V_(LSHLREV|LSHRREV|ASHRREV)_(B|I)64')
-  _VALUB_4_RE = re.compile(r'V_MAD_(U|I)64')
-  _VALUB_16_RE = re.compile(r'V_\w+_F64')
+_SOPP = (ir3.SOPP, ir4.SOPP, irc.SOPP)
+_SALU = (ir3.SOP1, ir3.SOP2, ir3.SOPC, ir3.SOPK, ir4.SOP1, ir4.SOP2, ir4.SOPC, ir4.SOPK, irc.SOP1, irc.SOP2, irc.SOPC, irc.SOPK)
+_SMEM = (ir3.SMEM, ir4.SMEM, irc.SMEM)
+_VALU = (ir3.VOP1, ir3.VOP2, ir3.VOP3, ir3.VOP3P, ir3.VOPC, ir3.VOPD, ir3.VOP3SD, ir3.VOP3_SDST, ir3.VOP1_SDST,
+         ir4.VOP1, ir4.VOP2, ir4.VOP3, ir4.VOP3P, ir4.VOPC, ir4.VOPD, ir4.VOP3SD, ir4.VOP3_SDST, ir4.VOP1_SDST,
+         irc.VOP1, irc.VOP2, irc.VOP3, irc.VOP3P, irc.VOP3PX2, irc.VOPC, irc.VOP3SD, irc.VOP3_SDST)
+_VINTERP = (ir3.VINTERP, ir4.VINTERP)
+_DS = (ir3.DS, ir4.DS, irc.DS)
+_GLOBAL = (ir3.GLOBAL, ir4.VGLOBAL, irc.GLOBAL)
+_FLAT = (ir3.FLAT, ir4.VFLAT, irc.FLAT)
+_SCRATCH = (ir3.SCRATCH, ir4.VSCRATCH, irc.SCRATCH)
 
-  def _valu_op(op_name: str) -> InstOp|None:
-    if 'CMPX' in op_name: return InstOp.VALU1_WR_EXEC
-    if _VALUB_2_RE.search(op_name): return InstOp.VALUB_2
-    if _VALUB_4_RE.search(op_name): return InstOp.VALUB_4
-    if _VALUB_16_RE.search(op_name): return InstOp.VALUB_16
-    if _VALUT_4_RE.search(op_name): return InstOp.VALUT_4
-    return None
+_SOPP_SKIP = {SOPPOp3.S_ENDPGM.value, SOPPOp3.S_ENDPGM_SAVED.value, SOPPOp3.S_ENDPGM_ORDERED_PS_DONE.value,
+              SOPPOp3.S_DELAY_ALU.value}
+_SOPP_IMMEDIATE = {SOPPOp3.S_NOP.value, SOPPOp3.S_CLAUSE.value, SOPPOp3.S_WAITCNT.value, SOPPOp3.S_WAITCNT_DEPCTR.value,
+                   SOPPOp3.S_WAIT_IDLE.value, SOPPOp3.S_WAIT_EVENT.value, SOPPOp3.S_SLEEP.value,
+                   SOPPOp3.S_SET_INST_PREFETCH_DISTANCE.value}
+for _op in (SOPPOp4.S_WAIT_ALU, SOPPOp4.S_WAIT_LOADCNT, SOPPOp4.S_WAIT_STORECNT, SOPPOp4.S_WAIT_SAMPLECNT,
+            SOPPOp4.S_WAIT_BVHCNT, SOPPOp4.S_WAIT_EXPCNT, SOPPOp4.S_WAIT_DSCNT, SOPPOp4.S_WAIT_KMCNT,
+            SOPPOp4.S_WAIT_LOADCNT_DSCNT, SOPPOp4.S_WAIT_STORECNT_DSCNT):
+  _SOPP_IMMEDIATE.add(_op.value)
+_SOPP_BARRIER = {SOPPOp3.S_BARRIER.value}
+if hasattr(SOPPOp4, "S_BARRIER_WAIT"): _SOPP_BARRIER.add(SOPPOp4.S_BARRIER_WAIT.value)
+if hasattr(SOPPOp4, "S_BARRIER_LEAVE"): _SOPP_BARRIER.add(SOPPOp4.S_BARRIER_LEAVE.value)
+_SOPP_BRANCH = {SOPPOp3.S_BRANCH.value, SOPPOp3.S_CBRANCH_SCC0.value, SOPPOp3.S_CBRANCH_SCC1.value,
+                SOPPOp3.S_CBRANCH_VCCZ.value, SOPPOp3.S_CBRANCH_VCCNZ.value,
+                SOPPOp3.S_CBRANCH_EXECZ.value, SOPPOp3.S_CBRANCH_EXECNZ.value}
 
-  def _mem_op(t: type[Inst], op_name: str) -> InstOp:
-    is_store = "STORE" in op_name
-    if issubclass(t, _DS): return InstOp.LDS_WR_2 if is_store else InstOp.LDS_RD
-    if issubclass(t, _GLOBAL): return InstOp.SGMEM_WR_2 if is_store else InstOp.SGMEM_RD_1
-    if issubclass(t, _FLAT) or issubclass(t, _SCRATCH): return InstOp.FLAT_WR_3 if is_store else InstOp.FLAT_RD_2
-    return InstOp.SALU
+_VALUT_4_RE = re.compile(r"V_(EXP|LOG|RCP|RSQ|SQRT|SIN|COS|CEIL|FLOOR|TRUNC|RNDNE|FRACT|FREXP)_")
+_VALUB_2_RE = re.compile(r"V_(LSHLREV|LSHRREV|ASHRREV)_(B|I)64")
+_VALUB_4_RE = re.compile(r"V_MAD_(U|I)64")
+_VALUB_16_RE = re.compile(r"V_\w+_F64")
+_DS_ATOMIC_RE = re.compile(r"DS_(ADD|SUB|RSUB|INC|DEC|MIN|MAX|AND|OR|XOR|MSKOR)(_|$)")
+_SALU_3_CYCLE = {"S_MUL_I32", "S_MULK_I32", "S_MUL_HI_I32", "S_MUL_HI_U32"}
+_SALU_INFLIGHT_LIMIT, _VALU_INFLIGHT_LIMIT, _VALUB_INFLIGHT_LIMIT, _TRANS_INFLIGHT_LIMIT, _VALU_READ_WARMUP = 6, 12, 8, 5, 7
+_SALU_DUPLICATE_READ_WARMUP = 5
+_CU_SIMDS = 2
 
-  nibbles: list[int] = []
-  started: set[int] = set()
-  _emit_nibbles(nibbles, LAYOUT_HEADER, layout=3, sel_a=6)
+def _op_name(inst) -> str:
+  if hasattr(inst, "opx"): return f"{inst.opx.name}_{inst.opy.name}"
+  return inst.op.name if hasattr(inst, "op") and hasattr(inst.op, "name") else ""
 
-  def emit(wave_id: int, inst: Inst, branch_taken: bool|None):
-    """Emit an SQTT packet for one executed instruction."""
-    w = wave_id & 0x1F
-    if wave_id not in started:
-      _emit_nibbles(nibbles, WAVESTART, delta=1, simd=0, wgp=0, wave=w, id7=wave_id)
-      started.add(wave_id)
-    inst_type, inst_op, op_name = type(inst), inst.op.value if hasattr(inst, 'op') else 0, inst.op.name if hasattr(inst, 'op') else ""
+def _valu_op(op_name: str) -> InstOp|None:
+  if "CMPX" in op_name: return InstOp.VALU1_WR_EXEC
+  if _VALUB_2_RE.search(op_name): return InstOp.VALUB_2
+  if _VALUB_4_RE.search(op_name): return InstOp.VALUB_4
+  if _VALUB_16_RE.search(op_name): return InstOp.VALUB_16
+  if _VALUT_4_RE.search(op_name): return InstOp.VALUT_4
+  return None
+
+def _mem_op(inst, op_name: str) -> InstOp:
+  t = type(inst)
+  is_store = "STORE" in op_name
+  if issubclass(t, _DS):
+    if "PERMUTE" in op_name: return InstOp.LDS_WR_2
+    if is_store and "_2ADDR" in op_name: return InstOp.LDS_WR_5 if "_B64" in op_name else InstOp.LDS_WR_3
+    if "CMPSTORE" in op_name: return InstOp.LDS_WR_5 if ("_B64" in op_name or "_F64" in op_name) else InstOp.LDS_WR_3
+    if _DS_ATOMIC_RE.match(op_name): return InstOp.LDS_WR_3 if re.search(r"_(B|U|I|F)64", op_name) else InstOp.LDS_WR_2
+    if not is_store: return InstOp.LDS_RD
+    if "_ADDTID" in op_name: return InstOp.LDS_WR_1
+    if "_B128" in op_name: return InstOp.LDS_WR_5
+    if "_B96" in op_name: return InstOp.LDS_WR_4
+    if "_B64" in op_name: return InstOp.LDS_WR_3
+    return InstOp.LDS_WR_2
+  data_words = max(1, (int(inst.canonical_op_bits.get("data", 32)) + 31) // 32)
+  if issubclass(t, _GLOBAL):
+    scalar_base = (saddr:=_field_offset(getattr(inst, "saddr", None))) is not None and saddr < 124
+    if "ATOMIC" in op_name: return InstOp.SGMEM_WR_6
+    if not is_store: return InstOp.SGMEM_RD_1 if scalar_base else InstOp.SGMEM_RD_2
+    return InstOp[f"SGMEM_WR_{data_words + (1 if scalar_base else 2)}"]
+  if issubclass(t, _FLAT + _SCRATCH):
+    return InstOp[f"FLAT_WR_{data_words + 2}"] if is_store else InstOp.FLAT_RD_2
+  return InstOp.SALU
+
+def _op_duration(op: InstOp|None) -> int:
+  if op is None: return 1
+  return int(m.group(1)) if (m:=re.search(r"_(\d+)$", op.name)) else 1
+
+def _valu_latencies(op: InstOp) -> tuple[int, int, int]:
+  duration = _op_duration(op)
+  if op == InstOp.VALUB_16: return duration, 32, 32
+  if op.name.startswith("VALUB_"): return duration, duration, duration
+  return duration, 1, 1
+
+def _lds_lgkm_latency(op: InstOp, pending: bool) -> int:
+  if op == InstOp.LDS_RD: return 34 if pending else 31
+  if op == InstOp.LDS_WR_1: return 31
+  if op == InstOp.LDS_WR_2: return 33
+  if op == InstOp.LDS_WR_3: return 35
+  if op == InstOp.LDS_WR_4: return 38
+  if op == InstOp.LDS_WR_5: return 39
+  return _op_duration(op)
+
+def _lds_exec_latency(op: InstOp) -> int:
+  if op in {InstOp.LDS_WR_1, InstOp.LDS_WR_3, InstOp.LDS_WR_4, InstOp.LDS_WR_5}: return 3
+  return _op_duration(op)
+
+def _field_offset(x: Any) -> int|None:
+  if x is None: return None
+  if hasattr(x, "offset"): return int(x.offset)
+  return int(x) if isinstance(x, int) else None
+
+def _has_operand(inst, name: str) -> bool:
+  return not hasattr(inst, "op_bits") or not inst.op_bits or name in inst.op_bits
+
+def _vgpr_offsets(x: Any) -> set[int]:
+  if (off:=_field_offset(x)) is None or off < 256: return set()
+  base = off - (384 if off >= 384 else 256)
+  return set(range(base, base + int(getattr(x, "sz", 1))))
+
+def _sgpr_offsets(x: Any) -> set[int]:
+  if (off:=_field_offset(x)) is None or off >= 128: return set()
+  return set(range(off, min(128, off + int(getattr(x, "sz", 1)))))
+
+def _wmma_exec_latency(inst) -> int:
+  blocks = {_field_offset(getattr(inst, name, None)) for name in ("vdst", "src0", "src1", "src2")}
+  return min(43, 40 + len(blocks - {None}))
+
+def _src_vgprs(inst) -> set[int]:
+  ret: set[int] = set()
+  for name in ("src0", "src1", "src2", "srcx0", "srcy0"):
+    if _has_operand(inst, name): ret.update(_vgpr_offsets(getattr(inst, name, None)))
+  for name in ("vsrc0", "vsrc1", "vsrc2", "vsrcx1", "vsrcy1", "data", "data0", "data1", "addr"):
+    if _has_operand(inst, name): ret.update(_vgpr_offsets(getattr(inst, name, None)))
+  if "FMAC" in _op_name(inst) or "DOT2ACC" in _op_name(inst):
+    for name in ("vdst", "vdstx", "vdsty"): ret.update(_vgpr_offsets(getattr(inst, name, None)))
+  return ret
+
+def _src_vgpr_operands(inst) -> tuple[int, ...]:
+  ret: list[int] = []
+  for name in ("src0", "src1", "src2", "vsrc0", "vsrc1", "vsrc2", "srcx0", "srcy0", "vsrcx1", "vsrcy1"):
+    if _has_operand(inst, name): ret.extend(sorted(_vgpr_offsets(getattr(inst, name, None))))
+  return tuple(ret)
+
+def _dst_vgprs(inst, op_name: str) -> set[int]:
+  ret: set[int] = set()
+  if "STORE" not in op_name:
+    for name in ("vdst", "vdstx", "vdsty"):
+      if _has_operand(inst, name): ret.update(_vgpr_offsets(getattr(inst, name, None)))
+  if "LOAD" in op_name: ret.update(_vgpr_offsets(getattr(inst, "vdata", None)))
+  return ret
+
+def _src_sgprs(inst) -> set[int]:
+  ret: set[int] = set()
+  for name in ("src0", "src1", "src2", "ssrc0", "ssrc1", "sbase", "soffset", "saddr"):
+    if _has_operand(inst, name): ret.update(_sgpr_offsets(getattr(inst, name, None)))
+  if _op_name(inst).startswith("S_FMAC"): ret.update(_sgpr_offsets(getattr(inst, "sdst", None)))
+  return ret
+
+def _src_sgpr_operands(inst) -> tuple[int, ...]:
+  ret: list[int] = []
+  for name in ("ssrc0", "ssrc1", "src0", "src1", "src2"):
+    if _has_operand(inst, name): ret.extend(sorted(_sgpr_offsets(getattr(inst, name, None))))
+  return tuple(ret)
+
+def _dst_sgprs(inst) -> set[int]:
+  ret: set[int] = set()
+  for name in ("sdst", "sdata"):
+    if _has_operand(inst, name): ret.update(_sgpr_offsets(getattr(inst, name, None)))
+  return ret
+
+def _writes_vcc(inst) -> bool:
+  return any(_field_offset(getattr(inst, name, None)) in {106, 107} for name in ("sdst", "sdata"))
+
+def _writes_exec(inst, op_name: str) -> bool:
+  return "SAVEEXEC" in op_name or "WREXEC" in op_name or \
+    any(_field_offset(getattr(inst, name, None)) in {126, 127} for name in ("sdst", "sdata"))
+
+@dataclass(frozen=True)
+class _TraceInfo:
+  pkt_cls: type[PacketType]|None
+  kwargs: dict[str, Any] = field(default_factory=dict)
+  pipe: str|None = None
+  exec_cls: type[PacketType]|None = None
+  exec_kwargs: dict[str, Any] = field(default_factory=dict)
+  duration: int = 1
+  issue_latency: int = 1
+  dst_latency: int|None = None
+  exec_latency: int = 0
+  exec_release: int = 1
+  exec_block: int = 0
+  forward_latency: int = 0
+  matrix: bool = False
+  interp: bool = False
+  trans: bool = False
+  trans_pipe: bool = False
+  nop: bool = False
+  vgpr_read_latency: int|None = None
+  reads_scc_delay: int|None = None
+  reads_vcc: bool = False
+  reads_exec: bool = False
+  writes_scc_latency: int|None = None
+  writes_vcc_latency: int|None = None
+  writes_exec_latency: int|None = None
+  lgkm_latency: int|None = None
+  wait_lgkm: bool = False
+  wait_lgkm_extra: int = 0
+  immediate_delay: int = 0
+  barrier: bool = False
+
+@dataclass(frozen=True)
+class _VALUQueueEntry:
+  retire: int
+  exec_retire: int
+  trans_retire: int|None
+  chains: frozenset[int]
+
+@dataclass
+class _VALUInstructionBuffer:
+  entries: list[_VALUQueueEntry] = field(default_factory=list)
+  reg_chains: dict[int, frozenset[int]] = field(default_factory=dict)
+  dependent_chains: set[int] = field(default_factory=set)
+  valub_chains: set[int] = field(default_factory=set)
+  next_chain: int = 0
+  valub_warm: bool = False
+  valub_issued: int = 0
+
+  def chains_for(self, srcs: set[int], *, valub: bool) -> frozenset[int]:
+    chains = frozenset(chain for reg in srcs for chain in self.reg_chains.get(reg, ()))
+    if chains:
+      self.dependent_chains.update(chains)
+    else:
+      self.next_chain += 1
+      chains = frozenset((self.next_chain,))
+    if valub: self.valub_chains.update(chains)
+    return chains
+
+  def issue_ready(self, base_issue: int, *, chains: frozenset[int], valub: bool, trans: bool, trans_source_ready: list[int]) -> int:
+    if valub and self.valub_issued >= 3:
+      active_exec = [entry.exec_retire for entry in self.entries if entry.exec_retire > base_issue]
+      early_admit = False
+      if len(active_exec) >= _VALUB_INFLIGHT_LIMIT and not self.valub_warm:
+        self.valub_warm = True
+        if (early_release:=min(active_exec) - 1) > base_issue: base_issue, early_admit = early_release, True
+      if not early_admit:
+        while len(active_exec:=[entry.exec_retire for entry in self.entries if entry.exec_retire > base_issue]) >= _VALUB_INFLIGHT_LIMIT:
+          base_issue = min(active_exec)
+    if valub: self.valub_issued += 1
+    active = [entry for entry in self.entries if entry.retire > base_issue]
+    active_chains = ((frozenset(chain for entry in active for chain in entry.chains) | chains) & self.dependent_chains) - self.valub_chains
+    # The first dependency chain uses the base IB entry; each additional live chain reserves one more entry.
+    limit = max(1, _VALU_INFLIGHT_LIMIT - max(0, len(active_chains) - 1))
+    if len(active) >= limit:
+      base_issue = max(base_issue, max(trans_source_ready) if not trans and trans_source_ready else min(entry.retire for entry in active))
+    if trans:
+      active_trans = [entry for entry in self.entries if entry.trans_retire is not None and entry.trans_retire > base_issue]
+      if len(active_trans) >= _TRANS_INFLIGHT_LIMIT:
+        base_issue = max(base_issue, min(entry.trans_retire for entry in active_trans if entry.trans_retire is not None))
+    return base_issue
+
+  def record(self, exec_time: int, *, chains: frozenset[int], dsts: set[int], trans: bool) -> None:
+    self.entries.append(_VALUQueueEntry(exec_time - 1, exec_time, exec_time if trans else None, chains))
+    for reg in dsts: self.reg_chains[reg] = chains
+
+@dataclass
+class _SALUInstructionBuffer:
+  entries: list[int] = field(default_factory=list)
+
+  def issue_ready(self, base_issue: int) -> int:
+    active = [retire for retire in self.entries if retire > base_issue]
+    if len(active) >= _SALU_INFLIGHT_LIMIT: base_issue = min(active)
+    return base_issue
+
+  def record(self, exec_time: int) -> None:
+    # The retiring instruction remains resident through its ALU execution cycle.
+    self.entries.append(exec_time + 1)
+
+@dataclass
+class _WaveState:
+  issue: int = 2
+  salu_ready: int = 2
+  valu_ready: int = 2
+  trans_ready: int = 2
+  lds_ready: int = 2
+  vmem_ready: int = 2
+  control_ready: int = 2
+  scc_ready: int = 2
+  vcc_ready: int = 2
+  exec_ready: int = 2
+  lgkm_ready: int = 2
+  immediate_ready: int = 0
+  salu_exec_ready: int = 2
+  valu_exec_ready: int = 2
+  valub_exec_ready: int = 2
+  lds_exec_ready: int = 2
+  vmem_exec_ready: int = 2
+  control_exec_ready: int = 2
+  matrix_start_ready: int = 0
+  matrix_interp_ready: int = 0
+  sgpr_valu_read_ready: int = 0
+  trans_warm: bool = False
+  had_lds: bool = False
+  last_time: int = 1
+  vgpr_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_lds_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_lds_pending: dict[int, bool] = field(default_factory=dict)
+  vgpr_exec_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_forward_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_interp_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_matrix_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_exec_event: dict[int, int] = field(default_factory=dict)
+  vgpr_producer_interp: dict[int, bool] = field(default_factory=dict)
+  vgpr_producer_trans: dict[int, bool] = field(default_factory=dict)
+  vgpr_producer_reads_vgpr: dict[int, bool] = field(default_factory=dict)
+  vgpr_valu_issue: dict[int, int] = field(default_factory=dict)
+  vgpr_trans_issue_ready: dict[int, int] = field(default_factory=dict)
+  vgpr_producer_shiftable: dict[int, bool] = field(default_factory=dict)
+  vgpr_read_after_write: dict[int, bool] = field(default_factory=dict)
+  shifted_exec_events: set[int] = field(default_factory=set)
+  sgpr_ready: dict[int, int] = field(default_factory=dict)
+  sgpr_exec_ready: dict[int, int] = field(default_factory=dict)
+  sgpr_read_regs: set[int] = field(default_factory=set)
+  sgpr_read_refill: int = 0
+  valu_since_salu: int = 0
+  valu_exec_history: list[int] = field(default_factory=list)
+  trans_exec_history: list[tuple[int, bool]] = field(default_factory=list)
+  valu_source_read: bool = False
+  valu_read_regs: set[int] = field(default_factory=set)
+  valu_read_warm: bool = False
+  valu_read_order_warm: bool = False
+  last_valu_valub: bool = False
+  last_valu_issue: int = -1
+  last_salu_issue: int = -1
+  valu_ib: _VALUInstructionBuffer = field(default_factory=_VALUInstructionBuffer)
+  salu_exec_history: list[int] = field(default_factory=list)
+  initial_sgpr_reads: dict[int, list[int]] = field(default_factory=dict)
+  pending_delays: list[tuple[int, int]] = field(default_factory=list)
+
+@dataclass(frozen=True)
+class _PacketEvent:
+  time: int
+  seq: int
+  pkt_cls: type[PacketType]
+  kwargs: dict[str, Any]
+
+@dataclass(frozen=True)
+class _SALUExecRecord:
+  event_idx: int
+  wave_id: int
+  issue: int
+  srcs: frozenset[int]
+  dsts: frozenset[int]
+  history_idx: int
+  ib_idx: int
+  long: bool
+
+class RDNA3SQTTTraceBuilder:
+  def __init__(self, workgroup_waves: int=1):
+    self.events: list[_PacketEvent] = []
+    self.waves: dict[int, _WaveState] = {}
+    self.started: set[int] = set()
+    self.workgroup_waves = workgroup_waves
+    self.selected_simd = getenv("SQTT_SIMD_SEL", 0)
+    self.selected_sa, self.selected_wgp = getenv("SQTT_SA_SEL", 0), getenv("SQTT_WGP_SEL", 0)
+    self.salu_ib = {simd: _SALUInstructionBuffer() for simd in range(_CU_SIMDS)}
+    self.salu_exec_records: dict[int, list[_SALUExecRecord]] = {simd: [] for simd in range(_CU_SIMDS)}
+    self.salu_exec_ready = {simd: 2 for simd in range(_CU_SIMDS)}
+    self.salu_long_exec_ready = {simd: 2 for simd in range(_CU_SIMDS)}
+    self.salu_exec_delayed = {simd: False for simd in range(_CU_SIMDS)}
+    self.valu_exec_ready = {simd: 2 for simd in range(_CU_SIMDS)}
+    self.valu_last_plain = {simd: False for simd in range(_CU_SIMDS)}
+    self.valu_started = {simd: False for simd in range(_CU_SIMDS)}
+    self.issue_ready = {simd: 2 for simd in range(_CU_SIMDS)}
+    self.lds_exec_ready = 2
+    self.seq = 0
+    self._add(0, LAYOUT_HEADER, layout=3, sel_a=6)
+
+  def _add(self, time: int, pkt_cls: type[PacketType], **kwargs) -> int:
+    self.events.append(_PacketEvent(time, self.seq, pkt_cls, kwargs))
+    self.seq += 1
+    return len(self.events) - 1
+
+  def _wave(self, wave_id: int) -> _WaveState:
+    if wave_id not in self.waves: self.waves[wave_id] = _WaveState()
+    if wave_id not in self.started:
+      simd, wave = wave_id % _CU_SIMDS, wave_id // _CU_SIMDS
+      self._add(wave_id + 1, WAVESTART, sa=self.selected_sa, simd=simd, wgp=self.selected_wgp, wave=wave & 0x1F, id7=wave_id)
+      self.started.add(wave_id)
+    return self.waves[wave_id]
+
+  def _traced_wave(self, wave_id: int) -> bool: return wave_id % _CU_SIMDS == self.selected_simd
+
+  @staticmethod
+  def _delay_ready(st: _WaveState, dep: int) -> int:
+    if 1 <= dep <= 4 and len(st.valu_exec_history) >= dep: return st.valu_exec_history[-dep] - 1
+    if 5 <= dep <= 7 and len(st.trans_exec_history) >= dep - 4:
+      exec_time, fast = st.trans_exec_history[4 - dep]
+      return exec_time + (2 if fast else 1)
+    if dep == 9 and st.salu_exec_history: return st.salu_exec_history[-1]
+    return 0
+
+  def _shift_exec_events(self, st: _WaveState, events: set[int]) -> None:
+    for event_idx in events - st.shifted_exec_events:
+      self.events[event_idx] = replace(self.events[event_idx], time=self.events[event_idx].time - 1)
+      st.shifted_exec_events.add(event_idx)
+      for reg, reg_event_idx in st.vgpr_exec_event.items():
+        if reg_event_idx != event_idx: continue
+        st.vgpr_exec_ready[reg] -= 1
+        st.vgpr_forward_ready[reg] -= 1
+        st.vgpr_interp_ready[reg] -= 1
+        if reg in st.vgpr_lds_ready: st.vgpr_lds_ready[reg] -= 1
+
+  def _shift_cross_interp_producers(self, st: _WaveState, src_vgprs: set[int], interp: bool) -> None:
+    events = {st.vgpr_exec_event[r] for r in src_vgprs if r in st.vgpr_exec_event and
+              st.vgpr_producer_interp.get(r) != interp and st.vgpr_producer_shiftable.get(r, False)}
+    self._shift_exec_events(st, events)
+
+  def _resolve_initial_sgpr_reads(self, st: _WaveState, simd: int, dsts: set[int]) -> None:
+    affected = {record_idx for reg in dsts for record_idx in st.initial_sgpr_reads.pop(reg, [])}
+    if not affected: return
+    floor, long_floor = 0, 0
+    producer_time: dict[tuple[int, int], int] = {}
+    previous: _SALUExecRecord|None = None
+    for record_idx, record in enumerate(self.salu_exec_records[simd]):
+      event, wave_st = self.events[record.event_idx], self.waves[record.wave_id]
+      dep_ready = max([producer_time.get((record.wave_id, reg), 0) + (3 if record.long else 2) for reg in record.srcs] + [0])
+      delayed_normal = previous is not None and record.long and not previous.long and floor - 1 > previous.issue + 2
+      new_time = max(event.time, floor + delayed_normal, long_floor if record.long else 0, dep_ready,
+                     record.issue + (5 if record.long else 4) if record_idx in affected else 0)
+      if new_time != event.time:
+        old_time = event.time
+        self.events[record.event_idx] = replace(event, time=new_time)
+        for reg in record.dsts:
+          if wave_st.sgpr_exec_ready.get(reg) == old_time: wave_st.sgpr_exec_ready[reg] = new_time
+        wave_st.salu_exec_history[record.history_idx] = new_time
+        self.salu_ib[simd].entries[record.ib_idx] = new_time + 1
+        wave_st.last_time = max(wave_st.last_time, new_time)
+      floor = new_time + 1
+      if record.long: long_floor = new_time + 2
+      for reg in record.dsts: producer_time[(record.wave_id, reg)] = new_time
+      previous = record
+    self.salu_exec_ready[simd] = max(self.salu_exec_ready[simd], floor)
+    self.salu_long_exec_ready[simd] = max(self.salu_long_exec_ready[simd], long_floor)
+    if previous is not None:
+      last_time = self.events[previous.event_idx].time
+      self.salu_exec_delayed[simd] = not previous.long and last_time > previous.issue + 2
+
+  def _long_salu_read_ready(self, st: _WaveState, simd: int, issue: int, exec_ready: int,
+                            srcs: tuple[int, ...], dsts: set[int]) -> int:
+    operand_ready = [st.sgpr_exec_ready[reg] for reg in srcs]
+    stale = [i for i, ready in enumerate(operand_ready) if ready + 1 < issue]
+    read_ready = max(issue + 3, max(operand_ready) + 3)
+    records, previous = self.salu_exec_records[simd], self.salu_exec_records[simd][-1] if self.salu_exec_records[simd] else None
+    first_producer_age = next((age for age, record in enumerate(reversed(records)) if srcs[0] in record.dsts), len(records))
+    if stale:
+      first_source_collision = previous is not None and srcs[0] in previous.dsts and (not self.salu_exec_delayed[simd] or \
+        (st.valu_since_salu == 0 and bool(previous.srcs & previous.dsts)) or \
+        (st.valu_since_salu == 1 and not previous.srcs & previous.dsts and operand_ready[0] > issue + 1)) and \
+        (operand_ready[0] > issue + 1 or (operand_ready[0] == issue + 1 and srcs[0] in dsts and (bool(previous.srcs) or bool(st.valu_exec_history))))
+      adjacent_refill_collision = previous is not None and not previous.long and not previous.srcs and \
+        srcs[0] ^ 1 == srcs[1] and operand_ready[0] == issue + 1 and first_producer_age < 3
+      ordered_collision = (0 not in stale and 1 in stale and \
+        ((not self.salu_exec_delayed[simd] and operand_ready[0] == operand_ready[1] + 1) or first_source_collision or adjacent_refill_collision)) or \
+        (0 in stale and 1 in stale and srcs[0] in dsts and srcs[0] in st.sgpr_read_regs and srcs[1] not in st.sgpr_read_regs and \
+         previous is not None and issue - 2 <= self.events[previous.event_idx].time < issue)
+      reverse_collision = 0 in stale and 1 not in stale and issue == st.last_salu_issue + 1 and previous is not None and previous.long and \
+        ((srcs[0] in previous.srcs and srcs[1] in dsts and srcs[1] in previous.dsts) or \
+         (dsts == previous.dsts and not set(srcs) & previous.srcs))
+      reverse_collision |= 0 in stale and 1 in stale and issue == st.last_salu_issue + 2 and st.valu_since_salu == 1 and \
+        previous is not None and previous.long and srcs[0] in previous.srcs and srcs[1] in dsts and srcs[1] not in previous.dsts
+      previous_long_producer = previous is not None and previous.long and srcs[0] in dsts and srcs[0] in previous.dsts and \
+        set(srcs) != previous.srcs
+      previous_long_side_read = len(records) >= 2 and records[-2].long and previous is not None and previous.long and \
+        1 in stale and srcs[1] in previous.srcs
+      duplicate_read_warm = len(st.valu_exec_history) >= _SALU_DUPLICATE_READ_WARMUP and srcs[0] == srcs[1] and srcs[0] in dsts and \
+        (not st.trans_exec_history or st.valu_since_salu >= 3) and previous is not None and not previous.long and srcs[0] not in previous.dsts and \
+        issue - self.events[previous.event_idx].time <= 7
+      cached_duplicate_read = srcs[0] == srcs[1] and srcs[0] not in dsts and srcs[0] in st.sgpr_read_regs
+      aligned_refill = 0 not in stale and st.sgpr_read_refill == 1 and self.salu_exec_delayed[simd] and \
+        previous is not None and not previous.long and self.events[previous.event_idx].time == issue and \
+        all(ready + 2 != issue for ready in operand_ready)
+      retained_forward = ((srcs[0] % 2 != srcs[1] % 2 and any(ready == issue for ready in operand_ready)) or \
+                          any(ready == issue + 1 for ready in operand_ready)) and all(srcs[i] in st.sgpr_read_regs for i in stale) and \
+        not (previous is not None and previous.long and bool(set(srcs) & previous.dsts) and bool(set(srcs) & previous.srcs))
+      partial_forward = self.salu_exec_delayed[simd] and operand_ready[1] == issue and srcs[1] in st.sgpr_read_regs and exec_ready == issue + 4
+      paired_refill = st.sgpr_read_refill == 2 and previous is not None and not previous.long and bool(previous.srcs) and \
+        srcs[0] ^ 1 == srcs[1] and (not set(srcs) & dsts or max(operand_ready) + 5 < issue) and \
+        bool(set(srcs) & st.sgpr_read_regs)
+      cached_distinct_refill = st.sgpr_read_refill == 1 and len(set(srcs)) == 2 and set(srcs) <= st.sgpr_read_regs
+      repeated_pair_refill = st.sgpr_read_refill == 2 and (len(set(srcs)) == 2 or srcs[0] not in dsts) and \
+        previous is not None and previous.long and set(srcs) <= previous.srcs
+      aged_retained_pair = (st.valu_since_salu >= 4 and bool(set(srcs) & st.sgpr_read_regs)) or \
+        (st.valu_since_salu >= 3 and set(srcs) <= st.sgpr_read_regs)
+      if previous is not None and not previous.long and set(srcs) == previous.srcs | previous.dsts: aged_retained_pair = False
+      reused_duplicate_destination = bool(st.valu_exec_history) and srcs[0] == srcs[1] and previous is not None and not previous.long and \
+        srcs[0] in previous.srcs and dsts == previous.dsts
+      if reused_duplicate_destination: cached_duplicate_read = False
+      duplicate_after_overwrite = srcs[0] == srcs[1] and srcs[0] not in dsts and previous is not None and not previous.long and \
+        len(records) > 4 and not previous.srcs and dsts == previous.dsts and st.valu_since_salu >= 3
+      duplicate_inplace_refill = srcs[0] == srcs[1] and srcs[0] in dsts and previous is not None and previous.long and \
+        srcs[0] in st.sgpr_read_regs and st.sgpr_read_refill == 2 and st.valu_since_salu == 2
+      pipeline_hidden_read = exec_ready == issue + 4 and previous is not None and not previous.long and \
+        bool(st.valu_exec_history) and bool(previous.srcs & previous.dsts) and bool(set(srcs) & dsts)
+      source_free_side_forward = bool(st.valu_exec_history) and st.sgpr_read_refill == 2 and previous is not None and \
+        not previous.long and not previous.srcs and 0 in stale and operand_ready[1] == issue + 1 and \
+        srcs[1] in previous.dsts and srcs[1] in dsts
+      read_is_warm = duplicate_read_warm or cached_duplicate_read or aligned_refill or retained_forward or partial_forward or paired_refill or \
+        cached_distinct_refill or repeated_pair_refill or aged_retained_pair or duplicate_after_overwrite or duplicate_inplace_refill or \
+        pipeline_hidden_read or source_free_side_forward
+      if not read_is_warm:
+        duplicate_after_fast_long = srcs[0] == srcs[1] and srcs[0] not in dsts and previous is not None and previous.long and \
+          issue == st.last_salu_issue + 1 and self.events[previous.event_idx].time == previous.issue + 3
+        cold_read_latency = 4 if duplicate_after_fast_long or (reused_duplicate_destination and st.valu_since_salu == 1) else 5
+        read_ready = max(read_ready, issue + cold_read_latency +
+                         max(ordered_collision * (1 + previous_long_producer + previous_long_side_read), reverse_collision))
+    delayed_refill = 0 not in stale and 1 in stale and operand_ready[0] > issue and self.salu_exec_delayed[simd] and \
+      first_producer_age >= 3 and not set(srcs) & dsts and exec_ready > read_ready
+    return max(read_ready, exec_ready + delayed_refill)
+
+  def _side_operand_refill(self, st: _WaveState, simd: int, issue: int, srcs: set[int]) -> int:
+    records = self.salu_exec_records[simd]
+    if issue != st.last_salu_issue + 1 or len(records) < 2 or not records[-1].long: return 0
+    producer, previous = records[-2:]
+    if not producer.long and bool(srcs & producer.dsts) and self.events[previous.event_idx].time == previous.issue + 3: return 2
+    if producer.long and bool(srcs & producer.dsts) and not srcs & (previous.srcs | previous.dsts): return 2
+    if len(records) < 3: return 0
+    normal, first_long, second_long = records[-3:]
+    return int(not normal.long and first_long.long and second_long.long and \
+      bool(second_long.srcs & second_long.dsts & first_long.dsts) and bool(srcs & (second_long.srcs - second_long.dsts)) and \
+      self.events[first_long.event_idx].time == self.events[normal.event_idx].time + 2 and \
+      self.events[second_long.event_idx].time == self.events[first_long.event_idx].time + 3)
+
+  def _classify(self, inst, branch_taken: bool|None) -> _TraceInfo:
+    inst_type, inst_op, op_name = type(inst), inst.op.value if hasattr(inst, "op") else 0, _op_name(inst)
     if issubclass(inst_type, _SOPP):
-      if inst_op in _SOPP_SKIP: return
-      if inst_op in _SOPP_IMMEDIATE: _emit_nibbles(nibbles, IMMEDIATE, delta=1, wave=w)
-      elif inst_op in _SOPP_BARRIER: _emit_nibbles(nibbles, INST, delta=1, wave=w, op=InstOp.BARRIER)
-      elif inst_op in _SOPP_BRANCH: _emit_nibbles(nibbles, INST, delta=1, wave=w, op=InstOp.JUMP if branch_taken else InstOp.JUMP_NO)
-      else: _emit_nibbles(nibbles, INST, delta=1, wave=w, op=InstOp.SALU)
-    elif issubclass(inst_type, _VALU):
-      if (op := _valu_op(op_name)) is None: _emit_nibbles(nibbles, VALUINST, delta=1, wave=w)
-      else: _emit_nibbles(nibbles, INST, delta=1, wave=w, op=op)
-    elif issubclass(inst_type, _SMEM): _emit_nibbles(nibbles, INST, delta=1, wave=w, op=InstOp.SMEM_RD)
-    else: _emit_nibbles(nibbles, INST, delta=1, wave=w, op=_mem_op(inst_type, op_name))
+      if inst_op in _SOPP_SKIP: return _TraceInfo(None)
+      if inst_op in _SOPP_IMMEDIATE:
+        waits_lgkm = inst_op in {SOPPOp3.S_WAITCNT.value, SOPPOp3.S_WAIT_IDLE.value} and getattr(inst, "simm16", 0) == 0
+        immediate_delay = getattr(inst, "simm16", 0) if inst_op == SOPPOp3.S_NOP.value else 0
+        return _TraceInfo(IMMEDIATE, wait_lgkm=waits_lgkm, wait_lgkm_extra=1 if inst_op == SOPPOp3.S_WAIT_IDLE.value and waits_lgkm else 0,
+                          immediate_delay=immediate_delay, nop=inst_op == SOPPOp3.S_NOP.value)
+      if inst_op in _SOPP_BARRIER:
+        if self.workgroup_waves <= 1: return _TraceInfo(IMMEDIATE)
+        return _TraceInfo(INST, {"op": InstOp.BARRIER}, barrier=True)
+      if inst_op in _SOPP_BRANCH:
+        reads_vcc = inst_op in {SOPPOp3.S_CBRANCH_VCCZ.value, SOPPOp3.S_CBRANCH_VCCNZ.value}
+        reads_exec = inst_op in {SOPPOp3.S_CBRANCH_EXECZ.value, SOPPOp3.S_CBRANCH_EXECNZ.value}
+        return _TraceInfo(INST, {"op": InstOp.JUMP if branch_taken else InstOp.JUMP_NO}, pipe="salu",
+                          issue_latency=10 if branch_taken else (3 if reads_vcc or reads_exec else 1),
+                          exec_block=14 if branch_taken and (getattr(inst, "simm16", 0) & 0x8000) else 0,
+                          reads_scc_delay=None if reads_vcc or reads_exec else (0 if branch_taken else 1),
+                          reads_vcc=reads_vcc, reads_exec=reads_exec)
+      return _TraceInfo(INST, {"op": InstOp.SALU}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
+                        exec_latency=2, forward_latency=2, writes_scc_latency=9 if op_name.startswith("S_CMP") else None)
+    if issubclass(inst_type, _SALU):
+      if op_name == "S_CALL_B64":
+        return _TraceInfo(INST, {"op": InstOp.CALL}, pipe="control", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
+                          issue_latency=28, exec_latency=2)
+      if op_name in {"S_SETPC_B64", "S_SWAPPC_B64"}:
+        return _TraceInfo(INST, {"op": InstOp.CALL}, pipe="control", issue_latency=28)
+      writes_exec = _writes_exec(inst, op_name)
+      salu_op = InstOp.SALU_WR_EXEC if writes_exec else InstOp.SALU
+      return _TraceInfo(INST, {"op": salu_op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU},
+                        exec_latency=3 if op_name in _SALU_3_CYCLE else 2, forward_latency=2,
+                        writes_scc_latency=9 if op_name.startswith("S_CMP") else None,
+                        writes_vcc_latency=7 if _writes_vcc(inst) else None, writes_exec_latency=7 if writes_exec else None)
+    if issubclass(inst_type, _VINTERP):
+      return _TraceInfo(INST, {"op": InstOp.VINTERP}, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
+                        exec_latency=9, forward_latency=5, interp=True)
+    if issubclass(inst_type, _VALU):
+      valu_op = _valu_op(op_name)
+      if valu_op is None:
+        if "WMMA" in op_name:
+          return _TraceInfo(VALUINST, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
+                            exec_latency=_wmma_exec_latency(inst), forward_latency=2, matrix=True)
+        return _TraceInfo(VALUINST, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
+                          exec_latency=6, vgpr_read_latency=9, forward_latency=5,
+                          writes_vcc_latency=18 if op_name.startswith("V_CMP") else None)
+      duration, issue_latency, dst_latency = _valu_latencies(valu_op)
+      exec_latency = {InstOp.VALUT_4: 9, InstOp.VALUB_2: 10, InstOp.VALUB_4: 12, InstOp.VALUB_16: 38,
+                      InstOp.VALU1_WR_EXEC: 9}[valu_op]
+      return _TraceInfo(INST, {"op": valu_op}, pipe="valu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.VALU},
+                        duration=duration, issue_latency=issue_latency, dst_latency=dst_latency,
+                        exec_latency=exec_latency, exec_release=4 if valu_op == InstOp.VALUB_16 else 1,
+                        forward_latency=10 if valu_op == InstOp.VALUT_4 else 5,
+                        writes_exec_latency=18 if valu_op == InstOp.VALU1_WR_EXEC else None, trans=valu_op == InstOp.VALUT_4,
+                        trans_pipe=valu_op.name.startswith(("VALUB_", "VALUT_")))
+    if issubclass(inst_type, _SMEM):
+      return _TraceInfo(INST, {"op": InstOp.SMEM_RD}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
+    mem_op = _mem_op(inst, op_name)
+    if mem_op.name.startswith("LDS"):
+      is_permute = "PERMUTE" in op_name
+      is_2addr_load = "_2ADDR" in op_name and "LOAD" in op_name
+      is_rtn_atomic = _DS_ATOMIC_RE.match(op_name) is not None and "_RTN_" in op_name
+      load_lgkm_latency = None
+      if is_2addr_load: load_lgkm_latency = 35 if "_B64" in op_name else 32
+      elif "LOAD" in op_name:
+        if "_B128" in op_name: load_lgkm_latency = 37
+        elif "_B96" in op_name: load_lgkm_latency = 36
+        elif "_B64" in op_name: load_lgkm_latency = 33
+      if is_rtn_atomic and re.search(r"_(B|U|I|F)64", op_name): load_lgkm_latency = 36
+      wide_load = load_lgkm_latency is not None and "_B32" not in op_name
+      lds_dst_latency: int|None = 8 if is_permute or (is_rtn_atomic and mem_op == InstOp.LDS_WR_2) else \
+        (9 if is_rtn_atomic and mem_op == InstOp.LDS_WR_3 else (7 if mem_op == InstOp.LDS_RD else None))
+      return _TraceInfo(INST, {"op": mem_op}, pipe="lds", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.LDS},
+                        duration=3 if is_permute or is_2addr_load or wide_load else _lds_exec_latency(mem_op), dst_latency=lds_dst_latency,
+                        exec_latency=3, exec_release=1 if mem_op == InstOp.LDS_RD else 2,
+                        lgkm_latency=35 if is_permute else load_lgkm_latency)
+    if mem_op.name.startswith(("SGMEM", "FLAT")):
+      return _TraceInfo(INST, {"op": mem_op}, pipe="vmem", exec_cls=VMEMEXEC, exec_kwargs={"src": MemSrc.VMEM}, duration=_op_duration(mem_op))
+    return _TraceInfo(INST, {"op": mem_op}, pipe="salu", exec_cls=ALUEXEC, exec_kwargs={"src": AluSrc.SALU})
 
-  def finish(wave_id: int):
-    """Emit WAVEEND for a completed wave."""
-    if wave_id in started: _emit_nibbles(nibbles, WAVEEND, delta=1, simd=0, wgp=0, wave=wave_id & 0x1F)
+  def emit(self, wave_id: int, inst, branch_taken: bool|None) -> None:
+    st = self._wave(wave_id)
+    simd, traced = wave_id % _CU_SIMDS, self._traced_wave(wave_id)
+    inst_op = inst.op.value if hasattr(inst, "op") else 0
+    if isinstance(inst, _SOPP) and inst_op == SOPPOp3.S_DELAY_ALU.value:
+      st.trans_warm = False
+      imm = getattr(inst, "simm16", 0)
+      if (dep0:=imm & 0xF): st.pending_delays.append((0, dep0))
+      if (dep1:=(imm >> 7) & 0xF): st.pending_delays.append(((imm >> 4) & 0x7, dep1))
+      return
+    info = self._classify(inst, branch_taken)
+    if info.pkt_cls is None: return
+    wave = wave_id // _CU_SIMDS & 0x1F
+    src_vgprs, src_sgprs = _src_vgprs(inst), _src_sgprs(inst)
+    src_vgpr_operands = _src_vgpr_operands(inst)
+    src_sgpr_operands = _src_sgpr_operands(inst)
+    dst_vgprs, dst_sgprs = _dst_vgprs(inst, _op_name(inst)), _dst_sgprs(inst)
+    initial_src_sgprs = {reg for reg in src_sgprs if reg not in st.sgpr_exec_ready}
+    self._resolve_initial_sgpr_reads(st, simd, dst_sgprs)
+    if info.pipe == "lds" or (info.pipe == "valu" and not info.matrix):
+      self._shift_cross_interp_producers(st, src_vgprs, info.interp if info.pipe == "valu" else False)
+    vgpr_ready = st.vgpr_lds_ready if info.pipe == "lds" else st.vgpr_ready
+    src_ready = max([vgpr_ready.get(r, st.vgpr_ready.get(r, 0)) for r in src_vgprs] +
+                    [st.sgpr_ready.get(r, 0) for r in src_sgprs] +
+                    ([] if info.reads_scc_delay is None else [st.scc_ready + info.reads_scc_delay]) +
+                    ([st.vcc_ready] if info.reads_vcc else []) + ([st.exec_ready] if info.reads_exec else []) +
+                    ([st.lgkm_ready + info.wait_lgkm_extra] if info.wait_lgkm else []) + [0])
+    pipe_ready = getattr(st, f"{info.pipe}_ready") if info.pipe else 0
+    if info.trans_pipe: pipe_ready = max(pipe_ready, st.trans_ready)
+    immediate_ready = st.immediate_ready + info.immediate_delay if info.pkt_cls == IMMEDIATE and st.immediate_ready else 0
+    active_delays = [dep for skip, dep in st.pending_delays if skip == 0]
+    delay_ready = max([self._delay_ready(st, dep) for dep in active_delays] + [0])
+    base_issue = max(st.issue, self.issue_ready[simd], pipe_ready, src_ready, immediate_ready, delay_ready)
+    salu_alu = info.pipe == "salu" and info.exec_cls is ALUEXEC and info.exec_kwargs.get("src") == AluSrc.SALU
+    if salu_alu: base_issue = self.salu_ib[simd].issue_ready(base_issue)
+    valu_chains: frozenset[int]|None = None
+    if info.pipe == "valu" and not info.matrix:
+      valub = info.trans_pipe and not info.trans
+      valu_chains = st.valu_ib.chains_for(src_vgprs, valub=valub)
+      trans_source_ready = [st.vgpr_trans_issue_ready[r] for r in src_vgprs if st.vgpr_producer_trans.get(r, False)]
+      base_issue = st.valu_ib.issue_ready(base_issue, chains=valu_chains, valub=valub, trans=info.trans, trans_source_ready=trans_source_ready)
+    sgpr_read_ready = st.sgpr_valu_read_ready if info.pipe == "salu" and (src_sgprs or dst_sgprs) else 0
+    salu_read_stall, issue = sgpr_read_ready > base_issue, max(base_issue, sgpr_read_ready)
+    lds_pending = info.pipe == "lds" and st.lgkm_ready > issue
+    kwargs = {"wave": wave, **info.kwargs} if info.pkt_cls in (INST, IMMEDIATE, VALUINST) else info.kwargs
+    if traced: self._add(issue, info.pkt_cls, **kwargs)
 
-  def finalize() -> bytes:
-    """Pad and return the encoded SQTT blob."""
+    exec_time = issue
+    if info.exec_cls is not None and info.pipe is not None:
+      exec_ready = self.salu_exec_ready[simd] if info.pipe == "salu" else \
+                   self.valu_exec_ready[simd] if info.pipe == "valu" else \
+                   self.lds_exec_ready if info.pipe == "lds" else getattr(st, f"{info.pipe}_exec_ready")
+      if info.pipe == "salu":
+        long_salu = _op_name(inst) in _SALU_3_CYCLE
+        if long_salu: exec_ready = max(exec_ready, self.salu_long_exec_ready[simd])
+        if long_salu and self.salu_exec_delayed[simd]: exec_ready += 1
+        dep_forward = 3 if long_salu else info.forward_latency
+        dep_ready = max([st.sgpr_exec_ready.get(r, 0) + dep_forward for r in src_sgprs if r in st.sgpr_exec_ready] + [0])
+        long_cold = 0 in initial_src_sgprs or bool(initial_src_sgprs & dst_sgprs)
+        long_stale = long_salu and any(st.sgpr_exec_ready.get(r, issue) + 1 <= issue for r in src_sgprs if r in st.sgpr_exec_ready)
+        exec_latency = info.exec_latency + (2 if long_salu and (long_cold or long_stale) else 0)
+        overlap_stall = 2 if not long_salu and (not st.salu_exec_history or issue != st.salu_exec_history[-1]) and \
+          any(r in dst_sgprs and r not in st.sgpr_exec_ready for r in src_sgprs) else 0
+        # A retired SGPR stays on the forwarding path through the following cycle, then requires a read refill.
+        stale_sgprs = {r for r in src_sgprs if st.sgpr_exec_ready.get(r, issue) + 1 < issue}
+        stale_read_stall = 0
+        if not long_salu and stale_sgprs:
+          previous = self.salu_exec_records[simd][-1] if self.salu_exec_records[simd] else None
+          scalar_refill_warm = len(st.valu_exec_history) >= _VALU_READ_WARMUP
+          buffered_refill = self.salu_exec_delayed[simd] and exec_ready == issue + 3 and st.valu_since_salu >= 1 and previous is not None and \
+            self.events[previous.event_idx].time == issue + 2 and (stale_sgprs <= st.sgpr_read_regs or bool(previous.srcs & previous.dsts))
+          full_inplace_refill = st.sgpr_read_refill == 2 and st.valu_since_salu == 1 and self.salu_exec_delayed[simd] and previous is not None and \
+            self.events[previous.event_idx].time == issue - 2 and bool(stale_sgprs & dst_sgprs) and bool(previous.srcs & previous.dsts)
+          reused_scalar_read = scalar_refill_warm and previous is not None and not previous.long and \
+            stale_sgprs <= previous.srcs and stale_sgprs <= st.sgpr_read_regs
+          source_free_refill = scalar_refill_warm and previous is not None and not previous.long and not previous.srcs and \
+            st.sgpr_read_refill >= 1 and stale_sgprs <= st.sgpr_read_regs
+          same_destination_refill = scalar_refill_warm and previous is not None and not previous.long and issue == previous.issue + 1 and \
+            dst_sgprs == previous.dsts and stale_sgprs <= st.sgpr_read_regs
+          execution_overlap_refill = scalar_refill_warm and previous is not None and not previous.long and bool(previous.srcs) and \
+            st.valu_since_salu == 1 and self.events[previous.event_idx].time == issue and not stale_sgprs <= st.sgpr_read_regs
+          long_cached_refill = scalar_refill_warm and previous is not None and previous.long and issue == previous.issue + 3 and \
+            self.events[previous.event_idx].time == previous.issue + 5 and stale_sgprs <= st.sgpr_read_regs and stale_sgprs <= previous.srcs
+          long_same_destination = scalar_refill_warm and previous is not None and previous.long and st.sgpr_read_refill == 2 and \
+            self.events[previous.event_idx].time == issue and dst_sgprs == previous.dsts and stale_sgprs <= previous.srcs
+          uncached_refill_window = scalar_refill_warm and previous is not None and not previous.long and bool(previous.srcs) and \
+            st.sgpr_read_refill == 2 and 6 <= issue - self.events[previous.event_idx].time <= 7 and not stale_sgprs <= st.sgpr_read_regs and \
+            bool(dst_sgprs & (previous.srcs | previous.dsts))
+          if long_same_destination: stale_read_stall = 2
+          elif full_inplace_refill or reused_scalar_read or source_free_refill or same_destination_refill or \
+               execution_overlap_refill or uncached_refill_window: stale_read_stall = 0
+          elif long_cached_refill: stale_read_stall = 1
+          elif buffered_refill: stale_read_stall = 1
+          elif stale_sgprs <= st.sgpr_read_regs: stale_read_stall = 2 - st.sgpr_read_refill
+          else: stale_read_stall = 2
+        read_stall = max(overlap_stall, stale_read_stall, 2 if not long_salu and 0 in initial_src_sgprs else 0,
+                         2 if salu_read_stall and src_sgprs else 0)
+        if long_salu and len(src_sgpr_operands) >= 2 and all(r in st.sgpr_exec_ready for r in src_sgpr_operands):
+          exec_time = self._long_salu_read_ready(st, simd, issue, exec_ready, src_sgpr_operands, dst_sgprs)
+        else:
+          side_operand_refill = not long_salu and bool(stale_read_stall) and self._side_operand_refill(st, simd, issue, src_sgprs)
+          exec_time = max(issue + exec_latency + read_stall, exec_ready + side_operand_refill, dep_ready)
+      elif info.pipe == "valu":
+        if info.trans_pipe and not info.trans and self.valu_last_plain[simd]: exec_ready += 1
+        order_read_warm = st.valu_read_order_warm or 0 <= st.last_valu_issue < st.last_salu_issue
+        mixed_read_warm = bool(st.salu_exec_history) and \
+          (st.valu_source_read or (0 in src_vgprs and bool(st.valu_exec_history)))
+        source_free_read_warm = st.valu_read_warm or (len(st.valu_exec_history) >= 2 and not st.valu_source_read)
+        trans_read_warm = len(st.valu_exec_history) >= 2 or \
+          bool(st.salu_exec_history and (st.valu_exec_history or st.valu_source_read))
+        recent_valu_regs = {r for r in src_vgprs if 4 <= issue - st.vgpr_valu_issue.get(r, issue) <= 6}
+        repeated_source_forward_regs = {src_vgpr_operands[0]} if len(src_vgpr_operands) == 2 and \
+          src_vgpr_operands[0] == src_vgpr_operands[1] and st.vgpr_producer_reads_vgpr.get(src_vgpr_operands[0], False) and \
+          issue - st.vgpr_valu_issue.get(src_vgpr_operands[0], issue) == 7 else set()
+        trans_forward_regs = {r for r in src_vgprs if st.vgpr_producer_trans.get(r, False) and
+                              3 <= issue - st.vgpr_exec_ready.get(r, issue) <= 5}
+        same_cycle_forward_regs = {r for r in src_vgprs if st.vgpr_exec_ready.get(r) == issue}
+        warm_valu_regs = st.valu_read_regs | recent_valu_regs | repeated_source_forward_regs | trans_forward_regs | same_cycle_forward_regs
+        if not info.trans and src_vgprs and any(5 <= dep <= 7 for dep in active_delays): latency = 8
+        elif not info.trans and any(st.vgpr_lds_pending.get(r, False) for r in src_vgprs): latency = 8
+        elif info.trans and st.trans_warm: latency = 7
+        elif info.trans and trans_read_warm: latency = 7 if src_vgprs & warm_valu_regs else 8
+        elif info.trans_pipe and not info.trans and (order_read_warm or source_free_read_warm):
+          latency = info.exec_latency - 1 - (order_read_warm and st.last_valu_valub and len(st.valu_exec_history) >= 2) - \
+            (not st.last_valu_valub and src_vgprs <= st.valu_read_regs)
+        elif src_vgprs and info.vgpr_read_latency is not None:
+          read_warm = len(st.valu_exec_history) >= _VALU_READ_WARMUP or mixed_read_warm or order_read_warm or \
+            source_free_read_warm
+          recent_producer = any(3 <= issue - st.vgpr_valu_issue.get(r, issue) <= 5 for r in src_vgprs)
+          shiftable_destination = any(st.vgpr_producer_shiftable.get(r, False) for r in dst_vgprs)
+          warm_in_place = len(st.valu_exec_history) >= _VALU_READ_WARMUP and bool(src_vgprs & dst_vgprs)
+          bank_conflict = len({reg % 4 for reg in src_vgprs}) < len(src_vgprs) and \
+            not recent_producer and not shiftable_destination and not warm_in_place and not bool(src_vgprs & st.valu_read_regs)
+          partial_bank_conflict = len(src_vgpr_operands) == 2 and src_vgpr_operands[0] < src_vgpr_operands[1] and \
+            src_vgpr_operands[0] % 4 == src_vgpr_operands[1] % 4 and issue == st.last_valu_issue + 2 and st.last_valu_valub and \
+            bool(src_vgprs & st.valu_read_regs) and not src_vgprs <= st.valu_read_regs
+          ordered_bank_conflict = not bank_conflict and len(src_vgpr_operands) == 2 and \
+            src_vgpr_operands[0] % 4 == src_vgpr_operands[1] % 4 and src_vgpr_operands[0] > src_vgpr_operands[1] and \
+            (not st.valu_read_regs or src_vgpr_operands[0] in warm_valu_regs or (issue == st.last_valu_issue + 2 and st.last_valu_valub))
+          latency = info.vgpr_read_latency - read_warm - (src_vgprs <= warm_valu_regs) + bank_conflict + ordered_bank_conflict + partial_bank_conflict
+        else: latency = info.exec_latency
+        if info.trans and st.had_lds:
+          events = {st.vgpr_exec_event[r] for r in src_vgprs if r in st.vgpr_exec_event and
+                    not st.vgpr_producer_trans.get(r, False) and st.vgpr_producer_shiftable.get(r, False)}
+          self._shift_exec_events(st, events)
+        interp_sources = any(st.vgpr_producer_interp.get(r, False) for r in src_vgprs)
+        if not info.interp and not info.matrix and st.matrix_start_ready > issue: st.matrix_start_ready += 4 if interp_sources else 2
+        dep_map = st.vgpr_matrix_ready if info.matrix else (st.vgpr_interp_ready if info.interp else st.vgpr_forward_ready)
+        dep_ready = max([dep_map.get(r, 0) for r in src_vgprs] + [0])
+        waw_ready = max([st.vgpr_exec_ready[r] + 6 for r in dst_vgprs if st.vgpr_producer_trans.get(r, False) and not info.trans] + [0])
+        if info.matrix:
+          matrix_start = max(issue, st.matrix_start_ready)
+          exec_time = max(matrix_start + latency, dep_ready, waw_ready)
+          st.matrix_start_ready = matrix_start + 32 + latency - 41
+          st.matrix_interp_ready = matrix_start + 44
+        elif info.interp:
+          exec_time = max(issue + latency, exec_ready, dep_ready, waw_ready, st.matrix_interp_ready)
+          if st.matrix_start_ready > issue: st.matrix_start_ready += 2
+        else:
+          valub_ready = st.valub_exec_ready if info.trans_pipe and not info.trans else 0
+          if info.trans_pipe and not info.trans:
+            # VALUB adds one cycle for a produced operand and one more after that value has already been read.
+            dep_ready = max([dep_map.get(r, 0) + (r in dep_map) + st.vgpr_read_after_write.get(r, False) for r in src_vgprs] + [0])
+          exec_time = max(issue + latency, exec_ready, dep_ready, waw_ready, valub_ready)
+          # Issue spacing does not preserve the VALUT initiation interval when an earlier execution stalls.
+          if info.trans and st.trans_exec_history: exec_time = max(exec_time, st.trans_exec_history[-1][0] + 4)
+      else: exec_time = max(issue + info.exec_latency, exec_ready)
+      if info.pipe == "salu":
+        self.salu_exec_ready[simd] = exec_time + info.exec_release
+        self.salu_exec_delayed[simd] = not long_salu and exec_time > issue + info.exec_latency
+        if long_salu: self.salu_long_exec_ready[simd] = exec_time + 2
+      elif info.pipe == "valu":
+        self.valu_exec_ready[simd] = exec_time + info.exec_release
+        self.valu_last_plain[simd] = not info.trans_pipe and not info.matrix and not info.interp
+      elif info.pipe == "lds": self.lds_exec_ready = exec_time + info.exec_release
+      else: setattr(st, f"{info.pipe}_exec_ready", exec_time + info.exec_release)
+    if info.pipe is not None and info.exec_block:
+      if info.pipe == "salu": self.salu_exec_ready[simd] = max(self.salu_exec_ready[simd], issue + info.exec_block)
+      else: setattr(st, f"{info.pipe}_exec_ready", max(getattr(st, f"{info.pipe}_exec_ready"), issue + info.exec_block))
+    exec_kwargs = {"src": MemSrc.LDS_ALT} if not traced and info.pipe == "lds" else info.exec_kwargs
+    exec_event = self._add(exec_time, info.exec_cls, **exec_kwargs) if info.exec_cls is not None and (traced or info.pipe == "lds") else None
+    if info.barrier and traced: self._add(issue + 1, WAVERDY, mask=1 << wave)
+
+    if info.pipe:
+      setattr(st, f"{info.pipe}_ready", issue + info.issue_latency)
+      if info.trans_pipe: st.trans_ready = issue + info.duration
+      if info.trans_pipe and not info.trans: st.salu_ready = max(st.salu_ready, issue + 5)
+      if info.pipe in {"salu", "valu", "lds", "vmem"}: st.immediate_ready = max(st.immediate_ready, issue + 3)
+    ready = issue + (info.duration if info.dst_latency is None else info.dst_latency)
+    if lds_pending and info.dst_latency is not None: ready += 1
+    if info.pipe == "lds" and dst_vgprs: st.valu_ready = max(st.valu_ready, ready)
+    natural_exec_latency = info.vgpr_read_latency if src_vgprs and info.vgpr_read_latency is not None else info.exec_latency
+    producer_shiftable = (info.interp or (info.vgpr_read_latency is not None and bool(src_vgprs))) and exec_time == issue + natural_exec_latency
+    producer_forward_latency = info.forward_latency + (1 if info.interp and not producer_shiftable else 0)
+    if info.trans_pipe and not info.trans and st.valu_exec_history: producer_forward_latency -= 1
+    if info.vgpr_read_latency is not None and not src_vgprs and not self.valu_started[simd]: producer_forward_latency += 1
+    for reg in dst_vgprs:
+      st.vgpr_ready[reg] = ready
+      st.vgpr_exec_ready[reg] = exec_time
+      st.vgpr_forward_ready[reg] = exec_time + producer_forward_latency
+      st.vgpr_interp_ready[reg] = exec_time + 6
+      if info.matrix: st.vgpr_matrix_ready[reg] = exec_time + 34
+      if exec_event is not None:
+        st.vgpr_exec_event[reg] = exec_event
+        st.vgpr_producer_interp[reg] = info.interp
+        st.vgpr_producer_trans[reg] = info.trans
+        st.vgpr_producer_reads_vgpr[reg] = bool(src_vgprs)
+        if info.trans: st.vgpr_trans_issue_ready[reg] = issue + 5
+        st.vgpr_producer_shiftable[reg] = producer_shiftable
+        st.vgpr_read_after_write[reg] = False
+      if info.pipe == "valu": st.vgpr_valu_issue[reg] = issue
+      else: st.vgpr_valu_issue.pop(reg, None)
+      if info.pipe == "valu": st.vgpr_lds_ready[reg] = issue + 18
+      st.vgpr_lds_pending[reg] = lds_pending
+    for reg in dst_sgprs:
+      st.sgpr_ready[reg] = ready
+      st.sgpr_exec_ready[reg] = exec_time
+    if info.writes_scc_latency is not None: st.scc_ready = issue + info.writes_scc_latency
+    if info.writes_vcc_latency is not None: st.vcc_ready = issue + info.writes_vcc_latency
+    if info.writes_exec_latency is not None: st.exec_ready = issue + info.writes_exec_latency
+    if info.pipe == "lds":
+      st.had_lds = True
+      op = info.kwargs.get("op")
+      if isinstance(op, InstOp):
+        latency = info.lgkm_latency if info.lgkm_latency is not None else _lds_lgkm_latency(op, st.lgkm_ready > issue)
+        st.lgkm_ready = max(st.lgkm_ready, issue + latency)
+    if info.pipe == "valu" and info.exec_cls is not None:
+      st.valu_read_order_warm |= order_read_warm
+      st.last_valu_issue = issue
+      self.valu_started[simd] = True
+      if src_sgprs: st.sgpr_valu_read_ready = max(st.sgpr_valu_read_ready, exec_time)
+      if info.trans:
+        st.trans_exec_history.append((exec_time, st.trans_warm))
+        st.valub_exec_ready = max(st.valub_exec_ready, exec_time + 5)
+      else:
+        st.valu_exec_history.append(exec_time)
+        if info.trans_pipe: st.valub_exec_ready = max(st.valub_exec_ready, exec_time + min(info.duration, 4))
+      if not info.matrix:
+        assert valu_chains is not None
+        st.valu_ib.record(exec_time, chains=valu_chains, dsts=dst_vgprs, trans=info.trans)
+      if src_vgprs:
+        st.valu_read_warm |= source_free_read_warm
+        st.valu_source_read = True
+        st.valu_read_regs.update(src_vgprs)
+        for reg in src_vgprs - dst_vgprs:
+          if reg in st.vgpr_exec_event: st.vgpr_read_after_write[reg] = True
+      st.last_valu_valub = info.trans_pipe and not info.trans
+    if info.pipe == "salu" and info.exec_cls is not None:
+      st.last_salu_issue = issue
+      history_idx, ib_idx = len(st.salu_exec_history), len(self.salu_ib[simd].entries)
+      st.salu_exec_history.append(exec_time)
+      if salu_alu: self.salu_ib[simd].record(exec_time)
+      if salu_alu and exec_event is not None:
+        record_idx = len(self.salu_exec_records[simd])
+        self.salu_exec_records[simd].append(_SALUExecRecord(exec_event, wave_id, issue, frozenset(src_sgprs), frozenset(dst_sgprs),
+                                                            history_idx, ib_idx, long_salu))
+        for reg in initial_src_sgprs - dst_sgprs: st.initial_sgpr_reads.setdefault(reg, []).append(record_idx)
+    if info.pipe == "valu":
+      if src_vgprs:
+        st.sgpr_read_refill = max(st.sgpr_read_refill, 2 if info.trans_pipe and not info.trans else min(2, st.valu_since_salu))
+      st.valu_since_salu += 1
+    elif info.pipe == "salu":
+      # VALU issue slots refill retained SGPR reads; cross-bank long reads also retain ready adjacent registers.
+      st.sgpr_read_regs.difference_update(dst_sgprs)
+      if len(st.valu_exec_history) >= 2:
+        st.sgpr_read_regs.update(src_sgprs - dst_sgprs)
+        if _op_name(inst) in _SALU_3_CYCLE and len(src_sgpr_operands) >= 2:
+          if src_sgpr_operands[0] == src_sgpr_operands[1]: siblings = {src_sgpr_operands[0] ^ 1}
+          elif dst_sgprs & src_sgprs and src_sgpr_operands[0] // 2 % 2 != src_sgpr_operands[1] // 2 % 2:
+            siblings = {src_sgpr_operands[0] ^ 1, src_sgpr_operands[1] ^ 1}
+          else: siblings = set()
+          siblings -= dst_sgprs
+          st.sgpr_read_regs.update(r for r in siblings if r in st.sgpr_exec_ready and st.sgpr_exec_ready[r] + 1 < issue)
+      if src_sgprs: st.sgpr_read_refill = 0
+      st.valu_since_salu = 0
+    st.pending_delays = [(skip - 1, dep) for skip, dep in st.pending_delays if skip > 0]
+    st.trans_warm = info.nop
+    self.issue_ready[simd] = issue + 1
+    st.issue, st.last_time = issue + info.issue_latency, max(st.last_time, exec_time, ready)
+
+  def finish(self, wave_id: int) -> None:
+    if wave_id not in self.started: return
+    st, simd, wave = self.waves[wave_id], wave_id % _CU_SIMDS, wave_id // _CU_SIMDS & 0x1F
+    self._add(max(wave_id + 2, st.issue, st.last_time + 1, st.lgkm_ready + 1), WAVEEND,
+              sa=self.selected_sa, simd=simd, wgp=self.selected_wgp, wave=wave)
+
+  def finalize(self) -> bytes:
+    nibbles: list[int] = []
+    current_time = 0
+    events = list(self.events)
+    drop: set[int] = set()
+    alu_by_time: dict[int, dict[AluSrc, list[int]]] = {}
+    for i, event in enumerate(events):
+      if event.pkt_cls is ALUEXEC: alu_by_time.setdefault(event.time, {}).setdefault(event.kwargs["src"], []).append(i)
+    for slots in alu_by_time.values():
+      if len(slots.get(AluSrc.SALU, [])) == 1 and len(slots.get(AluSrc.VALU, [])) == 1:
+        salu, valu = slots[AluSrc.SALU][0], slots[AluSrc.VALU][0]
+        events[salu] = replace(events[salu], kwargs={"src": AluSrc.VALU_SALU})
+        drop.add(valu)
+    for event in sorted((e for i, e in enumerate(events) if i not in drop), key=lambda e: (e.time, e.pkt_cls in (ALUEXEC, VMEMEXEC), e.seq)):
+      delta = event.time - current_time
+      if delta < 0: raise RuntimeError("SQTT events must be timestamp sorted")
+      max_delta = _max_delta(event.pkt_cls)
+      if delta > max_delta:
+        tail_delta = min(delta, max_delta)
+        _emit_nibbles(nibbles, TS_DELTA_OR_MARK, delta=delta - tail_delta, pl=0, rt=0)
+        current_time += delta - tail_delta
+        delta = tail_delta
+      kwargs = event.kwargs if getattr(event.pkt_cls, "delta", None) is None else {**event.kwargs, "delta": delta}
+      _emit_nibbles(nibbles, event.pkt_cls, **kwargs)
+      current_time += delta
     while len(nibbles) % 2 != 0: nibbles.append(0)
     nibbles.extend([0] * 32)
     while len(nibbles) % 64 != 0: nibbles.append(0)
-    return bytes(nibbles[i] | ((nibbles[i + 1] if i + 1 < len(nibbles) else 0) << 4) for i in range(0, len(nibbles), 2))
+    return _nibbles_to_bytes(nibbles)
 
-  return emit, finish, finalize
+def make_encoder(workgroup_waves: int=1):
+  builder = RDNA3SQTTTraceBuilder(workgroup_waves)
+  return builder.emit, builder.finish, builder.finalize

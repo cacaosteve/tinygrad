@@ -3,7 +3,7 @@ from tinygrad.helpers import Context
 from tinygrad.renderer.amd.sqtt import decode, LAYOUT_HEADER, WAVESTART, WAVEEND, INST, IMMEDIATE, VALUINST, InstOp
 from tinygrad.renderer.amd.dsl import NULL
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
-from test.mockgpu.amd.sqtt import _dst_sgprs, _dst_vgprs, _mem_op, _op_name, _src_sgpr_operands, _src_sgprs, _src_vgprs
+from test.mockgpu.amd.sqtt_enc import _dst_sgprs, _dst_vgprs, _mem_op, _op_name, _src_sgpr_operands, _src_sgprs, _src_vgprs
 
 def _run_kernel(instructions: list, lx=1, ly=1, lz=1, gx=1, gy=1, gz=1, args_ptr=0) -> bytes:
   from test.mockgpu.amd.emu import run_asm, sqtt_traces

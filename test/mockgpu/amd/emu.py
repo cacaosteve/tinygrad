@@ -70,9 +70,12 @@ from tinygrad.renderer.amd.dsl import VCC_LO, EXEC_LO, SCC, ttmp, Inst
 from tinygrad.runtime.autogen.amd.common import Fmt, OpType
 from test.amd.helpers import decode_dpp16
 from test.mockgpu.amd.pcode import parse_pcode, _FUNCS, _set_bits, _to_bool, _to_u32, _val_to_bits
-from test.mockgpu.amd.sqtt import RDNA3SQTTTraceBuilder, sqtt_traces
 
 MASK32 = 0xFFFFFFFF
+
+# SQTT encoder lives in sqtt_enc.py; traces are consumed by amdgpu.py
+from test.mockgpu.amd.sqtt_enc import make_encoder as _make_sqtt_encoder
+sqtt_traces: list[bytes] = []
 
 def _c(val, dtype=dtypes.uint32): return UOp.const(val, dtype)
 
@@ -1592,19 +1595,14 @@ def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLA
   def make_srcs(lane: UOp) -> dict:
     addr = make_addr(lane)
     if is_lds:
-      if data_bits_mem == 128:
-        data = {'DATA': ctx.rvgpr_dyn(vdata_reg, lane), 'DATA0': ctx.rvgpr_dyn(vdata_reg, lane), 'DATA1': ctx.rvgpr_dyn(vdata_reg + _c(1), lane),
-                'DATA2': ctx.rvgpr_dyn(vdata_reg + _c(2), lane), 'DATA3': ctx.rvgpr_dyn(vdata_reg + _c(3), lane)}
-      elif data_bits_mem == 96:
-        data = {'DATA': ctx.rvgpr_dyn(vdata_reg, lane), 'DATA0': ctx.rvgpr_dyn(vdata_reg, lane), 'DATA1': ctx.rvgpr_dyn(vdata_reg + _c(1), lane),
-                'DATA2': ctx.rvgpr_dyn(vdata_reg + _c(2), lane)}
-      elif data_bits_mem <= 32:
-        data0 = ctx.rvgpr_dyn(vdata_reg, lane)
-        data = {'DATA': data0, 'DATA0': data0, 'DATA2': ctx.rvgpr_dyn(data1_reg, lane) if has_data1 else UOp.const(0, dtypes.uint32)}
-      else:
-        data0 = _u64(ctx.rvgpr_dyn(vdata_reg, lane), ctx.rvgpr_dyn(vdata_reg + _c(1), lane))
-        data = {'DATA': data0, 'DATA0': data0,
+      if data_bits_mem <= 32:
+        data = {'DATA': ctx.rvgpr_dyn(vdata_reg, lane), 'DATA2': ctx.rvgpr_dyn(data1_reg, lane) if has_data1 else UOp.const(0, dtypes.uint32)}
+      elif data_bits_mem == 64:  # DATA/DATA2 are the 64-bit input registers, formed from VGPR pairs
+        data = {'DATA': _u64(ctx.rvgpr_dyn(vdata_reg, lane), ctx.rvgpr_dyn(vdata_reg + _c(1), lane)),
                 'DATA2': _u64(ctx.rvgpr_dyn(data1_reg, lane), ctx.rvgpr_dyn(data1_reg + _c(1), lane)) if has_data1 else UOp.const(0, dtypes.uint64)}
+      else:  # 96/128-bit: one VGPR per dword
+        data = {'DATA': ctx.rvgpr_dyn(vdata_reg, lane), **{f'DATA{i}': ctx.rvgpr_dyn(vdata_reg + _c(i), lane) for i in range(1, data_bits_mem // 32)}}
+      data['DATA0'] = data['DATA']
       # RDNA3 uses ADDR/OFFSET, RDNA4 uses vgpr_a/offset (lowercase) + CalcDsAddr function
       return {'ADDR': addr, 'ADDR_BASE': addr, 'OFFSET': offset, 'OFFSET0': offset0, 'OFFSET1': offset1, '_lds': mem,
               'laneId': lane, 'laneID': lane,
@@ -1939,7 +1937,7 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
 
   # Initialize SQTT encoder — emits packets inline as instructions execute (only when profiling)
   if PROFILE:
-    sqtt = RDNA3SQTTTraceBuilder(max(1, (total_threads + wave_size - 1) // wave_size))
+    sqtt_emit, sqtt_finish, sqtt_finalize = _make_sqtt_encoder(max(1, (total_threads + wave_size - 1) // wave_size))
 
   def _ensure_compiled(pc: int) -> tuple[Callable, list[int], bool, Inst]:
     if pc not in program:
@@ -1973,14 +1971,14 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
           pc = st.pc
           if pc == ENDPGM_PC:
             done[wi] = True
-            if tracing: sqtt.finish(wi)
+            if tracing: sqtt_finish(wi)
             break
           fxn, globals_list, is_barrier, inst = _ensure_compiled(pc)
           if DEBUG >= 5: print(f"  exec gid=({gidx},{gidy},{gidz}) w={wi} PC={pc - lib}: {inst!r}", flush=True)
           fxn(*[c_bufs[g] for g in globals_list])
           if tracing:
             inst_op = inst.op.value if hasattr(inst, 'op') else 0
-            sqtt.emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None)
+            sqtt_emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None)
           if is_barrier: break  # s_barrier hit: PC already advanced past it, pause this wave
         else: raise RuntimeError("exceeded 1M instructions in single wave, likely infinite loop")
       # All waves have either hit barrier or endpgm — release barrier waves for next round
@@ -1995,5 +1993,5 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
       tracing = False  # only trace the first workgroup
       if lds_size > 0: ctypes.memset(lds_buf._buf.va_addr, 0, max(lds_size, 4))  # reset LDS for next workgroup
 
-  if PROFILE: sqtt_traces.append(sqtt.finalize())
+  if PROFILE: sqtt_traces.append(sqtt_finalize())
   return 0

@@ -9,7 +9,7 @@ from tinygrad.renderer.amd.sqtt import (ALUEXEC, IMMEDIATE, IMMEDIATE_MASK, INST
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
 from tinygrad.runtime.autogen.amd.rdna3.enum import VOPDOp
 from test.mockgpu.amd.emu import run_asm, sqtt_traces
-from test.mockgpu.amd.sqtt import RDNA3SQTTTraceBuilder
+from test.mockgpu.amd.sqtt_enc import RDNA3SQTTTraceBuilder
 
 _RSRC2_WITH_LDS = 0x19c | (1 << 15)
 
