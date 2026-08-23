@@ -163,6 +163,12 @@ def _src_vgprs(inst) -> set[int]:
     for name in ("vdst", "vdstx", "vdsty"): ret.update(_vgpr_offsets(getattr(inst, name, None)))
   return ret
 
+def _src_vgpr_operands(inst) -> tuple[int, ...]:
+  ret: list[int] = []
+  for name in ("src0", "src1", "src2", "vsrc0", "vsrc1", "vsrc2", "srcx0", "srcy0", "vsrcx1", "vsrcy1"):
+    if _has_operand(inst, name): ret.extend(sorted(_vgpr_offsets(getattr(inst, name, None))))
+  return tuple(ret)
+
 def _dst_vgprs(inst, op_name: str) -> set[int]:
   ret: set[int] = set()
   if "STORE" not in op_name:
@@ -332,6 +338,7 @@ class _WaveState:
   vgpr_exec_event: dict[int, int] = field(default_factory=dict)
   vgpr_producer_interp: dict[int, bool] = field(default_factory=dict)
   vgpr_producer_trans: dict[int, bool] = field(default_factory=dict)
+  vgpr_producer_reads_vgpr: dict[int, bool] = field(default_factory=dict)
   vgpr_valu_issue: dict[int, int] = field(default_factory=dict)
   vgpr_trans_issue_ready: dict[int, int] = field(default_factory=dict)
   vgpr_producer_shiftable: dict[int, bool] = field(default_factory=dict)
@@ -471,29 +478,68 @@ class RDNA3SQTTTraceBuilder:
     stale = [i for i, ready in enumerate(operand_ready) if ready + 1 < issue]
     read_ready = max(issue + 3, max(operand_ready) + 3)
     records, previous = self.salu_exec_records[simd], self.salu_exec_records[simd][-1] if self.salu_exec_records[simd] else None
+    first_producer_age = next((age for age, record in enumerate(reversed(records)) if srcs[0] in record.dsts), len(records))
     if stale:
-      previous_produces_first = previous is not None and srcs[0] in previous.dsts
-      first_source_collision = previous_produces_first and \
-        (operand_ready[0] > issue + 1 or (operand_ready[0] == issue + 1 and srcs[0] in dsts))
-      ordered_collision = 0 not in stale and 1 in stale and \
-        ((not self.salu_exec_delayed[simd] and operand_ready[0] == operand_ready[1] + 1) or first_source_collision)
+      first_source_collision = previous is not None and srcs[0] in previous.dsts and (not self.salu_exec_delayed[simd] or \
+        (st.valu_since_salu == 0 and bool(previous.srcs & previous.dsts)) or \
+        (st.valu_since_salu == 1 and not previous.srcs & previous.dsts and operand_ready[0] > issue + 1)) and \
+        (operand_ready[0] > issue + 1 or (operand_ready[0] == issue + 1 and srcs[0] in dsts and (bool(previous.srcs) or bool(st.valu_exec_history))))
+      adjacent_refill_collision = previous is not None and not previous.long and not previous.srcs and \
+        srcs[0] ^ 1 == srcs[1] and operand_ready[0] == issue + 1 and first_producer_age < 3
+      ordered_collision = (0 not in stale and 1 in stale and \
+        ((not self.salu_exec_delayed[simd] and operand_ready[0] == operand_ready[1] + 1) or first_source_collision or adjacent_refill_collision)) or \
+        (0 in stale and 1 in stale and srcs[0] in dsts and srcs[0] in st.sgpr_read_regs and srcs[1] not in st.sgpr_read_regs and \
+         previous is not None and issue - 2 <= self.events[previous.event_idx].time < issue)
       reverse_collision = 0 in stale and 1 not in stale and issue == st.last_salu_issue + 1 and previous is not None and previous.long and \
-        srcs[0] in previous.srcs and srcs[1] in dsts and srcs[1] in previous.dsts
-      previous_long_producer = previous is not None and previous.long and srcs[0] in dsts and srcs[0] in previous.dsts
+        ((srcs[0] in previous.srcs and srcs[1] in dsts and srcs[1] in previous.dsts) or \
+         (dsts == previous.dsts and not set(srcs) & previous.srcs))
+      reverse_collision |= 0 in stale and 1 in stale and issue == st.last_salu_issue + 2 and st.valu_since_salu == 1 and \
+        previous is not None and previous.long and srcs[0] in previous.srcs and srcs[1] in dsts and srcs[1] not in previous.dsts
+      previous_long_producer = previous is not None and previous.long and srcs[0] in dsts and srcs[0] in previous.dsts and \
+        set(srcs) != previous.srcs
+      previous_long_side_read = len(records) >= 2 and records[-2].long and previous is not None and previous.long and \
+        1 in stale and srcs[1] in previous.srcs
       duplicate_read_warm = len(st.valu_exec_history) >= _SALU_DUPLICATE_READ_WARMUP and srcs[0] == srcs[1] and srcs[0] in dsts and \
         (not st.trans_exec_history or st.valu_since_salu >= 3) and previous is not None and not previous.long and srcs[0] not in previous.dsts and \
         issue - self.events[previous.event_idx].time <= 7
-      aligned_refill = st.sgpr_read_refill == 1 and self.salu_exec_delayed[simd] and previous is not None and not previous.long and \
-        self.events[previous.event_idx].time == issue and all(ready + 2 != issue for ready in operand_ready)
-      retained_forward = srcs[0] % 2 != srcs[1] % 2 and any(ready == issue for ready in operand_ready) and \
-        all(srcs[i] in st.sgpr_read_regs for i in stale)
+      cached_duplicate_read = srcs[0] == srcs[1] and srcs[0] not in dsts and srcs[0] in st.sgpr_read_regs
+      aligned_refill = 0 not in stale and st.sgpr_read_refill == 1 and self.salu_exec_delayed[simd] and \
+        previous is not None and not previous.long and self.events[previous.event_idx].time == issue and \
+        all(ready + 2 != issue for ready in operand_ready)
+      retained_forward = ((srcs[0] % 2 != srcs[1] % 2 and any(ready == issue for ready in operand_ready)) or \
+                          any(ready == issue + 1 for ready in operand_ready)) and all(srcs[i] in st.sgpr_read_regs for i in stale) and \
+        not (previous is not None and previous.long and bool(set(srcs) & previous.dsts) and bool(set(srcs) & previous.srcs))
       partial_forward = self.salu_exec_delayed[simd] and operand_ready[1] == issue and srcs[1] in st.sgpr_read_regs and exec_ready == issue + 4
-      paired_refill = st.sgpr_read_refill == 2 and previous is not None and not previous.long and \
-        srcs[0] ^ 1 == srcs[1] and bool(set(srcs) & st.sgpr_read_regs)
-      read_is_warm = duplicate_read_warm or aligned_refill or retained_forward or partial_forward or paired_refill
+      paired_refill = st.sgpr_read_refill == 2 and previous is not None and not previous.long and bool(previous.srcs) and \
+        srcs[0] ^ 1 == srcs[1] and (not set(srcs) & dsts or max(operand_ready) + 5 < issue) and \
+        bool(set(srcs) & st.sgpr_read_regs)
+      cached_distinct_refill = st.sgpr_read_refill == 1 and len(set(srcs)) == 2 and set(srcs) <= st.sgpr_read_regs
+      repeated_pair_refill = st.sgpr_read_refill == 2 and (len(set(srcs)) == 2 or srcs[0] not in dsts) and \
+        previous is not None and previous.long and set(srcs) <= previous.srcs
+      aged_retained_pair = (st.valu_since_salu >= 4 and bool(set(srcs) & st.sgpr_read_regs)) or \
+        (st.valu_since_salu >= 3 and set(srcs) <= st.sgpr_read_regs)
+      if previous is not None and not previous.long and set(srcs) == previous.srcs | previous.dsts: aged_retained_pair = False
+      reused_duplicate_destination = bool(st.valu_exec_history) and srcs[0] == srcs[1] and previous is not None and not previous.long and \
+        srcs[0] in previous.srcs and dsts == previous.dsts
+      if reused_duplicate_destination: cached_duplicate_read = False
+      duplicate_after_overwrite = srcs[0] == srcs[1] and srcs[0] not in dsts and previous is not None and not previous.long and \
+        len(records) > 4 and not previous.srcs and dsts == previous.dsts and st.valu_since_salu >= 3
+      duplicate_inplace_refill = srcs[0] == srcs[1] and srcs[0] in dsts and previous is not None and previous.long and \
+        srcs[0] in st.sgpr_read_regs and st.sgpr_read_refill == 2 and st.valu_since_salu == 2
+      pipeline_hidden_read = exec_ready == issue + 4 and previous is not None and not previous.long and \
+        bool(st.valu_exec_history) and bool(previous.srcs & previous.dsts) and bool(set(srcs) & dsts)
+      source_free_side_forward = bool(st.valu_exec_history) and st.sgpr_read_refill == 2 and previous is not None and \
+        not previous.long and not previous.srcs and 0 in stale and operand_ready[1] == issue + 1 and \
+        srcs[1] in previous.dsts and srcs[1] in dsts
+      read_is_warm = duplicate_read_warm or cached_duplicate_read or aligned_refill or retained_forward or partial_forward or paired_refill or \
+        cached_distinct_refill or repeated_pair_refill or aged_retained_pair or duplicate_after_overwrite or duplicate_inplace_refill or \
+        pipeline_hidden_read or source_free_side_forward
       if not read_is_warm:
-        read_ready = max(read_ready, issue + 5 + max(ordered_collision * (1 + previous_long_producer), reverse_collision))
-    first_producer_age = next((age for age, record in enumerate(reversed(records)) if srcs[0] in record.dsts), len(records))
+        duplicate_after_fast_long = srcs[0] == srcs[1] and srcs[0] not in dsts and previous is not None and previous.long and \
+          issue == st.last_salu_issue + 1 and self.events[previous.event_idx].time == previous.issue + 3
+        cold_read_latency = 4 if duplicate_after_fast_long or (reused_duplicate_destination and st.valu_since_salu == 1) else 5
+        read_ready = max(read_ready, issue + cold_read_latency +
+                         max(ordered_collision * (1 + previous_long_producer + previous_long_side_read), reverse_collision))
     delayed_refill = 0 not in stale and 1 in stale and operand_ready[0] > issue and self.salu_exec_delayed[simd] and \
       first_producer_age >= 3 and not set(srcs) & dsts and exec_ready > read_ready
     return max(read_ready, exec_ready + delayed_refill)
@@ -503,6 +549,7 @@ class RDNA3SQTTTraceBuilder:
     if issue != st.last_salu_issue + 1 or len(records) < 2 or not records[-1].long: return 0
     producer, previous = records[-2:]
     if not producer.long and bool(srcs & producer.dsts) and self.events[previous.event_idx].time == previous.issue + 3: return 2
+    if producer.long and bool(srcs & producer.dsts) and not srcs & (previous.srcs | previous.dsts): return 2
     if len(records) < 3: return 0
     normal, first_long, second_long = records[-3:]
     return int(not normal.long and first_long.long and second_long.long and \
@@ -604,6 +651,7 @@ class RDNA3SQTTTraceBuilder:
     if info.pkt_cls is None: return
     wave = wave_id // _CU_SIMDS & 0x1F
     src_vgprs, src_sgprs = _src_vgprs(inst), _src_sgprs(inst)
+    src_vgpr_operands = _src_vgpr_operands(inst)
     src_sgpr_operands = _src_sgpr_operands(inst)
     dst_vgprs, dst_sgprs = _dst_vgprs(inst, _op_name(inst)), _dst_sgprs(inst)
     initial_src_sgprs = {reg for reg in src_sgprs if reg not in st.sgpr_exec_ready}
@@ -657,9 +705,31 @@ class RDNA3SQTTTraceBuilder:
         stale_read_stall = 0
         if not long_salu and stale_sgprs:
           previous = self.salu_exec_records[simd][-1] if self.salu_exec_records[simd] else None
+          scalar_refill_warm = len(st.valu_exec_history) >= _VALU_READ_WARMUP
           buffered_refill = self.salu_exec_delayed[simd] and exec_ready == issue + 3 and st.valu_since_salu >= 1 and previous is not None and \
             self.events[previous.event_idx].time == issue + 2 and (stale_sgprs <= st.sgpr_read_regs or bool(previous.srcs & previous.dsts))
-          if buffered_refill: stale_read_stall = 1
+          full_inplace_refill = st.sgpr_read_refill == 2 and st.valu_since_salu == 1 and self.salu_exec_delayed[simd] and previous is not None and \
+            self.events[previous.event_idx].time == issue - 2 and bool(stale_sgprs & dst_sgprs) and bool(previous.srcs & previous.dsts)
+          reused_scalar_read = scalar_refill_warm and previous is not None and not previous.long and \
+            stale_sgprs <= previous.srcs and stale_sgprs <= st.sgpr_read_regs
+          source_free_refill = scalar_refill_warm and previous is not None and not previous.long and not previous.srcs and \
+            st.sgpr_read_refill >= 1 and stale_sgprs <= st.sgpr_read_regs
+          same_destination_refill = scalar_refill_warm and previous is not None and not previous.long and issue == previous.issue + 1 and \
+            dst_sgprs == previous.dsts and stale_sgprs <= st.sgpr_read_regs
+          execution_overlap_refill = scalar_refill_warm and previous is not None and not previous.long and bool(previous.srcs) and \
+            st.valu_since_salu == 1 and self.events[previous.event_idx].time == issue and not stale_sgprs <= st.sgpr_read_regs
+          long_cached_refill = scalar_refill_warm and previous is not None and previous.long and issue == previous.issue + 3 and \
+            self.events[previous.event_idx].time == previous.issue + 5 and stale_sgprs <= st.sgpr_read_regs and stale_sgprs <= previous.srcs
+          long_same_destination = scalar_refill_warm and previous is not None and previous.long and st.sgpr_read_refill == 2 and \
+            self.events[previous.event_idx].time == issue and dst_sgprs == previous.dsts and stale_sgprs <= previous.srcs
+          uncached_refill_window = scalar_refill_warm and previous is not None and not previous.long and bool(previous.srcs) and \
+            st.sgpr_read_refill == 2 and 6 <= issue - self.events[previous.event_idx].time <= 7 and not stale_sgprs <= st.sgpr_read_regs and \
+            bool(dst_sgprs & (previous.srcs | previous.dsts))
+          if long_same_destination: stale_read_stall = 2
+          elif full_inplace_refill or reused_scalar_read or source_free_refill or same_destination_refill or \
+               execution_overlap_refill or uncached_refill_window: stale_read_stall = 0
+          elif long_cached_refill: stale_read_stall = 1
+          elif buffered_refill: stale_read_stall = 1
           elif stale_sgprs <= st.sgpr_read_regs: stale_read_stall = 2 - st.sgpr_read_refill
           else: stale_read_stall = 2
         read_stall = max(overlap_stall, stale_read_stall, 2 if not long_salu and 0 in initial_src_sgprs else 0,
@@ -678,9 +748,13 @@ class RDNA3SQTTTraceBuilder:
         trans_read_warm = len(st.valu_exec_history) >= 2 or \
           bool(st.salu_exec_history and (st.valu_exec_history or st.valu_source_read))
         recent_valu_regs = {r for r in src_vgprs if 4 <= issue - st.vgpr_valu_issue.get(r, issue) <= 6}
+        repeated_source_forward_regs = {src_vgpr_operands[0]} if len(src_vgpr_operands) == 2 and \
+          src_vgpr_operands[0] == src_vgpr_operands[1] and st.vgpr_producer_reads_vgpr.get(src_vgpr_operands[0], False) and \
+          issue - st.vgpr_valu_issue.get(src_vgpr_operands[0], issue) == 7 else set()
         trans_forward_regs = {r for r in src_vgprs if st.vgpr_producer_trans.get(r, False) and
                               3 <= issue - st.vgpr_exec_ready.get(r, issue) <= 5}
-        warm_valu_regs = st.valu_read_regs | recent_valu_regs | trans_forward_regs
+        same_cycle_forward_regs = {r for r in src_vgprs if st.vgpr_exec_ready.get(r) == issue}
+        warm_valu_regs = st.valu_read_regs | recent_valu_regs | repeated_source_forward_regs | trans_forward_regs | same_cycle_forward_regs
         if not info.trans and src_vgprs and any(5 <= dep <= 7 for dep in active_delays): latency = 8
         elif not info.trans and any(st.vgpr_lds_pending.get(r, False) for r in src_vgprs): latency = 8
         elif info.trans and st.trans_warm: latency = 7
@@ -695,8 +769,14 @@ class RDNA3SQTTTraceBuilder:
           shiftable_destination = any(st.vgpr_producer_shiftable.get(r, False) for r in dst_vgprs)
           warm_in_place = len(st.valu_exec_history) >= _VALU_READ_WARMUP and bool(src_vgprs & dst_vgprs)
           bank_conflict = len({reg % 4 for reg in src_vgprs}) < len(src_vgprs) and \
-            not recent_producer and not shiftable_destination and not warm_in_place
-          latency = info.vgpr_read_latency - read_warm - (src_vgprs <= warm_valu_regs) + bank_conflict
+            not recent_producer and not shiftable_destination and not warm_in_place and not bool(src_vgprs & st.valu_read_regs)
+          partial_bank_conflict = len(src_vgpr_operands) == 2 and src_vgpr_operands[0] < src_vgpr_operands[1] and \
+            src_vgpr_operands[0] % 4 == src_vgpr_operands[1] % 4 and issue == st.last_valu_issue + 2 and st.last_valu_valub and \
+            bool(src_vgprs & st.valu_read_regs) and not src_vgprs <= st.valu_read_regs
+          ordered_bank_conflict = not bank_conflict and len(src_vgpr_operands) == 2 and \
+            src_vgpr_operands[0] % 4 == src_vgpr_operands[1] % 4 and src_vgpr_operands[0] > src_vgpr_operands[1] and \
+            (not st.valu_read_regs or src_vgpr_operands[0] in warm_valu_regs or (issue == st.last_valu_issue + 2 and st.last_valu_valub))
+          latency = info.vgpr_read_latency - read_warm - (src_vgprs <= warm_valu_regs) + bank_conflict + ordered_bank_conflict + partial_bank_conflict
         else: latency = info.exec_latency
         if info.trans and st.had_lds:
           events = {st.vgpr_exec_event[r] for r in src_vgprs if r in st.vgpr_exec_event and
@@ -763,6 +843,7 @@ class RDNA3SQTTTraceBuilder:
         st.vgpr_exec_event[reg] = exec_event
         st.vgpr_producer_interp[reg] = info.interp
         st.vgpr_producer_trans[reg] = info.trans
+        st.vgpr_producer_reads_vgpr[reg] = bool(src_vgprs)
         if info.trans: st.vgpr_trans_issue_ready[reg] = issue + 5
         st.vgpr_producer_shiftable[reg] = producer_shiftable
         st.vgpr_read_after_write[reg] = False
@@ -800,7 +881,7 @@ class RDNA3SQTTTraceBuilder:
         st.valu_read_warm |= source_free_read_warm
         st.valu_source_read = True
         st.valu_read_regs.update(src_vgprs)
-        for reg in src_vgprs:
+        for reg in src_vgprs - dst_vgprs:
           if reg in st.vgpr_exec_event: st.vgpr_read_after_write[reg] = True
       st.last_valu_valub = info.trans_pipe and not info.trans
     if info.pipe == "salu" and info.exec_cls is not None:
@@ -829,7 +910,8 @@ class RDNA3SQTTTraceBuilder:
           else: siblings = set()
           siblings -= dst_sgprs
           st.sgpr_read_regs.update(r for r in siblings if r in st.sgpr_exec_ready and st.sgpr_exec_ready[r] + 1 < issue)
-      st.sgpr_read_refill, st.valu_since_salu = 0, 0
+      if src_sgprs: st.sgpr_read_refill = 0
+      st.valu_since_salu = 0
     st.pending_delays = [(skip - 1, dep) for skip, dep in st.pending_delays if skip > 0]
     st.trans_warm = info.nop
     self.issue_ready[simd] = issue + 1
