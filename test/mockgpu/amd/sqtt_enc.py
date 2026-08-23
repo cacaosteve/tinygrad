@@ -67,7 +67,7 @@ _VALUB_4_RE = re.compile(r"V_MAD_(U|I)64")
 _VALUB_16_RE = re.compile(r"V_\w+_F64")
 _DS_ATOMIC_RE = re.compile(r"DS_(ADD|SUB|RSUB|INC|DEC|MIN|MAX|AND|OR|XOR|MSKOR)(_|$)")
 _SALU_3_CYCLE = {"S_MUL_I32", "S_MULK_I32", "S_MUL_HI_I32", "S_MUL_HI_U32"}
-_SALU_INFLIGHT_LIMIT, _VALU_INFLIGHT_LIMIT, _VALUB_INFLIGHT_LIMIT, _TRANS_INFLIGHT_LIMIT, _VALU_READ_WARMUP = 6, 12, 8, 5, 7
+_SALU_INFLIGHT_LIMIT, _VALU_INFLIGHT_LIMIT, _VALUB_INFLIGHT_LIMIT, _TRANS_INFLIGHT_LIMIT, _VALU_READ_WARMUP = 7, 12, 8, 5, 7
 _SALU_DUPLICATE_READ_WARMUP = 5
 _CU_SIMDS = 2
 
@@ -287,18 +287,33 @@ class _VALUInstructionBuffer:
     self.entries.append(_VALUQueueEntry(exec_time - 1, exec_time, exec_time if trans else None, chains))
     for reg in dsts: self.reg_chains[reg] = chains
 
+# The general SALU queue holds seven ops; a single-register in-place chain has a six-op issue window.
+@dataclass
+class _SALUQueueEntry:
+  exec_time: int
+  inplace: frozenset[int]
+  long: bool
+
+  @property
+  def retire(self) -> int: return self.exec_time + (3 if self.long else 2)
+
+  @property
+  def serial_retire(self) -> int: return self.exec_time + (0 if self.long else 1)
+
 @dataclass
 class _SALUInstructionBuffer:
-  entries: list[int] = field(default_factory=list)
+  entries: list[_SALUQueueEntry] = field(default_factory=list)
 
-  def issue_ready(self, base_issue: int) -> int:
-    active = [retire for retire in self.entries if retire > base_issue]
-    if len(active) >= _SALU_INFLIGHT_LIMIT: base_issue = min(active)
-    return base_issue
+  def issue_ready(self, base_issue: int, srcs: set[int], dsts: set[int]) -> int:
+    active = [entry for entry in self.entries if entry.retire > base_issue]
+    inplace = frozenset(srcs & dsts)
+    serial = [entry for entry in self.entries if entry.inplace == inplace and entry.serial_retire > base_issue] if inplace else []
+    general_ready = min(entry.retire for entry in active) if len(active) >= _SALU_INFLIGHT_LIMIT else base_issue
+    serial_ready = min(entry.serial_retire for entry in serial) if len(serial) >= _SALU_INFLIGHT_LIMIT - 1 else base_issue
+    return max(base_issue, general_ready, serial_ready)
 
-  def record(self, exec_time: int) -> None:
-    # The retiring instruction remains resident through its ALU execution cycle.
-    self.entries.append(exec_time + 1)
+  def record(self, exec_time: int, srcs: set[int], dsts: set[int], *, long: bool) -> None:
+    self.entries.append(_SALUQueueEntry(exec_time, frozenset(srcs & dsts), long))
 
 @dataclass
 class _WaveState:
@@ -458,7 +473,8 @@ class RDNA3SQTTTraceBuilder:
         for reg in record.dsts:
           if wave_st.sgpr_exec_ready.get(reg) == old_time: wave_st.sgpr_exec_ready[reg] = new_time
         wave_st.salu_exec_history[record.history_idx] = new_time
-        self.salu_ib[simd].entries[record.ib_idx] = new_time + 1
+        entry = self.salu_ib[simd].entries[record.ib_idx]
+        self.salu_ib[simd].entries[record.ib_idx] = replace(entry, exec_time=new_time)
         wave_st.last_time = max(wave_st.last_time, new_time)
       floor = new_time + 1
       if record.long: long_floor = new_time + 2
@@ -669,7 +685,7 @@ class RDNA3SQTTTraceBuilder:
     delay_ready = max([self._delay_ready(st, dep) for dep in active_delays] + [0])
     base_issue = max(st.issue, self.issue_ready[simd], pipe_ready, src_ready, immediate_ready, delay_ready)
     salu_alu = info.pipe == "salu" and info.exec_cls is ALUEXEC and info.exec_kwargs.get("src") == AluSrc.SALU
-    if salu_alu: base_issue = self.salu_ib[simd].issue_ready(base_issue)
+    if salu_alu: base_issue = self.salu_ib[simd].issue_ready(base_issue, src_sgprs, dst_sgprs)
     valu_chains: frozenset[int]|None = None
     if info.pipe == "valu" and not info.matrix:
       valub = info.trans_pipe and not info.trans
@@ -886,7 +902,7 @@ class RDNA3SQTTTraceBuilder:
       st.last_salu_issue = issue
       history_idx, ib_idx = len(st.salu_exec_history), len(self.salu_ib[simd].entries)
       st.salu_exec_history.append(exec_time)
-      if salu_alu: self.salu_ib[simd].record(exec_time)
+      if salu_alu: self.salu_ib[simd].record(exec_time, src_sgprs, dst_sgprs, long=long_salu)
       if salu_alu and exec_event is not None:
         record_idx = len(self.salu_exec_records[simd])
         self.salu_exec_records[simd].append(_SALUExecRecord(exec_event, wave_id, issue, frozenset(src_sgprs), frozenset(dst_sgprs),

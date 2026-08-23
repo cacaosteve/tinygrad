@@ -1084,6 +1084,9 @@ COMPOSITION_CASES: dict[str, tuple[TraceCase, list[int]]] = {
   "compose_salu_queue": (TraceCase("compose_salu_queue", [s_mov_b32(s[0], 1)] + [
     s_add_u32(s[0], s[0], 1) for _ in range(11)] + [s_endpgm()], local_size=32),
     [0, 1, 2, 2, 3, 4, 4, 5, 6, 6, 7, 8, 8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 22, 24]),
+  "compose_salu_mul_queue": (TraceCase("compose_salu_mul_queue", [s_mov_b32(s[i], i+1) for i in range(4)] + [
+    s_mul_i32(s[0], s[0], s[1]) for _ in range(8)] + [s_endpgm()], local_size=32),
+    [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 9, 10, 12, 12, 15, 18, 21, 24, 27, 30]),
   "compose_lds_read_queue": (TraceCase("compose_lds_read_queue", [
     ds_load_b32(vdst=v[2+i], addr=v[0]) for i in range(4)] + [s_endpgm()], local_size=32), [0, 1, 2, 3, 3, 4, 5, 6]),
   "compose_lds_write_queue": (TraceCase("compose_lds_write_queue", [
@@ -1443,8 +1446,8 @@ class TestSQTTHardwareCycle(unittest.TestCase):
     start, mismatches = getenv("SQTT_CYCLE_SALU_CORPUS_START", 20000), []
     for seed in range(start, start + count):
       case = _initialized_salu_corpus_case(seed)
-      want = [e for e in _timed_events(_run_mock_trace(case)) if e.kind == "ALUEXEC"]
-      got = [e for e in _timed_events(_run_hardware_trace(case, min_instructions=len(case.instructions)-1)) if e.kind == "ALUEXEC"]
+      want = _timed_events(_run_mock_trace(case))
+      got = _timed_events(_run_hardware_trace(case, min_instructions=len(case.instructions)-1))
       if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: mismatches.append(f"seed {seed}\n{msg}")
     if mismatches: self.fail(f"{len(mismatches)}/{count} initialized SALU traces mismatched\n{mismatches[0]}")
 
@@ -1454,8 +1457,8 @@ class TestSQTTHardwareCycle(unittest.TestCase):
     start, mismatches = getenv("SQTT_CYCLE_MIXED_CORPUS_START", 30000), []
     for seed in range(start, start + count):
       case = _initialized_mixed_corpus_case(seed)
-      want = [e for e in _timed_events(_run_mock_trace(case)) if e.kind == "ALUEXEC"]
-      got = [e for e in _timed_events(_run_hardware_trace(case, min_instructions=len(case.instructions)-1)) if e.kind == "ALUEXEC"]
+      want = _timed_events(_run_mock_trace(case))
+      got = _timed_events(_run_hardware_trace(case, min_instructions=len(case.instructions)-1))
       if (msg:=_first_mismatch(got, want, check_time=True, case=case)) is not None: mismatches.append(f"seed {seed}\n{msg}")
     if mismatches: self.fail(f"{len(mismatches)}/{count} initialized mixed traces mismatched\n{mismatches[0]}")
 
