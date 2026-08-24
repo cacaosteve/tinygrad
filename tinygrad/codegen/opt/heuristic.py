@@ -42,6 +42,16 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # make a copy so it does not mutate the input
   k = k.copy()
 
+  # Experimental fixed reduction mapping for backend-to-backend GEMV comparisons.
+  if (force_group:=getenv("MV_FORCE_GROUP", 0)):
+    force_axis = getenv("MV_FORCE_GROUP_AXIS", -1)
+    if force_axis < 0: force_axis = len(k.axes_of(AxisType.REDUCE)) - 1
+    if DEBUG >= 3: print(f"FORCE_GROUP: {k.full_shape=} {k.shape_str()=} {force_axis=} {force_group=}")
+    k.apply_opt(Opt(OptOps.GROUP, force_axis, force_group))
+    for _ in range(getenv("MV_FORCE_UNROLL_INNER", 0)):
+      k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
+    return k
+
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
   if IMAGE:
     for buf_index,buf in enumerate(k.bufs):
@@ -55,6 +65,38 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             k.apply_opt(Opt(OptOps.UPCAST, axis, 4))
           elif axis in k.unrollable_dims:
             k.apply_opt(Opt(OptOps.UNROLL, k.unrollable_dims.index(axis), 4))
+
+  # Quantized weights leave the vector load as an INDEX but wrap the matrix load in dequantization ALU.
+  # ISAs can opt into a one-wave-per-row mapping for these complex matvecs without broadening the generic rule below.
+  complex_mv_group = getattr(k.ren, "preferred_complex_matvec_group", None)
+  if complex_mv_group is not None and getenv("MV", 1) != 0 and k.ren.has_local and k.ren.has_shared and k.reduceop is not None and \
+     k.reduceop.arg[0] is Ops.ADD and resolve(prod(k.output_shape) >= 1024, False) and \
+     (mulop:=k.reduceop.src[0]).op is Ops.MUL:
+    direct_indexes = [x for x in mulop.src if x.op is Ops.INDEX]
+    if len(direct_indexes) == 1:
+      vector_load = direct_indexes[0]
+      matrix_expr = mulop.src[1] if mulop.src[0] is vector_load else mulop.src[0]
+      vector_idx = vector_load.src[1].get_idx()
+      vector_ranges = set(vector_idx.ranges)
+      matrix_indexes = [u.src[1].get_idx() for u in matrix_expr.toposort() if u.op is Ops.INDEX]
+      is_matrix_vector = any(vector_ranges.issubset(idx.ranges) and any(r.arg[-1] is AxisType.GLOBAL and r not in vector_ranges
+                             for r in idx.ranges) for idx in matrix_indexes)
+      unit_reduce_ranges = [r for r in k.ranges_of(AxisType.REDUCE) if r in vector_idx.split_uop(Ops.ADD) and
+                            r.src[0].divides(complex_mv_group) is not None]
+      if is_matrix_vector and unit_reduce_ranges:
+        group_rng = unit_reduce_ranges[-1]
+        group_axis = k.ranges_of(AxisType.REDUCE).index(group_rng)
+        if DEBUG >= 3: print(f"COMPLEX MATVEC: {k.full_shape=} {group_axis=} {complex_mv_group=}")
+        try: k.apply_opt(Opt(OptOps.GROUP, group_axis, complex_mv_group))
+        except KernelOptError: pass
+        else:
+          unroll_product = 1
+          while k.unrollable_dims:
+            inner_size = k.full_shape[k.unrollable_dims[-1]]
+            if inner_size > 3 or unroll_product * inner_size > 8: break
+            k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
+            unroll_product *= inner_size
+          return k
 
   # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
   MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)

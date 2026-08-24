@@ -8,6 +8,7 @@ from tinygrad.codegen.opt import KernelOptError, Opt, OptOps
 from tinygrad.device import CompileError, Device
 from tinygrad.dtype import AddrSpace, Invalid, dtypes
 from tinygrad.helpers import Context, Target, getenv
+from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.renderer.isa import IselContext, PreRegAllocContext, Register, greg
 from tinygrad.runtime.autogen import amdgpu_kd
 from tinygrad.runtime.support.elf import elf_loader
@@ -800,6 +801,15 @@ class TestAMDRenderer(unittest.TestCase):
     opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
     self.assertFalse(any(o.op is OptOps.UNROLL for o in opts))
 
+  def test_scheduler_maps_q6k_gemv_one_wave_per_row(self):
+    rows, cols, block_elements, block_bytes = 8192, 2048, 256, 210
+    qdata = Tensor.empty(rows * cols // block_elements * block_bytes, dtype=dtypes.uint8, device="AMD")
+    weights = ggml_data_to_tensor(qdata, rows * cols, 14).reshape(rows, cols)
+    with Context(BEAM=0): ast = (weights @ Tensor.empty(cols, device="AMD")).schedule_linear().src[-1].src[0]
+    opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
+    self.assertEqual(opts, (Opt(OptOps.GROUP, 4, 32), Opt(OptOps.UNROLL, 4, 0),
+                            Opt(OptOps.UNROLL, 3, 0), Opt(OptOps.UNROLL, 2, 0)))
+
   def test_to_program_assembles_elf(self):
     prg = _simple_add_program()
     self.assertIs(_prg_src(prg).op, Ops.SOURCE)
@@ -894,11 +904,15 @@ class TestAMDRenderer(unittest.TestCase):
         prg = _copy_program(dtype)
         _check_elf(self, prg)
 
-  def test_reserved_v254_v255_not_allocated(self):
+  def test_low_scratch_vgprs_keep_descriptor_pressure_bounded(self):
+    self.assertEqual((amd_lib.TMP_VDATA.offset, amd_lib.TMP_VADDR.offset), (256 + 3, 256 + 4))
+    allocatable = {r.index for r in amd_lib.VGPR}
+    self.assertNotIn(amd_lib.TMP_VDATA.offset, allocatable)
+    self.assertNotIn(amd_lib.TMP_VADDR.offset, allocatable)
     for prg in (_simple_add_program(), _range_program(), _var_range_program()):
       with self.subTest(name=prg.arg.name):
         regs = [greg(u).index for u in _prg_lin(prg).src if isinstance(greg(u), Register)]
-        self.assertLess(max(regs, default=0), 256 + 254)
+        self.assertLess(max(regs, default=0), 256 + 32)
 
   def test_abi_fixed_registers_are_not_temp_allocated(self):
     progs = (_multi_dim_program(), _z_dim_program(), _uint_var_program(), _global_dim_program(),
@@ -1883,9 +1897,9 @@ class TestAMDRenderer(unittest.TestCase):
     insts = amd_lib._parallel_vmov([(amd_lib.v[4], amd_lib.v[5]), (amd_lib.v[5], amd_lib.v[4])])
     self.assertEqual([getattr(i, "op_name", "") for i in insts], ["V_MOV_B32_E32"] * 3)
     self.assertEqual([str(i) for i in insts], [
-      "v_mov_b32_e32(v[254], v[5])",
+      "v_mov_b32_e32(v[3], v[5])",
       "v_mov_b32_e32(v[5], v[4])",
-      "v_mov_b32_e32(v[4], v[254])",
+      "v_mov_b32_e32(v[4], v[3])",
     ])
 
   def test_float4_global_memory_uses_b128_and_scalarized_alu(self):

@@ -44,6 +44,7 @@ class PreRegAllocContext:
 class ISARenderer(Renderer):
   float4_dtypes: tuple[DType, ...]|None = None
   preferred_reduce_group: int|None = None
+  preferred_complex_matvec_group: int|None = None
   local_prod_max: int|None = None
   wide_regalloc: bool = False
   pre_isel_matcher: PatternMatcher

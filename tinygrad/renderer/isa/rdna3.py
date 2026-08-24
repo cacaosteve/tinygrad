@@ -26,19 +26,21 @@ LID = tuple(Register(f"v{i}", 256+i) for i in range(3))
 # USER_SGPR=15 places WGID_X/Y/Z in s15:s17. SGPRs are allocated as even
 # 64-bit pairs, so reserve both s14:s15 and s16:s17 from the general pool.
 SGPR = tuple(Register(f"s{i}", i) for i in range(6, 104, 2) if i not in (14, 16, 102))
-VGPR = tuple(Register(f"v{i}", 256+i) for i in range(3, 254))
+# v3:v4 are reserved as lowering temporaries. Keeping them below the allocatable
+# range avoids making every kernel claim v254:v255 solely for two scratch values.
+VGPR = tuple(Register(f"v{i}", 256+i) for i in range(5, 254))
 # B gathers factor as k*4096+{0,32,64,96} for large N. AMD_B_COMPACT (default on): isel CSE
 # per-k page idx + in-place <<1 once + GLOBAL offset rem — keeps s_clause, cuts addr ALU.
 # AMD_B_COMPACT=0 → AMD_B_LSHL_ADD dest-as-addr. AMD_D16_HI stays env-gated (mock NaNs).
-WMMA_ACC_VGPR = VGPR[123:]
+WMMA_ACC_VGPR = VGPR[121:]
 # Disjoint pools: LDS half2 loads stay low; PACK_F16 early-clobber dests stay high (product-8 fix).
 # Under ALLOW_UPCAST16 ACC grows to v126..v253 and overlaps the high PACK band — use mid PACK then.
-LLOAD_VGPR = VGPR[:120]        # v3..v122
-PACK_F16_VGPR = VGPR[187:246]  # v190..v248 (default)
-PACK_F16_VGPR_UP16 = VGPR[61:123]  # v64..v125 — below ACC when WMMA=16
-LLOAD_VGPR_UP16 = VGPR[:61]        # v3..v63
-# v254/v255: per-instruction VGPR scratch; s102:103: long branch; s104:105: EXEC save/restore or SALU compare scratch.
-TMP_VDATA, TMP_VADDR = v[254], v[255]
+LLOAD_VGPR = VGPR[:118]        # v5..v122
+PACK_F16_VGPR = VGPR[185:244]  # v190..v248 (default)
+PACK_F16_VGPR_UP16 = VGPR[59:121]  # v64..v125 — below ACC when WMMA=16
+LLOAD_VGPR_UP16 = VGPR[:59]        # v5..v63
+# v3/v4: per-instruction VGPR scratch; s102:103: long branch; s104:105: EXEC save/restore or SALU compare scratch.
+TMP_VDATA, TMP_VADDR = v[3], v[4]
 TMP_BRANCH = s[102:103]
 TMP_EXEC = s[104:105]
 TMP_SDATA0, TMP_SDATA1 = s[104], s[105]
@@ -2814,6 +2816,7 @@ class AMDRenderer(ISARenderer):
   float4_dtypes = (dtypes.float32, dtypes.half)
   wide_regalloc = True
   preferred_reduce_group = 16
+  preferred_complex_matvec_group = 32
   global_max = (0x8fffffff, 0x8fffffff, 0x8fffffff)
   # 2D locals (WARP=lidx0 → e.g. (32,4,1)); needs gfx1100 USER_SGPR=15 (elf.py).
   local_max = (1024, 1024, 64)
