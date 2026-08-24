@@ -2849,65 +2849,6 @@ def isa_float4_mem_ok(f4, float4_safe, buf, value_dtype, u, uses, valid) -> bool
   if u.op is Ops.STORE and u.src[1].op is Ops.BITCAST: return False
   return bool(valid.op is Ops.CONST and valid.val is True)
 
-def scratch_inst_size(inst) -> int:
-  if type(inst).__name__ not in {"SCRATCH", "VSCRATCH"}: return 0
-  name = getattr(inst, "op_name", "")
-  if "_B128" in name: return 16
-  if "_B96" in name: return 12
-  if "_B64" in name: return 8
-  if any(x in name for x in ("_B32", "_U32", "_I32")): return 4
-  if any(x in name for x in ("_B16", "_U16", "_I16", "_D16")): return 2
-  if any(x in name for x in ("_B8", "_U8", "_I8")): return 1
-  return 0
-
-def scan_elf_regs(insts, scratch_size_fn=scratch_inst_size):
-  from tinygrad.renderer.amd.dsl import Reg, FixedBitField
-  from tinygrad.runtime.autogen.amd.common import OpType
-  max_vgpr, max_sgpr, max_accvgpr, private_segment_size = 0, 0, 0, 0
-  _ACCVGPR_TYPES = {OpType.OPR_ACCVGPR, OpType.OPR_SRC_ACCVGPR}
-  for inst in insts:
-    if (scratch_size:=scratch_size_fn(inst)) != 0:
-      private_segment_size = max(private_segment_size, getattr(inst, "ioffset", getattr(inst, "offset", 0)) + scratch_size)
-    accvgpr_fields: set[str] = set()
-    for opr_name, (_, _, opr_type) in inst.operands.items():
-      if opr_type in _ACCVGPR_TYPES: accvgpr_fields.add(opr_name)
-      elif opr_type in {OpType.OPR_VGPR_OR_ACCVGPR, OpType.OPR_SRC_VGPR_OR_ACCVGPR, OpType.OPR_SRC_VGPR_OR_ACCVGPR_OR_CONST}:
-        if getattr(inst, 'acc_cd', 0) == 1: accvgpr_fields.add(opr_name)
-    for name, field in inst._fields:
-      if isinstance(field, FixedBitField): continue
-      val = getattr(inst, name)
-      if not isinstance(val, Reg): continue
-      if 256 <= val.offset < 512:
-        if name in accvgpr_fields: max_accvgpr = max(max_accvgpr, (val.offset - 256) + val.sz)
-        else: max_vgpr = max(max_vgpr, (val.offset - 256) + val.sz)
-      elif val.offset < 106: max_sgpr = max(max_sgpr, val.offset + val.sz)
-  return max_vgpr, max_sgpr, max_accvgpr, private_segment_size
-
-def scan_elf_meta(prg:UOp, private_segment_size:int=0):
-  sink, n_bufs, n_vars, kernarg_size, param_sizes, lds_size, gids, lids = prg.src[0], 0, 0, 0, {}, 0, set(), set()
-  for u in sink.toposort():
-    if u.op is Ops.PARAM and u.addrspace is AddrSpace.ALU:
-      n_vars += 1
-      param_sizes[u.arg.slot] = u.dtype.itemsize
-    elif u.op is Ops.PARAM:
-      n_bufs += 1
-      param_sizes[u.arg.slot] = 8
-    elif u.op is Ops.INS and getattr(u.arg, "name", None) == "KERNARG":
-      kernarg_size = max(kernarg_size, u.src[0].arg + u.dtype.itemsize)
-    elif u.op is Ops.INS and getattr(u.arg, "name", None) == "SCRATCH_SIZE":
-      private_segment_size = max(private_segment_size, u.src[0].arg)
-    elif u.op is Ops.BUFFER and u.addrspace is AddrSpace.LOCAL:
-      lds_size += u.max_numel() * u.dtype.itemsize
-    elif u.op is Ops.INS and getattr(u.arg, "name", None) == "LDS_BASE":
-      lds_size = max(lds_size, (u.src[1].arg if len(u.src) > 1 else lds_size) + u.src[0].arg)
-    elif u.op is Ops.SPECIAL and u.arg.startswith("gidx"): gids.add(int(u.arg[-1]))
-    elif u.op is Ops.SPECIAL and u.arg.startswith("lidx") and u.vmax > 0: lids.add(int(u.arg[-1]))
-  if len(prg.src) > 1 and prg.src[1].op is Ops.LINEAR:
-    for u in prg.src[1].src:
-      if u.op is Ops.INS and getattr(u.arg, "name", None) == "SCRATCH_SIZE":
-        private_segment_size = max(private_segment_size, u.src[0].arg)
-  return n_bufs, n_vars, kernarg_size, param_sizes, lds_size, gids, lids, private_segment_size
-
 class AMDRenderer(ISARenderer):
   device = "AMD"
   has_local = True

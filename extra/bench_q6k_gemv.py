@@ -87,7 +87,7 @@ def program_metrics(runner: Any) -> list[dict[str, object]]:
         })
       if Device.DEFAULT.split(":")[0] == "AMD" and isinstance(binary, bytes) and binary.startswith(b"\x7fELF"):
         from tinygrad.renderer.amd import decode_inst
-        from tinygrad.renderer.isa.rdna3 import scan_elf_regs, scratch_inst_size
+        from tinygrad.renderer.amd.elf import scan_elf_regs, scratch_inst_size
         from tinygrad.runtime.support.elf import elf_loader
 
         text = next(section.content for section in elf_loader(binary)[1] if section.name == ".text")
