@@ -27,7 +27,7 @@ ROWS, COLS = 8192, 2048
 QK, BLOCK_BYTES = 256, 210
 BLOCKS_PER_ROW = COLS // QK
 N_BLOCKS = ROWS * BLOCKS_PER_ROW
-WARMUP, BATCH, ROUNDS = 5, 100, 7
+WARMUP, WARMUP_SECONDS, BATCH, ROUNDS = 5, 1.0, 100, 7
 
 
 def make_inputs() -> tuple[np.ndarray, np.ndarray]:
@@ -130,6 +130,13 @@ def main() -> None:
     result = runner(x)
   Device[Device.DEFAULT].synchronize()
 
+  # A handful of launches primes the JIT but does not bring a desktop RDNA3 card out of
+  # its low clock state. Keep the kernel busy for a fixed interval before taking samples.
+  warmup_end = time.perf_counter() + WARMUP_SECONDS
+  while time.perf_counter() < warmup_end:
+    for _ in range(BATCH): result = runner(x)
+    Device[Device.DEFAULT].synchronize()
+
   samples_us = []
   for _ in range(ROUNDS):
     start = time.perf_counter_ns()
@@ -146,6 +153,7 @@ def main() -> None:
     "arch": Device[Device.DEFAULT].arch,
     "shape": [ROWS, COLS],
     "q6k_bytes": int(qdata.nbytes),
+    "warmup_seconds": WARMUP_SECONDS,
     "median_us": statistics.median(samples_us),
     "best_us": min(samples_us),
     "samples_us": samples_us,
