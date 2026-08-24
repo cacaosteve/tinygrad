@@ -100,7 +100,7 @@ def optimize_local_size(call:UOp, prg:UOp) -> UOp|None:
   device = to_tuple(prg.device)[0]
   if prg.arg.local_size is not None or not Device[device].renderer.has_local or not all_int(prg.arg.global_size): return None
 
-  if (local_size:=local_size_cache.get(prg.key)) is None:
+  if (local_size:=local_size_cache.get(prg.program_key)) is None:
     # reuse one loaded runtime across candidates, only launch dims vary
     (bufs, var_vals), runtime = args_from_ast(prg.src[0], device), get_runtime(device, prg, cache=False)
     bufs  = [b.allocate() for b in bufs]
@@ -116,7 +116,7 @@ def optimize_local_size(call:UOp, prg:UOp) -> UOp|None:
     local_sizes = [list(x) for x in itertools.product(*local_dims) if prod(x) <= MAX_WORKGROUP] * 2  # try each valid size twice
     best_time, best = min([(try_exec(ls), ls) for ls in random.sample(local_sizes, len(local_sizes))])
     assert not math.isinf(best_time), "all optimize_local_size exec failed"
-    local_size = local_size_cache[prg.key] = tuple(best)
+    local_size = local_size_cache[prg.program_key] = tuple(best)
 
   new_global = tuple(g//l if g%l == 0 else g/l for g,l in zip(prg.arg.global_size, local_size))
   return call.replace(src=(prg.replace(arg=replace(prg.arg, global_size=new_global, local_size=local_size)), *call.src[1:]))
@@ -125,7 +125,7 @@ def optimize_local_size(call:UOp, prg:UOp) -> UOp|None:
 
 runtime_cache: dict[tuple[bytes, str], Any] = {}
 def get_runtime(device:str, ast:UOp, cache=True):
-  if (runtime:=runtime_cache.get(key:=(ast.key, device))) is None:
+  if (runtime:=runtime_cache.get(key:=(ast.program_key, device))) is None:
     runtime = Device[device].runtime(ast.to_elf())
     if cache: runtime_cache[key] = runtime
   return runtime
@@ -279,7 +279,7 @@ def lower_and_compile(linear:UOp) -> UOp:
     else:
       # UOp.__reduce__ intentionally omits recursive-property caches. Preserve the root key separately so loading a
       # PROGRAM with large symbolic launch dimensions does not rebuild the key by pretty-printing its entire graph.
-      prg.__dict__["_RECURSIVE_PROPERTY_key"] = cached[1]
+      prg.__dict__["program_key"] = cached[1]
       to_program_cache[key] = prg
   if len(todo):
     # kernels that beam search must compile in the parent, beam needs device access to time candidates
@@ -292,7 +292,7 @@ def lower_and_compile(linear:UOp) -> UOp:
         for i, prg in (map if pool is None else pool.imap_unordered)(_compile_kernel, tasks):
           pbar.set_description(f"compiling {ansipad(prg.src[0].arg.name, 40)}")
           to_program_cache[todo[i][0]] = prg
-          if (disk_key:=disk_keys.get(todo[i][0])) is not None: diskcache_put("isa_program", disk_key, (prg, prg.key))
+          if (disk_key:=disk_keys.get(todo[i][0])) is not None: diskcache_put("isa_program", disk_key, (prg, prg.program_key))
           pbar.update(1)
     except KeyboardInterrupt:
       if pool is not None: terminate_worker_pool()

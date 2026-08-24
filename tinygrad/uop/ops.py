@@ -266,7 +266,8 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   def is_invalid(self) -> bool: return self.op is Ops.CONST and self.val is Invalid
   @recursive_property
   def key(self) -> bytes:
-    return hashlib.sha256(str((self.op, self.dtype, self.arg)).encode() + b"".join([s.key for s in self.src])).digest()
+    arg_key = self.arg.key if self.op is Ops.PROGRAM and isinstance(self.arg, ProgramInfo) else str(self.arg).encode()
+    return hashlib.sha256(str((self.op, self.dtype)).encode() + arg_key + b"".join([s.key for s in self.src])).digest()
   def __repr__(self):
     from tinygrad.uop.render import pretty_print
     return pretty_print(self)
@@ -1197,11 +1198,21 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     kernel = fxn(*placeholders).call(*srcs, grad_fxn=grad_fxn)
     return [s.after(kernel) for s in srcs]
 
+  def _program_signature(self) -> tuple[tuple[str|None, int, DType, tuple], ...]:
+    assert self.op is Ops.PROGRAM and isinstance(self.arg, ProgramInfo), "to_elf should only be called on a PROGRAM ast"
+    return tuple((u.arg.name, u.arg.slot, u.dtype, u._shape)
+                 for u in tuple(filter(lambda u: u.op is Ops.PARAM and u.addrspace != AddrSpace.ALU, self.src[1].src)) + self.arg.vars)
+
+  @functools.cached_property
+  def program_key(self) -> bytes:
+    assert self.op is Ops.PROGRAM and isinstance(self.arg, ProgramInfo) and len(self.src) >= 4 and self.src[3].op is Ops.BINARY
+    def enc(x): return ("UOp", x.key) if isinstance(x, UOp) else tuple(map(enc, x)) if isinstance(x, tuple) else x
+    sig = tuple((*s[:3], enc(s[3])) for s in self._program_signature())
+    return hashlib.sha256(self.arg.key + pickle.dumps(sig) + self.src[3].arg).digest()
+
   def to_elf(self) -> TinyELF:
     assert self.op is Ops.PROGRAM and isinstance(self.arg, ProgramInfo), "to_elf should only be called on a PROGRAM ast"
-    sig = tuple((u.arg.name, u.arg.slot, u.dtype, u._shape)
-                for u in tuple(filter(lambda u: u.op is Ops.PARAM and u.addrspace != AddrSpace.ALU, self.src[1].src)) + self.arg.vars)
-    return TinyELF(self.src[3].arg, self.arg.function_name, self.arg.target, sig, self.key)
+    return TinyELF(self.src[3].arg, self.arg.function_name, self.arg.target, self._program_signature(), self.program_key)
 
 @dataclass(frozen=True)
 class KernelInfo:
@@ -1225,6 +1236,12 @@ class ProgramInfo:
   outs: tuple[int, ...] = ()
   ins: tuple[int, ...] = ()
   target: Target = Target()
+
+  @property
+  def key(self) -> bytes:
+    def enc(x): return ("UOp", x.key) if isinstance(x, UOp) else x
+    return hashlib.sha256(pickle.dumps((self.name, tuple(map(enc, self.global_size)), self.local_size,
+      tuple(map(enc, self.vars)), self.globals, self.outs, self.ins, self.target))).digest()
 
   @property
   def function_name(self): return to_function_name(self.name)

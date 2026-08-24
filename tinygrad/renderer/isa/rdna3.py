@@ -3031,13 +3031,32 @@ def wide_alloc(cons, i, nslots, allowed, live, lr, uops_len, slots_fn, pinned=fr
     uses = lr[vr]
     pos = bisect_left(uses, i)
     return uses[pos] - i if pos < len(uses) else uops_len
-  candidates = [(r, blockers(r)) for r in cons
-                if all(x in allowed_idxs for x in range(r.index, r.index+nslots))
-                and not (set(range(r.index, r.index+nslots)) & pinned)]
+  def get_candidates(check_pinned:bool):
+    candidates = []
+    for r in cons:
+      indices = range(r.index, r.index+nslots)
+      if not all(x in allowed_idxs for x in indices) or (check_pinned and any(x in pinned for x in indices)): continue
+      blocked = blockers(r)
+      score = min((next_use(vr) for vr in blocked), default=uops_len)
+      # uops_len is the largest possible score. Returning its first occurrence is exactly
+      # max(candidates, key=score), including Python's first-wins tie behavior, without
+      # scanning the remaining physical windows or recomputing every candidate's score.
+      if score == uops_len: return (r, blocked), []
+      candidates.append((r, blocked, score))
+    return None, candidates
+  free, candidates = get_candidates(True)
+  if free is not None:
+    reg, vregs = free
+    for vr in vregs: live.pop(vr, None)
+    return reg
   if not candidates:  # no unpinned window (wide nslots / fill) — steal via blockers
-    candidates = [(r, blockers(r)) for r in cons if all(x in allowed_idxs for x in range(r.index, r.index+nslots))]
+    free, candidates = get_candidates(False)
+    if free is not None:
+      reg, vregs = free
+      for vr in vregs: live.pop(vr, None)
+      return reg
   if not candidates: raise CompileError(f"wide_alloc: no free regs ({nslots} slots)")
-  reg,vregs = max(candidates, key=lambda rv: min((next_use(vv) for vv in rv[1]), default=uops_len))
+  reg,vregs,_ = max(candidates, key=lambda rv: rv[2])
   for vr in vregs: live.pop(vr, None)
   return reg
 
