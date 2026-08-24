@@ -1981,62 +1981,6 @@ def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
     i += 1
   return out
 
-def _schedule_non_wmma_loads(ops:list[UOp]) -> list[UOp]:
-  """Issue independent VMEM reads early inside non-WMMA basic blocks.
-
-  The waitcnt pass can then use a soft vmcnt for the first consumer while later
-  loads remain in flight. Keep implicit flag/control and memory side effects as
-  hard boundaries; the scheduler only reorders pure UOps within each segment.
-  """
-  if any(u.op is Ops.INS and (u.arg is AMDOps.WMMA or (u.arg is AMDOps.LOAD and u.dtype is dtypes.half)) for u in ops): return ops
-  barriers = {AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CMP_GE,
-              AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ, AMDOps.WHERE,
-              AMDOps.STORE, AMDOps.ATOMIC_ADD, AMDOps.LSTORE, AMDOps.SSTORE,
-              AMDOps.BARRIER, AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.KERNARG}
-  addr_ops = {AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR,
-              AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.MOV}
-
-  def schedule(segment:list[UOp]) -> list[UOp]:
-    loads = [u for u in segment if u.op is Ops.INS and u.arg is AMDOps.LOAD]
-    if len(loads) < 2: return segment
-    order = {u:i for i,u in enumerate(segment)}
-    deps = {u:{s for s in u.src if s in order} for u in segment}
-    users:dict[UOp, list[UOp]] = {u:[] for u in segment}
-    for u in segment:
-      for dep in deps[u]: users[dep].append(u)
-
-    load_addr_ancestors:set[UOp] = set()
-    stack = [s for u in loads for s in deps[u]]
-    while stack:
-      u = stack.pop()
-      if u in load_addr_ancestors or u.op is not Ops.INS or u.arg not in addr_ops or u.dtype not in dtypes.ints: continue
-      load_addr_ancestors.add(u)
-      stack.extend(deps[u])
-
-    indegree = {u:len(deps[u]) for u in segment}
-    ready = [u for u in segment if indegree[u] == 0]
-    scheduled:list[UOp] = []
-    while ready:
-      u = min(ready, key=lambda x: (0 if x.op is Ops.INS and x.arg is AMDOps.LOAD else
-                                    1 if x in load_addr_ancestors else 2, order[x]))
-      ready.remove(u)
-      scheduled.append(u)
-      for user in users[u]:
-        indegree[user] -= 1
-        if indegree[user] == 0: ready.append(user)
-    return scheduled if len(scheduled) == len(segment) else segment
-
-  ret:list[UOp] = []
-  segment:list[UOp] = []
-  for u in ops:
-    if u.op is not Ops.INS or u.arg in barriers:
-      ret.extend(schedule(segment))
-      ret.append(u)
-      segment = []
-    else: segment.append(u)
-  ret.extend(schedule(segment))
-  return ret
-
 def _vm_load_count(insts:list) -> int:
   return sum(1 for i in insts if (n:=getattr(i, "op_name", "")) and
              (n.startswith("GLOBAL_LOAD") or n.startswith("SCRATCH_LOAD") or
@@ -2884,7 +2828,6 @@ class AMDRenderer(ISARenderer):
     """
     lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
     lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
-    if getenv("AMD_SCHEDULE_LOADS", 0): lst = _schedule_non_wmma_loads(lst)
     uses: dict[UOp, list[UOp]] = {}
     for u in lst:
       for src in u.src: uses.setdefault(src, []).append(u)
