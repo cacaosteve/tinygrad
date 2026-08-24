@@ -2760,7 +2760,7 @@ class AMDRenderer(ISARenderer):
 
   def get_reduce_unroll(self, size:int, ast:UOp) -> int|None:
     # Full unroll on complex quantized reductions explodes native ISA and register allocation.
-    if size <= 3 or len(ast.toposort()) <= 64: return 0
+    if size <= 3 or len(ast.toposort()) <= 32: return 0
     return None
 
   def apply_tc_hand_opts(self, tk, rngs):
