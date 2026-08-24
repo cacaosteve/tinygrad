@@ -381,6 +381,15 @@ def _bitwise_program():
   sink = out.index(idx).store(val).sink(idx, arg=KernelInfo(name="amd_asm_bitwise"))
   return _to_prg(sink)
 
+def _fused_packed_byte_program():
+  out, inp = UOp.placeholder((32,), dtypes.uint32, 0), UOp.placeholder((32,), dtypes.uint8, 1)
+  idx = UOp.special(32, "lidx0")
+  value = inp.index(idx).load()
+  low, high = (value >> UOp.const(1, dtypes.uint8)) & 15, (value >> UOp.const(2, dtypes.uint8)) & 3
+  quant = low | (high << UOp.const(4, dtypes.uint8))
+  packed = quant.cast(dtypes.uint32) + (quant.cast(dtypes.uint32) << UOp.const(8, dtypes.uint32))
+  return _to_prg(out.index(idx).store(packed).sink(idx, arg=KernelInfo(name="amd_asm_fused_packed_byte")))
+
 def _cmod_pow2_program():
   out = UOp.placeholder((16,), dtypes.uint32, 0)
   inp = UOp.placeholder((16,), dtypes.uint32, 1)
@@ -2389,6 +2398,10 @@ class TestAMDRenderer(unittest.TestCase):
     linear_ops = _lin_ops(prg)
     for op in (AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.SHR):
       self.assertIn(op, linear_ops)
+
+  def test_fused_packed_byte_assembles(self):
+    _check_asm(self, _fused_packed_byte_program(), AMDOps.BFE, AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
+               insts=("V_BFE_U32", "V_LSHL_OR_B32", "V_LSHL_ADD_U32"))
 
   def test_cmod_pow2_legalizes_to_and(self):
     prg = _cmod_pow2_program()

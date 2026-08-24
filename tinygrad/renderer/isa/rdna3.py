@@ -102,6 +102,9 @@ class AMDOps(FastEnum):
   SWIZZLE = auto()
   DOT4 = auto()
   BYTE_PERM = auto()
+  BFE = auto()
+  LSHL_OR = auto()
+  LSHL_ADD = auto()
 
 _F32_UNARY = {AMDOps.RECIPROCAL: r3.v_rcp_f32_e32, AMDOps.EXP2: r3.v_exp_f32_e32, AMDOps.LOG2: r3.v_log_f32_e32,
               AMDOps.SQRT: r3.v_sqrt_f32_e32, AMDOps.TRUNC: r3.v_trunc_f32_e32}
@@ -966,6 +969,17 @@ def _nontemporal_load(x:UOp) -> UOp|None:
   if x.arg != AMD_NONTEMPORAL_LOAD or len(x.src) != 1 or x.src[0].op is not Ops.INDEX: return None
   return x.src[0].load(dtype=x.dtype)
 
+def _bitfield_extract(x:UOp, value:UOp, shift:UOp, mask:UOp) -> UOp|None:
+  m = int(mask.val)
+  if m <= 0 or (m & (m + 1)) != 0 or (width:=m.bit_length()) >= 32: return None
+  return x.ins(AMDOps.BFE, src=(value, shift, UOp.const(width, dtypes.uint32).rtag()))
+
+def _lshl_or(x:UOp, value:UOp, shift:UOp, other:UOp) -> UOp:
+  return x.ins(AMDOps.LSHL_OR, src=(value, shift, other))
+
+def _lshl_add(x:UOp, value:UOp, shift:UOp, other:UOp) -> UOp:
+  return x.ins(AMDOps.LSHL_ADD, src=(value, shift, other))
+
 def _atomic_add_ins(x:UOp) -> UOp|None:
   if x.arg != AMD_ATOMIC_ADD: return None
   if len(x.src) != 2 or x.src[0].op is not Ops.INDEX: raise CompileError(f"bad atomic {x}")
@@ -1129,6 +1143,16 @@ pre_isel_matcher = PatternMatcher([
   # Renderer legalization runs after the spec check. Canonical constants now arrive as
   # CAST(CONST(weak)); recover a typed bare CONST so the existing immediate isel paths apply.
   (UPat.cvar("c").cast(name="x"), lambda c,x: UOp.const(c.val, x.dtype)),
+  (UPat(Ops.AND, dtype=dtypes.uint8, src=(UPat(Ops.SHR, src=(UPat.var("value"), UPat.var("shift"))), UPat.cvar("mask")),
+   name="x"), _bitfield_extract),
+  (UPat(Ops.OR, dtype=dtypes.uint8, src=(UPat(Ops.SHL, src=(UPat.var("value"), UPat.var("shift"))), UPat.var("other")),
+   name="x"), _lshl_or),
+  (UPat(Ops.OR, dtype=dtypes.uint8, src=(UPat.var("other"), UPat(Ops.SHL, src=(UPat.var("value"), UPat.var("shift")))),
+   name="x"), _lshl_or),
+  (UPat(Ops.ADD, dtype=dtypes.uint32, src=(UPat(Ops.SHL, src=(UPat.var("value"), UPat.var("shift"))), UPat.var("other")),
+   name="x"), _lshl_add),
+  (UPat(Ops.ADD, dtype=dtypes.uint32, src=(UPat.var("other"), UPat(Ops.SHL, src=(UPat.var("value"), UPat.var("shift")))),
+   name="x"), _lshl_add),
   (UPat(Ops.CUSTOMI, name="x"), _nontemporal_load),
   (UPat(Ops.INDEX, name="addr").load(UPat.var("alt"), UPat.var("gate", dtype=dtypes.bool), name="x"), _gated_load),
   (UPat((Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.TRUNC, Ops.SIN), dtype=dtypes.float16, src=(UPat.var("d"),), name="x"),
@@ -1455,6 +1479,15 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       pre0, a = _vgpr_data(TMP_VDATA, u.src[0])
       pre1, b = _vgpr_data(TMP_VADDR, u.src[1])
       return pre0 + pre1 + [r3.v_perm_b32(_dst(u), a, b, _src(u.src[2]))]
+    case AMDOps.BFE:
+      pre, value = _vgpr_data(TMP_VDATA, u.src[0])
+      return pre + [r3.v_bfe_u32(_dst(u), value, _src(u.src[1]), _src(u.src[2]))]
+    case AMDOps.LSHL_OR:
+      pre, value = _vgpr_data(TMP_VDATA, u.src[0])
+      return pre + [r3.v_lshl_or_b32(_dst(u), value, _src(u.src[1]), _src(u.src[2]))]
+    case AMDOps.LSHL_ADD:
+      pre, value = _vgpr_data(TMP_VDATA, u.src[0])
+      return pre + [r3.v_lshl_add_u32(_dst(u), value, _src(u.src[1]), _src(u.src[2]))]
     case AMDOps.EXTRACT:
       lane = u.src[1].arg
       src = u.src[0]
@@ -1739,7 +1772,8 @@ def _hoist_lloads_before_extracts(ops:list[UOp]) -> list[UOp]:
 _SINKABLE_PAST_WMMA = frozenset({
   AMDOps.LOAD, AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV,
   # ADD excluded: sinking past loop S_ADD reorders the trip counter vs the last WMMA.
-  AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR,
+  AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE,
+  AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
 })
 
 def _sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
@@ -2037,7 +2071,9 @@ def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
 
 _VMEM_SCHEDULABLE = {AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.MULACC,
                      AMDOps.CAST, AMDOps.RECIPROCAL, AMDOps.EXP2, AMDOps.LOG2, AMDOps.SQRT, AMDOps.TRUNC, AMDOps.SIN,
-                     AMDOps.MAX, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.LOAD, AMDOps.PACK_F16}
+                     AMDOps.MAX, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE,
+                     AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
+                     AMDOps.LOAD, AMDOps.PACK_F16}
 
 def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp]:
   """Hoist independent scalar global reads inside conservative straight-line segments.
