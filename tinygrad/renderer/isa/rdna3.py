@@ -99,6 +99,9 @@ class AMDOps(FastEnum):
   END_MASK = auto()
   PACK_F16 = auto()
   WMMA = auto()
+  SWIZZLE = auto()
+  DOT4 = auto()
+  BYTE_PERM = auto()
 
 _F32_UNARY = {AMDOps.RECIPROCAL: r3.v_rcp_f32_e32, AMDOps.EXP2: r3.v_exp_f32_e32, AMDOps.LOG2: r3.v_log_f32_e32,
               AMDOps.SQRT: r3.v_sqrt_f32_e32, AMDOps.TRUNC: r3.v_trunc_f32_e32}
@@ -311,7 +314,7 @@ def _wait_for_domain(domain:str, cnt:int=0):
 def _wait_domain_for_load(u:UOp) -> str|None:
   if u.op is not Ops.INS: return None
   if u.arg in (AMDOps.LOAD, AMDOps.SLOAD, AMDOps.FILL): return "vm"
-  if u.arg in (AMDOps.KERNARG, AMDOps.LLOAD): return "lgkm"
+  if u.arg in (AMDOps.KERNARG, AMDOps.LLOAD, AMDOps.SWIZZLE): return "lgkm"
   return None
 
 def _wait_domain_for_store(u:UOp) -> str|None:
@@ -942,6 +945,27 @@ def _pack_f16_insts(u:UOp) -> list:
   return ret
 
 AMD_ATOMIC_ADD = "__hip_atomic_fetch_add({0}, {1}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);"
+AMD_DOT4 = "__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)"
+AMD_BYTE_PERM = "__builtin_amdgcn_perm({}, {}, {})"
+AMD_NONTEMPORAL_LOAD = "__builtin_nontemporal_load({0})"
+AMD_MBCNT_LO = "__builtin_amdgcn_mbcnt_lo(-1, 0)"
+AMD_SWIZZLE_PREFIX = "__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {0}), "
+
+def _amd_custom_intrinsic(x:UOp) -> UOp|None:
+  if x.arg == AMD_DOT4: return x.ins(AMDOps.DOT4)
+  if x.arg == AMD_BYTE_PERM: return x.ins(AMDOps.BYTE_PERM)
+  if x.arg == AMD_MBCNT_LO and len(x.src) == 1: return x.src[0]
+  if isinstance(x.arg, str) and x.arg.startswith(AMD_SWIZZLE_PREFIX) and x.arg.endswith("))"):
+    try: offset = int(x.arg[len(AMD_SWIZZLE_PREFIX):-2])
+    except ValueError: return None
+    if not 0 <= offset <= 0xffff: raise CompileError(f"bad ds_swizzle offset {offset}")
+    return x.ins(AMDOps.SWIZZLE, src=(x.src[0], UOp.const(offset, dtypes.uint32).rtag()))
+  return None
+
+def _nontemporal_load(x:UOp) -> UOp|None:
+  if x.arg != AMD_NONTEMPORAL_LOAD or len(x.src) != 1 or x.src[0].op is not Ops.INDEX: return None
+  return x.src[0].load(dtype=x.dtype)
+
 def _atomic_add_ins(x:UOp) -> UOp|None:
   if x.arg != AMD_ATOMIC_ADD: return None
   if len(x.src) != 2 or x.src[0].op is not Ops.INDEX: raise CompileError(f"bad atomic {x}")
@@ -1105,6 +1129,7 @@ pre_isel_matcher = PatternMatcher([
   # Renderer legalization runs after the spec check. Canonical constants now arrive as
   # CAST(CONST(weak)); recover a typed bare CONST so the existing immediate isel paths apply.
   (UPat.cvar("c").cast(name="x"), lambda c,x: UOp.const(c.val, x.dtype)),
+  (UPat(Ops.CUSTOMI, name="x"), _nontemporal_load),
   (UPat(Ops.INDEX, name="addr").load(UPat.var("alt"), UPat.var("gate", dtype=dtypes.bool), name="x"), _gated_load),
   (UPat((Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.TRUNC, Ops.SIN), dtype=dtypes.float16, src=(UPat.var("d"),), name="x"),
    _promote_f16_unary),
@@ -1183,6 +1208,7 @@ def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Regis
     (UPat(Ops.LOAD, src=(UPat((Ops.INDEX, Ops.SHRINK), name="a"), UPat.var("alt"), UPat.var("gate", dtype=dtypes.bool)), name="x"), _load_ins),
     (UPat(Ops.LOAD, src=(UPat((Ops.INDEX, Ops.SHRINK), name="a"),), name="x"), _load_ins),
     (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), name="a"), UPat.var("val")), name="x"), _store_ins),
+    (UPat((Ops.CUSTOM, Ops.CUSTOMI), name="x"), _amd_custom_intrinsic),
     (UPat(Ops.CUSTOM, name="x"), _atomic_add_ins),
     (UPat(Ops.BARRIER, name="x"), lambda x: x.ins(AMDOps.BARRIER)),
     (UPat(Ops.WMMA, name="x"), lambda ctx,x: _isel_wmma(ctx, x)),
@@ -1417,6 +1443,18 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       acc, src0, src1 = u.src[0], u.src[1], u.src[2]
       vdst = _reg_to_amd(greg(acc), 8)
       return [_wmma_inst(u)(vdst=vdst, src0=_reg_to_amd(greg(src0), 8), src1=_reg_to_amd(greg(src1), 8), src2=vdst)]
+    case AMDOps.SWIZZLE:
+      pre, val = _vgpr_data(TMP_VDATA, u.src[0])
+      offset = int(u.src[1].arg)
+      return pre + [r3.ds_swizzle_b32(vdst=_dst(u), addr=val, offset0=offset & 0xff, offset1=offset >> 8)]
+    case AMDOps.DOT4:
+      pre0, a = _vgpr_data(TMP_VDATA, u.src[0])
+      pre1, b = _vgpr_data(TMP_VADDR, u.src[1])
+      return pre0 + pre1 + [r3.v_dot4_i32_iu8(_dst(u), a, b, _src(u.src[2]), neg=0b011)]
+    case AMDOps.BYTE_PERM:
+      pre0, a = _vgpr_data(TMP_VDATA, u.src[0])
+      pre1, b = _vgpr_data(TMP_VADDR, u.src[1])
+      return pre0 + pre1 + [r3.v_perm_b32(_dst(u), a, b, _src(u.src[2]))]
     case AMDOps.EXTRACT:
       lane = u.src[1].arg
       src = u.src[0]
