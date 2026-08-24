@@ -180,6 +180,26 @@ def _where_program(dtype):
             .sink(idx, arg=KernelInfo(name=f"amd_asm_where_{dtype.name}"))
   return _to_prg(sink)
 
+def _bitcast_int8_where_program():
+  out = UOp.placeholder((16,), dtypes.int8, 0)
+  inp = UOp.placeholder((16,), dtypes.int8, 1)
+  idx = UOp.special(16, "lidx0")
+  zero = UOp.const(0, dtypes.uint8).bitcast(dtypes.int8)
+  sink = out.index(idx).store((idx < 8).where(inp.index(idx).load(), zero)).sink(
+    idx, arg=KernelInfo(name="amd_asm_bitcast_int8_where"))
+  return _to_prg(sink)
+
+def _signed_byte_load_cast_program():
+  with Context(BEAM=0):
+    ast = Tensor.empty(16, device="AMD", dtype=dtypes.uint8).bitcast(dtypes.int8).float().schedule_linear().src[0].src[0]
+  return _to_prg(ast)
+
+def _implicit_float_to_half_store_program():
+  out = UOp.placeholder((16,), dtypes.float16, 0)
+  inp = UOp.placeholder((16,), dtypes.float32, 1)
+  idx = UOp.special(16, "lidx0")
+  return _to_prg(out.index(idx).store(inp.index(idx).load()).sink(idx, arg=KernelInfo(name="amd_asm_implicit_f32_to_f16_store")))
+
 def _where_sgpr_true_program():
   out = UOp.placeholder((16,), dtypes.uint32, 0)
   idx = UOp.special(16, "lidx0")
@@ -771,6 +791,18 @@ class TestAMDRenderer(unittest.TestCase):
     with self.assertRaises(RuntimeError):
       AMDRenderer(Target("AMD", arch="gfx1200"))
 
+  def test_small_quant_reduce_unroll(self):
+    def quant_ast(output_size:int, quant_buffers:int) -> UOp:
+      out = UOp.placeholder((output_size,), dtypes.float, 0)
+      packed = [UOp.placeholder((1024,), dtypes.uchar, i+1) for i in range(quant_buffers)]
+      filler = [UOp.placeholder((i+1,), dtypes.float, quant_buffers+i+1) for i in range(40)]
+      return UOp.sink(out, *packed, *filler)
+
+    self.assertEqual(_REN.get_reduce_unroll(32, quant_ast(512, 1)), 4)
+    self.assertEqual(_REN.get_reduce_unroll(32, quant_ast(512, 2)), 0)
+    self.assertIsNone(_REN.get_reduce_unroll(32, quant_ast(1024, 2)))
+    self.assertEqual(_REN.get_reduce_unroll(3, quant_ast(1024, 0)), 0)
+
   def test_advertises_scheduler_locals_and_shared_memory(self):
     renderer = _REN
     self.assertTrue(renderer.has_shared)
@@ -801,14 +833,18 @@ class TestAMDRenderer(unittest.TestCase):
     opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
     self.assertFalse(any(o.op is OptOps.UNROLL for o in opts))
 
-  def test_scheduler_maps_q6k_gemv_one_wave_per_row(self):
-    rows, cols, block_elements, block_bytes = 8192, 2048, 256, 210
-    qdata = Tensor.empty(rows * cols // block_elements * block_bytes, dtype=dtypes.uint8, device="AMD")
-    weights = ggml_data_to_tensor(qdata, rows * cols, 14).reshape(rows, cols)
-    with Context(BEAM=0): ast = (weights @ Tensor.empty(cols, device="AMD")).schedule_linear().src[-1].src[0]
-    opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
-    self.assertEqual(opts, (Opt(OptOps.GROUP, 4, 32), Opt(OptOps.UNROLL, 4, 0),
-                            Opt(OptOps.UNROLL, 3, 0), Opt(OptOps.UNROLL, 2, 0)))
+  def test_scheduler_maps_quant_gemv_one_wave_per_row(self):
+    rows, cols = 8192, 2048
+    cases = (("Q4_K", 12, 256, 144), ("Q5_K", 13, 256, 176), ("Q6_K", 14, 256, 210), ("Q8_0", 8, 32, 34))
+    for name, ggml_type, block_elements, block_bytes in cases:
+      with self.subTest(name=name):
+        qdata = Tensor.empty(rows * cols // block_elements * block_bytes, dtype=dtypes.uint8, device="AMD")
+        weights = ggml_data_to_tensor(qdata, rows * cols, ggml_type).reshape(rows, cols)
+        with Context(BEAM=0): ast = (weights @ Tensor.empty(cols, device="AMD")).schedule_linear().src[-1].src[0]
+        opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
+        expected = (Opt(OptOps.GROUP, 1, 32),) if name == "Q8_0" else (
+          Opt(OptOps.GROUP, 4, 32), Opt(OptOps.UNROLL, 4, 0), Opt(OptOps.UNROLL, 3, 0), Opt(OptOps.UNROLL, 2, 0))
+        self.assertEqual(opts, expected)
 
   def test_to_program_assembles_elf(self):
     prg = _simple_add_program()
@@ -945,6 +981,20 @@ class TestAMDRenderer(unittest.TestCase):
     for dtype in (dtypes.uint32, dtypes.int32, dtypes.float32):
       with self.subTest(dtype=dtype):
         _check_asm(self, _where_program(dtype), AMDOps.CMPLT, AMDOps.WHERE)
+
+  def test_bitcast_int8_immediate_where_assembles(self):
+    _check_asm(self, _bitcast_int8_where_program(), AMDOps.WHERE, insts=("V_CNDMASK_B32_E32",))
+
+  def test_signed_byte_load_cast_fuses_sign_extension(self):
+    prg = _signed_byte_load_cast_program()
+    _check_asm(self, prg, AMDOps.LOAD, AMDOps.CAST, insts=("GLOBAL_LOAD_I8", "V_CVT_F32_I32_E32"))
+    names = _amd_inst_names(prg)
+    self.assertNotIn("V_ASHRREV_I32_E64", names)
+
+  def test_store_uses_destination_dtype(self):
+    prg = _implicit_float_to_half_store_program()
+    _check_asm(self, prg, AMDOps.CAST, AMDOps.STORE, insts=("V_CVT_F16_F32_E32", "GLOBAL_STORE_B16"))
+    self.assertNotIn("GLOBAL_STORE_B32", _amd_inst_names(prg))
 
   def test_where_sgpr_true_materializes_vsrc1(self):
     prg = _where_sgpr_true_program()

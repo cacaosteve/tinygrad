@@ -181,7 +181,7 @@ def _parallel_vmov(moves:list[tuple[Reg, Reg|int|float]]) -> list:
   return ret
 
 def _unwrap_const(x:UOp) -> UOp|None:
-  while x.op in (Ops.CAST, Ops.BITCAST) and len(x.src) == 1: x = x.src[0]
+  while x.op in (Ops.CAST, Ops.BITCAST, Ops.NOOP) and len(x.src) == 1: x = x.src[0]
   return x if x.op is Ops.CONST else None
 
 def _src(x:UOp):
@@ -1076,6 +1076,11 @@ def _materialize_store_compare_flag(x:UOp) -> UOp|None:
   return _materialize_flags(x, (1,)) if len(x.src) >= 2 and x.src[1].op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) else None
 def _materialize_where_value_flags(x:UOp) -> UOp|None: return _materialize_flags(x, (1, 2))
 
+def _cast_store_value(x:UOp, a:UOp, val:UOp) -> UOp|None:
+  # C-style renderers implicitly convert through the destination pointer type. ISA stores
+  # must make that conversion explicit or they also select the wrong width/address scale.
+  return x.replace(src=(a, val.cast(a.dtype), *x.src[2:])) if val.dtype != a.dtype else None
+
 def _materialize_bool_where(m:UOp, a:UOp, b:UOp) -> UOp|None:
   if m.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): return None
   return UOp(Ops.WHERE, a.dtype, (UOp(Ops.CMPNE, dtypes.bool, (m, UOp.const(False, dtypes.bool))), a, b))
@@ -1091,6 +1096,10 @@ def _promote_f16_unary(x:UOp, d:UOp) -> UOp:
 def _int_cast(y:UOp, x:UOp) -> UOp|None:
   if x.dtype.itemsize == y.dtype.itemsize: return x.replace(op=Ops.NOOP)
   return x.ins(AMDOps.CAST, src=(y,))
+
+def _fuse_signed_byte_load_cast(x:UOp, y:UOp) -> UOp|None:
+  if len(y.src) != 1 or (ld := y.src[0]).op is not Ops.LOAD or ld.dtype is not dtypes.uint8: return None
+  return ld.replace(dtype=dtypes.int8).cast(x.dtype)
 
 pre_isel_matcher = PatternMatcher([
   # Renderer legalization runs after the spec check. Canonical constants now arrive as
@@ -1109,10 +1118,13 @@ pre_isel_matcher = PatternMatcher([
    _cmp_bool_const),
   (UPat((Ops.AND, Ops.OR, Ops.XOR, Ops.CMPNE, Ops.CMPEQ), dtype=dtypes.bool, name="x"), _materialize_compare_flags),
   (UPat(Ops.STORE, name="x"), _materialize_store_compare_flag),
+  (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), name="a"), UPat.var("val")), allow_any_len=True, name="x"), _cast_store_value),
   (UPat(Ops.WHERE, name="x"), _materialize_where_value_flags),
   (UPat.var("m", dtypes.bool).cast(dtypes.ints+(dtypes.float16, dtypes.float32), name="x"),
    lambda m,x: m.where(UOp.const(1, x.dtype), UOp.const(0, x.dtype))),
   (UPat.var("m", dtypes.bool).where(UPat.var("a"), UPat.var("b")), _materialize_bool_where),
+  (UPat(Ops.CAST, dtype=dtypes.float32,
+        src=(UPat((Ops.NOOP, Ops.BITCAST), dtype=dtypes.int8, name="y"),), name="x"), _fuse_signed_byte_load_cast),
   (UPat.var("y", dtypes.ints).cast(dtypes.ints, name="x"), _int_cast),
   (UPat.var("y", dtypes.ints).cast(dtypes.float16), lambda y: y.cast(dtypes.float32).cast(dtypes.float16)),
   (UPat.var("y", dtypes.float16).cast(dtypes.ints, name="x"), lambda y,x: y.cast(dtypes.float32).cast(x.dtype)),
@@ -1444,6 +1456,8 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
         return pre + [r3.v_cvt_f16_f32_e32(_dst(u), cast_src)]
       if u.dtype is dtypes.float32 and u.src[0].dtype in dtypes.ints:
         if u.src[0].dtype in dtypes.sints and u.src[0].dtype.itemsize < 4:
+          if u.src[0].op is Ops.INS and u.src[0].arg is AMDOps.LOAD:
+            return pre + [r3.v_cvt_f32_i32_e32(_dst(u), cast_src)]
           # Narrow signed values normally arrive sign-extended from i8/i16 loads, but a
           # BITCAST from u8/u16 is a register no-op and leaves the high bits clear.
           # Canonicalize the source before using the i32 conversion instruction.
@@ -2837,8 +2851,18 @@ class AMDRenderer(ISARenderer):
     self.tensor_cores = [x for x in tc.get_amd(target.arch) if (x.dtype_in, x.dtype_out) == (dtypes.half, dtypes.float)]
 
   def get_reduce_unroll(self, size:int, ast:UOp) -> int|None:
-    # Full unroll on complex quantized reductions explodes native ISA and register allocation.
-    if size <= 3 or len(ast.toposort()) <= 32: return 0
+    # Broad unrolling of complex quantized reductions explodes native ISA. It is still valuable
+    # for small-output quantized projections, where the 32-way loop is on the decoder's critical path.
+    ast_uops = ast.toposort()
+    output_size = next((u.src[0].arg for u in ast_uops if u.op is Ops.PARAM and getattr(u.arg, "slot", None) == 0 and
+                        len(u.src) and u.src[0].op is Ops.CONST), None)
+    quant_buffers = sum(u.op is Ops.PARAM and u.dtype is dtypes.uchar for u in ast_uops)
+    small_quant_projection = size == 32 and isinstance(output_size, int) and 0 < output_size <= 512 and \
+                             quant_buffers > 0
+    # A four-way split avoids a runtime loop explosion for plain GEMV. Fused projections with
+    # multiple packed inputs benefit enough to justify fully unrolling this innermost dimension.
+    if small_quant_projection: return 0 if quant_buffers >= 2 else 4
+    if size <= 3 or len(ast_uops) <= 32: return 0
     return None
 
   def apply_tc_hand_opts(self, tk, rngs):

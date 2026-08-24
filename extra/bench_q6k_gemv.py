@@ -6,7 +6,7 @@ generated from integer formulas so the equivalent Mojo program uses the same
 bytes without exchanging a model file.
 
 AMD:AMD selects the complex-matvec wave-per-row schedule automatically.  Use
-MV_FORCE_GROUP=32 MV_FORCE_UNROLL_INNER=3 for the same launch geometry on HIP
+MV_FORCE_GROUP=32 MV_FORCE_UNROLL_INNER=-1 for the same launch geometry on HIP
 or LLVM when making backend-to-backend comparisons.
 """
 
@@ -14,6 +14,7 @@ import json
 import statistics
 import time
 from collections import Counter
+from typing import Any
 
 import numpy as np
 
@@ -59,58 +60,57 @@ def reference_rows(qdata: np.ndarray, x: np.ndarray, count: int = 16) -> np.ndar
   return out
 
 
-def program_metrics(runner: TinyJit) -> list[dict[str, object]]:
+def program_metrics(runner: Any) -> list[dict[str, object]]:
   assert runner.captured is not None
-  ret = []
+  ret, seen = [], set()
   for call in runner.captured.linear.src:
-    program = call.src[0]
-    if program.op is not Ops.PROGRAM:
-      continue
-    source = next((s.arg for s in program.src if s.op is Ops.SOURCE), "")
-    binary = next((s.arg for s in program.src if s.op is Ops.BINARY), b"")
-    metrics: dict[str, object] = {
-      "name": program.arg.function_name,
-      "source_bytes": len(source.encode()) if isinstance(source, str) else 0,
-      "binary_bytes": len(binary) if isinstance(binary, bytes) else 0,
-      "global_size": program.arg.global_size,
-      "local_size": program.arg.local_size,
-    }
-    if isinstance(source, str) and source.lstrip().startswith("AMDOps."):
-      asm_ops = Counter(line.strip().removeprefix("AMDOps.") for line in source.splitlines() if line.strip())
-      metrics.update({
-        "asm_instruction_count": sum(asm_ops.values()),
-        "asm_fills": asm_ops["FILL"],
-        "asm_spills": asm_ops["SPILL"],
-        "asm_waits": asm_ops["WAIT"],
-        "asm_top_ops": dict(asm_ops.most_common(16)),
-      })
-    if isinstance(binary, bytes) and binary.startswith(b"\x7fELF"):
-      from tinygrad.renderer.amd import decode_inst
-      from tinygrad.renderer.isa.rdna3 import scan_elf_regs, scratch_inst_size
-      from tinygrad.runtime.support.elf import elf_loader
+    for program in call.src[0].toposort():
+      if program.op is not Ops.PROGRAM or program in seen: continue
+      seen.add(program)
+      source = next((s.arg for s in program.src if s.op is Ops.SOURCE), "")
+      binary = next((s.arg for s in program.src if s.op is Ops.BINARY), b"")
+      metrics: dict[str, object] = {
+        "name": program.arg.function_name,
+        "source_bytes": len(source.encode()) if isinstance(source, str) else 0,
+        "binary_bytes": len(binary) if isinstance(binary, bytes) else 0,
+        "global_size": program.arg.global_size,
+        "local_size": program.arg.local_size,
+      }
+      if isinstance(source, str) and source.lstrip().startswith("AMDOps."):
+        asm_ops = Counter(line.strip().removeprefix("AMDOps.") for line in source.splitlines() if line.strip())
+        metrics.update({
+          "asm_instruction_count": sum(asm_ops.values()),
+          "asm_fills": asm_ops["FILL"],
+          "asm_spills": asm_ops["SPILL"],
+          "asm_waits": asm_ops["WAIT"],
+          "asm_top_ops": dict(asm_ops.most_common(16)),
+        })
+      if Device.DEFAULT.split(":")[0] == "AMD" and isinstance(binary, bytes) and binary.startswith(b"\x7fELF"):
+        from tinygrad.renderer.amd import decode_inst
+        from tinygrad.renderer.isa.rdna3 import scan_elf_regs, scratch_inst_size
+        from tinygrad.runtime.support.elf import elf_loader
 
-      text = next(section.content for section in elf_loader(binary)[1] if section.name == ".text")
-      insts, offset = [], 0
-      while offset < len(text):
-        inst = decode_inst(text[offset:], "rdna3")
-        insts.append(inst)
-        offset += inst.size()
-        if getattr(inst, "op_name", "").lower() == "s_endpgm":
-          break
-      machine_ops = Counter(getattr(inst, "op_name", type(inst).__name__).lower() for inst in insts)
-      max_vgpr, max_sgpr, _, private_segment_size = scan_elf_regs(insts, scratch_inst_size)
-      metrics.update({
-        "machine_instruction_count": len(insts),
-        "machine_waits": sum(count for op, count in machine_ops.items() if "waitcnt" in op),
-        "machine_vmcnt_values": dict(Counter(str(getattr(inst, "simm16", "")) for inst in insts
-                                              if getattr(inst, "op_name", "").lower() == "s_waitcnt_vmcnt")),
-        "machine_global_loads": sum(count for op, count in machine_ops.items() if op.startswith("global_load")),
-        "machine_top_ops": dict(machine_ops.most_common(24)),
-        "max_vgpr": max_vgpr,
-        "max_sgpr": max_sgpr,
-        "private_segment_size": private_segment_size,
-      })
-    ret.append(metrics)
+        text = next(section.content for section in elf_loader(binary)[1] if section.name == ".text")
+        insts, offset = [], 0
+        while offset < len(text):
+          inst = decode_inst(text[offset:], "rdna3")
+          insts.append(inst)
+          offset += inst.size()
+          if getattr(inst, "op_name", "").lower() == "s_endpgm": break
+        machine_ops = Counter(getattr(inst, "op_name", type(inst).__name__).lower() for inst in insts)
+        max_vgpr, max_sgpr, _, private_segment_size = scan_elf_regs(insts, scratch_inst_size)
+        metrics.update({
+          "machine_instruction_count": len(insts),
+          "machine_waits": sum(count for op, count in machine_ops.items() if "waitcnt" in op),
+          "machine_vmcnt_values": dict(Counter(str(getattr(inst, "simm16", "")) for inst in insts
+                                                if getattr(inst, "op_name", "").lower() == "s_waitcnt_vmcnt")),
+          "machine_global_loads": sum(count for op, count in machine_ops.items() if op.startswith("global_load")),
+          "machine_top_ops": dict(machine_ops.most_common(24)),
+          "max_vgpr": max_vgpr,
+          "max_sgpr": max_sgpr,
+          "private_segment_size": private_segment_size,
+        })
+      ret.append(metrics)
   return ret
 
 

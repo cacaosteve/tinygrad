@@ -5,6 +5,14 @@ from tinygrad.uop.ops import Ops, resolve, AxisType
 from tinygrad.codegen.late.coalesce import image_valid_dims
 from tinygrad.codegen.opt.postrange import Scheduler
 
+def _unroll_small_inner_reduces(k:Scheduler, max_product:int=8) -> None:
+  unroll_product = 1
+  while k.unrollable_dims:
+    inner_size = k.full_shape[k.unrollable_dims[-1]]
+    if inner_size > 3 or unroll_product * inner_size > max_product: break
+    k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
+    unroll_product *= inner_size
+
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # first try the tensor cores
   """ Attempts to apply a tensor core optimization to the kernel. If one exists and applies properly, return true, otherwise return false.
@@ -43,13 +51,15 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   k = k.copy()
 
   # Experimental fixed reduction mapping for backend-to-backend GEMV comparisons.
-  if (force_group:=getenv("MV_FORCE_GROUP", 0)):
+  if (force_group:=getenv("MV_FORCE_GROUP", 0)) and k.ren.has_local:
     force_axis = getenv("MV_FORCE_GROUP_AXIS", -1)
     if force_axis < 0: force_axis = len(k.axes_of(AxisType.REDUCE)) - 1
     if DEBUG >= 3: print(f"FORCE_GROUP: {k.full_shape=} {k.shape_str()=} {force_axis=} {force_group=}")
     k.apply_opt(Opt(OptOps.GROUP, force_axis, force_group))
-    for _ in range(getenv("MV_FORCE_UNROLL_INNER", 0)):
-      k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
+    force_unroll = getenv("MV_FORCE_UNROLL_INNER", 0)
+    if force_unroll < 0: _unroll_small_inner_reduces(k)
+    else:
+      for _ in range(force_unroll): k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
     return k
 
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
@@ -70,17 +80,19 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # ISAs can opt into a one-wave-per-row mapping for these complex matvecs without broadening the generic rule below.
   complex_mv_group = getattr(k.ren, "preferred_complex_matvec_group", None)
   if complex_mv_group is not None and getenv("MV", 1) != 0 and k.ren.has_local and k.ren.has_shared and k.reduceop is not None and \
-     k.reduceop.arg[0] is Ops.ADD and resolve(prod(k.output_shape) >= 1024, False) and \
-     (mulop:=k.reduceop.src[0]).op is Ops.MUL:
-    direct_indexes = [x for x in mulop.src if x.op is Ops.INDEX]
-    if len(direct_indexes) == 1:
-      vector_load = direct_indexes[0]
-      matrix_expr = mulop.src[1] if mulop.src[0] is vector_load else mulop.src[0]
+     k.reduceop.arg[0] is Ops.ADD and resolve(prod(k.output_shape) >= 1024, False):
+    reduce_term = k.reduceop.src[0]
+    simple_matvec = reduce_term.op is Ops.MUL and all(x.op is Ops.INDEX for x in reduce_term.src)
+    indexes = [u for u in reduce_term.toposort() if u.op is Ops.INDEX]
+    reduce_ranges = set(k.ranges_of(AxisType.REDUCE))
+    for vector_load in (() if simple_matvec else indexes):
       vector_idx = vector_load.src[1].get_idx()
       vector_ranges = set(vector_idx.ranges)
-      matrix_indexes = [u.src[1].get_idx() for u in matrix_expr.toposort() if u.op is Ops.INDEX]
-      is_matrix_vector = any(vector_ranges.issubset(idx.ranges) and any(r.arg[-1] is AxisType.GLOBAL and r not in vector_ranges
-                             for r in idx.ranges) for idx in matrix_indexes)
+      if not vector_ranges or not vector_ranges.issubset(reduce_ranges): continue
+      matrix_indexes = [u.src[1].get_idx() for u in indexes if u is not vector_load]
+      matrix_ranges = set().union(*(idx.ranges for idx in matrix_indexes))
+      is_matrix_vector = vector_ranges.issubset(matrix_ranges) and any(any(r.arg[-1] is AxisType.GLOBAL for r in idx.ranges)
+                                                                       for idx in matrix_indexes)
       unit_reduce_ranges = [r for r in k.ranges_of(AxisType.REDUCE) if r in vector_idx.split_uop(Ops.ADD) and
                             r.src[0].divides(complex_mv_group) is not None]
       if is_matrix_vector and unit_reduce_ranges:
@@ -90,12 +102,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         try: k.apply_opt(Opt(OptOps.GROUP, group_axis, complex_mv_group))
         except KernelOptError: pass
         else:
-          unroll_product = 1
-          while k.unrollable_dims:
-            inner_size = k.full_shape[k.unrollable_dims[-1]]
-            if inner_size > 3 or unroll_product * inner_size > 8: break
-            k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
-            unroll_product *= inner_size
+          _unroll_small_inner_reduces(k)
           return k
 
   # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
