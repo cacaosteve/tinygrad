@@ -11,9 +11,11 @@ class Register:
   index: int
   _cons: tuple[Register, ...] = field(default_factory=tuple)
   size: int = 8
+  _cons_hash: int = field(init=False, repr=False, compare=False)
+  def __post_init__(self): object.__setattr__(self, "_cons_hash", hash(tuple(r.index for r in self._cons)))
   @property
   def cons(self): return self._cons or (self,)
-  def __hash__(self): return hash((self.name, self.index, self.size, tuple(r.index for r in self._cons)))
+  def __hash__(self): return hash((self.name, self.index, self.size, self._cons_hash))
   def __repr__(self): return self.name
 
 class IselContext:
@@ -47,6 +49,7 @@ class ISARenderer(Renderer):
   preferred_complex_matvec_group: int|None = None
   local_prod_max: int|None = None
   wide_regalloc: bool = False
+  disk_program_cache: bool = False
   pre_isel_matcher: PatternMatcher
   isel_matcher: PatternMatcher
   pre_regalloc_matcher: PatternMatcher|None = None

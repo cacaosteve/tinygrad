@@ -3,12 +3,13 @@ from typing import cast, Iterator, Any, Sequence
 import random, itertools, math, weakref, array, decimal
 from dataclasses import dataclass, replace, field
 from tinygrad.helpers import colored, DEBUG, GlobalCounters, ansipad, all_int, prod, flatten, Context, getenv, to_tuple, tqdm
+from tinygrad.helpers import diskcache_get, diskcache_put
 from tinygrad.helpers import BEAM, size_to_str, time_to_str, VALIDATE_WITH_CPU, PROFILE, ProfilePointEvent, cpu_events, perf_counter_us
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, AxisType, sym_infer, graph_rewrite, ProgramInfo
 from tinygrad.device import Device, Buffer, MultiBuffer, ProfileGraphEntry
 from tinygrad.dtype import dtypes
 from tinygrad.renderer import Estimates, Renderer
-from tinygrad.codegen import to_program, to_program_cache, to_program_key, to_program_context
+from tinygrad.codegen import to_program, to_program_cache, to_program_key, to_program_disk_key, to_program_context
 from tinygrad.codegen.opt.postrange import args_from_ast
 from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
 
@@ -266,7 +267,20 @@ def lower_and_compile(linear:UOp) -> UOp:
 
   # lower and compile what's not cached, in parallel if there's a worker pool
   keys = {c: to_program_key(*a) for c, a in ar.items()}
-  todo = list({keys[c]: a for c, a in ar.items() if keys[c] not in to_program_cache}.items())
+  uncached = {keys[c]: a for c, a in ar.items() if keys[c] not in to_program_cache}
+  disk_keys: dict[tuple, str] = {}
+  todo = []
+  for key, ast_ren in uncached.items():
+    if (disk_key:=to_program_disk_key(*ast_ren)) is not None: disk_keys[key] = disk_key
+    cached = diskcache_get("isa_program", disk_key) if disk_key is not None else None
+    if not (isinstance(cached, tuple) and len(cached) == 2 and isinstance(prg:=cached[0], UOp) and isinstance(cached[1], bytes) and
+            prg.op is Ops.PROGRAM and prg.src[-1].op is Ops.BINARY):
+      todo.append((key, ast_ren))
+    else:
+      # UOp.__reduce__ intentionally omits recursive-property caches. Preserve the root key separately so loading a
+      # PROGRAM with large symbolic launch dimensions does not rebuild the key by pretty-printing its entire graph.
+      prg.__dict__["_RECURSIVE_PROPERTY_key"] = cached[1]
+      to_program_cache[key] = prg
   if len(todo):
     # kernels that beam search must compile in the parent, beam needs device access to time candidates
 
@@ -278,6 +292,7 @@ def lower_and_compile(linear:UOp) -> UOp:
         for i, prg in (map if pool is None else pool.imap_unordered)(_compile_kernel, tasks):
           pbar.set_description(f"compiling {ansipad(prg.src[0].arg.name, 40)}")
           to_program_cache[todo[i][0]] = prg
+          if (disk_key:=disk_keys.get(todo[i][0])) is not None: diskcache_put("isa_program", disk_key, (prg, prg.key))
           pbar.update(1)
     except KeyboardInterrupt:
       if pool is not None: terminate_worker_pool()

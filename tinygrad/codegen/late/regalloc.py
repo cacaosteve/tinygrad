@@ -45,7 +45,10 @@ class LinearScanRegallocContext:
     live: dict[Register, Register] = {} # mapping from virtual to real that's currently assigned to it
     live_ins: list[dict[Register, Register]] = [] # mapping from virtual to real at loop entry
 
-    def slots(v:Register) -> int: return ren.register_slots(self.vdef(v), v)
+    slot_counts: dict[Register, int] = {}
+    def slots(v:Register) -> int:
+      if (ret:=slot_counts.get(v)) is None: slot_counts[v] = ret = ren.register_slots(self.vdef(v), v)
+      return ret
 
     pinned: set[int] = set()  # live source phys regs; defs must not steal (except two-address)
 

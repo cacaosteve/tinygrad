@@ -1,8 +1,8 @@
 from dataclasses import replace, dataclass
-import itertools, functools
+import itertools, functools, hashlib, json, os, pathlib, pickle, re, sys, time
 from typing import Callable
 from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC
-from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, NUM_CPU_THREADS, TC_SELECT, TC_OPT, TracingKey, Context, panic, getenv
+from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, NUM_CPU_THREADS, TC_SELECT, TC_OPT, CCACHE, TracingKey, Context, panic, getenv
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
 from tinygrad.uop.weak import pm_lower_index_dtype, pm_commit_weak, pm_cast_weak
 from tinygrad.uop.render import pyrender
@@ -461,22 +461,37 @@ def line_rewrite(lst:list[UOp], pm:PatternMatcher, ctx=None) -> list[UOp]:
     newlst.extend(ret[1])
   return newlst
 
+def _print_compile_stage(prg:UOp, stage:str, st:int, uops:int) -> None:
+  if getenv("COMPILE_TIMING", 0):
+    print("COMPILE_STAGE "+json.dumps({"name": prg.arg.function_name, "stage": stage,
+      "ms": (time.perf_counter_ns() - st) / 1e6, "uops": uops}), flush=True)
+
 def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:
   if DEBUG >= 3 and sink.arg.applied_opts: print(f"{sink.arg.function_name:<25} opts: {sink.arg.applied_opts}")
+  stage_st = time.perf_counter_ns()
   lst = line_rewrite(linearize(sink), pm_linearize_cleanups)
+  _print_compile_stage(prg, "linearize", stage_st, len(lst))
   # isa renderers need to allocate registers
   if isinstance(ctx, ISARenderer):
     if ctx.pre_regalloc_matcher is not None:
+      stage_st = time.perf_counter_ns()
       lst, scratch = ctx.prepare_pre_regalloc(lst)
       pa_ctx = PreRegAllocContext(lst)
       pa_ctx.scratch.update(scratch)
       lst = line_rewrite(lst, ctx.pre_regalloc_matcher, pa_ctx)
       if (after:=getattr(ctx, "after_pre_regalloc", None)) is not None: lst = after(lst)
+      _print_compile_stage(prg, "pre_regalloc", stage_st, len(lst))
     # register definitions (INS without srcs) move to the top so regalloc sees their live ranges span the whole program (callee saved regs)
+    stage_st = time.perf_counter_ns()
     lst = sorted(lst, key=lambda u: u.op is not Ops.INS or bool(u.src))
     regalloc_ctx = LinearScanRegallocContext(lst, ctx)
+    _print_compile_stage(prg, "regalloc_init", stage_st, len(lst))
+    stage_st = time.perf_counter_ns()
     lst = line_rewrite(lst, pm_regalloc_rewrite, regalloc_ctx)
+    _print_compile_stage(prg, "regalloc", stage_st, len(lst))
+    stage_st = time.perf_counter_ns()
     lst = line_rewrite(lst, ctx.post_regalloc_matcher, regalloc_ctx)
+    _print_compile_stage(prg, "post_regalloc", stage_st, len(lst))
     if DEBUG >= 4: print(ctx.asm_str(lst, sink.arg.function_name))
   return prg.replace(src=prg.src + (UOp(Ops.LINEAR, src=tuple(lst)),))
 
@@ -487,7 +502,9 @@ def do_estimates(prg:UOp, sink:UOp, lin:UOp) -> UOp|None:
 def do_assemble(ctx:Renderer, prg:UOp, lin:UOp) -> UOp:
   src = "\n".join(str(u.arg) for u in lin.src)
   if DEBUG >= 4: print(src)
+  stage_st = time.perf_counter_ns()
   binary = ctx.asm(prg, lin)
+  _print_compile_stage(prg, "assemble", stage_st, len(lin.src))
   return prg.replace(src=prg.src[:2]+(UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=binary)))
 
 def do_render(ctx:Renderer, prg:UOp, lin:UOp) -> UOp:
@@ -521,20 +538,36 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   Returns:
     The Ops.PROGRAM with SINK/LINEAR/SOURCE/BINARY.
   """
+  compile_timing, timings = getenv("COMPILE_TIMING", 0), {}
+  total_st = time.perf_counter_ns()
   if ast.op is Ops.PROGRAM: prg = ast
   elif ast.op is Ops.SINK:
     assert isinstance(ast.arg, KernelInfo), "requires KernelInfo on arg to to_program"
+    stage_st = time.perf_counter_ns()
     full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.tag is None)
+    if compile_timing: timings["rewrite_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
     prog_info = ProgramInfo.from_sink(full_sink, renderer.target)
     if isinstance(renderer, ISARenderer):
+      stage_st = time.perf_counter_ns()
       if full_sink.arg.estimates is None:
         full_sink = full_sink.replace(arg=replace(full_sink.arg, estimates=Estimates.from_uops(tuple(full_sink.toposort()), ignore_indexing=True)))
+      if compile_timing: timings["estimates_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
+      stage_st = time.perf_counter_ns()
       full_sink = graph_rewrite(full_sink, renderer.pre_isel_matcher, ctx=itertools.count(-1, -1), name="pre instruction selection", bottom_up=True)
+      if compile_timing: timings["pre_isel_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
+      stage_st = time.perf_counter_ns()
       full_sink = graph_rewrite(full_sink, renderer.isel_matcher, ctx=IselContext(full_sink), name="instruction selection", bottom_up=True)
+      if compile_timing: timings["isel_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
     prg = UOp(Ops.PROGRAM, src=(full_sink,), arg=prog_info)
   else: raise RuntimeError(f"can't call to_program on {ast.op}")
   if not isinstance(prg.arg, ProgramInfo): prg = prg.replace(arg=ProgramInfo.from_sink(prg.src[0], renderer.target))
+  stage_st = time.perf_counter_ns()
   prg = graph_rewrite(prg, pm_to_program, ctx=renderer, name="linearize/render")
+  if compile_timing:
+    timings["linearize_render_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
+    timings["total_ms"] = (time.perf_counter_ns() - total_st) / 1e6
+    print("COMPILE_TIMING "+json.dumps({"name": prg.arg.function_name, "renderer": type(renderer).__name__,
+      "ast_uops": len(ast.toposort()), "program_uops": len(prg.src[1].src), "binary_bytes": len(prg.src[-1].arg), **timings}), flush=True)
   if VIZ: graph_rewrite(prg, PatternMatcher([]), name="View Program")
   return prg
 
@@ -544,6 +577,40 @@ to_program_config = (NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC, IMAGE, DISABLE_FA
 to_program_context = (*to_program_config, SPEC, DEBUG)
 def to_program_key(ast:UOp, renderer:Renderer) -> tuple:
   return (ast.key, type(renderer), renderer.target, *[x.value for x in to_program_config])
+
+@functools.cache
+def _program_source_paths() -> tuple[pathlib.Path, ...]:
+  root = pathlib.Path(__file__).resolve().parents[1]
+  paths = [root/"dtype.py", root/"helpers.py", root/"runtime"/"autogen"/"amdgpu_kd.py",
+           root/"runtime"/"autogen"/"hsa.py", root/"runtime"/"autogen"/"libc.py"]
+  for dirname in ("codegen", "renderer", "schedule", "uop", "runtime/autogen/amd"):
+    paths.extend((root/dirname).rglob("*.py"))
+  return tuple(sorted(paths))
+
+@functools.cache
+def _program_source_fingerprint() -> bytes:
+  """Invalidate native PROGRAM pickles whenever lowering, rendering, or encoding code changes."""
+  root = pathlib.Path(__file__).resolve().parents[1]
+  h = hashlib.sha256()
+  for path in _program_source_paths():
+    h.update(path.relative_to(root).as_posix().encode())
+    h.update(path.read_bytes())
+  return h.digest()
+
+@functools.cache
+def _program_cache_env_names() -> tuple[str, ...]:
+  # Literal getenv controls in compiler sources can alter code without altering an AST. Capture any that are set,
+  # while leaving the timing-only switch free to inspect cache hits.
+  root = pathlib.Path(__file__).resolve().parents[1]
+  paths = itertools.chain.from_iterable((root/d).rglob("*.py") for d in ("codegen", "renderer", "schedule", "uop"))
+  names = {name.decode() for path in paths for name in re.findall(rb"getenv\(\s*['\"]([A-Z][A-Z0-9_]*)['\"]", path.read_bytes())}
+  return tuple(sorted(names - {"COMPILE_TIMING"}))
+
+def to_program_disk_key(ast:UOp, renderer:Renderer) -> str|None:
+  if not CCACHE or not getattr(renderer, "disk_program_cache", False): return None
+  env = tuple((name, os.environ[name]) for name in _program_cache_env_names() if name in os.environ)
+  key = (to_program_key(ast, renderer), _program_source_fingerprint(), env, sys.version_info[:2])
+  return hashlib.sha256(pickle.dumps(key, protocol=pickle.HIGHEST_PROTOCOL)).hexdigest()
 
 to_program_cache: dict[tuple, UOp] = {}
 def to_program(ast:UOp, renderer:Renderer) -> UOp:
