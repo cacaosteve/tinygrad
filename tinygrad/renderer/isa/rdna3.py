@@ -1,6 +1,5 @@
 from __future__ import annotations
 import struct
-from bisect import bisect_left
 
 from tinygrad.device import CompileError
 from tinygrad.dtype import dtypes, DType, AddrSpace
@@ -3105,83 +3104,6 @@ class AMDRenderer(ISARenderer):
 
   def supported_dtypes(self):
     return {dtypes.bool, dtypes.int8, dtypes.uint8, dtypes.int16, dtypes.uint16, dtypes.int32, dtypes.uint32, dtypes.float16, dtypes.float32}
-
-# ***** wide (AMD) linear-scan helpers *****
-def wide_alloc(cons, i, nslots, allowed, live, lr, uops_len, slots_fn, pinned=frozenset()):
-  allowed_idxs = {r.index for r in allowed}
-  occupied: dict[int, list[Register]] = {}
-  for vr, r in live.items():
-    for idx in range(r.index, r.index + slots_fn(vr)): occupied.setdefault(idx, []).append(vr)
-  def blockers(reg):
-    return tuple(dict.fromkeys(vr for idx in range(reg.index, reg.index+nslots) for vr in occupied.get(idx, ())))
-  def next_use(vr):
-    uses = lr[vr]
-    pos = bisect_left(uses, i)
-    return uses[pos] - i if pos < len(uses) else uops_len
-  def get_candidates(check_pinned:bool):
-    candidates = []
-    for r in cons:
-      indices = range(r.index, r.index+nslots)
-      if not all(x in allowed_idxs for x in indices) or (check_pinned and any(x in pinned for x in indices)): continue
-      blocked = blockers(r)
-      score = min((next_use(vr) for vr in blocked), default=uops_len)
-      # uops_len is the largest possible score. Returning its first occurrence is exactly
-      # max(candidates, key=score), including Python's first-wins tie behavior, without
-      # scanning the remaining physical windows or recomputing every candidate's score.
-      if score == uops_len: return (r, blocked), []
-      candidates.append((r, blocked, score))
-    return None, candidates
-  free, candidates = get_candidates(True)
-  if free is not None:
-    reg, vregs = free
-    for vr in vregs: live.pop(vr, None)
-    return reg
-  if not candidates:  # no unpinned window (wide nslots / fill) — steal via blockers
-    free, candidates = get_candidates(False)
-    if free is not None:
-      reg, vregs = free
-      for vr in vregs: live.pop(vr, None)
-      return reg
-  if not candidates: raise CompileError(f"wide_alloc: no free regs ({nslots} slots)")
-  reg,vregs,_ = max(candidates, key=lambda rv: rv[2])
-  for vr in vregs: live.pop(vr, None)
-  return reg
-
-def wide_restore(ctx, v, r, i):
-  if v in ctx.remat:
-    vd, src_regs = ctx.vdef(v), []  # type: ignore[var-annotated]
-    for su in vd.src:
-      if su.op is Ops.CONST or not isinstance(sv:=greg(su), Register): src_regs.append(None)
-      else: src_regs.append(ctx.reals[i][sv])
-    return ctx.ren.remat(vd, r, src_regs)
-  return ctx.ren.fill(ctx.spills[v], ctx.vdef(v), r)
-
-def wide_regalloc_rewrite(ctx, x:UOp):
-  i = ctx.regalloc_i
-  if x.op in {Ops.CONST, Ops.NOOP, Ops.AFTER, Ops.BARRIER, Ops.GROUP, Ops.STACK}: return None
-  if x.op in (Ops.LOAD, Ops.STORE) and not ctx.insert_before.get(i):
-    spilled = any(i in ctx.reals and ((vr:=greg(ctx.uops[i].src[j])) in ctx.spills or vr in ctx.remat)
-                  for j in range(len(x.src)))
-    if not spilled and i not in (ctx.first_real_idx, ctx.last_real_idx): return None
-  nsrc = []
-  for j,su in enumerate(x.src):
-    vr = greg(ctx.uops[i].src[j]) if i in ctx.reals else None
-    if isinstance(vr, Register) and vr in ctx.remat:
-      # Actual remat runs in `before` via insert_before; source is just a bind to that phys.
-      # Preserve the use dtype: no-op BITCASTs can share a vreg with a differently typed definition.
-      nsrc.append(ctx.ren.bind(su.dtype, ctx.reals[i][vr]))
-    elif isinstance(vr, Register) and vr in ctx.spills: nsrc.append(ctx.ren.fill(ctx.spills[vr], su, ctx.reals[i][vr]))
-    else: nsrc.append(su)
-  ndefs = tuple(ctx.reals[i][vr] for vr in x.tag) if isinstance(x.tag, tuple) else x.tag
-  if x.op is Ops.BUFFER: nx = ctx.ren.isel_matcher.rewrite(ctx.ren.stack_pointer().index(ctx.locals[x], tag=ndefs))
-  else: nx = x.replace(src=tuple(nsrc), tag=ndefs)
-  before = [wide_restore(ctx, vr, r, i) for vr,r in ctx.insert_before.get(i, [])]
-  after = [ctx.ren.spill(ctx.spills[vr], nx) for vr in x.tag if vr in ctx.spills] if isinstance(x.tag, tuple) else []
-  if ctx.stack_size > 0:
-    sp, offset = ctx.ren.stack_pointer(), UOp(Ops.CONST, ctx.ren.stack_pointer().dtype, arg=ctx.stack_size)
-    if i == ctx.first_real_idx: before = [ctx.ren.isel_matcher.rewrite(UOp(Ops.SUB, src=(sp, offset), tag=sp.tag))] + before
-    elif i == ctx.last_real_idx: before += [ctx.ren.isel_matcher.rewrite(UOp(Ops.ADD, src=(sp, offset), tag=sp.tag))]
-  return nx, before + [nx] + after
 
 # ***** public install (was thin isa/amd.py) *****
 def _install_hooks():
