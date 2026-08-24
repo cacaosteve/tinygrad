@@ -837,6 +837,27 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertLess(second_load, first_wait)
     self.assertLess(first_wait, inst_names.index("V_ADD_F32_E32"))
 
+  def test_scalar_vmem_scheduler_hoists_independent_load(self):
+    base = UOp(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
+    idx0 = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))
+    idx1 = UOp(Ops.INS, dtypes.uint32, (idx0, UOp.const(1, dtypes.uint32)), AMDOps.ADD, (Register("idx1", 261),))
+    load0 = UOp(Ops.INS, dtypes.uint32, (base, idx0), AMDOps.LOAD, (Register("load0", 270),))
+    use0 = UOp(Ops.INS, dtypes.uint32, (load0, UOp.const(1, dtypes.uint32)), AMDOps.ADD, (Register("use0", 271),))
+    load1 = UOp(Ops.INS, dtypes.uint32, (base, idx1), AMDOps.LOAD, (Register("load1", 272),))
+    use1 = UOp(Ops.INS, dtypes.uint32, (load1, UOp.const(1, dtypes.uint32)), AMDOps.ADD, (Register("use1", 273),))
+    scheduled = amd_lib._schedule_scalar_vmem([load0, use0, idx1, load1, use1], {})
+    self.assertEqual(scheduled, [load0, idx1, load1, use0, use1])
+
+  def test_scalar_vmem_scheduler_preserves_reg_store_boundary(self):
+    base = UOp(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
+    idx = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx", 260),))
+    acc = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("acc", 280),))
+    load0 = UOp(Ops.INS, dtypes.uint32, (base, idx), AMDOps.LOAD, (Register("load0", 270),))
+    update = UOp(Ops.INS, dtypes.void, (acc, load0), AMDOps.REG_STORE)
+    load1 = UOp(Ops.INS, dtypes.uint32, (base, idx), AMDOps.LOAD, (Register("load1", 271),))
+    # REG_STORE mutates acc implicitly; the later load must not cross that boundary.
+    self.assertEqual(amd_lib._schedule_scalar_vmem([load0, update, load1], {}), [load0, update, load1])
+
   def test_global_store_drains_vscnt_before_end(self):
     # RDNA3 vector stores complete on vscnt; must drain before s_endpgm.
     prg = _simple_add_program()

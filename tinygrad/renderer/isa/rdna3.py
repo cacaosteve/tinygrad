@@ -1981,6 +1981,81 @@ def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
     i += 1
   return out
 
+_VMEM_SCHEDULABLE = {AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.MULACC,
+                     AMDOps.CAST, AMDOps.RECIPROCAL, AMDOps.EXP2, AMDOps.LOG2, AMDOps.SQRT, AMDOps.TRUNC, AMDOps.SIN,
+                     AMDOps.MAX, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.LOAD, AMDOps.PACK_F16}
+
+def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp]:
+  """Hoist independent scalar global reads inside conservative straight-line segments.
+
+  Run before register allocation so independent reads receive distinct live registers.
+  Explicit SSA dependencies preserve value order; REG_STORE and all other implicit
+  architectural state or memory side effects are hard boundaries.
+  """
+  if any(u.op is Ops.INS and (u.arg is AMDOps.WMMA or (u.arg is AMDOps.LOAD and _reg_slots(u) > 1)) for u in ops): return ops
+  fused_d16 = set(d16_hi_lo) | set(d16_hi_lo.values())
+
+  def schedulable(u:UOp) -> bool:
+    if u in fused_d16 or u.op is not Ops.INS or u.arg not in _VMEM_SCHEDULABLE: return False
+    # Wide/d16 loads have emitter-level destination and temporary-register constraints.
+    return u.arg is not AMDOps.LOAD or _reg_slots(u) == 1
+
+  def schedule(segment:list[UOp]) -> list[UOp]:
+    loads = [i for i,u in enumerate(segment) if u.arg is AMDOps.LOAD]
+    if len(loads) < 2: return segment
+    deps:list[set[int]] = [set() for _ in segment]
+    users:list[list[int]] = [[] for _ in segment]
+    order = {u:i for i,u in enumerate(segment)}
+    for i,u in enumerate(segment):
+      # Preserve explicit UOp dependencies even when the value has no allocated register.
+      deps[i].update(order[s] for s in u.src if s in order and order[s] < i)
+    for i,ds in enumerate(deps):
+      for dep in ds: users[dep].append(i)
+
+    # Address/dependency chains of loads are favored after already-ready loads.  Hard
+    # segment boundaries keep implicit mutable state and memory side effects fixed.
+    load_ancestors:set[int] = set()
+    stack = [dep for i in loads for dep in deps[i]]
+    while stack:
+      i = stack.pop()
+      if i in load_ancestors: continue
+      load_ancestors.add(i)
+      stack.extend(deps[i])
+
+    indegree = [len(ds) for ds in deps]
+    ready = [i for i,n in enumerate(indegree) if n == 0]
+    scheduled:list[UOp] = []
+    while ready:
+      i = min(ready, key=lambda j: (0 if segment[j].arg is AMDOps.LOAD else 1 if j in load_ancestors else 2, j))
+      ready.remove(i)
+      scheduled.append(segment[i])
+      for user in users[i]:
+        indegree[user] -= 1
+        if indegree[user] == 0: ready.append(user)
+    return scheduled if len(scheduled) == len(segment) else segment
+
+  out:list[UOp] = []
+  segment:list[UOp] = []
+  mask_depth = 0
+  for u in ops:
+    if u.op is Ops.INS and u.arg is AMDOps.IF_MASK:
+      out.extend(schedule(segment))
+      segment = []
+      out.append(u)
+      mask_depth += 1
+    elif u.op is Ops.INS and u.arg is AMDOps.END_MASK:
+      out.extend(segment)
+      segment = []
+      out.append(u)
+      mask_depth = max(0, mask_depth - 1)
+    elif mask_depth or not schedulable(u):
+      out.extend(schedule(segment))
+      segment = []
+      out.append(u)
+    else: segment.append(u)
+  out.extend(schedule(segment))
+  return out
+
 def _vm_load_count(insts:list) -> int:
   return sum(1 for i in insts if (n:=getattr(i, "op_name", "")) and
              (n.startswith("GLOBAL_LOAD") or n.startswith("SCRATCH_LOAD") or
@@ -2825,6 +2900,7 @@ class AMDRenderer(ISARenderer):
        unread lanes (half rows 62–63).
     5. AMD_D16_HI: keep each fused lo LOAD before its hi — post-regalloc-only reorder lets lo
        dest-as-addr reuse hi's still-live index VGPR (MMU on gfx1100).
+    6. Hoist independent scalar VMEM reads in kernels without WMMA or wide global loads.
     """
     lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
     lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
@@ -2846,7 +2922,10 @@ class AMDRenderer(ISARenderer):
         if u in store_cast: out.append(store_cast[u])
         out.append(u)
       lst = out
-    return _order_d16_lo_before_hi(lst, _d16_hi_lo_map(lst))
+    d16_hi_lo = _d16_hi_lo_map(lst)
+    lst = _order_d16_lo_before_hi(lst, d16_hi_lo)
+    if getenv("AMD_SCHEDULE_VMEM", 1): lst = _schedule_scalar_vmem(lst, d16_hi_lo)
+    return lst
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True
     if x.op is not Ops.INS or x.dtype not in (dtypes.int32, dtypes.uint32): return False
