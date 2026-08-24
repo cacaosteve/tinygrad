@@ -1067,25 +1067,65 @@ def _const_cmod(x:UOp, c:UOp) -> UOp|None:
 def _bool_not(x:UOp) -> UOp:
   return x.where(UOp.const(False, dtypes.bool), UOp.const(True, dtypes.bool))
 
-def _u32_divmod(n:UOp, d:UOp) -> tuple[UOp, UOp]:
+def _u32_divmod(n:UOp, d:UOp, bits:int|None=None) -> tuple[UOp, UOp]:
   zero, one = UOp.const(0, dtypes.uint32), UOp.const(1, dtypes.uint32)
   q, r = zero, zero
-  for i in range(31, -1, -1):
+  # Restoring division only needs the numerator's reachable bits. Symbolic LLM indices are
+  # often bounded by max_context; building all 32 rounds makes their kernels enormous.
+  for i in range(max(1, int(n.vmax).bit_length() if bits is None else bits) - 1, -1, -1):
     r = (r << one.const_like(1)) | ((n >> UOp.const(i, dtypes.uint32)) & one)
     ge = _bool_not(r < d)
     q = q | ge.where(one << UOp.const(i, dtypes.uint32), zero)
     r = ge.where(r - d, r)
   return q, r
 
+def _affine_int_bounds(x:UOp) -> tuple[int, int]|None:
+  def form(u:UOp) -> tuple[dict[UOp, int], int]|None:
+    if (cu:=_unwrap_const(u)) is not None: return {}, int(cu.val)
+    if u.op is Ops.CAST and u.dtype in dtypes.ints and u.src[0].dtype in dtypes.ints+(dtypes.weakint,):
+      return form(u.src[0]) if not u.src[0].overflows(u.dtype) else None
+    if u.op in (Ops.PARAM, Ops.SPECIAL): return {u:1}, 0
+    if u.op in (Ops.ADD, Ops.SUB):
+      if u.overflows(u.dtype): return None
+      if (a:=form(u.src[0])) is None or (b:=form(u.src[1])) is None: return None
+      sign = -1 if u.op is Ops.SUB else 1
+      coeffs = dict(a[0])
+      for atom, coeff in b[0].items(): coeffs[atom] = coeffs.get(atom, 0) + sign * coeff
+      return coeffs, a[1] + sign * b[1]
+    if u.op is Ops.MUL:
+      if u.overflows(u.dtype): return None
+      if (cu:=_unwrap_const(u.src[0])) is not None: c, other = int(cu.val), u.src[1]
+      elif (cu:=_unwrap_const(u.src[1])) is not None: c, other = int(cu.val), u.src[0]
+      else: return None
+      if (f:=form(other)) is None: return None
+      return {atom:c*coeff for atom,coeff in f[0].items()}, c*f[1]
+    return None
+  if (f:=form(x)) is None: return None
+  lo = hi = f[1]
+  for atom, coeff in f[0].items():
+    lo += coeff * int(atom.vmin if coeff >= 0 else atom.vmax)
+    hi += coeff * int(atom.vmax if coeff >= 0 else atom.vmin)
+  return lo, hi
+
 def _var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
   if x.dtype != d.dtype or x.dtype not in (dtypes.int32, dtypes.uint32): return None
   if x.dtype is dtypes.uint32:
     q, r = _u32_divmod(x, d)
     return q if op.op is Ops.CDIV else r
+  if x.vmin >= 0 and d.vmin > 0:
+    q, r = _u32_divmod(x.cast(dtypes.uint32), d.cast(dtypes.uint32), int(x.vmax).bit_length())
+    return (q if op.op is Ops.CDIV else r).cast(dtypes.int32)
+  if x.vmin >= 0 and d.vmax < 0:
+    signed_zero = UOp.const(0, dtypes.int32)
+    gap = _affine_int_bounds((signed_zero - d) - x)
+    if gap is not None and gap[0] > 0: return signed_zero if op.op is Ops.CDIV else x
+    zero = UOp.const(0, dtypes.uint32)
+    q, r = _u32_divmod(x.cast(dtypes.uint32), zero - d.cast(dtypes.uint32), int(x.vmax).bit_length())
+    return ((zero - q) if op.op is Ops.CDIV else r).cast(dtypes.int32)
   zero = UOp.const(0, dtypes.int32)
   xneg, dneg = x < zero, d < zero
   ax, ad = xneg.where(zero - x, x).cast(dtypes.uint32), dneg.where(zero - d, d).cast(dtypes.uint32)
-  q, r = _u32_divmod(ax, ad)
+  q, r = _u32_divmod(ax, ad, max(abs(int(x.vmin)), abs(int(x.vmax))).bit_length())
   q, r = q.cast(dtypes.int32), r.cast(dtypes.int32)
   return xneg.where(zero - r, r) if op.op is Ops.CMOD else (xneg ^ dneg).where(zero - q, q)
 

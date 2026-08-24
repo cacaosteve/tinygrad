@@ -415,6 +415,15 @@ def _var_divmod_program():
   sink = out.index(idx).store(q * UOp.const(10, dtypes.int32) + r).sink(idx, arg=KernelInfo(name="amd_asm_var_divmod"))
   return _to_prg(sink)
 
+def _bounded_negative_divmod_program():
+  out = UOp.placeholder((2,), dtypes.int32, 0)
+  n = UOp.param(1, dtypes.int32, (), vmin_vmax=(1, 4127), name="n", addrspace=AddrSpace.ALU)
+  idx = UOp.special(2, "lidx0")
+  x, d = n - UOp.const(1, dtypes.int32), UOp.const(1, dtypes.int32) - n * UOp.const(2, dtypes.int32)
+  q, r = UOp(Ops.CDIV, dtypes.int32, (x, d)), UOp(Ops.CMOD, dtypes.int32, (x, d))
+  sink = out.index(idx).store((idx < 1).where(q, r)).sink(idx, n, arg=KernelInfo(name="amd_asm_bounded_negative_divmod"))
+  return _to_prg(sink)
+
 def _max_program(dtype):
   out = UOp.placeholder((16,), dtype, 0)
   inp = UOp.placeholder((16,), dtype, 1)
@@ -2426,6 +2435,12 @@ class TestAMDRenderer(unittest.TestCase):
     for op in (AMDOps.SHL, AMDOps.SHR, AMDOps.CMPLT, AMDOps.WHERE):
       self.assertIn(op, linear_ops)
 
+  def test_bounded_negative_divmod_uses_range_proof(self):
+    prg = _bounded_negative_divmod_program()
+    _check_elf(self, prg)
+    self.assertFalse(any(u.op in (Ops.CDIV, Ops.CMOD) for u in _prg_lin(prg).src))
+    self.assertLess(len(_prg_lin(prg).src), 40)
+
   def test_max_assembles(self):
     for dtype in (dtypes.uint32, dtypes.int32, dtypes.float32):
       with self.subTest(dtype=dtype):
@@ -3008,6 +3023,15 @@ class TestAMDRenderer(unittest.TestCase):
     rt = _amd_rt(prg)
     rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [-21, 19, 21, -19])
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_bounded_negative_divmod_smoke(self):
+    out = Tensor.empty(2, dtype=dtypes.int32, device="AMD").contiguous().realize()
+    buf, prg = out._buffer().ensure_allocated(), _bounded_negative_divmod_program()
+    rt = _amd_rt(prg)
+    for n in (1, 2, 4127):
+      rt(buf.get_buf("AMD"), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(n,), wait=True)
+      self.assertEqual(out.tolist(), [0, n-1])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_exp2_smoke(self):
