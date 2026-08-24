@@ -4,7 +4,7 @@ from collections import defaultdict
 from tinygrad.uop.ops import Ops, PatternMatcher, UPat, UOp, GroupOp, exec_alu
 from tinygrad.dtype import PyConst, ConstType, dtypes, can_lossless_cast, Invalid, bitcast, truncate
 from tinygrad.helpers import partition, all_same, prod, flatten, unwrap, IMAGE, dedup
-from tinygrad.uop.divandmod import div_and_mod_symbolic
+from tinygrad.uop.divandmod import affine_int_bounds, div_and_mod_symbolic
 from tinygrad.uop.movement import mop_cleanup
 from tinygrad.uop.weak import commit_weak
 
@@ -106,6 +106,11 @@ def fold_const_where(gate:UOp, c0:UOp, c1:UOp, w:UOp) -> UOp:
   ret = c0 if gate.val else c1
   return commit_weak(ret, w.dtype) if ret.op is Ops.CONST and ret.dtype in dtypes.weaks and w.dtype not in dtypes.weaks else ret
 
+def fold_neg_floor_max_one(x:UOp, d:UOp) -> UOp|None:
+  # If 0 <= x < -d with d < 0, floor(x/d) is -1 or 0, so max(-floor(x/d), 1) is 1.
+  gap = affine_int_bounds(-d-x) if x.vmin >= 0 and d.vmax < 0 else None
+  return x.const_like(1) if gap is not None and gap[0] > 0 else None
+
 symbolic_simple = pm_data_invalid + PatternMatcher([
   # ** self folding **
   (UPat({Ops.ADD, Ops.XOR, Ops.OR}, src=[UPat.var("x"), UPat.const(0)]), lambda x: x),  # x+0 / x^0 / x|0 -> x
@@ -114,6 +119,8 @@ symbolic_simple = pm_data_invalid + PatternMatcher([
   (UPat.var("x") // UPat.var("x"), lambda x: x.const_like(1)), # x//x -> 1
   (UPat.var("x") // 1, lambda x: x),   # x//1 -> x
   (UPat.var("x") // -1, lambda x: -x), # x//-1 -> -x
+  (UPat(Ops.MAX, src=(UPat(Ops.MUL, src=(UPat(Ops.FLOORDIV, src=(UPat.var("x"), UPat.var("d"))), UPat.const(-1))), UPat.const(1))),
+   fold_neg_floor_max_one),
   ((UPat.var("x") ^ UPat.var("y")) ^ UPat.var("y"), lambda x,y: x), # (x^y)^y -> x
   ((UPat.var() % UPat.var("y")).named("base") % UPat.var("y"), lambda base,y: base),  # (x%y)%y = -> x%y (rewritten with base for speed)
   # variations of (x%c)+(x//c)*c = x (ints too: index dtype lowers weakint→int before final symbolic)

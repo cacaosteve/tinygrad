@@ -553,7 +553,7 @@ class TestSymbolic(unittest.TestCase):
     self.helper_test_variable((d*a*20+b*d*5+10)//(5*d), 0, 52, "((b+(a*4))+(2//d))")
 
   def test_mod_gcd_factor_neg(self):
-    self.helper_test_variable((Variable("a", 0, 10)*-4+4)%8, 0, 4, "((a*-1+1)%2*4)")
+    self.helper_test_variable((Variable("a", 0, 10)*-4+4)%8, 0, 4, "((a+1)%2*4)")
 
   def test_mod_gcd_fold_neg(self):
     self.helper_test_variable((Variable("a", 0, 10)*-8+20)%4, 0, 0, "0")
@@ -663,6 +663,27 @@ class TestSymbolic(unittest.TestCase):
     a = Variable("a", 0, 3)
     b = Variable("b", 0, 1)
     self.helper_test_variable((d*a+b)%d, 0, 1, "b")
+
+  def test_mod_large_coefficient_congruence(self):
+    r = Variable("r", 0, 128255)
+    self.helper_test_variable((r*-64127)%64128, 0, 64127, "(r%64128)")
+
+  def test_range_dependent_variable_mod(self):
+    # Symbolic arange/cumsum lowering: both ranges are bounded by n, relationships that
+    # ordinary global vmin/vmax cannot retain when n itself is a variable.
+    n = Variable("n", 1, 32)
+    r0, r1 = UOp.range(n, 0), UOp.range(n, 1)
+    stride = (2*n-1) * (-((n-1)//(1-2*n))).maximum(1) + 1
+    expr = ((stride*r0+r1) % (n*stride)) % (2*n-1)
+    simplified = graph_rewrite(expr, sym, name="simplify dependent range mod")
+    self.check_equal_z3(expr, simplified)
+    self.assertIs(simplified, r0+r1)
+
+    # Increasing the inner range by one permits the outer modulo to wrap, so it must remain.
+    wide = UOp.range(n+1, 2)
+    wrapping = graph_rewrite(((2*n*r0+wide) % (2*n*n)) % (2*n-1), sym, name="keep wrapping range mod")
+    self.check_equal_z3(((2*n*r0+wide) % (2*n*n)) % (2*n-1), wrapping)
+    self.assertTrue(any(u.op is Ops.FLOORMOD for u in wrapping.toposort()))
 
   def test_divmod_variable_denom_fold_to_const(self):
     x = Variable("x", 20, 23)

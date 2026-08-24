@@ -3,6 +3,59 @@ from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import unwrap
 
+def affine_int_bounds(x:UOp) -> tuple[int, int]|None:
+  """Bounds for affine integer expressions, preserving RANGE < end dependencies."""
+  def const_int(u:UOp) -> int|None:
+    if u.op is Ops.CONST: return int(u.val)
+    if u.op is Ops.CAST and u.dtype in dtypes.ints+(dtypes.weakint,) and u.src[0].dtype in dtypes.ints+(dtypes.weakint,) \
+       and not u.src[0].overflows(u.dtype): return const_int(u.src[0])
+    return None
+
+  def form(u:UOp) -> tuple[dict[UOp, int], int]|None:
+    if (c:=const_int(u)) is not None: return {}, c
+    if u.op is Ops.CAST and u.dtype in dtypes.ints and u.src[0].dtype in dtypes.ints+(dtypes.weakint,):
+      return form(u.src[0]) if not u.src[0].overflows(u.dtype) else None
+    if u.op in (Ops.PARAM, Ops.SPECIAL, Ops.RANGE): return {u:1}, 0
+    if u.op in (Ops.ADD, Ops.SUB):
+      if u.dtype not in dtypes.ints+(dtypes.weakint,) or u.overflows(u.dtype): return None
+      if (a:=form(u.src[0])) is None or (b:=form(u.src[1])) is None: return None
+      sign = -1 if u.op is Ops.SUB else 1
+      coeffs = dict(a[0])
+      for atom, coeff in b[0].items(): coeffs[atom] = coeffs.get(atom, 0) + sign * coeff
+      return coeffs, a[1] + sign * b[1]
+    if u.op is Ops.MUL:
+      if u.dtype not in dtypes.ints+(dtypes.weakint,) or u.overflows(u.dtype): return None
+      if (c:=const_int(u.src[0])) is not None: other = u.src[1]
+      elif (c:=const_int(u.src[1])) is not None: other = u.src[0]
+      else: return None
+      if (f:=form(other)) is None: return None
+      return {atom:c*coeff for atom,coeff in f[0].items()}, c*f[1]
+    return None
+
+  def bound(f:tuple[dict[UOp, int], int], upper:bool) -> int|None:
+    # Substitute each RANGE with either 0 or end-1 while the expression is still affine.
+    # Combining coefficients before taking PARAM extrema preserves correlations such as
+    # 2*n-1-RANGE(n)-RANGE(n) == 1 at its lower bound.
+    coeffs:dict[UOp, int] = {}
+    total = f[1]
+    for atom, coeff in f[0].items():
+      if atom.op is not Ops.RANGE:
+        coeffs[atom] = coeffs.get(atom, 0) + coeff
+        continue
+      if (coeff > 0) != upper: continue
+      if (end:=form(atom.src[0]-1)) is None or any(a.op is Ops.RANGE for a in end[0]): return None
+      total += coeff*end[1]
+      for a, c in end[0].items(): coeffs[a] = coeffs.get(a, 0) + coeff*c
+    for atom, coeff in coeffs.items():
+      extreme = atom.vmax if (coeff > 0) == upper else atom.vmin
+      if not isinstance(extreme, int): return None
+      total += coeff*extreme
+    return total
+
+  if (f:=form(x)) is None: return None
+  lo, hi = bound(f, False), bound(f, True)
+  return None if lo is None or hi is None else (lo, hi)
+
 # NOTE: this cache is only on index UOps
 @functools.cache
 def fold_divmod_general(d: UOp) -> UOp|None:
@@ -47,6 +100,12 @@ def fold_divmod_general(d: UOp) -> UOp|None:
         if d.op is Ops.FLOORMOD: return rem - rem.vmin//c*c
         return sum((f-r)//c * v for f,r,v in zip(factors,rems,terms)) + const//c + rem.vmin//c
 
+    # A lone coefficient congruent to one can be canonicalized even when its range crosses
+    # several periods: ((1-k*c)*r+b)%c == (r+b)%c. Keeping the large negative coefficient
+    # would otherwise make late software division needlessly wide.
+    if d.op is Ops.FLOORMOD and len(terms) == 1 and factors[0] != 1 and factors[0]%c == 1 and terms[0].vmin >= 0:
+      return (terms[0] + const%c) % y
+
     # gcd_with_remainder: factor out common gcd from numerator
     if (g:=math.gcd(*factors, c)) > 1:
       new_x = unwrap(x_peeled.divides(g)).simplify() + (const//g)%(c//g)
@@ -73,6 +132,40 @@ def fold_divmod_general(d: UOp) -> UOp|None:
   # These rules apply to variables OR constants that failed the checks above.
   # Reconstruct all uops including const for these checks.
   all_uops = list(x.split_uop(Ops.ADD))
+
+  # Dependent ranges retain RANGE < end even when global vmin/vmax loses that relationship.
+  if x.vmin >= 0 and y.vmin > 0 and (gap:=affine_int_bounds(y-x)) is not None and gap[0] > 0:
+    return x if d.op is Ops.FLOORMOD else x.const_like(0)
+
+  # Mixed-radix identity: (a*f+b) < k*f when a<k and b<f. Candidate f comes from
+  # a RANGE-bearing numerator term, so it also works when f and k are symbolic.
+  if x.vmin >= 0 and y.vmin > 0:
+    candidates = {factor.simplify() for u in all_uops for r in u.split_uop(Ops.MUL)
+                  if r.op is Ops.RANGE and (factor:=u.divide_exact(r)) is not None}
+    for factor in candidates:
+      if (k:=y.divide_exact(factor)) is None: continue
+      quotients:list[UOp] = []
+      remainders:list[UOp] = []
+      for u in all_uops:
+        (quotients if (q:=u.divide_exact(factor)) is not None else remainders).append(q if q is not None else u)
+      a, b = sum(quotients, x.const_like(0)), sum(remainders, x.const_like(0))
+      agap, bgap = affine_int_bounds(k-a), affine_int_bounds(factor-b)
+      if a.vmin >= 0 and b.vmin >= 0 and agap is not None and bgap is not None and agap[0] > 0 and bgap[0] > 0:
+        return x if d.op is Ops.FLOORMOD else x.const_like(0)
+
+  # Reduce coefficients modulo a symbolic denominator when their difference is an affine constant.
+  if d.op is Ops.FLOORMOD and x.vmin >= 0 and y.vmin > 0 and y.op is not Ops.CONST:
+    new_uops, changed = [], False
+    for u in all_uops:
+      nu = u
+      for r in u.split_uop(Ops.MUL):
+        if r.op is not Ops.RANGE or (factor:=u.divide_exact(r)) is None: continue
+        factor = factor.simplify()
+        if (delta:=affine_int_bounds(factor-y)) is None or delta[0] != delta[1]: continue
+        nu, changed = r*delta[0], True
+        break
+      new_uops.append(nu)
+    if changed: return sum(new_uops, x.const_like(0)) % y
 
   # divide_by_gcd: x//y -> (x//gcd)//(y//gcd)
   # gcd may not exactly divide symbolic x/y; skip instead of asserting.
