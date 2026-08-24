@@ -82,6 +82,12 @@ def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
 def _amd_byte_perm(a:UOp, b:UOp, selectors:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, dtypes.uint32, tuple(x.cast(dtypes.uint32) for x in (a, b, selectors)), arg="__builtin_amdgcn_perm({}, {}, {})")
 
+def _amd_pack_bytes(a:UOp, b:UOp, c:UOp, d:UOp) -> UOp:
+  def perm(x:UOp, y:UOp, selectors:int) -> UOp:
+    return UOp(Ops.CUSTOMI, dtypes.uint32, (x, y, UOp.const(selectors, dtypes.uint32)), arg="__builtin_amdgcn_perm({}, {}, {})")
+  ab, cd = perm(b, a, 0x0c0c0400), perm(d, c, 0x0c0c0400)
+  return perm(cd, ab, 0x05040100)
+
 def _amd_load(ptr:UOp, lanes:int|None=None) -> UOp:
   assert ptr.op is Ops.INDEX
   if lanes is None: return UOp(Ops.CUSTOMI, ptr.dtype, (ptr,), arg="__builtin_nontemporal_load({0})")
@@ -179,7 +185,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_
       low = _amd_load(raw[base + (pos//128)*64 + within%64], 4) >> ((within//64)*4).cast(dtypes.uint8)
       high = _amd_load(raw[base + 128 + (pos//128)*32 + within%32], 4) >> ((within//32)*2).cast(dtypes.uint8)
       quant = ((low & 15) | ((high & 3) << 4)).bitcast(dtypes.int8) - 32
-      word = sum((quant[i].cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
+      word = _amd_pack_bytes(*(quant[i] for i in range(4)))
       dots[word_idx//4] = _amd_dp4a(word, xwords[word_idx], dots[word_idx//4])
     scales = [raw[base + 192 + subgroup*2+i].cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(2)]
     dbits = raw[base+208].cast(dtypes.uint16) | (raw[base+209].cast(dtypes.uint16) << 8)
