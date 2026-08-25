@@ -111,10 +111,21 @@ _F32_UNARY = {AMDOps.RECIPROCAL: r3.v_rcp_f32_e32, AMDOps.EXP2: r3.v_exp_f32_e32
 _ISEL_UNARY = {Ops.RECIPROCAL: AMDOps.RECIPROCAL, Ops.EXP2: AMDOps.EXP2, Ops.LOG2: AMDOps.LOG2, Ops.SQRT: AMDOps.SQRT,
                Ops.TRUNC: AMDOps.TRUNC, Ops.SIN: AMDOps.SIN}
 
+def _unwrap_const(x:UOp) -> UOp|None:
+  while x.op in (Ops.CAST, Ops.BITCAST, Ops.NOOP) and len(x.src) == 1: x = x.src[0]
+  return x if x.op is Ops.CONST else None
+
+def _const_value(x:UOp):
+  return c.val if (c:=_unwrap_const(x)) is not None else None
+
+def _tconst(value, dtype:DType, tag=None) -> UOp:
+  """Typed bare constant for renderer-internal graphs, after the program spec boundary."""
+  return UOp(Ops.CONST, dtype, arg=dtype.const(value), tag=tag)
+
 def _elem_count(u:UOp) -> int:
   """Logical vector element count. INS shape is always scalar; width lives in the opcode/srcs."""
   if u.op is Ops.AFTER: return _elem_count(u.src[0])
-  if u.op is Ops.SHRINK and len(u.src) > 2 and u.src[2].op is Ops.CONST: return int(u.src[2].arg)
+  if u.op is Ops.SHRINK and len(u.src) > 2 and (n:=_const_value(u.src[2])) is not None: return int(n)
   if u.op is Ops.INS:
     if u.arg is AMDOps.WMMA: return 8
     if u.arg is AMDOps.PACK: return len(u.src)
@@ -124,7 +135,7 @@ def _elem_count(u:UOp) -> int:
       return len(u.src)
     if u.arg is AMDOps.EXTRACT: return 1
     if u.arg in (AMDOps.LOAD, AMDOps.LLOAD, AMDOps.SLOAD):
-      return int(u.src[2].arg) if len(u.src) > 2 and u.src[2].op is Ops.CONST else 1
+      return int(n) if len(u.src) > 2 and (n:=_const_value(u.src[2])) is not None else 1
     if u.arg is AMDOps.MOV and u.src and u.src[0].op is not Ops.SPECIAL: return _elem_count(u.src[0])
     return 1
   try: return u.max_numel()
@@ -141,7 +152,7 @@ def _reg_slots(u:UOp) -> int:
       return max(1, len(u.src) // 2)
     if u.arg is AMDOps.EXTRACT: return 1
     if u.arg is AMDOps.FILL:
-      return int(u.src[1].arg) if len(u.src) > 1 and u.src[1].op is Ops.CONST else 1
+      return int(n) if len(u.src) > 1 and (n:=_const_value(u.src[1])) is not None else 1
     if u.arg in (AMDOps.LOAD, AMDOps.LLOAD, AMDOps.SLOAD):
       return max(1, (u.dtype.itemsize * _elem_count(u) + 3) // 4)
     if u.arg in (AMDOps.STORE, AMDOps.LSTORE, AMDOps.SSTORE): return _reg_slots(u.src[2])
@@ -151,7 +162,7 @@ def _reg_slots(u:UOp) -> int:
   return max(1, (u.dtype.itemsize * _elem_count(u) + 3) // 4)
 
 def _mem_itemsize(dt:DType) -> int: return dt.itemsize
-def _load_count_src(n:int) -> UOp: return UOp.const(n, dtypes.int32).rtag()
+def _load_count_src(n:int) -> UOp: return _tconst(n, dtypes.int32).rtag()
 def _reg_to_amd(reg:Register, sz:int=1) -> Reg:
   if reg.index >= 256:
     idx = reg.index - 256
@@ -186,16 +197,12 @@ def _parallel_vmov(moves:list[tuple[Reg, Reg|int|float]]) -> list:
       pending = [(dst, TMP_VDATA if isinstance(s, Reg) and s == src else s) for dst,s in pending]
   return ret
 
-def _unwrap_const(x:UOp) -> UOp|None:
-  while x.op in (Ops.CAST, Ops.BITCAST, Ops.NOOP) and len(x.src) == 1: x = x.src[0]
-  return x if x.op is Ops.CONST else None
-
 def _src(x:UOp):
   if x.op is Ops.AFTER: return _src(x.src[0])
   if (c:=_unwrap_const(x)) is not None:
-    if x.dtype is dtypes.float32: return float(c.arg)
-    if x.dtype is dtypes.float16: return struct.unpack("H", struct.pack("e", float(c.arg)))[0]
-    return int(c.arg)
+    if x.dtype is dtypes.float32: return float(c.val)
+    if x.dtype is dtypes.float16: return struct.unpack("H", struct.pack("e", float(c.val)))[0]
+    return int(c.val)
   if not isinstance(greg(x), Register): raise CompileError(f"expected reg src {x}")
   if _elem_count(x) > 1: return _reg_lane(greg(x), 0)
   return _reg_to_amd(greg(x), _reg_slots(x))
@@ -456,17 +463,17 @@ def _lds_offsets(ctx:IselContext) -> dict[int, int]:
 def _lds_base(ctx:IselContext, x:UOp) -> UOp|None:
   if x.addrspace is not AddrSpace.LOCAL: return None
   return UOp(Ops.INS, dtypes.uint32,
-             (UOp.const(_lds_size_bytes(x), dtypes.int32).rtag(), UOp.const(_lds_offsets(ctx)[x.arg.slot], dtypes.int32).rtag()),
+             (_tconst(_lds_size_bytes(x), dtypes.int32).rtag(), _tconst(_lds_offsets(ctx)[x.arg.slot], dtypes.int32).rtag()),
              AMDOps.LDS_BASE)
 
 def _lds_base_offset(x:UOp) -> int:
   if x.op is Ops.AFTER: return _lds_base_offset(x.src[0])
-  if x.op is Ops.INS and x.arg is AMDOps.LDS_BASE: return x.src[1].arg
+  if x.op is Ops.INS and x.arg is AMDOps.LDS_BASE: return _const_int(x.src[1]) or 0
   return 0
 
 def _scratch_base_offset(x:UOp) -> int:
   if x.op is Ops.AFTER: return _scratch_base_offset(x.src[0])
-  if x.op is Ops.INS and x.arg is AMDOps.SCRATCH_ADDR: return x.src[0].arg
+  if x.op is Ops.INS and x.arg is AMDOps.SCRATCH_ADDR: return _const_int(x.src[0]) or 0
   return 0
 
 def _local_addr(base:UOp, idx:UOp, itemsize:int) -> tuple[list, Reg]:
@@ -489,9 +496,9 @@ def _reg_mem_key(base:UOp, idx:UOp) -> tuple[UOp, int]|None:
   return buf, off
 
 def _is_zero_val(val:UOp) -> bool:
-  if (c:=_unwrap_const(val)) is not None: return c.arg == 0
+  if (c:=_unwrap_const(val)) is not None: return c.val == 0
   if val.op is Ops.INS and val.arg is AMDOps.MOV and val.src and (c:=_unwrap_const(val.src[0])) is not None:
-    return c.arg == 0
+    return c.val == 0
   return False
 
 def _is_identity_sload(val:UOp, key:tuple[UOp, int]) -> bool:
@@ -567,16 +574,16 @@ def _amd_fused_d16(ctx:PreRegAllocContext) -> set[UOp]:
   return ctx.scratch.get("fused_d16") or set()
 
 def _const_int(x:UOp) -> int|None:
-  if (c:=_unwrap_const(x)) is not None: return int(c.arg)
-  if x.op is Ops.INS and x.arg is AMDOps.MOV and x.src and (c:=_unwrap_const(x.src[0])) is not None: return int(c.arg)
+  if (c:=_unwrap_const(x)) is not None: return int(c.val)
+  if x.op is Ops.INS and x.arg is AMDOps.MOV and x.src and (c:=_unwrap_const(x.src[0])) is not None: return int(c.val)
   return None
 
 def _is_wmma_acc_reload_pack(cin:UOp, ctx:PreRegAllocContext|None=None) -> bool:
   if cin.op is not Ops.INS or cin.arg is not AMDOps.PACK or len(cin.src) != 8: return False
   if all(s.op is Ops.INS and s.arg is AMDOps.SLOAD for s in cin.src): return True
   # LDS product-16: cin is PACK of zero MOVs (register path uses SLOAD reload).
-  if all(s.op is Ops.INS and s.arg is AMDOps.MOV and s.src and s.src[0].op is Ops.CONST and
-         s.src[0].dtype is dtypes.float and float(s.src[0].arg) == 0.0 for s in cin.src):
+  if all(s.op is Ops.INS and s.arg is AMDOps.MOV and s.src and s.src[0].dtype is dtypes.float and
+         _const_value(s.src[0]) == 0.0 for s in cin.src):
     return True
   # SLOAD may already have been rewritten to EXTRACT from the zero-init packs
   if ctx is not None and all(s.op is Ops.INS and s.arg is AMDOps.EXTRACT for s in cin.src):
@@ -643,7 +650,7 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
       tile = next_tile
       next_tile += 1
     seen.add(tid)
-    init = UOp(Ops.INS, dtypes.float, tuple(UOp.const(0.0, dtypes.float32) for _ in range(8)), AMDOps.PACK, pack.tag)
+    init = UOp(Ops.INS, dtypes.float, tuple(_tconst(0.0, dtypes.float32) for _ in range(8)), AMDOps.PACK, pack.tag)
     inits.append(init)
     tiles[tile] = init
     for lane, idx in enumerate(sload_idxs):
@@ -704,10 +711,10 @@ def _ds_off(byte_off:int) -> dict:
   return {"offset0": byte_off & 0xff, "offset1": (byte_off >> 8) & 0xff}
 
 def _mem_byte_off(u:UOp, src_i:int=3) -> int:
-  return int(u.src[src_i].arg) if len(u.src) > src_i and u.src[src_i].op is Ops.CONST else 0
+  return _const_int(u.src[src_i]) or 0 if len(u.src) > src_i else 0
 
 def _is_b_compact_load(u:UOp) -> bool:
-  return len(u.src) > 3 and u.src[3].op is Ops.CONST and u.src[3].tag == "b_compact"
+  return len(u.src) > 3 and _const_value(u.src[3]) is not None and u.src[3].tag == "b_compact"
 
 def _lds_byte_off(u:UOp) -> int:
   return _mem_byte_off(u, 3)
@@ -718,14 +725,14 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
     raw = UOp(Ops.LOAD, x.dtype, (a,))
     if n == 1: return gate.where(raw, alt)
     return UOp(Ops.STACK, x.dtype, tuple(
-      gate.where(raw.index(UOp.const(i, dtypes.weakint)), alt.index(UOp.const(i, dtypes.weakint)) if alt.max_numel() > 1 else alt)
+      gate.where(raw.index(_tconst(i, dtypes.weakint)), alt.index(_tconst(i, dtypes.weakint)) if alt.max_numel() > 1 else alt)
       for i in range(n)))
   count = _load_count_src(n)
   if _is_lds_ref(a.src[0]):
     if _local_load(x.dtype, n) is None and not (x.dtype is dtypes.half and n == 16):
       raise CompileError(f"no lds load {x.dtype} x{n}")
     idx, off = _peel_add_imm(a.src[1], _mem_itemsize(x.dtype))
-    src = (a.src[0], idx, count) if off == 0 else (a.src[0], idx, count, UOp.const(off, dtypes.int32).rtag())
+    src = (a.src[0], idx, count) if off == 0 else (a.src[0], idx, count, _tconst(off, dtypes.int32).rtag())
     return x.ins(AMDOps.LLOAD, dtype=x.dtype, src=src)
   if _is_scratch_ref(a.src[0]):
     if _scratch_load(x.dtype, n) is None: raise CompileError(f"no scratch load {x.dtype} x{n}")
@@ -742,11 +749,11 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
         page, rem = divmod(total, 0x1000)
         idx = _b_page_idx(base, page, itemsize)
         # Always attach rem (incl. 0) tagged so emit can in-place <<1 safely.
-        src = (a.src[0], idx, count, UOp.const(rem, dtypes.int32).rtag("b_compact"))
+        src = (a.src[0], idx, count, _tconst(rem, dtypes.int32).rtag("b_compact"))
         return x.ins(AMDOps.LOAD, dtype=x.dtype, src=src)
     elif getenv("AMD_B_LSHL_ADD", 1):
       idx, off = _peel_add_imm(a.src[1], itemsize, max_byte=0x7fffffff, deep=True)
-      src = (a.src[0], idx, count) if off == 0 else (a.src[0], idx, count, UOp.const(off, dtypes.int32).rtag())
+      src = (a.src[0], idx, count) if off == 0 else (a.src[0], idx, count, _tconst(off, dtypes.int32).rtag())
       return x.ins(AMDOps.LOAD, dtype=x.dtype, src=src)
   return x.ins(AMDOps.LOAD, dtype=x.dtype, src=(a.src[0], a.src[1], count))
 
@@ -760,7 +767,7 @@ def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
     if peel:
       # Peel base+imm so one addr VGPR is shared (TC_LDS C-stores: 64 ADD(base,imm) → few bases).
       idx, off = _peel_add_imm(a.src[1], _mem_itemsize(val.dtype), max_byte=max_byte, deep=deep)
-      src = (a.src[0], idx, val) if off == 0 else (a.src[0], idx, val, UOp.const(off, dtypes.int32).rtag())
+      src = (a.src[0], idx, val) if off == 0 else (a.src[0], idx, val, _tconst(off, dtypes.int32).rtag())
       return x.ins(op, src=src)
     return x.ins(op, src=(a.src[0], a.src[1], val))
   if _is_lds_ref(a.src[0]): return try_store(_local_store, AMDOps.LSTORE, peel=True)
@@ -770,21 +777,21 @@ def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
   return try_store(_global_store, AMDOps.STORE, peel=True, max_byte=0x7fffffff, deep=True)
 
 def _lane_const(x:UOp) -> int|None:
-  if (c:=_unwrap_const(x)) is not None: return c.arg
-  if x.op is Ops.INS and x.arg is AMDOps.MOV and len(x.src) == 1 and (c:=_unwrap_const(x.src[0])) is not None: return c.arg
+  if (c:=_unwrap_const(x)) is not None: return int(c.val)
+  if x.op is Ops.INS and x.arg is AMDOps.MOV and len(x.src) == 1 and (c:=_unwrap_const(x.src[0])) is not None: return int(c.val)
   return None
 
 def _extract_vec_lane(x:UOp) -> UOp|None:
   if len(x.src) != 2 or (lane:=_lane_const(x.src[1])) is None: return None
   if x.src[0].op is Ops.WMMA:
-    return UOp(Ops.INS, dtypes.float32, (x.src[0], UOp.const(lane, dtypes.int32).rtag()), AMDOps.EXTRACT)
+    return UOp(Ops.INS, dtypes.float32, (x.src[0], _tconst(lane, dtypes.int32).rtag()), AMDOps.EXTRACT)
   n = _elem_count(x.src[0])
   if n == 1 and lane == 0 and x.src[0].addrspace in (None, AddrSpace.ALU): return x.src[0]
   if n == 1: return None
   sc = x.src[0].dtype
   if sc not in (dtypes.float32, dtypes.float16): raise CompileError(f"no extract from {x.src[0].dtype}")
   if not 0 <= lane < n: raise CompileError(f"lane {lane} oob for {x.src[0].dtype} x{n}")
-  return UOp(Ops.INS, sc, (x.src[0], UOp.const(lane, dtypes.int32).rtag()), AMDOps.EXTRACT)
+  return UOp(Ops.INS, sc, (x.src[0], _tconst(lane, dtypes.int32).rtag()), AMDOps.EXTRACT)
 
 def _pack_vec(x:UOp) -> UOp|None:
   if x.max_numel() == 1 and len(x.src) <= 1: return None
@@ -820,15 +827,14 @@ def _wmma_ab_vec_loads(elems:tuple[UOp, ...]) -> tuple[UOp, ...]|None:
   i = 0
   while i < 16:
     e = elems[i]
-    if e.op is not Ops.INDEX or len(e.src) != 2 or e.src[1].op is not Ops.CONST: return None
-    base, lane0 = e.src[0], int(e.src[1].arg)
+    if e.op is not Ops.INDEX or len(e.src) != 2 or (lane0:=_lane_const(e.src[1])) is None: return None
+    base = e.src[0]
     if lane0 != 0 or base.op is not Ops.LOAD: return None
     n = base.max_numel()
     if n < 2 or i + n > 16: return None
     for j in range(n):
       ej = elems[i + j]
-      if (ej.op is not Ops.INDEX or ej.src[0] is not base or ej.src[1].op is not Ops.CONST or
-          int(ej.src[1].arg) != j): return None
+      if ej.op is not Ops.INDEX or ej.src[0] is not base or _lane_const(ej.src[1]) != j: return None
     loads.append(base)
     i += n
   return tuple(loads) if loads else None
@@ -962,7 +968,7 @@ def _amd_custom_intrinsic(x:UOp) -> UOp|None:
     try: offset = int(x.arg[len(AMD_SWIZZLE_PREFIX):-2])
     except ValueError: return None
     if not 0 <= offset <= 0xffff: raise CompileError(f"bad ds_swizzle offset {offset}")
-    return x.ins(AMDOps.SWIZZLE, src=(x.src[0], UOp.const(offset, dtypes.uint32).rtag()))
+    return x.ins(AMDOps.SWIZZLE, src=(x.src[0], _tconst(offset, dtypes.uint32).rtag()))
   return None
 
 def _nontemporal_load(x:UOp) -> UOp|None:
@@ -972,7 +978,7 @@ def _nontemporal_load(x:UOp) -> UOp|None:
 def _bitfield_extract(x:UOp, value:UOp, shift:UOp, mask:UOp) -> UOp|None:
   m = int(mask.val)
   if m <= 0 or (m & (m + 1)) != 0 or (width:=m.bit_length()) >= 32: return None
-  return x.ins(AMDOps.BFE, src=(value, shift, UOp.const(width, dtypes.uint32).rtag()))
+  return x.ins(AMDOps.BFE, src=(value, shift, _tconst(width, dtypes.uint32).rtag()))
 
 def _lshl_or(x:UOp, value:UOp, shift:UOp, other:UOp) -> UOp:
   return x.ins(AMDOps.LSHL_OR, src=(value, shift, other))
@@ -1050,7 +1056,7 @@ def _gated_load(addr:UOp, alt:UOp, gate:UOp, x:UOp) -> UOp|None:
 
 def _pow2_cmod(x:UOp, c:UOp) -> UOp|None:
   if c.arg <= 0 or c.arg & (c.arg - 1) or (x.dtype not in dtypes.uints and x.vmin < 0): return None
-  return x & UOp.const(c.arg - 1, x.dtype)
+  return x & _tconst(c.arg - 1, x.dtype)
 
 class _AMDFastDivRenderer(Renderer):
   def __init__(self): super().__init__(Target("NULL", ""))
@@ -1062,20 +1068,20 @@ def _const_cdiv(x:UOp, c:UOp) -> UOp|None:
 def _const_cmod(x:UOp, c:UOp) -> UOp|None:
   if c.arg <= 0 or x.vmin < 0: return None
   if (q:=_const_cdiv(x, c)) is None: return None
-  return x - q * UOp.const(c.arg, x.dtype)
+  return x - q * _tconst(c.arg, x.dtype)
 
 def _bool_not(x:UOp) -> UOp:
-  return x.where(UOp.const(False, dtypes.bool), UOp.const(True, dtypes.bool))
+  return x.where(_tconst(False, dtypes.bool), _tconst(True, dtypes.bool))
 
 def _u32_divmod(n:UOp, d:UOp, bits:int|None=None) -> tuple[UOp, UOp]:
-  zero, one = UOp.const(0, dtypes.uint32), UOp.const(1, dtypes.uint32)
+  zero, one = _tconst(0, dtypes.uint32), _tconst(1, dtypes.uint32)
   q, r = zero, zero
   # Restoring division only needs the numerator's reachable bits. Symbolic LLM indices are
   # often bounded by max_context; building all 32 rounds makes their kernels enormous.
   for i in range(max(1, int(n.vmax).bit_length() if bits is None else bits) - 1, -1, -1):
-    r = (r << one.const_like(1)) | ((n >> UOp.const(i, dtypes.uint32)) & one)
+    r = (r << _tconst(1, dtypes.uint32)) | ((n >> _tconst(i, dtypes.uint32)) & one)
     ge = _bool_not(r < d)
-    q = q | ge.where(one << UOp.const(i, dtypes.uint32), zero)
+    q = q | ge.where(one << _tconst(i, dtypes.uint32), zero)
     r = ge.where(r - d, r)
   return q, r
 
@@ -1088,13 +1094,13 @@ def _var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
     q, r = _u32_divmod(x.cast(dtypes.uint32), d.cast(dtypes.uint32), int(x.vmax).bit_length())
     return (q if op.op is Ops.CDIV else r).cast(dtypes.int32)
   if x.vmin >= 0 and d.vmax < 0:
-    signed_zero = UOp.const(0, dtypes.int32)
+    signed_zero = _tconst(0, dtypes.int32)
     gap = affine_int_bounds((signed_zero - d) - x)
     if gap is not None and gap[0] > 0: return signed_zero if op.op is Ops.CDIV else x
-    zero = UOp.const(0, dtypes.uint32)
+    zero = _tconst(0, dtypes.uint32)
     q, r = _u32_divmod(x.cast(dtypes.uint32), zero - d.cast(dtypes.uint32), int(x.vmax).bit_length())
     return ((zero - q) if op.op is Ops.CDIV else r).cast(dtypes.int32)
-  zero = UOp.const(0, dtypes.int32)
+  zero = _tconst(0, dtypes.int32)
   xneg, dneg = x < zero, d < zero
   ax, ad = xneg.where(zero - x, x).cast(dtypes.uint32), dneg.where(zero - d, d).cast(dtypes.uint32)
   q, r = _u32_divmod(ax, ad, max(abs(int(x.vmin)), abs(int(x.vmax))).bit_length())
@@ -1108,10 +1114,10 @@ def _narrow_var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
 
 def _cmp_bool_const(x:UOp, m:UOp, c:UOp) -> UOp:
   keep = (x.op is Ops.CMPNE and c.arg is False) or (x.op is Ops.CMPEQ and c.arg is True)
-  return m if keep else m.where(UOp.const(False, dtypes.bool), UOp.const(True, dtypes.bool))
+  return m if keep else m.where(_tconst(False, dtypes.bool), _tconst(True, dtypes.bool))
 
 def _bool_flag(x:UOp) -> UOp:
-  return x.where(UOp.const(True, dtypes.bool), UOp.const(False, dtypes.bool))
+  return x.where(_tconst(True, dtypes.bool), _tconst(False, dtypes.bool))
 
 def _materialize_flags(x:UOp, idx:tuple[int, ...]|None=None) -> UOp|None:
   src, changed = list(x.src), False
@@ -1133,7 +1139,7 @@ def _cast_store_value(x:UOp, a:UOp, val:UOp) -> UOp|None:
 
 def _materialize_bool_where(m:UOp, a:UOp, b:UOp) -> UOp|None:
   if m.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): return None
-  return UOp(Ops.WHERE, a.dtype, (UOp(Ops.CMPNE, dtypes.bool, (m, UOp.const(False, dtypes.bool))), a, b))
+  return UOp(Ops.WHERE, a.dtype, (UOp(Ops.CMPNE, dtypes.bool, (m, _tconst(False, dtypes.bool))), a, b))
 
 def _is_foldable(ctx:IselContext, x:UOp, s:UOp) -> bool: return len(ctx.uses[s]) == x.src.count(s) == 1
 
@@ -1154,7 +1160,7 @@ def _fuse_signed_byte_load_cast(x:UOp, y:UOp) -> UOp|None:
 pre_isel_matcher = PatternMatcher([
   # Renderer legalization runs after the spec check. Canonical constants now arrive as
   # CAST(CONST(weak)); recover a typed bare CONST so the existing immediate isel paths apply.
-  (UPat.cvar("c").cast(name="x"), lambda c,x: UOp.const(c.val, x.dtype)),
+  (UPat.cvar("c").cast(name="x"), lambda c,x: _tconst(c.val, x.dtype)),
   (UPat(Ops.AND, dtype=dtypes.uint8, src=(UPat(Ops.SHR, src=(UPat.var("value"), UPat.var("shift"))), UPat.cvar("mask")),
    name="x"), _bitfield_extract),
   (UPat(Ops.OR, dtype=dtypes.uint8, src=(UPat(Ops.SHL, src=(UPat.var("value"), UPat.var("shift"))), UPat.var("other")),
@@ -1182,7 +1188,7 @@ pre_isel_matcher = PatternMatcher([
   (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), name="a"), UPat.var("val")), allow_any_len=True, name="x"), _cast_store_value),
   (UPat(Ops.WHERE, name="x"), _materialize_where_value_flags),
   (UPat.var("m", dtypes.bool).cast(dtypes.ints+(dtypes.float16, dtypes.float32), name="x"),
-   lambda m,x: m.where(UOp.const(1, x.dtype), UOp.const(0, x.dtype))),
+   lambda m,x: m.where(_tconst(1, x.dtype), _tconst(0, x.dtype))),
   (UPat.var("m", dtypes.bool).where(UPat.var("a"), UPat.var("b")), _materialize_bool_where),
   (UPat(Ops.CAST, dtype=dtypes.float32,
         src=(UPat((Ops.NOOP, Ops.BITCAST), dtype=dtypes.int8, name="y"),), name="x"), _fuse_signed_byte_load_cast),
@@ -1204,12 +1210,12 @@ def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Regis
     (UPat(Ops.INDEX, src=(UPat(Ops.INS, arg=AMDOps.SCRATCH_BASE), UPat.cvar("off")), name="x"),
      lambda off,x: UOp(Ops.INS, dtypes.uint32, (off,), AMDOps.SCRATCH_ADDR)),
     (UPat(Ops.RANGE, src=(UPat.cvar("c"),), allow_any_len=True, name="x"), lambda c,x:
-     x.replace(dtype=dtypes.uint32, src=(UOp.const(c.arg, dtypes.uint32).rtag(),) + x.src[1:])),
+     x.replace(dtype=dtypes.uint32, src=(_tconst(c.arg, dtypes.uint32).rtag(),) + x.src[1:])),
     (UPat(Ops.RANGE, name="x"), lambda ctx,x,sgpr_pool=sgpr_pool:
      x.replace(dtype=dtypes.uint32, tag=(ctx.vreg(sgpr_pool),)) if not isinstance(x.tag, tuple) else None),
     (UPat(Ops.PARAM, name="x"), lambda ctx,x:
      UOp(Ops.INS, dtypes.uint64 if x.arg.addrspace is not AddrSpace.ALU else dtypes.uint32,
-         (UOp.const(_kernarg_offset(ctx, x), dtypes.int32).rtag(),), AMDOps.KERNARG, None)
+         (_tconst(_kernarg_offset(ctx, x), dtypes.int32).rtag(),), AMDOps.KERNARG, None)
      if not isinstance(x.tag, tuple) else None),
     (UPat(Ops.BUFFER, name="x"), lambda ctx,x: _lds_base(ctx, x)),
     (UPat(Ops.SPECIAL, name="x"), lambda ctx,x,vgpr_pool=vgpr_pool:
@@ -1257,7 +1263,7 @@ def _loop_label(x:UOp) -> str: return "_".join(str(i) for i in x.arg[:-1])
 
 def _lower_range(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
   loop_label = _loop_label(x)
-  acc = x.ins(AMDOps.MOV, dtype=dtypes.uint32, src=(UOp.const(0, dtypes.uint32).rtag(),))
+  acc = x.ins(AMDOps.MOV, dtype=dtypes.uint32, src=(_tconst(0, dtypes.uint32).rtag(),))
   label = UOp(Ops.INS, dtypes.void, arg=AMDOps.LABEL, tag=f".LOOP_{loop_label}")
   cmp = UOp(Ops.INS, dtypes.void, (acc, x.src[0]), AMDOps.CMP_GE)
   jump_out = UOp(Ops.INS, dtypes.void, (cmp,), AMDOps.CBRANCH_SCC1, tag=f".LOOP_OUT_{loop_label}")
@@ -1268,7 +1274,7 @@ def _lower_end(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
   loop_label = ctx.loop_label[x.src[1]]
   jmp = UOp(Ops.INS, dtypes.void, arg=AMDOps.BRANCH, tag=f".LOOP_{loop_label}")
   return jmp, [
-    x.src[1].ins(AMDOps.ADD, dtype=dtypes.uint32, src=(x.src[1], UOp.const(1, dtypes.uint32).rtag())),
+    x.src[1].ins(AMDOps.ADD, dtype=dtypes.uint32, src=(x.src[1], _tconst(1, dtypes.uint32).rtag())),
     jmp,
     UOp(Ops.INS, dtypes.void, arg=AMDOps.LABEL, tag=f".LOOP_OUT_{loop_label}")]
 
@@ -1305,7 +1311,7 @@ def _vcc_rematerialize(ctx, x:UOp):
 
 def _lower_late_index(x:UOp) -> tuple[UOp, list[UOp]]: return x, []
 def _store_addr(a:UOp) -> UOp:
-  return a if a.op in (Ops.INDEX, Ops.SHRINK) else UOp(Ops.INDEX, a.dtype, (a, UOp.const(0, dtypes.int32).rtag()))
+  return a if a.op in (Ops.INDEX, Ops.SHRINK) else UOp(Ops.INDEX, a.dtype, (a, _tconst(0, dtypes.int32).rtag()))
 
 def _lower_late_store(ctx, x:UOp, a:UOp, val:UOp, gate:UOp|None=None) -> tuple[UOp, list[UOp]]:
   if x in _amd_skip(ctx): return x, []
@@ -1365,7 +1371,7 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
         if (init:=tiles.get(tile)) is None: return None
       n = ctx.scratch.get("wmma_ext_n", 0)
       ctx.scratch["wmma_ext_n"] = n + 1
-      ext = UOp(Ops.INS, dtypes.float32, (init, UOp.const(lane, dtypes.int32).rtag()), AMDOps.EXTRACT,
+      ext = UOp(Ops.INS, dtypes.float32, (init, _tconst(lane, dtypes.int32).rtag()), AMDOps.EXTRACT,
                 (Register(f"wmma_ext{n}", 0, _cons=VGPR),))
       return ext, [ext]
     if (slot:=_reg_promote_slot(ctx, x.src[0], x.src[1])) is None: return None
@@ -1454,7 +1460,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
           AMDOps.SCRATCH_SIZE | AMDOps.SCRATCH_ADDR | AMDOps.LDS_BASE):
       return []
     case AMDOps.KERNARG:
-      off = u.src[0].arg
+      if (off:=_const_int(u.src[0])) is None: raise CompileError("non-constant kernarg offset")
       load = r3.s_load_b64(sdata=_dst(u), sbase=KERNARG_REG, soffset=NULL, offset=off) if u.dtype.itemsize == 8 else \
              r3.s_load_b32(sdata=_dst(u), sbase=KERNARG_REG, soffset=NULL, offset=off)
       return [load]
@@ -1481,7 +1487,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       return [_wmma_inst(u)(vdst=vdst, src0=_reg_to_amd(greg(src0), 8), src1=_reg_to_amd(greg(src1), 8), src2=vdst)]
     case AMDOps.SWIZZLE:
       pre, val = _vgpr_data(TMP_VDATA, u.src[0])
-      offset = int(u.src[1].arg)
+      if (offset:=_const_int(u.src[1])) is None: raise CompileError("non-constant swizzle offset")
       return pre + [r3.ds_swizzle_b32(vdst=_dst(u), addr=val, offset0=offset & 0xff, offset1=offset >> 8)]
     case AMDOps.DOT4:
       pre0, a = _vgpr_data(TMP_VDATA, u.src[0])
@@ -1501,7 +1507,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       pre, value = _vgpr_data(TMP_VDATA, u.src[0])
       return pre + [r3.v_lshl_add_u32(_dst(u), value, _src(u.src[1]), _src(u.src[2]))]
     case AMDOps.EXTRACT:
-      lane = u.src[1].arg
+      if (lane:=_const_int(u.src[1])) is None: raise CompileError("non-constant extract lane")
       src = u.src[0]
       if not isinstance(greg(src), Register): raise CompileError(f"expected vec reg src {u}")
       sc = src.dtype
@@ -1701,7 +1707,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if greg(u).index < 256: raise CompileError("no sgpr scratch fill")
       slots = _reg_slots(u)
       if (disp_uop:=_unwrap_const(u.src[0])) is None: raise CompileError("non-constant scratch fill offset")
-      disp = int(disp_uop.arg)
+      disp = int(disp_uop.val)
       if disp < 0 or disp + (slots-1)*4 > 0xffffffff: raise CompileError(f"scratch fill oob: offset={disp}, slots={slots}")
       if slots > 1:
         # raw VGPR lanes (f32 packs or half2 LDS loads)
@@ -1722,7 +1728,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if greg(u.src[1]).index < 256: raise CompileError("no sgpr scratch spill")
       slots = _reg_slots(u.src[1])
       if (disp_uop:=_unwrap_const(u.src[0])) is None: raise CompileError("non-constant scratch spill offset")
-      disp = int(disp_uop.arg)
+      disp = int(disp_uop.val)
       if disp < 0 or disp + (slots-1)*4 > 0xffffffff: raise CompileError(f"scratch spill oob: offset={disp}, slots={slots}")
       if slots > 1:
         # raw VGPR lanes (f32 packs or half2 LDS loads)
@@ -2461,7 +2467,7 @@ def insts_from_linear(lin:UOp):
 _WMMA_LDS_AXES, _WMMA_LDS_LOOP_BASE, _WMMA_TC = (AxisType.LOCAL, AxisType.WARP), 200, 16
 
 def _range_size(r:UOp) -> int:
-  return int(r.src[0].vmax) if r.src[0].op is Ops.CONST else int(r.vmax) + 1
+  return int(n) if (n:=_const_value(r.src[0])) is not None else int(r.vmax) + 1
 
 def _linearize_ranges(axes:list[UOp]) -> UOp:
   out = axes[0]
@@ -2483,7 +2489,7 @@ def _index_row_stride(idx:UOp) -> int|None:
   for side in e.src:
     if side.op is Ops.MUL:
       for t in side.src:
-        if t.op is Ops.CONST and int(t.arg) > 1: return int(t.arg)
+        if (n:=_const_value(t)) is not None and int(n) > 1: return int(n)
   return None
 
 def _delinearize_ranges(linear:UOp, axes:list[UOp]) -> dict[UOp, UOp]:
@@ -2808,7 +2814,7 @@ def expand_wmma_lds_tiles(u, a, b, c, done_arg, unroll_axis, ctx):
   max_prod = 16 if _allow_upcast16() else 8
   if ta * tb > max_prod: return None
   a_batch = getenv("TC_LDS_A_BATCH", 2)
-  c_stk = c if c.op is Ops.STACK else UOp.stack(*[c.index(UOp.const(i, dtypes.weakint)) for i in range(c.max_numel())])
+  c_stk = c if c.op is Ops.STACK else UOp.stack(*[c.index(_tconst(i, dtypes.weakint)) for i in range(c.max_numel())])
   wmmas: list[UOp] = []
   prev_batch: UOp|None = None
   for i0 in range(0, ta, a_batch):
@@ -2882,8 +2888,8 @@ class AMDRenderer(ISARenderer):
     # Broad unrolling of complex quantized reductions explodes native ISA. It is still valuable
     # for small-output quantized projections, where the 32-way loop is on the decoder's critical path.
     ast_uops = ast.toposort()
-    output_size = next((u.src[0].arg for u in ast_uops if u.op is Ops.PARAM and getattr(u.arg, "slot", None) == 0 and
-                        len(u.src) and u.src[0].op is Ops.CONST), None)
+    output_size = next((n for u in ast_uops if u.op is Ops.PARAM and getattr(u.arg, "slot", None) == 0 and len(u.src) and
+                        (n:=_const_value(u.src[0])) is not None), None)
     quant_buffers = sum(u.op is Ops.PARAM and u.dtype is dtypes.uchar for u in ast_uops)
     small_quant_projection = size == 32 and isinstance(output_size, int) and 0 < output_size <= 512 and \
                              quant_buffers > 0
@@ -3044,7 +3050,7 @@ class AMDRenderer(ISARenderer):
     return UOp(Ops.INS, dtypes.void, (disp, x), AMDOps.SPILL)
   def fill(self, disp:UOp, x:UOp, reg) -> UOp:
     if reg.index < 256: raise CompileError("no sgpr fill")
-    return UOp(Ops.INS, x.dtype, (disp, UOp.const(_reg_slots(x), dtypes.int32).rtag()), AMDOps.FILL, (reg,))
+    return UOp(Ops.INS, x.dtype, (disp, _tconst(_reg_slots(x), dtypes.int32).rtag()), AMDOps.FILL, (reg,))
 
   def asm_str(self, uops:list[UOp], function_name:str) -> str:
     ret = [f".{function_name}:"]

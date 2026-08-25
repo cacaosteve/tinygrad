@@ -53,19 +53,19 @@ def scan_elf_meta(prg:UOp, private_segment_size:int=0):
       n_bufs += 1
       param_sizes[u.arg.slot] = 8
     elif u.op is Ops.INS and getattr(u.arg, "name", None) == "KERNARG":
-      kernarg_size = max(kernarg_size, u.src[0].arg + u.dtype.itemsize)
+      kernarg_size = max(kernarg_size, u.src[0].val + u.dtype.itemsize)
     elif u.op is Ops.INS and getattr(u.arg, "name", None) == "SCRATCH_SIZE":
-      private_segment_size = max(private_segment_size, u.src[0].arg)
+      private_segment_size = max(private_segment_size, u.src[0].val)
     elif u.op is Ops.BUFFER and u.addrspace is AddrSpace.LOCAL:
       lds_size += u.max_numel() * u.dtype.itemsize
     elif u.op is Ops.INS and getattr(u.arg, "name", None) == "LDS_BASE":
-      lds_size = max(lds_size, (u.src[1].arg if len(u.src) > 1 else lds_size) + u.src[0].arg)
+      lds_size = max(lds_size, (u.src[1].val if len(u.src) > 1 else lds_size) + u.src[0].val)
     elif u.op is Ops.SPECIAL and u.arg.startswith("gidx"): gids.add(int(u.arg[-1]))
     elif u.op is Ops.SPECIAL and u.arg.startswith("lidx") and u.vmax > 0: lids.add(int(u.arg[-1]))
   if len(prg.src) > 1 and prg.src[1].op is Ops.LINEAR:
     for u in prg.src[1].src:
       if u.op is Ops.INS and getattr(u.arg, "name", None) == "SCRATCH_SIZE":
-        private_segment_size = max(private_segment_size, u.src[0].arg)
+        private_segment_size = max(private_segment_size, u.src[0].val)
   return n_bufs, n_vars, kernarg_size, param_sizes, lds_size, gids, lids, private_segment_size
 
 def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
