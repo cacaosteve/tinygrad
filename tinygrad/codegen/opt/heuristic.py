@@ -62,6 +62,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       for _ in range(force_unroll): k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
     return k
 
+  # Direct-ISA renderers can provide a narrow, structurally matched quantized-matvec schedule.
+  # Keep this behind a renderer hook: native backends may need explicit unrolling that LLVM performs itself.
+  if (quant_mv:=getattr(k.ren, "apply_quant_matvec_opts", None)) is not None and quant_mv(k): return k
+
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
   if IMAGE:
     for buf_index,buf in enumerate(k.bufs):

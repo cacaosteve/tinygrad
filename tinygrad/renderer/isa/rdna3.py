@@ -2893,6 +2893,31 @@ class AMDRenderer(ISARenderer):
     if size <= 3 or len(ast_uops) <= 32: return 0
     return None
 
+  def apply_quant_matvec_opts(self, k) -> bool:
+    """Expose memory-level parallelism that LLVM's loop optimizer otherwise supplies for Q8_0/IQ4_XS GEMV."""
+    from tinygrad.codegen.opt import Opt, OptOps
+    if k.reduceop is None or k.reduceop.arg[0] is not Ops.ADD or not isinstance(output_size:=prod(k.output_shape), int) or output_size < 1024:
+      return False
+    if not any(u.op is Ops.PARAM and u.dtype is dtypes.uchar for u in k.ast.toposort()): return False
+    reduce_sizes = tuple(k.full_shape[a] for a in k.axes_of(AxisType.REDUCE))
+
+    # Q8_0: use 16 lanes on the outer block loop and expose eight packed values per iteration.
+    if len(reduce_sizes) == 2 and reduce_sizes[-1] == 32 and isinstance(reduce_sizes[0], int) and reduce_sizes[0] % 16 == 0:
+      k.apply_opt(Opt(OptOps.GROUP, 0, 16))
+      k.apply_opt(Opt(OptOps.UNROLL, 2, 8))
+      return True
+
+    # IQ4_XS: the dequantized reduction is [blocks, 4, 2, 2, 16]. Use a 2-D 32-128 lane group
+    # and expose the adjacent two-way reduction. More unrolling has no runtime benefit here and
+    # materially increases cold compile time. Cap the first group dimension so larger/unusual
+    # reductions retain the conservative generic schedule.
+    if len(reduce_sizes) == 5 and reduce_sizes[1:] == (4, 2, 2, 16) and isinstance(reduce_sizes[0], int) and \
+       2 <= reduce_sizes[0] <= 32 and output_size % 4 == 0:
+      for opt in (Opt(OptOps.GROUP, 0, 0), Opt(OptOps.GROUP, 0, 0), Opt(OptOps.UNROLL, 3, 0)):
+        k.apply_opt(opt)
+      return True
+    return False
+
   def apply_tc_hand_opts(self, tk, rngs):
     apply_tc_hand_opts(tk, rngs)
 

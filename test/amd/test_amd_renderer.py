@@ -851,17 +851,20 @@ class TestAMDRenderer(unittest.TestCase):
     opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
     self.assertFalse(any(o.op is OptOps.UNROLL for o in opts))
 
-  def test_scheduler_maps_quant_gemv_one_wave_per_row(self):
+  def test_scheduler_maps_quant_gemv(self):
     rows, cols = 8192, 2048
-    cases = (("Q4_K", 12, 256, 144), ("Q5_K", 13, 256, 176), ("Q6_K", 14, 256, 210), ("Q8_0", 8, 32, 34))
+    cases = (("Q4_K", 12, 256, 144), ("Q5_K", 13, 256, 176), ("Q6_K", 14, 256, 210),
+             ("Q8_0", 8, 32, 34), ("IQ4_XS", 23, 256, 136))
     for name, ggml_type, block_elements, block_bytes in cases:
       with self.subTest(name=name):
         qdata = Tensor.empty(rows * cols // block_elements * block_bytes, dtype=dtypes.uint8, device="AMD")
         weights = ggml_data_to_tensor(qdata, rows * cols, ggml_type).reshape(rows, cols)
         with Context(BEAM=0): ast = (weights @ Tensor.empty(cols, device="AMD")).schedule_linear().src[-1].src[0]
         opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
-        expected = (Opt(OptOps.GROUP, 1, 32),) if name == "Q8_0" else (
-          Opt(OptOps.GROUP, 4, 32), Opt(OptOps.UNROLL, 4, 0), Opt(OptOps.UNROLL, 3, 0), Opt(OptOps.UNROLL, 2, 0))
+        if name == "Q8_0": expected = (Opt(OptOps.GROUP, 0, 16), Opt(OptOps.UNROLL, 2, 8))
+        elif name == "IQ4_XS": expected = (Opt(OptOps.GROUP, 0, 0), Opt(OptOps.GROUP, 0, 0), Opt(OptOps.UNROLL, 3, 0))
+        else: expected = (Opt(OptOps.GROUP, 4, 32), Opt(OptOps.UNROLL, 4, 0),
+                          Opt(OptOps.UNROLL, 3, 0), Opt(OptOps.UNROLL, 2, 0))
         self.assertEqual(opts, expected)
 
   def test_to_program_assembles_elf(self):
