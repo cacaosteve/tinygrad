@@ -14,6 +14,7 @@ WMMA_ACC, THREADS_PER_BLOCK = WMMA_M // LANES_PER_WAVE_M, WARP_SIZE * WAVES_M * 
 LDS_PAD, WMMA_ARG, LOG2E = 4, ((WMMA_M, WMMA_N, WMMA_K), 'AMD', 32), math.log2(math.e)
 Q4_K, Q5_K, Q6_K, IQ4_XS, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS = 12, 13, 14, 23, 256, 32, 36, 44, 210, 34
 QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4}  # bytes per 256-weight block
+AMD_PACKED_U8X16_LOAD = "__builtin_nontemporal_load((const unsigned_int4*){0})"
 
 def kernel_var(x:UOp) -> UOp:
   # a Variable is a 0-d ALU BUFFER in the tensor graph; inside kernels it takes the ALU PARAM form (same name keeps the value binding)
@@ -31,6 +32,12 @@ def amd_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   # @function contexts set ALLOW_DEVICE_USAGE=0 (scheduling must not open devices); the device is always open here
   with Context(ALLOW_DEVICE_USAGE=1):
     return (t:=getattr(Device[device], "target", None)) is not None and t[0] == 11
+
+@functools.cache
+def _amd_direct_isa(device:str|tuple[str, ...]|None) -> bool:
+  if isinstance(device, tuple): device = device[0]
+  if device is None or device.split(":")[0] != "AMD": return False
+  with Context(ALLOW_DEVICE_USAGE=1): return Device[device].renderer.__class__.__name__ == "AMDRenderer"
 
 def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
@@ -94,6 +101,13 @@ def _amd_load(ptr:UOp, lanes:int|None=None) -> UOp:
   buf, coords = ptr.src[0], ptr.src[1:]
   idx = sum((coord*math.prod(buf.shape[i+1:]) for i,coord in enumerate(coords)), UOp.const(0, dtypes.weakint))
   return UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(lanes, dtypes.weakint))).load(dtype=ptr.dtype)
+
+def _amd_load_u8x16(ptr:UOp) -> UOp:
+  assert ptr.op is Ops.INDEX and ptr.dtype is dtypes.uint8
+  buf, coords = ptr.src[0], ptr.src[1:]
+  idx = sum((coord*math.prod(buf.shape[i+1:]) for i,coord in enumerate(coords)), UOp.const(0, dtypes.weakint))
+  span = UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(4, dtypes.weakint)))
+  return UOp(Ops.CUSTOMI, dtypes.uint32, (span,), arg=AMD_PACKED_U8X16_LOAD)
 
 def _load_byte(raw:UOp, base:UOp, offset:UOp) -> UOp: return (raw[base + offset//4] >> ((offset&3)*8).cast(dtypes.uint32)) & 255
 def _half(value:UOp) -> UOp: return value.cast(dtypes.uint16).bitcast(dtypes.float16).float()
@@ -179,17 +193,21 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_
       d, scale = _iq4_scales(raw, base, subgroup)
       return dot.float() * xd[token, group] * d * scale
     base = (output*in_features//GGML_BLOCK_SIZE+block)*Q6_BYTES
-    dots = [UOp.const(0, dtypes.int32)] * 2
-    for word_idx in range(8):
-      pos, within = subgroup*32 + word_idx*4, (subgroup*32 + word_idx*4)%128
-      low = _amd_load(raw[base + (pos//128)*64 + within%64], 4) >> ((within//64)*4).cast(dtypes.uint8)
-      high = _amd_load(raw[base + 128 + (pos//128)*32 + within%32], 4) >> ((within//32)*2).cast(dtypes.uint8)
-      quant = ((low & 15) | ((high & 3) << 4)).bitcast(dtypes.int8) - 32
-      word = _amd_pack_bytes(*(quant[i] for i in range(4)))
-      dots[word_idx//4] = _amd_dp4a(word, xwords[word_idx], dots[word_idx//4])
+    dots, sums = [UOp.const(0, dtypes.int32)] * 2, [UOp.const(0, dtypes.int32)] * 2
+    for half in range(2):
+      word_indices = tuple(half*4+i for i in range(4))
+      positions = tuple(subgroup*32 + word_idx*4 for word_idx in word_indices)
+      within = tuple(pos%128 for pos in positions)
+      lows = _amd_load_u8x16(raw[base + (positions[0]//128)*64 + within[0]%64])
+      highs = _amd_load_u8x16(raw[base + 128 + (positions[0]//128)*32 + within[0]%32])
+      for i,(word_idx,off) in enumerate(zip(word_indices, within)):
+        low, high = lows[i] >> ((off//64)*4).cast(dtypes.uint32), highs[i] >> ((off//32)*2).cast(dtypes.uint32)
+        quant = (low & 0x0f0f0f0f) | ((high & 0x03030303) << 4)
+        dots[half] = _amd_dp4a(quant, xwords[word_idx], dots[half])
+        sums[half] = _amd_dp4a(UOp.const(0x01010101, dtypes.uint32), xwords[word_idx], sums[half])
     scales = [raw[base + 192 + subgroup*2+i].cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(2)]
     dbits = raw[base+208].cast(dtypes.uint16) | (raw[base+209].cast(dtypes.uint16) << 8)
-    return (dots[0].float()*scales[0] + dots[1].float()*scales[1]) * xd[token, group] * _half(dbits)
+    return ((dots[0]-sums[0]*32).float()*scales[0] + (dots[1]-sums[1]*32).float()*scales[1]) * xd[token, group] * _half(dbits)
   names = {Q4_K: "linear_q4_k", Q5_K: "linear_q5_k", IQ4_XS: "linear_iq4_xs", Q6_K: "linear_q6"}
   return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type])
 
@@ -441,6 +459,12 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
   T_real, q_start = q.shape[2], None
   if resolve(T_real == 1): return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, assigned_kv.shape[3]))
+  # The direct-ISA renderer does not yet preserve the hand WMMA kernel's value accumulator across multiple N tiles.
+  # Keep prefill correct through the generic lowering until nested WMMA loop-carried state is supported there.
+  if _amd_direct_isa(q.device):
+    k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
+    mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
+    return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]

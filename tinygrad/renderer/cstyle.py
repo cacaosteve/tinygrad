@@ -163,7 +163,7 @@ class CStyleLanguage(Renderer):
     return prg if prefix is None else "\n".join(prefix)+f"\n{prg}"
 
   def render_index(self, x:UOp, buf:UOp, idx:UOp):
-    if buf.addrspace == AddrSpace.ALU:
+    if buf.addrspace == AddrSpace.ALU or (buf.op is Ops.CUSTOMI and buf.max_numel() > 1):
       # this is lane access in C
       if not (idx.op is Ops.CAST and idx.src[0].op is Ops.CONST): return f"({self[buf]})[{self[idx]}]"
       return self[buf]+(f"[{idx.src[0].val}]" if buf.max_numel() > self.gep_arr_threshold else f".{'xyzwabcd'[idx.src[0].val]}")

@@ -5,7 +5,7 @@ from tinygrad import Tensor
 from tinygrad.codegen import Estimates, full_rewrite_to_sink, line_rewrite, linearize, pm_linearize_cleanups, to_program, to_program_cache
 from tinygrad.codegen.late.regalloc import LinearScanRegallocContext, pm_regalloc_rewrite
 from tinygrad.codegen.opt import KernelOptError, Opt, OptOps
-from tinygrad.device import CompileError, Device
+from tinygrad.device import Device
 from tinygrad.dtype import AddrSpace, Invalid, dtypes
 from tinygrad.helpers import Context, Target, getenv
 from tinygrad.llm.gguf import ggml_data_to_tensor
@@ -1973,6 +1973,11 @@ class TestAMDRenderer(unittest.TestCase):
       "v_mov_b32_e32(v[4], v[3])",
     ])
 
+  def test_global_memory_index_is_not_vector_extract(self):
+    base = UOp.placeholder((4,), dtypes.float, slot=0)
+    addr = base.index(UOp.const(0, dtypes.int32))
+    self.assertIsNone(amd_lib._extract_vec_lane(addr))
+
   def test_float4_global_memory_uses_b128_and_scalarized_alu(self):
     prg = _float4_add_program()
     _check_elf(self, prg)
@@ -2854,9 +2859,12 @@ class TestAMDRenderer(unittest.TestCase):
     insts = list(_REN._insts_from_linear(_prg_lin(prg)))
     self.assertTrue(any(i.op_name == "V_ADD_NC_U32_E64" and i.vdst == amd_lib.TMP_VADDR for i in insts))
 
-  def test_duplicate_lds_slot_rejected(self):
-    with self.assertRaises(CompileError):
-      _duplicate_local_slot_program()
+  def test_duplicate_lds_slot_aliases_largest_view(self):
+    prg = _duplicate_local_slot_program()
+    _check_elf(self, prg)
+    bases = [u for u in _prg_lin(prg).src if u.op is Ops.INS and u.arg is AMDOps.LDS_BASE]
+    self.assertEqual(sorted((u.src[0].arg, u.src[1].arg) for u in bases), [(32, 0), (64, 0)])
+    self.assertGreaterEqual(_amd_desc(prg).group_segment_fixed_size, 64)
 
   def test_gidx_metadata_survives_for_descriptor(self):
     prg = _gidx_program()

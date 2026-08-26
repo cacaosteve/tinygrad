@@ -226,7 +226,7 @@ def _global_load_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
     if (load:=_global_load(u.dtype, _elem_count(u))) is None: raise CompileError(f"no global load {u.dtype}")
     return [load(_dst(u), addr, saddr=saddr, **off_kw)]
   # multi-VGPR by byte width: float×2/×4 or half×4/×8 → B64/B128 (ungated only; coalesce rejects gated)
-  if sc not in (dtypes.float16, dtypes.float32): raise CompileError(f"no vec global load {u.dtype}")
+  if sc not in (dtypes.float16, dtypes.float32, dtypes.int32, dtypes.uint32): raise CompileError(f"no vec global load {u.dtype}")
   if not isinstance(greg(u), Register): raise CompileError(f"expected reg dst {u}")
   if slots == 2: return [r3.global_load_b64(_dst(u), addr, saddr=saddr)]
   if slots == 4: return [r3.global_load_b128(_dst(u), addr, saddr=saddr)]
@@ -450,13 +450,16 @@ def _align(x:int, a:int) -> int: return x + (-x % a)
 
 def _lds_offsets(ctx:IselContext) -> dict[int, int]:
   if (offsets:=ctx.scratch.get("lds_offsets")) is None:
-    offsets, slots, off = {}, set(), 0
-    for b in sorted([u for u in ctx.uses if u.op is Ops.BUFFER and u.addrspace is AddrSpace.LOCAL], key=lambda u: u.arg.slot):
-      if b.arg.slot in slots: raise CompileError(f"duplicate lds slot {b.arg.slot}")
-      slots.add(b.arg.slot)
-      off = _align(off, _lds_itemsize(b))
-      offsets[b.arg.slot] = off
-      off += _lds_size_bytes(b)
+    # Slot identity is physical allocation identity: logical buffers may share a slot across disjoint lifetimes.
+    layouts: dict[int, tuple[int, int]] = {}
+    for b in [u for u in ctx.uses if u.op is Ops.BUFFER and u.addrspace is AddrSpace.LOCAL]:
+      align, size = layouts.get(b.arg.slot, (1, 0))
+      layouts[b.arg.slot] = (max(align, _lds_itemsize(b)), max(size, _lds_size_bytes(b)))
+    offsets, off = {}, 0
+    for slot,(align,size) in sorted(layouts.items()):
+      off = _align(off, align)
+      offsets[slot] = off
+      off += size
     ctx.scratch["lds_offsets"] = offsets
   return offsets
 
@@ -716,6 +719,9 @@ def _mem_byte_off(u:UOp, src_i:int=3) -> int:
 def _is_b_compact_load(u:UOp) -> bool:
   return len(u.src) > 3 and _const_value(u.src[3]) is not None and u.src[3].tag == "b_compact"
 
+def _is_byte_addr_load(u:UOp) -> bool:
+  return len(u.src) > 3 and _const_value(u.src[3]) is not None and u.src[3].tag == "byte_addr"
+
 def _lds_byte_off(u:UOp) -> int:
   return _mem_byte_off(u, 3)
 
@@ -783,13 +789,16 @@ def _lane_const(x:UOp) -> int|None:
 
 def _extract_vec_lane(x:UOp) -> UOp|None:
   if len(x.src) != 2 or (lane:=_lane_const(x.src[1])) is None: return None
+  # INDEX into memory is an address. Only ALU values use INDEX as vector lane access.
+  if x.src[0].addrspace not in (None, AddrSpace.ALU): return None
   if x.src[0].op is Ops.WMMA:
     return UOp(Ops.INS, dtypes.float32, (x.src[0], _tconst(lane, dtypes.int32).rtag()), AMDOps.EXTRACT)
   n = _elem_count(x.src[0])
   if n == 1 and lane == 0 and x.src[0].addrspace in (None, AddrSpace.ALU): return x.src[0]
   if n == 1: return None
   sc = x.src[0].dtype
-  if sc not in (dtypes.float32, dtypes.float16): raise CompileError(f"no extract from {x.src[0].dtype}")
+  if sc not in (dtypes.float32, dtypes.float16, dtypes.int32, dtypes.uint32):
+    raise CompileError(f"no extract from {x.src[0].dtype}")
   if not 0 <= lane < n: raise CompileError(f"lane {lane} oob for {x.src[0].dtype} x{n}")
   return UOp(Ops.INS, sc, (x.src[0], _tconst(lane, dtypes.int32).rtag()), AMDOps.EXTRACT)
 
@@ -957,12 +966,16 @@ AMD_ATOMIC_ADD = "__hip_atomic_fetch_add({0}, {1}, __ATOMIC_RELAXED, __HIP_MEMOR
 AMD_DOT4 = "__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)"
 AMD_BYTE_PERM = "__builtin_amdgcn_perm({}, {}, {})"
 AMD_NONTEMPORAL_LOAD = "__builtin_nontemporal_load({0})"
+AMD_PACKED_U8X16_LOAD = "__builtin_nontemporal_load((const unsigned_int4*){0})"
 AMD_MBCNT_LO = "__builtin_amdgcn_mbcnt_lo(-1, 0)"
 AMD_SWIZZLE_PREFIX = "__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {0}), "
 
 def _amd_custom_intrinsic(x:UOp) -> UOp|None:
   if x.arg == AMD_DOT4: return x.ins(AMDOps.DOT4)
   if x.arg == AMD_BYTE_PERM: return x.ins(AMDOps.BYTE_PERM)
+  if x.arg == AMD_PACKED_U8X16_LOAD and len(x.src) == 1 and x.src[0].op is Ops.SHRINK:
+    ptr = x.src[0]
+    return x.ins(AMDOps.LOAD, src=(ptr.src[0], ptr.src[1], _load_count_src(4), _tconst(0, dtypes.int32).rtag("byte_addr")))
   if x.arg == AMD_MBCNT_LO and len(x.src) == 1: return x.src[0]
   if isinstance(x.arg, str) and x.arg.startswith(AMD_SWIZZLE_PREFIX) and x.arg.endswith("))"):
     try: offset = int(x.arg[len(AMD_SWIZZLE_PREFIX):-2])
@@ -1511,7 +1524,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       src = u.src[0]
       if not isinstance(greg(src), Register): raise CompileError(f"expected vec reg src {u}")
       sc = src.dtype
-      if sc is dtypes.float32:
+      if sc in (dtypes.float32, dtypes.int32, dtypes.uint32):
         lane_src = _reg_lane(greg(src), lane)
         return [] if isinstance(greg(u), Register) and greg(u).index == greg(src).index+lane else [r3.v_mov_b32_e32(_dst(u), lane_src)]
       if sc is dtypes.float16:
@@ -1524,7 +1537,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
         if isinstance(greg(u), Register) and greg(u).index == greg(src).index+slot:
           return [r3.v_lshrrev_b32_e64(TMP_VDATA, 16, lane_src), r3.v_mov_b32_e32(_dst(u), TMP_VDATA)]
         return [r3.v_lshrrev_b32_e64(_dst(u), 16, lane_src)]
-      raise CompileError(f"f16/f32 extract only, got {src.dtype}")
+      raise CompileError(f"unsupported extract dtype {src.dtype}")
     case AMDOps.ADD | AMDOps.SUB | AMDOps.MUL:
       return _alu2(u)
     case AMDOps.MULACC:
@@ -1627,7 +1640,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
           if addr != TMP_VDATA: pre = pre + [r3.v_mov_b32_e32(TMP_VDATA, addr)]
           addr = TMP_VDATA
         return pre + [r3.global_load_d16_hi_b16(dst, addr, dst, saddr=_src(u.src[0]))]
-      itemsize, byte_off = _mem_itemsize(u.dtype), _mem_byte_off(u)
+      itemsize, byte_off = (1 if _is_byte_addr_load(u) else _mem_itemsize(u.dtype)), _mem_byte_off(u)
       # Compact B: in-place <<1 on page-idx UOp once (track by UOp id, not phys VGPR —
       # regalloc may reuse the VGPR for a later unscaled page idx).
       if byte_scaled is not None and _is_b_compact_load(u) and _reg_slots(u) == 1 and not masked and itemsize == 2:
