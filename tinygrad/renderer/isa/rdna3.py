@@ -766,8 +766,10 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
   if n == 1 and _mem_itemsize(x.dtype) in (1, 4):
     itemsize = _mem_itemsize(x.dtype)
     idx, off = _peel_add_imm(a.src[1], itemsize, max_byte=0xfff, deep=True)
-    if off > 0:
-      if itemsize == 4: idx = idx << _tconst(2, dtypes.int32)
+    # Keep 64-bit indices intact. Scaling a peeled long index introduces long CASTs after
+    # instruction selection, which ISA lowering cannot encode (notably in spill-heavy kernels).
+    if off > 0 and idx.dtype.itemsize <= 4:
+      if itemsize == 4: idx = idx << _tconst(2, idx.dtype)
       return x.ins(AMDOps.LOAD, dtype=x.dtype,
                    src=(a.src[0], idx, count, _tconst(off, dtypes.int32).rtag("byte_addr")))
   return x.ins(AMDOps.LOAD, dtype=x.dtype, src=(a.src[0], a.src[1], count))
@@ -1559,8 +1561,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
         if u.dtype.itemsize > 4 or u.src[0].dtype.itemsize > 4: raise CompileError(f"no cast {u.src[0].dtype} -> {u.dtype}")
         narrow = u.src[0].dtype if u.src[0].dtype.itemsize <= u.dtype.itemsize else u.dtype
         if narrow in dtypes.uints: return pre + [r3.v_and_b32_e32(_dst(u), (1 << (narrow.itemsize * 8)) - 1, cast_src)]
-        shift = 32 - narrow.itemsize * 8
-        return pre + [r3.v_lshlrev_b32_e64(_dst(u), shift, cast_src), r3.v_ashrrev_i32_e64(_dst(u), shift, _dst(u))]
+        return pre + [r3.v_bfe_i32(_dst(u), cast_src, 0, narrow.itemsize * 8)]
       if u.dtype is dtypes.float32 and u.src[0].dtype is dtypes.float16:
         return pre + [r3.v_cvt_f32_f16_e32(_dst(u), cast_src)]
       if u.src[0].dtype is dtypes.float32 and u.dtype is dtypes.float16:
@@ -1571,10 +1572,8 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
             return pre + [r3.v_cvt_f32_i32_e32(_dst(u), cast_src)]
           # Narrow signed values normally arrive sign-extended from i8/i16 loads, but a
           # BITCAST from u8/u16 is a register no-op and leaves the high bits clear.
-          # Canonicalize the source before using the i32 conversion instruction.
-          shift = 32 - u.src[0].dtype.itemsize * 8
-          return pre + [r3.v_lshlrev_b32_e64(_dst(u), shift, cast_src),
-                        r3.v_ashrrev_i32_e64(_dst(u), shift, _dst(u)),
+          # Sign-extend it in one instruction before using the i32 conversion instruction.
+          return pre + [r3.v_bfe_i32(_dst(u), cast_src, 0, u.src[0].dtype.itemsize * 8),
                         r3.v_cvt_f32_i32_e32(_dst(u), _dst(u))]
         cast_op = r3.v_cvt_f32_i32_e32 if u.src[0].dtype in dtypes.sints else r3.v_cvt_f32_u32_e32
         return pre + [cast_op(_dst(u), cast_src)]

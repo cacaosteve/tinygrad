@@ -1139,8 +1139,8 @@ class TestAMDRenderer(unittest.TestCase):
     prg = _int_signed_narrow_cast_program()
     _check_elf(self, prg)
     inst_names = _amd_inst_names(prg)
-    self.assertIn("V_LSHLREV_B32_E64", inst_names)
-    self.assertIn("V_ASHRREV_I32_E64", inst_names)
+    self.assertIn("V_BFE_I32", inst_names)
+    self.assertNotIn("V_ASHRREV_I32_E64", inst_names)
     self.assertNotIn("V_AND_B32_E32", inst_names)
 
   def test_global_loads_share_single_vmcnt_wait(self):
@@ -1999,13 +1999,23 @@ class TestAMDRenderer(unittest.TestCase):
   def test_scalar_global_load_peels_byte_offset(self):
     buf = UOp.placeholder((128,), dtypes.float, slot=0)
     base = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("base", 260),))
-    addr = buf.index(base + UOp.const(32, dtypes.int32))
+    addr = buf.index(base + UOp.const(32, dtypes.uint32))
     load = addr.load()
     lowered = amd_lib._load_ins(load, addr)
     self.assertIs(lowered.arg, AMDOps.LOAD)
     self.assertTrue(amd_lib._is_byte_addr_load(lowered))
     self.assertEqual(amd_lib._mem_byte_off(lowered), 128)
     self.assertIs(lowered.src[1].op, Ops.SHL)
+    self.assertIs(lowered.src[1].dtype, dtypes.uint32)
+
+  def test_scalar_global_load_keeps_64bit_index(self):
+    buf = UOp.placeholder((128,), dtypes.float, slot=0)
+    base = UOp(Ops.INS, dtypes.int64, arg=AMDOps.DEFINE, tag=(Register("base", 260),))
+    addr = buf.index(base + UOp.const(32, dtypes.int64))
+    lowered = amd_lib._load_ins(addr.load(), addr)
+    self.assertIs(lowered.arg, AMDOps.LOAD)
+    self.assertFalse(amd_lib._is_byte_addr_load(lowered))
+    self.assertIs(lowered.src[1].op, Ops.ADD)
 
   def test_float4_global_memory_uses_b128_and_scalarized_alu(self):
     prg = _float4_add_program()
@@ -2424,8 +2434,8 @@ class TestAMDRenderer(unittest.TestCase):
     prg = _int_signed_widen_cast_program()
     _check_elf(self, prg)
     inst_names = _amd_inst_names(prg)
-    self.assertIn("V_LSHLREV_B32_E64", inst_names)
-    self.assertIn("V_ASHRREV_I32_E64", inst_names)
+    self.assertIn("V_BFE_I32", inst_names)
+    self.assertNotIn("V_ASHRREV_I32_E64", inst_names)
     self.assertNotIn("V_AND_B32_E32", inst_names)
 
   def test_float16_unary_promotes_to_float32(self):
