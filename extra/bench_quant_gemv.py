@@ -63,6 +63,7 @@ def main() -> None:
   parser.add_argument("--rows", type=int, default=8192)
   parser.add_argument("--cols", type=int, default=2048)
   parser.add_argument("--warmup", type=int, default=3)
+  parser.add_argument("--warmup-seconds", type=float, default=0.0)
   parser.add_argument("--batch", type=int, default=50)
   parser.add_argument("--rounds", type=int, default=5)
   args = parser.parse_args()
@@ -84,6 +85,11 @@ def main() -> None:
     Device[Device.DEFAULT].synchronize()
     call_ms.append((time.perf_counter_ns() - start) / 1e6)
 
+  warmup_end = time.perf_counter() + args.warmup_seconds
+  while time.perf_counter() < warmup_end:
+    for _ in range(args.batch): result = runner(x)
+    Device[Device.DEFAULT].synchronize()
+
   samples_us = []
   for _ in range(args.rounds):
     start = time.perf_counter_ns()
@@ -104,6 +110,7 @@ def main() -> None:
     "first_call_ms": call_ms[0],
     "capture_call_ms": call_ms[1],
     "warmup_call_ms": call_ms,
+    "warmup_seconds": args.warmup_seconds,
     "median_us": median_us,
     "best_us": min(samples_us),
     "samples_us": samples_us,

@@ -761,6 +761,15 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
       idx, off = _peel_add_imm(a.src[1], itemsize, max_byte=0x7fffffff, deep=True)
       src = (a.src[0], idx, count) if off == 0 else (a.src[0], idx, count, _tconst(off, dtypes.int32).rtag())
       return x.ins(AMDOps.LOAD, dtype=x.dtype, src=src)
+  # Scalar global gathers: keep one shared byte-address base and use GLOBAL's 12-bit offset.
+  # LLVM performs this fold for quantized GEMV; without it every adjacent load repeats ADD+LSHL.
+  if n == 1 and _mem_itemsize(x.dtype) in (1, 4):
+    itemsize = _mem_itemsize(x.dtype)
+    idx, off = _peel_add_imm(a.src[1], itemsize, max_byte=0xfff, deep=True)
+    if off > 0:
+      if itemsize == 4: idx = idx << _tconst(2, dtypes.int32)
+      return x.ins(AMDOps.LOAD, dtype=x.dtype,
+                   src=(a.src[0], idx, count, _tconst(off, dtypes.int32).rtag("byte_addr")))
   return x.ins(AMDOps.LOAD, dtype=x.dtype, src=(a.src[0], a.src[1], count))
 
 def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
@@ -1656,7 +1665,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
         return [r3.v_lshl_add_u32(dst, _src(u.src[1]), 1, byte_off)] + _global_load_insts(u, dst)
       pre, addr = _scaled_addr(_dst(u) if _reg_slots(u) == 1 else TMP_VADDR, u.src[1], itemsize)
       pre, addr = _masked_addr(pre, addr, masked)
-      return pre + _global_load_insts(u, addr)
+      return pre + _global_load_insts(u, addr, byte_off)
     case AMDOps.STORE:
       itemsize, byte_off = _mem_itemsize(u.src[2].dtype), _mem_byte_off(u)
       if store_addr_cache is not None and not masked:
@@ -2117,6 +2126,7 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp]:
   fused_d16 = set(d16_hi_lo) | set(d16_hi_lo.values())
 
   def schedulable(u:UOp) -> bool:
+    if u.op is Ops.NOOP and u.dtype in (dtypes.int8, dtypes.uint8): return True  # pure byte bitcast used by quantized loads
     if u in fused_d16 or u.op is not Ops.INS or u.arg not in _VMEM_SCHEDULABLE: return False
     # Wide/d16 loads have emitter-level destination and temporary-register constraints.
     return u.arg is not AMDOps.LOAD or _reg_slots(u) == 1

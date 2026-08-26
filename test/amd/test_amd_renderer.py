@@ -915,6 +915,15 @@ class TestAMDRenderer(unittest.TestCase):
     scheduled = amd_lib._schedule_scalar_vmem([load0, use0, idx1, load1, use1], {})
     self.assertEqual(scheduled, [load0, idx1, load1, use0, use1])
 
+  def test_scalar_vmem_scheduler_crosses_pure_noop(self):
+    base = UOp(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
+    idx0 = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))
+    idx1 = UOp(Ops.INS, dtypes.uint32, (idx0, UOp.const(1, dtypes.uint32)), AMDOps.ADD, (Register("idx1", 261),))
+    load0 = UOp(Ops.INS, dtypes.uint8, (base, idx0), AMDOps.LOAD, (Register("load0", 270),))
+    noop = UOp(Ops.NOOP, dtypes.int8, (load0,))
+    load1 = UOp(Ops.INS, dtypes.uint32, (base, idx1), AMDOps.LOAD, (Register("load1", 272),))
+    self.assertEqual(amd_lib._schedule_scalar_vmem([load0, noop, idx1, load1], {}), [load0, idx1, load1, noop])
+
   def test_scalar_vmem_scheduler_preserves_reg_store_boundary(self):
     base = UOp(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
     idx = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx", 260),))
@@ -924,6 +933,15 @@ class TestAMDRenderer(unittest.TestCase):
     load1 = UOp(Ops.INS, dtypes.uint32, (base, idx), AMDOps.LOAD, (Register("load1", 271),))
     # REG_STORE mutates acc implicitly; the later load must not cross that boundary.
     self.assertEqual(amd_lib._schedule_scalar_vmem([load0, update, load1], {}), [load0, update, load1])
+
+  def test_scalar_vmem_scheduler_preserves_void_noop_gate(self):
+    base = UOp(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
+    idx0 = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))
+    idx1 = UOp(Ops.INS, dtypes.uint32, (idx0, UOp.const(1, dtypes.uint32)), AMDOps.ADD, (Register("idx1", 261),))
+    load0 = UOp(Ops.INS, dtypes.uint32, (base, idx0), AMDOps.LOAD, (Register("load0", 270),))
+    gate = UOp(Ops.NOOP, dtypes.void, (load0,))
+    load1 = UOp(Ops.INS, dtypes.uint32, (base, idx1), AMDOps.LOAD, (Register("load1", 271),))
+    self.assertEqual(amd_lib._schedule_scalar_vmem([load0, gate, idx1, load1], {}), [load0, gate, idx1, load1])
 
   def test_global_store_drains_vscnt_before_end(self):
     # RDNA3 vector stores complete on vscnt; must drain before s_endpgm.
@@ -1977,6 +1995,17 @@ class TestAMDRenderer(unittest.TestCase):
     base = UOp.placeholder((4,), dtypes.float, slot=0)
     addr = base.index(UOp.const(0, dtypes.int32))
     self.assertIsNone(amd_lib._extract_vec_lane(addr))
+
+  def test_scalar_global_load_peels_byte_offset(self):
+    buf = UOp.placeholder((128,), dtypes.float, slot=0)
+    base = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("base", 260),))
+    addr = buf.index(base + UOp.const(32, dtypes.int32))
+    load = addr.load()
+    lowered = amd_lib._load_ins(load, addr)
+    self.assertIs(lowered.arg, AMDOps.LOAD)
+    self.assertTrue(amd_lib._is_byte_addr_load(lowered))
+    self.assertEqual(amd_lib._mem_byte_off(lowered), 128)
+    self.assertIs(lowered.src[1].op, Ops.SHL)
 
   def test_float4_global_memory_uses_b128_and_scalarized_alu(self):
     prg = _float4_add_program()

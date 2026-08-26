@@ -17,17 +17,17 @@ BACKENDS = {
   "llvm": {"DEV": "AMD:LLVM"},
 }
 QUANT_OVERRIDES = {"MV_FORCE_GROUP": "32", "MV_FORCE_UNROLL_INNER": "-1"}
-QUANT_TYPES = [(qtype, 8192, 2048) for qtype in ("Q4_K", "Q5_K", "Q6_K", "Q8_0")]
+QUANT_TYPES = [(qtype, 8192, 2048) for qtype in ("Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ4_XS")]
 Q6_SHAPES = [("Q6_K", rows, cols) for rows, cols in (
   (4096, 4096), (11008, 4096), (4096, 11008), (32000, 4096))]
 ORDINARY_CASES = ("elementwise", "reduce", "gemv", "gemm")
 
 
-def run_probe(backend: str, suite: str, label: str, cmd: list[str]) -> None:
+def run_probe(backend: str, suite: str, label: str, cmd: list[str], same_layout: bool = False) -> None:
   env = os.environ.copy()
-  env.update({"PYTHONPATH": str(ROOT), "CCACHE": "0", **BACKENDS[backend], **(QUANT_OVERRIDES if suite != "ordinary" else {})})
+  env.update({"PYTHONPATH": str(ROOT), "CCACHE": "0", **BACKENDS[backend], **(QUANT_OVERRIDES if same_layout else {})})
   for key in ("MV_FORCE_GROUP", "MV_FORCE_UNROLL_INNER"):
-    if suite == "ordinary": env.pop(key, None)
+    if not same_layout: env.pop(key, None)
   try:
     proc = subprocess.run([sys.executable, *cmd], cwd=ROOT, env=env, text=True, capture_output=True, check=True, timeout=180)
     data = json.loads(proc.stdout)
@@ -60,12 +60,14 @@ def main() -> None:
     for qtype, rows, cols in QUANT_TYPES:
       for backend in backends:
         run_probe(backend, "quant-types", qtype, ["extra/bench_quant_gemv.py", "--qtype", qtype, "--rows", str(rows),
-          "--cols", str(cols), "--warmup", "50", "--batch", "50", "--rounds", "5"])
+          "--cols", str(cols), "--warmup", "3", "--warmup-seconds", "1", "--batch", "50", "--rounds", "5"],
+          same_layout=qtype in ("Q4_K", "Q5_K", "Q6_K"))
   if args.suite in ("q6-shapes", "all"):
     for qtype, rows, cols in Q6_SHAPES:
       for backend in backends:
         run_probe(backend, "q6-shapes", f"{qtype}:{rows}x{cols}", ["extra/bench_quant_gemv.py", "--qtype", qtype,
-          "--rows", str(rows), "--cols", str(cols), "--warmup", "50", "--batch", "50", "--rounds", "5"])
+          "--rows", str(rows), "--cols", str(cols), "--warmup", "3", "--warmup-seconds", "1",
+          "--batch", "50", "--rounds", "5"], same_layout=True)
   if args.suite in ("ordinary", "all"):
     for case in ORDINARY_CASES:
       for backend in backends:
