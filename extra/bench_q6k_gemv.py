@@ -10,6 +10,7 @@ MV_FORCE_GROUP=32 MV_FORCE_UNROLL_INNER=-1 for the same launch geometry on HIP
 or LLVM when making backend-to-backend comparisons.
 """
 
+import argparse
 import json
 import statistics
 import time
@@ -60,7 +61,7 @@ def reference_rows(qdata: np.ndarray, x: np.ndarray, count: int = 16) -> np.ndar
   return out
 
 
-def program_metrics(runner: Any) -> list[dict[str, object]]:
+def program_metrics(runner: Any, dump_machine: bool = False) -> list[dict[str, object]]:
   assert runner.captured is not None
   ret, seen = [], set()
   for call in runner.captured.linear.src:
@@ -110,11 +111,15 @@ def program_metrics(runner: Any) -> list[dict[str, object]]:
           "max_sgpr": max_sgpr,
           "private_segment_size": private_segment_size,
         })
+        if dump_machine: metrics["machine_instructions"] = [repr(inst) for inst in insts]
       ret.append(metrics)
   return ret
 
 
 def main() -> None:
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--dump-machine", action="store_true")
+  args = parser.parse_args()
   qdata, x_np = make_inputs()
   ref = reference_rows(qdata, x_np)
   qdata_dev = Tensor(qdata, device=Device.DEFAULT).realize()
@@ -160,7 +165,7 @@ def main() -> None:
     "max_abs_error_first16": float(np.max(np.abs(out[:16] - ref))),
     "checksum": float(out.astype(np.float64).sum()),
     "first8": out[:8].tolist(),
-    "programs": program_metrics(runner),
+    "programs": program_metrics(runner, dump_machine=args.dump_machine),
   }
   print(json.dumps(metrics, indent=2))
 

@@ -815,7 +815,8 @@ def _extract_vec_lane(x:UOp) -> UOp|None:
   return UOp(Ops.INS, sc, (x.src[0], _tconst(lane, dtypes.int32).rtag()), AMDOps.EXTRACT)
 
 def _pack_vec(x:UOp) -> UOp|None:
-  if x.max_numel() == 1 and len(x.src) <= 1: return None
+  if x.max_numel() == 1 and len(x.src) == 1: return x.src[0]
+  if x.max_numel() == 1: return None
   if len(x.src) != x.max_numel(): raise CompileError(f"pack size {len(x.src)} != {x.max_numel()}")
   if x.dtype is dtypes.float32:
     return UOp(Ops.INS, dtypes.float32, x.src, AMDOps.PACK, x.tag)
@@ -981,6 +982,32 @@ AMD_NONTEMPORAL_LOAD = "__builtin_nontemporal_load({0})"
 AMD_PACKED_U8X16_LOAD = "__builtin_nontemporal_load((const unsigned_int4*){0})"
 AMD_MBCNT_LO = "__builtin_amdgcn_mbcnt_lo(-1, 0)"
 AMD_SWIZZLE_PREFIX = "__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {0}), "
+
+def _warp_group_reduce(x:UOp) -> UOp|None:
+  """Use a wave32 butterfly for an isolated f32 ADD group reduction."""
+  grouped = [r for r in x.src[1:] if r.op is Ops.RANGE and r.arg[-1] is AxisType.GROUP_REDUCE]
+  if x.dtype is not dtypes.float32 or not 1 <= x.max_numel() <= 4 or x.arg[0] is not Ops.ADD or len(grouped) != 1 or \
+     _const_value(grouped[0].src[0]) != 32: return None
+  group = grouped[0]
+  # The group must map directly to hardware lane id. Mixed local/group layouts retain
+  # the generic LDS reduction, whose addressing and barriers cover those cases.
+  if any(r is not group and r.op is Ops.RANGE and r.arg[-1] in (AxisType.WARP, AxisType.LOCAL, AxisType.GROUP_REDUCE)
+         for r in x.src[0].toposort()): return None
+  remaining = tuple(r for r in x.src[1:] if r is not group)
+  val = x.replace(src=(x.src[0],)+remaining) if remaining or x.arg[1] else x.src[0]
+  def butterfly(lane_val:UOp) -> UOp:
+    # CUSTOM inputs are not part of the generic add-loads matcher. Keep each reduced
+    # register value behind an elementwise node so an accumulator AFTER becomes a LOAD.
+    lane_val = lane_val + lane_val.const_like(0)
+    for offset in (16, 8, 4, 2, 1):
+      other = UOp(Ops.CUSTOM, src=(lane_val,), arg=(f"{AMD_SWIZZLE_PREFIX}{0x1f | offset<<10}))", dtypes.float))
+      lane_val = lane_val + other
+    return lane_val
+  return butterfly(val) if x.max_numel() == 1 else UOp.stack(*(butterfly(val.index(i)) for i in range(x.max_numel())))
+
+pm_warp_group_reduce = PatternMatcher([
+  (UPat(Ops.REDUCE, name="x"), _warp_group_reduce),
+])
 
 def _custom_name(x:UOp) -> object: return x.arg[0] if isinstance(x.arg, tuple) else x.arg
 
@@ -2158,25 +2185,28 @@ _VMEM_SCHEDULABLE = {AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.ADD, AMDOps
                      AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
                      AMDOps.LOAD, AMDOps.PACK_F16}
 
+def _vmem_schedulable_load(u:UOp) -> bool:
+  slots = _reg_slots(u)
+  return slots == 1 or (u.dtype is dtypes.float32 and slots <= 4) or \
+    (u.dtype is dtypes.uint32 and slots == 4 and _is_byte_addr_load(u))
+
 def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:bool|None=None) -> list[UOp]:
-  """Hoist independent scalar global reads inside conservative straight-line segments.
+  """Hoist independent global reads inside conservative straight-line segments.
 
   Run before register allocation so independent reads receive distinct live registers.
   Explicit SSA dependencies preserve value order; REG_STORE and all other implicit
   architectural state or memory side effects are hard boundaries.
   """
-  if any(u.op is Ops.INS and (u.arg is AMDOps.WMMA or (u.arg is AMDOps.LOAD and _reg_slots(u) > 1 and
-      not (u.dtype is dtypes.uint32 and _reg_slots(u) == 4 and _is_byte_addr_load(u)))) for u in ops): return ops
+  if any(u.op is Ops.INS and (u.arg is AMDOps.WMMA or (u.arg is AMDOps.LOAD and not _vmem_schedulable_load(u))) for u in ops): return ops
   fused_d16 = set(d16_hi_lo) | set(d16_hi_lo.values())
 
   def schedulable(u:UOp) -> bool:
-    if u.op is Ops.NOOP and u.dtype in (dtypes.int8, dtypes.uint8): return True  # pure byte bitcast used by quantized loads
+    if u.op is Ops.NOOP and u.dtype is not dtypes.void: return True  # value identity/bitcast, never a void ordering gate
+    if u.op is Ops.AFTER and u.addrspace is AddrSpace.REG: return True  # register accumulator binding, not a memory/state boundary
     if u in fused_d16 or u.op is not Ops.INS or u.arg not in _VMEM_SCHEDULABLE: return False
-    # Packed byte x16 custom loads have independent addresses and four dedicated
-    # destination VGPRs, so they can participate in the same dependency schedule.
-    # Other wide/d16 loads retain emitter-level destination and temporary constraints.
-    return u.arg is not AMDOps.LOAD or _reg_slots(u) == 1 or \
-      (u.dtype is dtypes.uint32 and _reg_slots(u) == 4 and _is_byte_addr_load(u))
+    # Wide f32 and packed-byte loads have independent addresses and dedicated destination
+    # VGPRs, so they can participate. Other wide/d16 loads retain emitter temp constraints.
+    return u.arg is not AMDOps.LOAD or _vmem_schedulable_load(u)
 
   def schedule(segment:list[UOp]) -> list[UOp]:
     loads = [i for i,u in enumerate(segment) if u.arg is AMDOps.LOAD]
@@ -2956,6 +2986,7 @@ class AMDRenderer(ISARenderer):
   isel_matcher = isel_matcher
   pre_regalloc_matcher = pre_regalloc_matcher
   post_regalloc_matcher = post_regalloc_matcher
+  pm_group_reduce = pm_warp_group_reduce
   pm_stage_wmma_ab = pm_stage_wmma_ab
   _code_ops = (Ops.ADD, Ops.SUB, Ops.MUL, Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.TRUNC, Ops.SIN, Ops.MAX,
                Ops.SHL, Ops.SHR, Ops.AND, Ops.OR, Ops.XOR, Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ)
@@ -2980,6 +3011,14 @@ class AMDRenderer(ISARenderer):
     if small_quant_projection: return 0 if quant_buffers >= 2 else 4
     if size <= 3 or len(ast_uops) <= 32: return 0
     return None
+
+  def get_complex_matvec_rows(self, k) -> int:
+    # Large packed-quant projections amortize the activation reads across two rows.
+    # Below this threshold the extra code/register pressure only increases cold latency.
+    output_size = prod(k.output_shape)
+    if not isinstance(output_size, int) or output_size < 16384: return 1
+    if not any(u.op is Ops.PARAM and u.dtype is dtypes.uchar for u in k.ast.toposort()): return 1
+    return 2
 
   def apply_quant_matvec_opts(self, k) -> bool:
     """Expose memory-level parallelism that LLVM's loop optimizer otherwise supplies for Q8_0/IQ4_XS GEMV."""

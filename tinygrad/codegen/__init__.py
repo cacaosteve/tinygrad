@@ -357,6 +357,10 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   # expand
   sink = graph_rewrite(sink, expander2, ctx=build_range_map(sink), name="expander")
 
+  # ISA renderers may lower narrowly supported group reductions to native wave operations.
+  if (pm := getattr(ren, "pm_group_reduce", None)) is not None:
+    sink = graph_rewrite(sink, pm, name="native group reduce")
+
   # remove reduce
   sink = graph_rewrite(sink, codegen_mops+pm_reduce_local, ctx=ReduceContext(), name="remove reduces")
 

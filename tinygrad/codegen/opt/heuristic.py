@@ -107,6 +107,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         except KernelOptError: pass
         else:
           _unroll_small_inner_reduces(k)
+          rows_policy = getattr(k.ren, "get_complex_matvec_rows", None)
+          rows_per_wave = rows_policy(k) if rows_policy is not None else getattr(k.ren, "preferred_complex_matvec_rows", 1)
+          if rows_per_wave > 1:
+            global_axes = k.axes_of(AxisType.GLOBAL)
+            if global_axes and k.full_shape[global_axes[0]] % rows_per_wave == 0:
+              k.apply_opt(Opt(OptOps.UPCAST, global_axes[0], rows_per_wave))
           return k
 
   # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat

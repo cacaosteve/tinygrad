@@ -102,6 +102,11 @@ def _matmul64_program():
     ast = (Tensor.empty(64, 64, device="AMD") @ Tensor.empty(64, 64, device="AMD")).schedule_linear().src[-1].src[0]
   return _to_prg(ast)
 
+def _float_gemv_program():
+  with Context(BEAM=0):
+    ast = (Tensor.empty(8192, 2048, device="AMD") @ Tensor.empty(2048, device="AMD")).schedule_linear().src[-1].src[0]
+  return _to_prg(ast)
+
 def _half_matmul_wmma_program():
   with Context(BEAM=0):
     ast = (Tensor.empty(64, 64, dtype=dtypes.half, device="AMD") @ Tensor.empty(64, 64, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
@@ -879,6 +884,31 @@ class TestAMDRenderer(unittest.TestCase):
                           Opt(OptOps.UNROLL, 3, 0), Opt(OptOps.UNROLL, 2, 0))
         self.assertEqual(opts, expected)
 
+  def test_q6_gemv_uses_wave32_butterfly_reduce(self):
+    rows, cols = 1024, 2048
+    qdata = Tensor.empty(rows * cols // 256 * 210, dtype=dtypes.uint8, device="AMD")
+    weights = ggml_data_to_tensor(qdata, rows * cols, 14).reshape(rows, cols)
+    with Context(BEAM=0): ast = (weights @ Tensor.empty(cols, device="AMD")).schedule_linear().src[-1].src[0]
+    prg = to_program(ast, _REN)
+    _check_elf(self, prg)
+    names = _amd_inst_names(prg)
+    self.assertEqual(names.count("DS_SWIZZLE_B32"), 5)
+    self.assertNotIn("DS_STORE_B32", names)
+    self.assertNotIn("S_BARRIER", names)
+
+  def test_large_q6_gemv_upcasts_two_rows_and_reduces_each(self):
+    rows, cols = 16384, 2048
+    qdata = Tensor.empty(rows * cols // 256 * 210, dtype=dtypes.uint8, device="AMD")
+    weights = ggml_data_to_tensor(qdata, rows * cols, 14).reshape(rows, cols)
+    with Context(BEAM=0): ast = (weights @ Tensor.empty(cols, device="AMD")).schedule_linear().src[-1].src[0]
+    prg = to_program(ast, _REN)
+    _check_elf(self, prg)
+    self.assertEqual(prg.arg.global_size, (rows // 2, 1, 1))
+    self.assertEqual(prg.src[0].arg.applied_opts[-1], Opt(OptOps.UPCAST, 0, 2))
+    names = _amd_inst_names(prg)
+    self.assertEqual(names.count("DS_SWIZZLE_B32"), 10)
+    self.assertNotIn("DS_STORE_B32", names)
+
   def test_to_program_assembles_elf(self):
     prg = _simple_add_program()
     self.assertIs(_prg_src(prg).op, Ops.SOURCE)
@@ -960,6 +990,24 @@ class TestAMDRenderer(unittest.TestCase):
     lane1 = UOp(Ops.INS, dtypes.uint32, (load1, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane1", 279),))
     scheduled = amd_lib._schedule_scalar_vmem([load0, lane0, idx1, load1, lane1], {})
     self.assertEqual(scheduled, [load0, idx1, load1, lane0, lane1])
+
+  def test_scalar_vmem_scheduler_hoists_wide_f32_load(self):
+    base = UOp(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
+    idx0 = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))
+    idx1 = UOp(Ops.INS, dtypes.uint32, (idx0, UOp.const(4, dtypes.uint32)), AMDOps.ADD, (Register("idx1", 261),))
+    count = UOp.const(4, dtypes.int32)
+    load0 = UOp(Ops.INS, dtypes.float32, (base, idx0, count), AMDOps.LOAD, (Register("load0", 270),))
+    lane0 = UOp(Ops.INS, dtypes.float32, (load0, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane0", 274),))
+    load1 = UOp(Ops.INS, dtypes.float32, (base, idx1, count), AMDOps.LOAD, (Register("load1", 275),))
+    lane1 = UOp(Ops.INS, dtypes.float32, (load1, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane1", 279),))
+    scheduled = amd_lib._schedule_scalar_vmem([load0, lane0, idx1, load1, lane1], {})
+    self.assertEqual(scheduled, [load0, idx1, load1, lane0, lane1])
+
+  def test_float_gemv_issues_wide_loads_before_fma_chain(self):
+    names = _amd_inst_names(_float_gemv_program())
+    loads = [i for i,n in enumerate(names) if n == "GLOBAL_LOAD_B128"]
+    self.assertEqual(len(loads), 5)
+    self.assertLess(max(loads), names.index("V_MUL_F32_E32"))
 
   def test_scalar_vmem_scheduler_preserves_reg_store_boundary(self):
     base = UOp(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))

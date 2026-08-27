@@ -67,7 +67,7 @@ def main() -> None:
       for backend in backends:
         run_probe(backend, "q6-shapes", f"{qtype}:{rows}x{cols}", ["extra/bench_quant_gemv.py", "--qtype", qtype,
           "--rows", str(rows), "--cols", str(cols), "--warmup", "3", "--warmup-seconds", "1",
-          "--batch", "50", "--rounds", "5"], same_layout=True)
+          "--batch", "50", "--rounds", "5"], same_layout=backend != "direct")
   if args.suite in ("ordinary", "all"):
     for case in ORDINARY_CASES:
       for backend in backends:

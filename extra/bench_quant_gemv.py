@@ -66,6 +66,7 @@ def main() -> None:
   parser.add_argument("--warmup-seconds", type=float, default=0.0)
   parser.add_argument("--batch", type=int, default=50)
   parser.add_argument("--rounds", type=int, default=5)
+  parser.add_argument("--dump-machine", action="store_true")
   args = parser.parse_args()
   quant = QUANTS[args.qtype]
   qdata, x_np = make_inputs(args.rows, args.cols, quant)
@@ -118,7 +119,7 @@ def main() -> None:
     "max_abs_error_first16": float(np.max(np.abs(out[:len(ref)] - ref))),
     "checksum": float(out.astype(np.float64).sum()),
     "first8": out[:8].tolist(),
-    "programs": program_metrics(runner),
+    "programs": program_metrics(runner, dump_machine=args.dump_machine),
   }, indent=2))
 
 
