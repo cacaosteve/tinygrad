@@ -79,7 +79,10 @@ class Linear(nn.Linear):
       # (a one-time copy at load) so the kernel can do all its reads as aligned u32 words
       nbytes, nblocks = raw.max_numel(), raw.max_numel() // Q6_BYTES
       byte_view = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer).view(nbytes, dtypes.uint8, raw_offset)))
-      padded = byte_view.reshape((nblocks, Q6_BYTES)).pad_to((nblocks, Q6_PADDED)).contiguous().realize()
+      # set_quantized can first run while tracing an @function block, where ordinary device discovery is disabled.
+      # This is a one-time copy on the already-open weight device, not scheduler-time device selection.
+      with Context(ALLOW_DEVICE_USAGE=1):
+        padded = byte_view.reshape((nblocks, Q6_BYTES)).pad_to((nblocks, Q6_PADDED)).contiguous().realize()
       self.weight = Tensor(UOp.from_buffer(cast(Buffer, padded.uop.buf_uop.buffer).view(nblocks * Q6_WORDS, dtypes.uint32, 0)))
     else:
       self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
@@ -498,7 +501,9 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   chunks = min(256, max_kv_len // 64)
   partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
-  fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=64, waves=16)
+  # 16 waves is fastest through AMDLLVM. Direct ISA currently tops out at eight for this LDS exchange mapping.
+  waves = 8 if _amd_direct_isa(q.device) else 16
+  fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=64, waves=waves)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len+63)//64
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)

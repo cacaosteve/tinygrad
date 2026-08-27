@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, UOp, dtypes, nn
+from tinygrad import Context, Tensor, UOp, dtypes, nn
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, q8_quantize, flash_attention
 from tinygrad.llm.gguf import ggml_data_to_tensor
 
@@ -37,6 +37,8 @@ class TestQ8Quantize(unittest.TestCase):
     decoded = ggml_data_to_tensor(raw, 256, 14).reshape(1, 256)
     linear = Linear(256, 1, bias=False)
     nn.state.load_state_dict(linear, {"weight":decoded}, verbose=False, realize=False)
+    # Models discover quantized weights while tracing @function blocks, where ambient device use is disabled.
+    with Context(ALLOW_DEVICE_USAGE=0): linear.set_quantized(linear.weight)
     self.assertTrue(np.isfinite(linear(Tensor.randn(1, 256)).realize().item()))
     # the Q6 weight is repacked: 210-byte blocks padded to 212 (one block = 53 words)
     self.assertEqual(linear.weight.uop.buf_uop.buffer.nbytes, 53*4)
@@ -91,6 +93,16 @@ class TestQ8Quantize(unittest.TestCase):
     assigned = Tensor(cache.uop.after(cache[:, :, :, 0:1, :].uop.store(Tensor.stack(k, v).cast(dtypes.half).uop)))
     out = flash_attention(q, assigned, 1).realize()
     np.testing.assert_allclose(out.numpy(), v.expand(1, 2, 1, 32).numpy(), rtol=2e-2, atol=2e-2)
+
+  def test_attention_decode_multiple_chunks_and_gqa_heads(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng, valid = np.random.default_rng(42), 129
+    q, kv = Tensor.zeros(1, 32, 1, 64), rng.normal(size=(2, 1, 8, valid, 64)).astype(np.float32)
+    cache = Tensor.empty(2, 1, 8, 256, 64, dtype=dtypes.half).contiguous()
+    assigned = Tensor(cache.uop.after(cache[:, :, :, :valid, :].uop.store(Tensor(kv).cast(dtypes.half).uop)))
+    out = flash_attention(q, assigned, valid).realize().numpy()
+    expected = np.repeat(kv[1].astype(np.float16).astype(np.float32).mean(2), 4, axis=1)[:, :, None, :]
+    np.testing.assert_allclose(out, expected, rtol=5e-3, atol=5e-3)
 
   def test_prefill_attention_unaligned_start(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
