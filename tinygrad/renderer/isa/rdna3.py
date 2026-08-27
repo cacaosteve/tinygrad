@@ -63,6 +63,7 @@ class AMDOps(FastEnum):
   SUB = auto()
   MUL = auto()
   MULACC = auto()
+  FMAC = auto()
   CAST = auto()
   RECIPROCAL = auto()
   EXP2 = auto()
@@ -1168,7 +1169,10 @@ def _materialize_bool_where(m:UOp, a:UOp, b:UOp) -> UOp|None:
 def _is_foldable(ctx:IselContext, x:UOp, s:UOp) -> bool: return len(ctx.uses[s]) == x.src.count(s) == 1
 
 def _fused_mulacc(ctx:IselContext, a:UOp, b:UOp, c:UOp) -> UOp|None:
-  return a.ins(AMDOps.MULACC, src=(*a.src, b)) if _is_foldable(ctx, c, a) else None
+  if not _is_foldable(ctx, c, a): return None
+  # Single-use addends can be overwritten in place with compact VOP2 FMAC. Keep
+  # VOP3 FMA when the addend remains live elsewhere.
+  return a.ins(AMDOps.FMAC, src=(b, *a.src)) if _is_foldable(ctx, c, b) else a.ins(AMDOps.MULACC, src=(*a.src, b))
 
 def _promote_f16_unary(x:UOp, d:UOp) -> UOp:
   return UOp(x.op, dtypes.float32, (d.cast(dtypes.float32),)).cast(dtypes.float16)
@@ -1555,6 +1559,10 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if u.dtype is dtypes.float16: return [r3.v_fma_f16(_dst(u), _src(u.src[0]), _src(u.src[1]), _src(u.src[2]))]
       if u.dtype is dtypes.float32: return [r3.v_fma_f32(_dst(u), _src(u.src[0]), _src(u.src[1]), _src(u.src[2]))]
       raise CompileError(f"f16/f32 mulacc only, got {u.dtype}")
+    case AMDOps.FMAC:
+      if u.dtype is dtypes.float16: return [r3.v_fmac_f16_e32(_dst(u), _src(u.src[1]), _src(u.src[2]))]
+      if u.dtype is dtypes.float32: return [r3.v_fmac_f32_e32(_dst(u), _src(u.src[1]), _src(u.src[2]))]
+      raise CompileError(f"f16/f32 fmac only, got {u.dtype}")
     case AMDOps.CAST:
       pre, cast_src = _vgpr_data(TMP_VDATA, u.src[0])
       if u.dtype in dtypes.ints and u.src[0].dtype in dtypes.ints:
@@ -2108,7 +2116,7 @@ def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
     i += 1
   return out
 
-_VMEM_SCHEDULABLE = {AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.MULACC,
+_VMEM_SCHEDULABLE = {AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.MULACC, AMDOps.FMAC,
                      AMDOps.CAST, AMDOps.RECIPROCAL, AMDOps.EXP2, AMDOps.LOG2, AMDOps.SQRT, AMDOps.TRUNC, AMDOps.SIN,
                      AMDOps.MAX, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE,
                      AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
@@ -2998,7 +3006,7 @@ class AMDRenderer(ISARenderer):
 
   def is_two_address(self, x:UOp) -> bool:
     if x.op is not Ops.INS: return False
-    if x.arg is AMDOps.WMMA: return True
+    if x.arg in (AMDOps.WMMA, AMDOps.FMAC): return True
     # PACK_F16(half×16 LOAD) — coalesce onto the load (hand FA/FB).
     return x.arg is AMDOps.PACK_F16 and _pack_f16_is_vec_load(x) and len(x.src) == 1
   def prefer_phys(self, x:UOp, src_phys:list) -> Register|None:

@@ -1189,11 +1189,11 @@ class TestAMDRenderer(unittest.TestCase):
       Opt(OptOps.LOCAL, 0, 8), Opt(OptOps.LOCAL, 1, 16)))
     self.assertEqual(prg.arg.local_size, (8, 16, 1))
     linear_ops = _lin_ops(prg)
-    self.assertEqual(linear_ops.count(AMDOps.MULACC), 48)
+    self.assertEqual(linear_ops.count(AMDOps.FMAC), 48)
     inst_names = _amd_inst_names(prg)
     self.assertEqual(inst_names.count("GLOBAL_LOAD_B128"), 8)
     self.assertEqual(inst_names.count("GLOBAL_STORE_B128"), 4)
-    self.assertEqual(inst_names.count("V_FMA_F32"), 48)
+    self.assertEqual(inst_names.count("V_FMAC_F32_E32"), 48)
 
   def test_half_matmul_wmma_assembles(self):
     prg = _half_matmul_wmma_program()
@@ -2507,19 +2507,23 @@ class TestAMDRenderer(unittest.TestCase):
         _check_asm(self, _max_program(dtype), AMDOps.MAX)
 
   def test_mulacc_assembles(self):
-    for prg in (_mulacc_program(), _fused_mulacc_program()):
-      with self.subTest(name=prg.arg.name):
-        _check_elf(self, prg)
-        linear_ops = _lin_ops(prg)
-        self.assertIn(AMDOps.MULACC, linear_ops)
-        insts = list(_REN._insts_from_linear(_prg_lin(prg)))
-        self.assertIn("V_FMA_F32", [getattr(i, "op_name", "") for i in insts])
+    raw, fused = _mulacc_program(), _fused_mulacc_program()
+    _check_asm(self, raw, AMDOps.MULACC, insts=("V_FMA_F32",))
+    _check_asm(self, fused, AMDOps.FMAC, insts=("V_FMAC_F32_E32",))
+
+  def test_single_use_accumulator_uses_compact_fmac(self):
+    out = UOp.placeholder((16,), dtypes.float32, 0)
+    inps = [UOp.placeholder((16,), dtypes.float32, i+1) for i in range(4)]
+    idx = UOp.special(16, "lidx0")
+    val = inps[0].index(idx).load() * inps[1].index(idx).load() + inps[2].index(idx).load() * inps[3].index(idx).load()
+    prg = _to_prg(out.index(idx).store(val).sink(idx, arg=KernelInfo(name="amd_asm_compact_fmac")))
+    _check_asm(self, prg, AMDOps.FMAC, insts=("V_FMAC_F32_E32",))
 
   def test_fused_mulacc_is_isel_only(self):
     self.assertNotIn(Ops.MULACC, AMDRenderer.code_for_op)
     prg = _fused_mulacc_program()
     linear_ops = _lin_ops(prg)
-    self.assertIn(AMDOps.MULACC, linear_ops)
+    self.assertIn(AMDOps.FMAC, linear_ops)
     self.assertNotIn(AMDOps.MUL, linear_ops)
     self.assertNotIn(AMDOps.ADD, linear_ops)
 
@@ -2527,11 +2531,11 @@ class TestAMDRenderer(unittest.TestCase):
     prg = _float16_fused_mulacc_program()
     _check_elf(self, prg)
     linear_ops = _lin_ops(prg)
-    self.assertIn(AMDOps.MULACC, linear_ops)
+    self.assertIn(AMDOps.FMAC, linear_ops)
     self.assertNotIn(AMDOps.MUL, linear_ops)
     self.assertNotIn(AMDOps.ADD, linear_ops)
     inst_names = _amd_inst_names(prg)
-    self.assertIn("V_FMA_F16", inst_names)
+    self.assertIn("V_FMAC_F16_E32", inst_names)
 
   def test_sgpr_sub_uses_scalar_instruction(self):
     src = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.MOV, tag=(Register("s8", 8),))
