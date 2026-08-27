@@ -62,6 +62,8 @@ class ISARenderer(Renderer):
   # If True, a rematerialized value stays in its phys reg across uses (no re-remat each time).
   def keep_remat(self, x:UOp) -> bool: return False
   def register_slots(self, x:UOp, v:Register|None=None) -> int: return 1
+  def spill_size(self, x:UOp, v:Register) -> int:
+    return 16 if v.cons[0].size == 16 else (8 if x.op is Ops.BUFFER else x.dtype.itemsize)
   def stack_pointer(self) -> UOp: raise NotImplementedError("arch specific")
   def copy(self, x:UOp, reg:Register) -> UOp: raise NotImplementedError("arch specific")
   def spill(self, disp:UOp, x:UOp) -> UOp: raise NotImplementedError("arch specific")

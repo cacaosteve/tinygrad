@@ -1743,11 +1743,24 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
     case AMDOps.BARRIER:
       return [r3.s_barrier()]
     case AMDOps.FILL:
-      if greg(u).index < 256: raise CompileError("no sgpr scratch fill")
       slots = _reg_slots(u)
       if (disp_uop:=_unwrap_const(u.src[0])) is None: raise CompileError("non-constant scratch fill offset")
       disp = int(disp_uop.val)
       if disp < 0 or disp + (slots-1)*4 > 0xffffffff: raise CompileError(f"scratch fill oob: offset={disp}, slots={slots}")
+      if greg(u).index < 256:
+        # Scratch is a vector-memory path. Restore one lane into the reserved VGPR,
+        # wait for it, then collect that identical per-lane value back into the SGPR.
+        sgpr_loads:list[Inst] = []
+        sgpr_fill_page:int|None = None
+        for i in range(slots):
+          scratch_addr = disp + i*4
+          if (new_page:=scratch_addr & ~0xfff) != sgpr_fill_page:
+            sgpr_fill_page = new_page
+            sgpr_loads.append(r3.v_mov_b32_e32(TMP_VADDR, new_page))
+          sgpr_loads += [r3.scratch_load_b32(addr=TMP_VADDR, vdst=TMP_VDATA, offset=scratch_addr & 0xfff, sve=1),
+                         r3.s_waitcnt_vmcnt(sdst=NULL, simm16=0),
+                         r3.v_readfirstlane_b32_e32(_reg_lane(greg(u), i), TMP_VDATA)]
+        return sgpr_loads
       if slots > 1:
         # raw VGPR lanes (f32 packs or half2 LDS loads)
         loads: list[Inst] = []
@@ -1764,11 +1777,21 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       return [r3.v_mov_b32_e32(TMP_VADDR, disp & ~0xfff),
               scratch_load(addr=TMP_VADDR, vdst=_dst(u), offset=disp & 0xfff, sve=1)]
     case AMDOps.SPILL:
-      if greg(u.src[1]).index < 256: raise CompileError("no sgpr scratch spill")
       slots = _reg_slots(u.src[1])
       if (disp_uop:=_unwrap_const(u.src[0])) is None: raise CompileError("non-constant scratch spill offset")
       disp = int(disp_uop.val)
       if disp < 0 or disp + (slots-1)*4 > 0xffffffff: raise CompileError(f"scratch spill oob: offset={disp}, slots={slots}")
+      if greg(u.src[1]).index < 256:
+        sgpr_stores:list[Inst] = []
+        sgpr_spill_page:int|None = None
+        for i in range(slots):
+          scratch_addr = disp + i*4
+          if (new_page:=scratch_addr & ~0xfff) != sgpr_spill_page:
+            sgpr_spill_page = new_page
+            sgpr_stores.append(r3.v_mov_b32_e32(TMP_VADDR, new_page))
+          sgpr_stores += [r3.v_mov_b32_e32(TMP_VDATA, _reg_lane(greg(u.src[1]), i)),
+                          r3.scratch_store_b32(addr=TMP_VADDR, data=TMP_VDATA, offset=scratch_addr & 0xfff, sve=1)]
+        return sgpr_stores + [r3.s_waitcnt_vscnt(sdst=NULL, simm16=0)]
       if slots > 1:
         # raw VGPR lanes (f32 packs or half2 LDS loads)
         stores: list[Inst] = []
@@ -3104,12 +3127,13 @@ class AMDRenderer(ISARenderer):
   def register_slots(self, x:UOp, vreg:Register|None=None) -> int:
     if vreg is None or not all(c.index >= 256 for c in vreg.cons): return 1
     return _reg_slots(x)
+  def spill_size(self, x:UOp, vreg:Register) -> int:
+    # Scalar scratch transport uses B32 even for bool/int8/int16 SGPR values.
+    return max(4, x.dtype.itemsize) if all(c.index < 256 for c in vreg.cons) else super().spill_size(x, vreg)
   def copy(self, x:UOp, reg): return UOp(Ops.INS, x.dtype, (x,), AMDOps.MOV, (reg,))
   def spill(self, disp:UOp, x:UOp) -> UOp:
-    if greg(x).index < 256: raise CompileError("no sgpr spill")
     return UOp(Ops.INS, dtypes.void, (disp, x), AMDOps.SPILL)
   def fill(self, disp:UOp, x:UOp, reg) -> UOp:
-    if reg.index < 256: raise CompileError("no sgpr fill")
     return UOp(Ops.INS, x.dtype, (disp, _tconst(_reg_slots(x), dtypes.int32).rtag()), AMDOps.FILL, (reg,))
 
   def asm_str(self, uops:list[UOp], function_name:str) -> str:

@@ -73,7 +73,7 @@ class LinearScanRegallocContext:
             self.reals.setdefault(i, {})[sv] = live[sv]
             if pin: pinned.update(range(live[sv].index, live[sv].index + slots(sv)))
       elif v not in self.spills:
-        sz = 16 if v.cons[0].size == 16 else (8 if vd.op is Ops.BUFFER else vd.dtype.itemsize)
+        sz = ren.spill_size(vd, v)
         offset = self.stack_size + (sz - self.stack_size % sz) % sz
         self.spills[v] = UOp.cconst(offset, dtypes.int32)
         self.stack_size = offset + sz

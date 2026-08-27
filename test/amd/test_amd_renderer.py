@@ -46,6 +46,9 @@ class OneVGPRAMDRenderer(AMDRenderer):
 class FourVGPRAMDRenderer(AMDRenderer):
   isel_matcher = amd_lib.make_isel_matcher(amd_lib.SGPR, amd_lib.VGPR[:4])
 
+class OneSGPRAMDRenderer(AMDRenderer):
+  isel_matcher = amd_lib.make_isel_matcher(amd_lib.SGPR[:1], amd_lib.VGPR)
+
 def _prg_lin(prg): return prg.src[1]
 def _prg_src(prg): return prg.src[2]
 def _prg_bin(prg): return prg.src[3]
@@ -510,6 +513,15 @@ def _spill_program():
   to_program_cache.clear()
   # One VGPR: sequential reduce still spills because each load+acc needs a second temp.
   return to_program(sink, OneVGPRAMDRenderer(_GFX11))
+
+def _sgpr_spill_program():
+  out = UOp.placeholder((16,), dtypes.uint32, 0)
+  inps = [UOp.placeholder((16,), dtypes.uint32, i+1) for i in range(3)]
+  idx = UOp.special(16, "lidx0")
+  vals = [inp.index(idx).load() for inp in inps]
+  sink = out.index(idx).store(vals[0] + vals[1] + vals[2]).sink(idx, arg=KernelInfo(name="amd_asm_sgpr_spill"))
+  to_program_cache.clear()
+  return to_program(sink, OneSGPRAMDRenderer(_GFX11))
 
 def _paged_bitcast_spill_program():
   base, page_base = _bitcast_spill_program(), 15400
@@ -2705,6 +2717,39 @@ class TestAMDRenderer(unittest.TestCase):
       self.assertEqual(insts[0].literal, 12288)
       self.assertEqual(next(i for i in insts if type(i).__name__ == "SCRATCH").offset, 3112)
 
+  def test_sgpr_spill_roundtrip_uses_reserved_vgpr(self):
+    renderer = TinyVGPRAMDRenderer(_GFX11)
+    sgpr_vreg = Register("sgpr_vreg", 0, _cons=(Register("s6", 6),))
+    vgpr_vreg = Register("vgpr_vreg", 0, _cons=(Register("v5", 261),))
+    self.assertEqual(renderer.spill_size(UOp(Ops.INS, dtypes.bool, arg=AMDOps.MOV), sgpr_vreg), 4)
+    self.assertEqual(renderer.spill_size(UOp(Ops.INS, dtypes.bool, arg=AMDOps.MOV), vgpr_vreg), 1)
+    disp = UOp.const(64, dtypes.int32)
+    src = UOp(Ops.INS, dtypes.uint32, (), AMDOps.MOV, (Register("s6", 6),))
+    spill = UOp(Ops.INS, dtypes.void, (disp, src), AMDOps.SPILL)
+    fill = UOp(Ops.INS, dtypes.uint32, (disp, UOp.const(1, dtypes.int32).rtag()), AMDOps.FILL, (Register("s8", 8),))
+    spill_insts, fill_insts = renderer._insts_for_uop(spill), renderer._insts_for_uop(fill)
+    self.assertEqual([getattr(i, "op_name", "") for i in spill_insts],
+                     ["V_MOV_B32_E32", "V_MOV_B32_E32", "SCRATCH_STORE_B32", "S_WAITCNT_VSCNT"])
+    self.assertEqual(spill_insts[1].vdst, amd_lib.TMP_VDATA)
+    self.assertEqual(spill_insts[1].src0, amd_lib.s[6])
+    self.assertEqual([getattr(i, "op_name", "") for i in fill_insts],
+                     ["V_MOV_B32_E32", "SCRATCH_LOAD_B32", "S_WAITCNT_VMCNT", "V_READFIRSTLANE_B32_E32"])
+    self.assertEqual(fill_insts[1].vdst, amd_lib.TMP_VDATA)
+    self.assertEqual(fill_insts[3].vdst, amd_lib.s[8])
+    self.assertEqual(fill_insts[3].src0, amd_lib.TMP_VDATA)
+    self.assertEqual(spill_insts[2].sve, 1)
+    self.assertEqual(fill_insts[1].sve, 1)
+
+  def test_sgpr_spill_program_uses_nonoverlapping_slots(self):
+    prg = _sgpr_spill_program()
+    _check_elf(self, prg)
+    spill_ops = [u for u in _prg_lin(prg).src if u.op is Ops.INS and u.arg is AMDOps.SPILL]
+    self.assertTrue(spill_ops)
+    self.assertTrue(all(greg(u.src[1]).index < 256 for u in spill_ops))
+    offsets = sorted({amd_lib._const_int(u.src[0]) for u in spill_ops})
+    self.assertEqual(offsets, list(range(0, len(offsets) * 8, 8)))
+    self.assertGreaterEqual(_amd_desc(prg).private_segment_fixed_size, len(offsets) * 8)
+
   def test_vector_vgpr_spill_expands_to_scalar_scratch_lanes(self):
     renderer = _REN
     disp = UOp.const(64, dtypes.int32)
@@ -3169,6 +3214,15 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(16, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     out = Tensor.custom_kernel(out, inp, fxn=_custom_renderer_spill)[0].realize()
     self.assertEqual(out.tolist(), [6*x + 15 for x in range(16)])
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_sgpr_spill_smoke(self):
+    inps = [Tensor([base+i for i in range(16)], dtype=dtypes.uint32, device="AMD").contiguous().realize()
+            for base in (0, 100, 200)]
+    out = Tensor.empty(16, dtype=dtypes.uint32, device="AMD").contiguous().realize()
+    bufs, prg = [x._buffer().ensure_allocated() for x in (out, *inps)], _sgpr_spill_program()
+    _amd_rt(prg)(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    self.assertEqual(out.tolist(), [300 + 3*i for i in range(16)])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_paged_spills(self):
