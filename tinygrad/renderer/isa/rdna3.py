@@ -19,16 +19,21 @@ from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
 # RDNA3: kernarg in s[0:1], local ids packed in v0. Even SGPR bases for 64-bit kernarg loads.
 # WGID follows USER_SGPR_COUNT: s2 when count=2 (1D locals); s15 when gfx1100 pads to 15 (2D locals).
 # AMD_PREFETCH_A (default 1): within-K next-A B128 before PACK so A tiles overlap WMMA; 0 opts out.
+# AMD_COALESCE_U8 (default 1): combine adjacent byte loads into packed B32/B64/B128 VMEM operations.
+# AMD_UNIFORM_INT (default 1): move wave-uniform packed-byte extraction and integer address chains to SGPRs.
 _PREFETCH_NEXT_A = False
 KERNARG_REG = s[0:1]
-WGID = tuple(Register(f"s{i}", i) for i in range(2, 5))  # 1D default; 2D uses s15+ via _wgid_reg
-LID = tuple(Register(f"v{i}", 256+i) for i in range(3))
+WGID = tuple(Register(f"s{i}", i, size=4) for i in range(2, 5))  # 1D default; 2D uses s15+ via _wgid_reg
+LID = tuple(Register(f"v{i}", 256+i, size=4) for i in range(3))
 # USER_SGPR=15 places WGID_X/Y/Z in s15:s17. SGPRs are allocated as even
 # 64-bit pairs, so reserve both s14:s15 and s16:s17 from the general pool.
-SGPR = tuple(Register(f"s{i}", i) for i in range(6, 104, 2) if i not in (14, 16, 102))
+SGPR = tuple(Register(f"s{i}", i, size=8) for i in range(6, 104, 2) if i not in (14, 16, 102))
+# Wave-uniform 32-bit temporaries can use both halves of the scalar register file.
+# Keep the ABI workgroup-ID window and branch/EXEC temporaries reserved.
+SGPR32 = tuple(Register(f"s{i}", i, size=4) for i in range(6, 102) if i not in (14, 15, 16, 17))
 # v3:v4 are reserved as lowering temporaries. Keeping them below the allocatable
 # range avoids making every kernel claim v254:v255 solely for two scratch values.
-VGPR = tuple(Register(f"v{i}", 256+i) for i in range(5, 254))
+VGPR = tuple(Register(f"v{i}", 256+i, size=4) for i in range(5, 254))
 # B gathers factor as k*4096+{0,32,64,96} for large N. AMD_B_COMPACT (default on): isel CSE
 # per-k page idx + in-place <<1 once + GLOBAL offset rem — keeps s_clause, cuts addr ALU.
 # AMD_B_COMPACT=0 → AMD_B_LSHL_ADD dest-as-addr. AMD_D16_HI stays env-gated (mock NaNs).
@@ -59,6 +64,7 @@ class AMDOps(FastEnum):
   MOV = auto()
   PACK = auto()
   EXTRACT = auto()
+  COLLECT = auto()
   ADD = auto()
   SUB = auto()
   MUL = auto()
@@ -226,8 +232,9 @@ def _global_load_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
   if slots == 1:
     if (load:=_global_load(u.dtype, _elem_count(u))) is None: raise CompileError(f"no global load {u.dtype}")
     return [load(_dst(u), addr, saddr=saddr, **off_kw)]
-  # multi-VGPR by byte width: float×2/×4 or half×4/×8 → B64/B128 (ungated only; coalesce rejects gated)
-  if sc not in (dtypes.float16, dtypes.float32, dtypes.int32, dtypes.uint32): raise CompileError(f"no vec global load {u.dtype}")
+  # multi-VGPR by byte width: float×2/×4, half×4/×8, or byte×8/×16 → B64/B128.
+  if sc not in (dtypes.uint8, dtypes.float16, dtypes.float32, dtypes.int32, dtypes.uint32):
+    raise CompileError(f"no vec global load {u.dtype}")
   if not isinstance(greg(u), Register): raise CompileError(f"expected reg dst {u}")
   if slots == 2: return [r3.global_load_b64(_dst(u), addr, saddr=saddr)]
   if slots == 4: return [r3.global_load_b128(_dst(u), addr, saddr=saddr)]
@@ -381,6 +388,9 @@ _WIDE_STORE = {8: (r3.global_store_b64, r3.ds_store_b64), 16: (r3.global_store_b
 def _mem_load(kind:int, dt:DType, n:int=1):
   if n > 1:
     nbytes = dt.itemsize * n
+    if dt is dtypes.uint8 and kind == 0:
+      if nbytes == 4: return r3.global_load_b32
+      return _WIDE_LOAD.get(nbytes, (None, None))[0]
     # half×2 → B32; half×4/×8 → B64/B128 for global+LDS (PACK_F16 clobber fixed; gated stays scalar).
     # scratch stays half2 — no wide scratch half path yet.
     if dt is dtypes.float16:
@@ -799,7 +809,7 @@ def _lane_const(x:UOp) -> int|None:
   if x.op is Ops.INS and x.arg is AMDOps.MOV and len(x.src) == 1 and (c:=_unwrap_const(x.src[0])) is not None: return int(c.val)
   return None
 
-def _extract_vec_lane(x:UOp) -> UOp|None:
+def _extract_vec_lane(ctx:IselContext, x:UOp) -> UOp|None:
   if len(x.src) != 2 or (lane:=_lane_const(x.src[1])) is None: return None
   # INDEX into memory is an address. Only ALU values use INDEX as vector lane access.
   if x.src[0].addrspace not in (None, AddrSpace.ALU): return None
@@ -809,9 +819,12 @@ def _extract_vec_lane(x:UOp) -> UOp|None:
   if n == 1 and lane == 0 and x.src[0].addrspace in (None, AddrSpace.ALU): return x.src[0]
   if n == 1: return None
   sc = x.src[0].dtype
-  if sc not in (dtypes.float32, dtypes.float16, dtypes.int32, dtypes.uint32):
+  if sc not in (dtypes.uint8, dtypes.float32, dtypes.float16, dtypes.int32, dtypes.uint32):
     raise CompileError(f"no extract from {x.src[0].dtype}")
   if not 0 <= lane < n: raise CompileError(f"lane {lane} oob for {x.src[0].dtype} x{n}")
+  if sc is dtypes.uint8 and getenv("AMD_UNIFORM_INT", 1) and x.src[0].op is Ops.INS and \
+     x.src[0].arg is AMDOps.LOAD and all(_is_scalar_source(s) for s in x.src[0].src):
+    return _uniform_byte_extract(ctx, UOp(Ops.INS, sc, (x.src[0], _tconst(lane, dtypes.int32).rtag()), AMDOps.EXTRACT))
   return UOp(Ops.INS, sc, (x.src[0], _tconst(lane, dtypes.int32).rtag()), AMDOps.EXTRACT)
 
 def _pack_vec(x:UOp) -> UOp|None:
@@ -1056,7 +1069,7 @@ def _need_yi(ctx:IselContext) -> bool:
 def _wgid_reg(ctx:IselContext, dim:int) -> Register:
   # HSA: workgroup IDs are placed immediately after user SGPRs.
   base = 15 if _need_yi(ctx) else 2
-  return Register(f"s{base + dim}", base + dim)
+  return Register(f"s{base + dim}", base + dim, size=4)
 
 def _special_reg(name:str, ctx:IselContext|None=None) -> Register:
   if len(name) != 5 or name[:4] not in ("lidx", "gidx") or name[-1] not in "012":
@@ -1078,8 +1091,38 @@ def _kernarg_offset(ctx:IselContext, x:UOp) -> int:
     return len(bufs) * 8 + next(i for i,u in enumerate(vals) if u.arg == x.arg) * 4
   return next(i for i,u in enumerate(bufs) if u.arg == x.arg) * 8
 
+def _is_scalar_source(x:UOp) -> bool:
+  if _unwrap_const(x) is not None: return True
+  return isinstance((reg:=greg(x)), Register) and all(c.index < 256 for c in reg.cons)
+
+def _uniform_byte_extract(ctx:IselContext, x:UOp) -> UOp|None:
+  if x.arg is not AMDOps.EXTRACT or not x.src or x.src[0].op is not Ops.INS or x.src[0].arg is not AMDOps.LOAD or \
+     x.src[0].dtype is not dtypes.uint8 or not all(_is_scalar_source(s) for s in x.src[0].src): return None
+  if (lane:=_const_int(x.src[1])) is None: return None
+  collects = ctx.scratch.setdefault("uniform_byte_collects", {})
+  word_lane = lane // 4
+  word = collects.setdefault((x.src[0], word_lane), UOp(Ops.INS, dtypes.uint32,
+    (x.src[0], _tconst(word_lane, dtypes.int32).rtag()), AMDOps.COLLECT))
+  return UOp(Ops.INS, x.dtype,
+    (word, _tconst((lane % 4) * 8, dtypes.uint32).rtag(), _tconst(8, dtypes.uint32).rtag()), AMDOps.BFE)
+
+def _wants_uniform_sgpr(x:UOp) -> bool:
+  if x.arg is AMDOps.COLLECT: return True
+  if x.arg is AMDOps.EXTRACT and x.src and x.src[0].op is Ops.INS and x.src[0].arg is AMDOps.LOAD and \
+     x.src[0].dtype is dtypes.uint8 and all(_is_scalar_source(s) for s in x.src[0].src):
+    return True
+  if x.arg is AMDOps.CAST and (not x.src or x.src[0].dtype not in dtypes.ints): return False
+  return x.dtype in dtypes.ints and x.arg in (AMDOps.MOV, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.CAST,
+    AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE, AMDOps.LSHL_OR, AMDOps.LSHL_ADD) and \
+    all(_is_scalar_source(s) for s in x.src)
+
 def _alloc_vregs(ctx:IselContext, x:UOp, sgpr_pool:tuple[Register, ...], vgpr_pool:tuple[Register, ...]) -> UOp|None:
-  if isinstance(x.tag, tuple): return None
+  scalar_pool = SGPR32 if sgpr_pool == SGPR else sgpr_pool
+  if getenv("AMD_UNIFORM_INT", 1) and (uniform_extract:=_uniform_byte_extract(ctx, x)) is not None: return uniform_extract
+  if isinstance(x.tag, tuple):
+    if getenv("AMD_UNIFORM_INT", 1) and _wants_uniform_sgpr(x) and not all(c.index < 256 for c in x.tag[0].cons):
+      return x.replace(tag=(ctx.vreg(scalar_pool),))
+    return None
   if x.op is Ops.BUFFER:
     return x.replace(src=tuple(s.rtag() for s in x.src), tag=None) if x.addrspace is AddrSpace.REG else None
   if x.arg in (AMDOps.DEFINE, AMDOps.SCRATCH_SIZE, AMDOps.SCRATCH_ADDR, AMDOps.LDS_BASE,
@@ -1102,6 +1145,7 @@ def _alloc_vregs(ctx:IselContext, x:UOp, sgpr_pool:tuple[Register, ...], vgpr_po
     return x.replace(tag=(ctx.vreg(PACK_F16_VGPR_UP16 if _allow_upcast16() else PACK_F16_VGPR),))
   if x.arg is AMDOps.LLOAD:
     return x.replace(tag=(ctx.vreg(LLOAD_VGPR_UP16 if _allow_upcast16() else LLOAD_VGPR),))
+  if getenv("AMD_UNIFORM_INT", 1) and _wants_uniform_sgpr(x): return x.replace(tag=(ctx.vreg(scalar_pool),))
   return x.replace(tag=(ctx.vreg(vgpr_pool),))
 
 def _gated_load(addr:UOp, alt:UOp, gate:UOp, x:UOp) -> UOp|None:
@@ -1465,7 +1509,7 @@ pre_regalloc_matcher = PatternMatcher([
 _ALU2: dict[AMDOps, tuple] = {
   AMDOps.ADD: (r3.v_add_f16_e32, r3.v_add_f32_e32, r3.s_add_u32, r3.v_add_nc_u32_e64),
   AMDOps.SUB: (r3.v_sub_f16_e32, r3.v_sub_f32_e32, r3.s_sub_u32, r3.v_sub_nc_u32_e64),
-  AMDOps.MUL: (r3.v_mul_f16_e32, r3.v_mul_f32_e32, r3.v_mul_lo_u32, r3.v_mul_lo_u32),
+  AMDOps.MUL: (r3.v_mul_f16_e32, r3.v_mul_f32_e32, r3.s_mul_i32, r3.v_mul_lo_u32),
 }
 def _alu2(u:UOp):
   f16, f32, sgpr, vint = _ALU2[u.arg]
@@ -1569,14 +1613,32 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       pre1, b = _vgpr_data(TMP_VADDR, u.src[1])
       return pre0 + pre1 + [r3.v_perm_b32(_dst(u), a, b, _src(u.src[2]))]
     case AMDOps.BFE:
+      if greg(u).index < 256:
+        shift, width = _const_int(u.src[1]), _const_int(u.src[2])
+        if shift is None or width is None: raise CompileError("scalar bfe needs constant shift and width")
+        scalar_bfe = r3.s_bfe_i32 if u.dtype in dtypes.sints else r3.s_bfe_u32
+        return [scalar_bfe(_dst(u), _src(u.src[0]), shift | (width << 16))]
       pre, value = _vgpr_data(TMP_VDATA, u.src[0])
       return pre + [r3.v_bfe_u32(_dst(u), value, _src(u.src[1]), _src(u.src[2]))]
     case AMDOps.LSHL_OR:
+      if greg(u).index < 256:
+        return [r3.s_lshl_b32(_dst(u), _src(u.src[0]), _src(u.src[1])),
+                r3.s_or_b32(_dst(u), _dst(u), _src(u.src[2]))]
       pre, value = _vgpr_data(TMP_VDATA, u.src[0])
       return pre + [r3.v_lshl_or_b32(_dst(u), value, _src(u.src[1]), _src(u.src[2]))]
     case AMDOps.LSHL_ADD:
+      if greg(u).index < 256:
+        if (shift:=_const_int(u.src[1])) in (1, 2, 3, 4):
+          return [(r3.s_lshl1_add_u32, r3.s_lshl2_add_u32, r3.s_lshl3_add_u32, r3.s_lshl4_add_u32)[shift-1](
+            _dst(u), _src(u.src[0]), _src(u.src[2]))]
+        return [r3.s_lshl_b32(_dst(u), _src(u.src[0]), _src(u.src[1])),
+                r3.s_add_u32(_dst(u), _dst(u), _src(u.src[2]))]
       pre, value = _vgpr_data(TMP_VDATA, u.src[0])
       return pre + [r3.v_lshl_add_u32(_dst(u), value, _src(u.src[1]), _src(u.src[2]))]
+    case AMDOps.COLLECT:
+      if (lane:=_const_int(u.src[1])) is None: raise CompileError("non-constant collect lane")
+      if not isinstance(greg(u.src[0]), Register): raise CompileError(f"expected vec reg src {u}")
+      return [r3.v_readfirstlane_b32_e32(_dst(u), _reg_lane(greg(u.src[0]), lane))]
     case AMDOps.EXTRACT:
       if (lane:=_const_int(u.src[1])) is None: raise CompileError("non-constant extract lane")
       src = u.src[0]
@@ -1585,6 +1647,12 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if sc in (dtypes.float32, dtypes.int32, dtypes.uint32):
         lane_src = _reg_lane(greg(src), lane)
         return [] if isinstance(greg(u), Register) and greg(u).index == greg(src).index+lane else [r3.v_mov_b32_e32(_dst(u), lane_src)]
+      if sc is dtypes.uint8:
+        lane_src, shift = _reg_lane(greg(src), lane // 4), (lane % 4) * 8
+        if greg(u).index < 256:
+          return [r3.v_readfirstlane_b32_e32(TMP_SDATA0, lane_src),
+                  r3.s_bfe_u32(_dst(u), TMP_SDATA0, shift | (8 << 16))]
+        return [r3.v_bfe_u32(_dst(u), lane_src, shift, 8)]
       if sc is dtypes.float16:
         # two f16s per VGPR; high lane needs a 16-bit shift
         slot, hi = divmod(int(lane), 2)
@@ -1607,7 +1675,15 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if u.dtype is dtypes.float32: return [r3.v_fmac_f32_e32(_dst(u), _src(u.src[1]), _src(u.src[2]))]
       raise CompileError(f"f16/f32 fmac only, got {u.dtype}")
     case AMDOps.CAST:
-      pre, cast_src = _vgpr_data(TMP_VDATA, u.src[0])
+      cast_src = _src(u.src[0])
+      if greg(u).index < 256:
+        if u.dtype not in dtypes.ints or u.src[0].dtype not in dtypes.ints:
+          raise CompileError(f"no scalar cast {u.src[0].dtype} -> {u.dtype}")
+        narrow = u.src[0].dtype if u.src[0].dtype.itemsize <= u.dtype.itemsize else u.dtype
+        if narrow in dtypes.uints: return [r3.s_and_b32(_dst(u), cast_src, (1 << (narrow.itemsize * 8)) - 1)]
+        return [r3.s_bfe_i32(_dst(u), cast_src, narrow.itemsize * 8 << 16)]
+      pre = [] if isinstance(cast_src, Reg) else [r3.v_mov_b32_e32(TMP_VDATA, cast_src)]
+      if pre: cast_src = TMP_VDATA
       if u.dtype in dtypes.ints and u.src[0].dtype in dtypes.ints:
         if u.dtype.itemsize > 4 or u.src[0].dtype.itemsize > 4: raise CompileError(f"no cast {u.src[0].dtype} -> {u.dtype}")
         narrow = u.src[0].dtype if u.src[0].dtype.itemsize <= u.dtype.itemsize else u.dtype
@@ -1660,17 +1736,24 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
     case AMDOps.MAX:
       return _max(u)
     case AMDOps.SHL:
+      if greg(u).index < 256: return [r3.s_lshl_b32(_dst(u), _src(u.src[0]), _src(u.src[1]))]
       pre, a = _vgpr_data(TMP_VDATA, u.src[0])
       return pre + [r3.v_lshlrev_b32_e64(_dst(u), _src(u.src[1]), a)]
     case AMDOps.SHR:
+      if greg(u).index < 256:
+        scalar_shift = r3.s_ashr_i32 if u.dtype in dtypes.sints else r3.s_lshr_b32
+        return [scalar_shift(_dst(u), _src(u.src[0]), _src(u.src[1]))]
       pre, a = _vgpr_data(TMP_VDATA, u.src[0])
       if u.dtype in dtypes.sints: return pre + [r3.v_ashrrev_i32_e64(_dst(u), _src(u.src[1]), a)]
       return pre + [r3.v_lshrrev_b32_e64(_dst(u), _src(u.src[1]), a)]
     case AMDOps.AND:
+      if greg(u).index < 256: return [r3.s_and_b32(_dst(u), _src(u.src[0]), _src(u.src[1]))]
       return _commutative_vop2(u, r3.v_and_b32_e32)
     case AMDOps.OR:
+      if greg(u).index < 256: return [r3.s_or_b32(_dst(u), _src(u.src[0]), _src(u.src[1]))]
       return _commutative_vop2(u, r3.v_or_b32_e32)
     case AMDOps.XOR:
+      if greg(u).index < 256: return [r3.s_xor_b32(_dst(u), _src(u.src[0]), _src(u.src[1]))]
       return _commutative_vop2(u, r3.v_xor_b32_e32)
     case AMDOps.CMPLT:
       return _cmp_lt(u)
@@ -2179,7 +2262,7 @@ def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
     i += 1
   return out
 
-_VMEM_SCHEDULABLE = {AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.MULACC, AMDOps.FMAC,
+_VMEM_SCHEDULABLE = {AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.COLLECT, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.MULACC, AMDOps.FMAC,
                      AMDOps.CAST, AMDOps.RECIPROCAL, AMDOps.EXP2, AMDOps.LOG2, AMDOps.SQRT, AMDOps.TRUNC, AMDOps.SIN,
                      AMDOps.MAX, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE,
                      AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
@@ -2187,7 +2270,7 @@ _VMEM_SCHEDULABLE = {AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.ADD, AMDOps
 
 def _vmem_schedulable_load(u:UOp) -> bool:
   slots = _reg_slots(u)
-  return slots == 1 or (u.dtype is dtypes.float32 and slots <= 4) or \
+  return slots == 1 or (u.dtype in (dtypes.uint8, dtypes.float32) and slots <= 4) or \
     (u.dtype is dtypes.uint32 and slots == 4 and _is_byte_addr_load(u))
 
 def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:bool|None=None) -> list[UOp]:
@@ -2962,6 +3045,9 @@ def isa_float4_coalesce(uops, ctx):
 
 def isa_float4_mem_ok(f4, float4_safe, buf, value_dtype, u, uses, valid) -> bool:
   if f4 is None: return True
+  if buf.dtype is dtypes.uint8:
+    return u.op is Ops.LOAD and value_dtype is dtypes.uint8 and buf.addrspace is not AddrSpace.LOCAL and \
+      bool(valid.op is Ops.CONST and valid.val is True)
   if not float4_safe or buf.dtype != value_dtype: return False
   if u.op is Ops.LOAD and any(v.op in {Ops.CAST, Ops.BITCAST} for v in uses[u]): return False
   if u.op is Ops.STORE and u.src[1].op is Ops.BITCAST: return False
@@ -3054,6 +3140,7 @@ class AMDRenderer(ISARenderer):
   def coalesce_vec_lengths(self, buf, f4):
     # 16 halves = one WMMA A frag (2×B128); PACK identity-aliases the load.
     if buf.dtype == dtypes.half: return [16, 8, 4, 2]
+    if buf.dtype == dtypes.uint8 and getenv("AMD_COALESCE_U8", 1): return [16, 8, 4]
     return None
 
   def prepare_pre_regalloc(self, lst:list[UOp]) -> tuple[list[UOp], dict]:
@@ -3167,7 +3254,8 @@ class AMDRenderer(ISARenderer):
   def bind(self, dtype, reg:Register) -> UOp: return UOp(Ops.INS, dtype, (), AMDOps.MOV, (reg,))
   def stack_pointer(self) -> UOp: return UOp(Ops.INS, dtypes.uint32, arg=AMDOps.SCRATCH_BASE)
   def register_slots(self, x:UOp, vreg:Register|None=None) -> int:
-    if vreg is None or not all(c.index >= 256 for c in vreg.cons): return 1
+    if vreg is None: return 1
+    if all(c.index < 256 for c in vreg.cons): return max(1, (x.dtype.itemsize + 3) // 4)
     return _reg_slots(x)
   def spill_size(self, x:UOp, vreg:Register) -> int:
     # Scalar scratch transport uses B32 even for bool/int8/int16 SGPR values.

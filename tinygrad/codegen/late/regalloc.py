@@ -140,7 +140,10 @@ class LinearScanRegallocContext:
           if v not in live or live[v] != r: live[v] = fill(v, i, (r,), pin=False)
 
 def wide_alloc(cons, i, nslots, allowed, live, lr, uops_len, slots_fn, pinned=frozenset()):
-  allowed_idxs = {r.index for r in allowed}
+  # Candidates can describe an aligned multi-slot physical class (for example an
+  # even 64-bit SGPR pair). Include covered sub-registers when validating width,
+  # while still using only the listed candidates as legal starting positions.
+  allowed_idxs = {idx for r in allowed for idx in range(r.index, r.index + max(1, r.size // 4))}
   occupied: dict[int, list[Register]] = {}
   for vr, r in live.items():
     for idx in range(r.index, r.index + slots_fn(vr)): occupied.setdefault(idx, []).append(vr)

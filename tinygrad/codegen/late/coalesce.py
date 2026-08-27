@@ -145,6 +145,10 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
     must_divide = True
     if ctx is not None and ctx.target.device == "DSP":
       lengths, must_divide = [128,64,32,16,8,4], False
+    # Renderer-provided vector widths can opt additional scalar dtypes into coalescing.
+    # Native ISAs use this when narrow vectors remain packed in registers.
+    elif vec_lengths is not None and (L:=vec_lengths(buf, f4)) is not None:
+      lengths = L
     elif buf.dtype not in (dtypes.float, dtypes.half, dtypes.int, dtypes.uint, *dtypes.fp8s) and not is_image_shape(buf._shape):
       pass
     elif buf.addrspace == AddrSpace.REG:
@@ -152,8 +156,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
     elif is_image_shape(buf._shape):
       lengths = [4]
     elif ctx is not None and ctx.supports_float4 and (f4 is None or buf.dtype in f4):
-      if vec_lengths is not None and (L:=vec_lengths(buf, f4)) is not None: lengths = L
-      else: lengths = [8,4,2] if buf.dtype == dtypes.half and getenv("ALLOW_HALF8") else [4,2]
+      lengths = [8,4,2] if buf.dtype == dtypes.half and getenv("ALLOW_HALF8") else [4,2]
     lengths.append(1)  # worst case, it's not folded
     grouped_offsets = [[x for _,x in group] for _,group in itertools.groupby(enumerate(sorted(offsets.keys())), lambda x: x[1]-x[0])]
     for full_grp in grouped_offsets:

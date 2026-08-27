@@ -1114,7 +1114,7 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_signed_byte_load_cast_fuses_sign_extension(self):
     prg = _signed_byte_load_cast_program()
-    _check_asm(self, prg, AMDOps.LOAD, AMDOps.CAST, insts=("GLOBAL_LOAD_I8", "V_CVT_F32_I32_E32"))
+    _check_asm(self, prg, AMDOps.LOAD, AMDOps.CAST, insts=("GLOBAL_LOAD_B32", "V_BFE_I32", "V_CVT_F32_I32_E32"))
     names = _amd_inst_names(prg)
     self.assertNotIn("V_ASHRREV_I32_E64", names)
 
@@ -2083,7 +2083,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_global_memory_index_is_not_vector_extract(self):
     base = UOp.placeholder((4,), dtypes.float, slot=0)
     addr = base.index(UOp.const(0, dtypes.int32))
-    self.assertIsNone(amd_lib._extract_vec_lane(addr))
+    self.assertIsNone(amd_lib._extract_vec_lane(IselContext(UOp.sink(addr)), addr))
 
   def test_scalar_global_load_peels_byte_offset(self):
     buf = UOp.placeholder((128,), dtypes.float, slot=0)
@@ -2118,6 +2118,19 @@ class TestAMDRenderer(unittest.TestCase):
     inst_names = _amd_inst_names(prg)
     self.assertEqual(inst_names.count("GLOBAL_LOAD_B128"), 2)
     self.assertEqual(inst_names.count("GLOBAL_STORE_B128"), 1)
+
+  def test_uniform_packed_u8_uses_scalar_extracts(self):
+    rows, cols = 16384, 2048
+    qdata = Tensor.empty(rows * cols // 256 * 144, dtype=dtypes.uint8, device="AMD")
+    weights = ggml_data_to_tensor(qdata, rows * cols, 12).reshape(rows, cols)
+    with Context(BEAM=0): ast = (weights @ Tensor.empty(cols, device="AMD")).schedule_linear().src[-1].src[0]
+    prg = to_program(ast, _REN)
+    _check_elf(self, prg)
+    inst_names = _amd_inst_names(prg)
+    self.assertEqual(inst_names.count("GLOBAL_LOAD_B128"), 2)
+    self.assertEqual(inst_names.count("V_READFIRSTLANE_B32_E32"), 8)
+    self.assertEqual(inst_names.count("S_BFE_U32"), 32)
+    self.assertFalse(any(op in inst_names for op in ("SCRATCH_LOAD_B32", "SCRATCH_STORE_B32")))
 
   def test_float4_lds_memory_uses_ds_b128(self):
     prg = _float4_lds_program()
