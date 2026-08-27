@@ -924,6 +924,19 @@ class TestAMDRenderer(unittest.TestCase):
     load1 = UOp(Ops.INS, dtypes.uint32, (base, idx1), AMDOps.LOAD, (Register("load1", 272),))
     self.assertEqual(amd_lib._schedule_scalar_vmem([load0, noop, idx1, load1], {}), [load0, idx1, load1, noop])
 
+  def test_scalar_vmem_scheduler_interleaves_independent_alu_chains(self):
+    base = UOp(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
+    idx0 = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))
+    idx1 = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx1", 261),))
+    load0 = UOp(Ops.INS, dtypes.int8, (base, idx0), AMDOps.LOAD, (Register("load0", 270),))
+    load1 = UOp(Ops.INS, dtypes.int8, (base, idx1), AMDOps.LOAD, (Register("load1", 271),))
+    cast0 = UOp(Ops.INS, dtypes.float32, (load0,), AMDOps.CAST, (Register("cast0", 272),))
+    mul0 = UOp(Ops.INS, dtypes.float32, (cast0, UOp.const(2.0, dtypes.float32)), AMDOps.MUL, (Register("mul0", 273),))
+    cast1 = UOp(Ops.INS, dtypes.float32, (load1,), AMDOps.CAST, (Register("cast1", 274),))
+    mul1 = UOp(Ops.INS, dtypes.float32, (cast1, UOp.const(3.0, dtypes.float32)), AMDOps.MUL, (Register("mul1", 275),))
+    scheduled = amd_lib._schedule_scalar_vmem([load0, load1, cast0, mul0, cast1, mul1], {}, alu_breadth=True)
+    self.assertEqual([id(x) for x in scheduled], [id(x) for x in (load0, load1, cast0, cast1, mul0, mul1)])
+
   def test_scalar_vmem_scheduler_preserves_reg_store_boundary(self):
     base = UOp(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
     idx = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx", 260),))

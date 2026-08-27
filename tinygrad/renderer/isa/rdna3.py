@@ -2114,7 +2114,7 @@ _VMEM_SCHEDULABLE = {AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.ADD, AMDOps
                      AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
                      AMDOps.LOAD, AMDOps.PACK_F16}
 
-def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp]:
+def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:bool|None=None) -> list[UOp]:
   """Hoist independent scalar global reads inside conservative straight-line segments.
 
   Run before register allocation so independent reads receive distinct live registers.
@@ -2152,11 +2152,23 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp]:
       load_ancestors.add(i)
       stack.extend(deps[i])
 
+    # Independent dequantization chains are commonly linearized one at a time.  Once
+    # their VMEM reads are issued, breadth-first ALU order keeps several BFE/cvt/mul
+    # chains in flight instead of immediately consuming each dependent result.  This
+    # approximates LLVM's latency-hiding list schedule without crossing hard segment
+    # boundaries or inventing dependencies. AMD_SCHEDULE_ALU=0 is a diagnostic opt-out.
+    use_alu_breadth = bool(getenv("AMD_SCHEDULE_ALU", 1)) if alu_breadth is None else alu_breadth
+    alu_depth = [0] * len(segment)
+    if use_alu_breadth:
+      for i,u in enumerate(segment):
+        if u.arg is not AMDOps.LOAD and deps[i]: alu_depth[i] = max(alu_depth[d] + 1 for d in deps[i])
+
     indegree = [len(ds) for ds in deps]
     ready = [i for i,n in enumerate(indegree) if n == 0]
     scheduled:list[UOp] = []
     while ready:
-      i = min(ready, key=lambda j: (0 if segment[j].arg is AMDOps.LOAD else 1 if j in load_ancestors else 2, j))
+      i = min(ready, key=lambda j: (0 if segment[j].arg is AMDOps.LOAD else 1 if j in load_ancestors else 2,
+                                    alu_depth[j] if use_alu_breadth else 0, j))
       ready.remove(i)
       scheduled.append(segment[i])
       for user in users[i]:
