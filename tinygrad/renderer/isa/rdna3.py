@@ -982,22 +982,25 @@ AMD_PACKED_U8X16_LOAD = "__builtin_nontemporal_load((const unsigned_int4*){0})"
 AMD_MBCNT_LO = "__builtin_amdgcn_mbcnt_lo(-1, 0)"
 AMD_SWIZZLE_PREFIX = "__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {0}), "
 
+def _custom_name(x:UOp) -> object: return x.arg[0] if isinstance(x.arg, tuple) else x.arg
+
 def _amd_custom_intrinsic(x:UOp) -> UOp|None:
-  if x.arg == AMD_DOT4: return x.ins(AMDOps.DOT4)
-  if x.arg == AMD_BYTE_PERM: return x.ins(AMDOps.BYTE_PERM)
-  if x.arg == AMD_PACKED_U8X16_LOAD and len(x.src) == 1 and x.src[0].op is Ops.SHRINK:
+  arg = _custom_name(x)
+  if arg == AMD_DOT4: return x.ins(AMDOps.DOT4)
+  if arg == AMD_BYTE_PERM: return x.ins(AMDOps.BYTE_PERM)
+  if arg == AMD_PACKED_U8X16_LOAD and len(x.src) == 1 and x.src[0].op is Ops.SHRINK:
     ptr = x.src[0]
     return x.ins(AMDOps.LOAD, src=(ptr.src[0], ptr.src[1], _load_count_src(4), _tconst(0, dtypes.int32).rtag("byte_addr")))
-  if x.arg == AMD_MBCNT_LO and len(x.src) == 1: return x.src[0]
-  if isinstance(x.arg, str) and x.arg.startswith(AMD_SWIZZLE_PREFIX) and x.arg.endswith("))"):
-    try: offset = int(x.arg[len(AMD_SWIZZLE_PREFIX):-2])
+  if arg == AMD_MBCNT_LO and len(x.src) == 1: return x.src[0]
+  if isinstance(arg, str) and arg.startswith(AMD_SWIZZLE_PREFIX) and arg.endswith("))"):
+    try: offset = int(arg[len(AMD_SWIZZLE_PREFIX):-2])
     except ValueError: return None
     if not 0 <= offset <= 0xffff: raise CompileError(f"bad ds_swizzle offset {offset}")
     return x.ins(AMDOps.SWIZZLE, src=(x.src[0], _tconst(offset, dtypes.uint32).rtag()))
   return None
 
 def _nontemporal_load(x:UOp) -> UOp|None:
-  if x.arg != AMD_NONTEMPORAL_LOAD or len(x.src) != 1 or x.src[0].op is not Ops.INDEX: return None
+  if _custom_name(x) != AMD_NONTEMPORAL_LOAD or len(x.src) != 1 or x.src[0].op is not Ops.INDEX: return None
   return x.src[0].load(dtype=x.dtype)
 
 def _bitfield_extract(x:UOp, value:UOp, shift:UOp, mask:UOp) -> UOp|None:
@@ -1012,7 +1015,7 @@ def _lshl_add(x:UOp, value:UOp, shift:UOp, other:UOp) -> UOp:
   return x.ins(AMDOps.LSHL_ADD, src=(value, shift, other))
 
 def _atomic_add_ins(x:UOp) -> UOp|None:
-  if x.arg != AMD_ATOMIC_ADD: return None
+  if _custom_name(x) != AMD_ATOMIC_ADD: return None
   if len(x.src) != 2 or x.src[0].op is not Ops.INDEX: raise CompileError(f"bad atomic {x}")
   a, val = x.src
   if val.dtype is not dtypes.float32: raise CompileError(f"f32 atomic only, got {val.dtype}")

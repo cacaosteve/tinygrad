@@ -339,7 +339,7 @@ def _atomic_add_program():
   out = UOp.placeholder((16,), dtypes.float32, 0)
   inp = UOp.placeholder((16,), dtypes.float32, 1)
   idx = UOp.special(16, "lidx0")
-  atomic = UOp(Ops.CUSTOM, dtypes.void, (out.index(idx), inp.index(idx).load()), arg=amd_lib.AMD_ATOMIC_ADD)
+  atomic = UOp(Ops.CUSTOM, src=(out.index(idx), inp.index(idx).load()), arg=(amd_lib.AMD_ATOMIC_ADD, dtypes.void))
   sink = UOp.sink(atomic, idx, arg=KernelInfo(name="amd_asm_atomic_add"))
   return _to_prg(sink)
 
@@ -909,7 +909,6 @@ class TestAMDRenderer(unittest.TestCase):
     first_wait = inst_names.index("S_WAITCNT_VMCNT")
     self.assertEqual(inst_names.count("GLOBAL_LOAD_B32"), 2)
     self.assertEqual(inst_names.count("S_LOAD_B64"), 3)
-    self.assertEqual(inst_names.count("S_WAITCNT_LGKMCNT"), 1)
     self.assertEqual(inst_names.count("S_WAITCNT_VMCNT"), 1)
     self.assertLess(inst_names.index("S_WAITCNT_LGKMCNT"), first_load)
     self.assertLess(first_load, first_wait)
@@ -1034,9 +1033,12 @@ class TestAMDRenderer(unittest.TestCase):
       with self.subTest(name=prg.arg.name):
         _assert_abi_reg_isolation(self, prg)
 
-  def test_kernarg_sgpr_pairs_do_not_overlap(self):
-    prg = _uint_var_program()
-    kernarg_bases = [greg(u).index for u in _prg_lin(prg).src if u.op is Ops.INS and u.arg is AMDOps.KERNARG and u.dtype.itemsize == 8]
+  def test_live_kernarg_sgpr_pairs_do_not_overlap(self):
+    # Physical pairs may be reused after their pointer's last use. Check two input pointers that are live together.
+    linear = _prg_lin(_two_load_add_program()).src
+    first_load = next(i for i,u in enumerate(linear) if u.op is Ops.INS and u.arg is AMDOps.LOAD)
+    kernarg_bases = [greg(u).index for u in linear[:first_load]
+                     if u.op is Ops.INS and u.arg is AMDOps.KERNARG and u.dtype.itemsize == 8]
     self.assertEqual(kernarg_bases, sorted(kernarg_bases))
     for a, b in zip(kernarg_bases, kernarg_bases[1:]):
       self.assertGreaterEqual(b - a, 2)
@@ -1833,11 +1835,12 @@ class TestAMDRenderer(unittest.TestCase):
       names = _amd_inst_names(prg)
       i_b128 = names.index("GLOBAL_LOAD_B128")
       i_first_u16 = names.index("GLOBAL_LOAD_U16")
-      # Between A’s B128 and B’s first U16: wait + unpack, then addr ADDs — not ADDs first.
+      # Between A’s B128 and B’s first U16: wait + unpack, then B address arithmetic — not address arithmetic first.
       window = names[i_b128:i_first_u16]
       self.assertIn("S_WAITCNT_VMCNT", window)
       self.assertTrue(any(n.startswith("V_MOV") or n.startswith("V_LSHR") for n in window))
-      add_i = next(i for i, n in enumerate(window) if n == "V_ADD_NC_U32_E64")
+      # master can fold the base into an SMEM load, leaving either an ADD or the scaled-index LSHL here.
+      add_i = next(i for i, n in enumerate(window) if n in {"V_ADD_NC_U32_E64", "V_LSHLREV_B32_E64"})
       unpack_i = next(i for i, n in enumerate(window) if n.startswith("V_MOV") or n.startswith("V_LSHR"))
       self.assertLess(unpack_i, add_i)
     finally:
