@@ -937,6 +937,19 @@ class TestAMDRenderer(unittest.TestCase):
     scheduled = amd_lib._schedule_scalar_vmem([load0, load1, cast0, mul0, cast1, mul1], {}, alu_breadth=True)
     self.assertEqual([id(x) for x in scheduled], [id(x) for x in (load0, load1, cast0, cast1, mul0, mul1)])
 
+  def test_scalar_vmem_scheduler_hoists_packed_byte_load(self):
+    base = UOp(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
+    idx0 = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))
+    idx1 = UOp(Ops.INS, dtypes.uint32, (idx0, UOp.const(16, dtypes.uint32)), AMDOps.ADD, (Register("idx1", 261),))
+    count = UOp.const(4, dtypes.int32)
+    byte_off = UOp.const(0, dtypes.int32).rtag("byte_addr")
+    load0 = UOp(Ops.INS, dtypes.uint32, (base, idx0, count, byte_off), AMDOps.LOAD, (Register("load0", 270),))
+    lane0 = UOp(Ops.INS, dtypes.uint32, (load0, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane0", 274),))
+    load1 = UOp(Ops.INS, dtypes.uint32, (base, idx1, count, byte_off), AMDOps.LOAD, (Register("load1", 275),))
+    lane1 = UOp(Ops.INS, dtypes.uint32, (load1, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane1", 279),))
+    scheduled = amd_lib._schedule_scalar_vmem([load0, lane0, idx1, load1, lane1], {})
+    self.assertEqual(scheduled, [load0, idx1, load1, lane0, lane1])
+
   def test_scalar_vmem_scheduler_preserves_reg_store_boundary(self):
     base = UOp(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
     idx = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx", 260),))
@@ -2467,6 +2480,21 @@ class TestAMDRenderer(unittest.TestCase):
     linear_ops = _lin_ops(prg)
     for op in (AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.SHR):
       self.assertIn(op, linear_ops)
+
+  def test_commutative_immediates_use_vop2_src0(self):
+    value = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("value", 260),))
+    for op,inst_name in ((AMDOps.AND, "V_AND_B32_E32"), (AMDOps.OR, "V_OR_B32_E32"), (AMDOps.XOR, "V_XOR_B32_E32")):
+      with self.subTest(op=op):
+        result = UOp(Ops.INS, dtypes.uint32, (value, UOp.const(0x01010101, dtypes.uint32)), op, (Register("result", 261),))
+        self.assertEqual([x.op_name for x in amd_lib.insts_for_uop(result)], [inst_name])
+    compare = UOp(Ops.INS, dtypes.bool, (value, UOp.const(0, dtypes.uint32)), AMDOps.CMPEQ)
+    self.assertEqual([x.op_name for x in amd_lib.insts_for_uop(compare)], ["V_CMP_EQ_U32_E32"])
+
+  def test_dot4_literal_avoids_temp_move(self):
+    packed = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("packed", 260),))
+    acc = UOp(Ops.INS, dtypes.int32, arg=AMDOps.DEFINE, tag=(Register("acc", 261),))
+    dot = UOp(Ops.INS, dtypes.int32, (UOp.const(0x01010101, dtypes.uint32), packed, acc), AMDOps.DOT4, (Register("dot", 262),))
+    self.assertEqual([x.op_name for x in amd_lib.insts_for_uop(dot)], ["V_DOT4_I32_IU8"])
 
   def test_fused_packed_byte_assembles(self):
     _check_asm(self, _fused_packed_byte_program(), AMDOps.BFE, AMDOps.LSHL_OR, AMDOps.LSHL_ADD,

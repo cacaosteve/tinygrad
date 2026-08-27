@@ -1191,9 +1191,9 @@ pre_isel_matcher = PatternMatcher([
   (UPat.cvar("c").cast(name="x"), lambda c,x: _tconst(c.val, x.dtype)),
   (UPat(Ops.AND, dtype=dtypes.uint8, src=(UPat(Ops.SHR, src=(UPat.var("value"), UPat.var("shift"))), UPat.cvar("mask")),
    name="x"), _bitfield_extract),
-  (UPat(Ops.OR, dtype=dtypes.uint8, src=(UPat(Ops.SHL, src=(UPat.var("value"), UPat.var("shift"))), UPat.var("other")),
+  (UPat(Ops.OR, dtype=(dtypes.uint8, dtypes.uint32), src=(UPat(Ops.SHL, src=(UPat.var("value"), UPat.var("shift"))), UPat.var("other")),
    name="x"), _lshl_or),
-  (UPat(Ops.OR, dtype=dtypes.uint8, src=(UPat.var("other"), UPat(Ops.SHL, src=(UPat.var("value"), UPat.var("shift")))),
+  (UPat(Ops.OR, dtype=(dtypes.uint8, dtypes.uint32), src=(UPat.var("other"), UPat(Ops.SHL, src=(UPat.var("value"), UPat.var("shift")))),
    name="x"), _lshl_or),
   (UPat(Ops.ADD, dtype=dtypes.uint32, src=(UPat(Ops.SHL, src=(UPat.var("value"), UPat.var("shift"))), UPat.var("other")),
    name="x"), _lshl_add),
@@ -1465,17 +1465,28 @@ def _cmp_lt(u:UOp):
   else: cmp = r3.v_cmp_gt_u32_e32
   return pre + [cmp(_src(u.src[1]), a)]
 def _cmp_ne(u:UOp):
-  pre, b = _vgpr_data(TMP_VDATA, u.src[1])
   sc = u.src[0].dtype
-  if sc is dtypes.float16: return pre + [r3.v_cmp_neq_f16_e32(_src(u.src[0]), b)]
-  if sc is dtypes.float32: return pre + [r3.v_cmp_neq_f32_e32(_src(u.src[0]), b)]
-  return pre + [r3.v_cmp_ne_u32_e32(_src(u.src[0]), b)]
+  cmp = r3.v_cmp_neq_f16_e32 if sc is dtypes.float16 else r3.v_cmp_neq_f32_e32 if sc is dtypes.float32 else r3.v_cmp_ne_u32_e32
+  a, b = _src(u.src[0]), _src(u.src[1])
+  if isinstance(b, Reg) and b.offset >= 256: return [cmp(a, b)]
+  if isinstance(a, Reg) and a.offset >= 256: return [cmp(b, a)]
+  pre, b = _vgpr_data(TMP_VDATA, u.src[1])
+  return pre + [cmp(a, b)]
 def _cmp_eq(u:UOp):
-  pre, b = _vgpr_data(TMP_VDATA, u.src[1])
   sc = u.src[0].dtype
-  if sc is dtypes.float16: return pre + [r3.v_cmp_eq_f16_e32(_src(u.src[0]), b)]
-  if sc is dtypes.float32: return pre + [r3.v_cmp_eq_f32_e32(_src(u.src[0]), b)]
-  return pre + [r3.v_cmp_eq_u32_e32(_src(u.src[0]), b)]
+  cmp = r3.v_cmp_eq_f16_e32 if sc is dtypes.float16 else r3.v_cmp_eq_f32_e32 if sc is dtypes.float32 else r3.v_cmp_eq_u32_e32
+  a, b = _src(u.src[0]), _src(u.src[1])
+  if isinstance(b, Reg) and b.offset >= 256: return [cmp(a, b)]
+  if isinstance(a, Reg) and a.offset >= 256: return [cmp(b, a)]
+  pre, b = _vgpr_data(TMP_VDATA, u.src[1])
+  return pre + [cmp(a, b)]
+
+def _commutative_vop2(u:UOp, inst) -> list:
+  a, b = _src(u.src[0]), _src(u.src[1])
+  if isinstance(b, Reg) and b.offset >= 256: return [inst(_dst(u), a, b)]
+  if isinstance(a, Reg) and a.offset >= 256: return [inst(_dst(u), b, a)]
+  pre, b = _vgpr_data(TMP_VDATA, u.src[1])
+  return pre + [inst(_dst(u), a, b)]
 
 _MASKED_MEM = (AMDOps.LOAD, AMDOps.STORE, AMDOps.LLOAD, AMDOps.LSTORE, AMDOps.SLOAD, AMDOps.SSTORE)
 
@@ -1518,8 +1529,10 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if (offset:=_const_int(u.src[1])) is None: raise CompileError("non-constant swizzle offset")
       return pre + [r3.ds_swizzle_b32(vdst=_dst(u), addr=val, offset0=offset & 0xff, offset1=offset >> 8)]
     case AMDOps.DOT4:
-      pre0, a = _vgpr_data(TMP_VDATA, u.src[0])
-      pre1, b = _vgpr_data(TMP_VADDR, u.src[1])
+      a, b = _src(u.src[0]), _src(u.src[1])
+      pre0, a = ([], a) if not isinstance(a, Reg) else _vgpr_data(TMP_VDATA, u.src[0])
+      pre1, b = ([], b) if not isinstance(b, Reg) else _vgpr_data(TMP_VADDR, u.src[1])
+      if not isinstance(a, Reg) and not isinstance(b, Reg) and a != b: pre1, b = _vgpr_data(TMP_VADDR, u.src[1])
       return pre0 + pre1 + [r3.v_dot4_i32_iu8(_dst(u), a, b, _src(u.src[2]), neg=0b011)]
     case AMDOps.BYTE_PERM:
       pre0, a = _vgpr_data(TMP_VDATA, u.src[0])
@@ -1624,14 +1637,11 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if u.dtype in dtypes.sints: return pre + [r3.v_ashrrev_i32_e64(_dst(u), _src(u.src[1]), a)]
       return pre + [r3.v_lshrrev_b32_e64(_dst(u), _src(u.src[1]), a)]
     case AMDOps.AND:
-      pre, b = _vgpr_data(TMP_VDATA, u.src[1])
-      return pre + [r3.v_and_b32_e32(_dst(u), _src(u.src[0]), b)]
+      return _commutative_vop2(u, r3.v_and_b32_e32)
     case AMDOps.OR:
-      pre, b = _vgpr_data(TMP_VDATA, u.src[1])
-      return pre + [r3.v_or_b32_e32(_dst(u), _src(u.src[0]), b)]
+      return _commutative_vop2(u, r3.v_or_b32_e32)
     case AMDOps.XOR:
-      pre, b = _vgpr_data(TMP_VDATA, u.src[1])
-      return pre + [r3.v_xor_b32_e32(_dst(u), _src(u.src[0]), b)]
+      return _commutative_vop2(u, r3.v_xor_b32_e32)
     case AMDOps.CMPLT:
       return _cmp_lt(u)
     case AMDOps.CMPNE:
@@ -2129,14 +2139,18 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
   Explicit SSA dependencies preserve value order; REG_STORE and all other implicit
   architectural state or memory side effects are hard boundaries.
   """
-  if any(u.op is Ops.INS and (u.arg is AMDOps.WMMA or (u.arg is AMDOps.LOAD and _reg_slots(u) > 1)) for u in ops): return ops
+  if any(u.op is Ops.INS and (u.arg is AMDOps.WMMA or (u.arg is AMDOps.LOAD and _reg_slots(u) > 1 and
+      not (u.dtype is dtypes.uint32 and _reg_slots(u) == 4 and _is_byte_addr_load(u)))) for u in ops): return ops
   fused_d16 = set(d16_hi_lo) | set(d16_hi_lo.values())
 
   def schedulable(u:UOp) -> bool:
     if u.op is Ops.NOOP and u.dtype in (dtypes.int8, dtypes.uint8): return True  # pure byte bitcast used by quantized loads
     if u in fused_d16 or u.op is not Ops.INS or u.arg not in _VMEM_SCHEDULABLE: return False
-    # Wide/d16 loads have emitter-level destination and temporary-register constraints.
-    return u.arg is not AMDOps.LOAD or _reg_slots(u) == 1
+    # Packed byte x16 custom loads have independent addresses and four dedicated
+    # destination VGPRs, so they can participate in the same dependency schedule.
+    # Other wide/d16 loads retain emitter-level destination and temporary constraints.
+    return u.arg is not AMDOps.LOAD or _reg_slots(u) == 1 or \
+      (u.dtype is dtypes.uint32 and _reg_slots(u) == 4 and _is_byte_addr_load(u))
 
   def schedule(segment:list[UOp]) -> list[UOp]:
     loads = [i for i,u in enumerate(segment) if u.arg is AMDOps.LOAD]
@@ -3010,8 +3024,12 @@ class AMDRenderer(ISARenderer):
     # PACK_F16(half×16 LOAD) — coalesce onto the load (hand FA/FB).
     return x.arg is AMDOps.PACK_F16 and _pack_f16_is_vec_load(x) and len(x.src) == 1
   def prefer_phys(self, x:UOp, src_phys:list) -> Register|None:
-    # Float EXTRACT from a multi-VGPR pack/WMMA → alias onto pack+lane (kill C-store movs).
-    if x.op is not Ops.INS or x.arg is not AMDOps.EXTRACT or x.dtype is not dtypes.float32: return None
+    # EXTRACT from a multi-VGPR value → alias onto its source lane. Besides WMMA
+    # float stores, packed quantized byte loads use uint32 lanes exactly once.
+    if x.op is not Ops.INS or x.arg is not AMDOps.EXTRACT: return None
+    packed_bytes = x.dtype is dtypes.uint32 and x.src and x.src[0].op is Ops.INS and x.src[0].arg is AMDOps.LOAD and \
+      _reg_slots(x.src[0]) == 4 and _is_byte_addr_load(x.src[0])
+    if x.dtype is not dtypes.float32 and not packed_bytes: return None
     if not src_phys or src_phys[0] is None or not isinstance(x.tag, tuple): return None
     if (lane := _lane_const(x.src[1])) is None: return None
     want = src_phys[0].index + int(lane)
