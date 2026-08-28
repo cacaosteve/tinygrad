@@ -214,6 +214,19 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
       np.testing.assert_allclose(recurrent_state, expected_recurrent[step], rtol=1e-3, atol=1e-3,
                                  err_msg=f"GatedDeltaNet reset recurrent cache mismatch at step {step}")
 
+  def test_fused_rmsnorm_projection_into_window_store(self):
+    config = self._make_config(max_context=3)
+    block = self._make_block(config)
+    x = Tensor.linspace(-1.0, 1.0, 3 * config.dim, dtype=dtypes.float32).reshape(1, 3, config.dim)
+    x_np = self._rms_norm_np(x.numpy(), block.attn_norm.weight.numpy(), block.attn_norm.eps).astype(np.float16)
+    expected_qkv = self._linear_np(x_np, block.attn_qkv.weight.numpy())
+    block._init_state(x)
+    win = Tensor.zeros(1, block.ssm_conv_kernel-1 + x.shape[1], block.conv_channels).uop
+    win = win.after(win[:, :block.ssm_conv_kernel-1].store(block.conv_state.cast(win.dtype).uop))
+    win = win.after(win[:, block.ssm_conv_kernel-1:].store(block.attn_qkv(block.attn_norm(x).half()).cast(win.dtype).uop))
+    expected = np.concatenate([np.zeros((1, block.ssm_conv_kernel-1, block.conv_channels), np.float32), expected_qkv], axis=1)
+    np.testing.assert_allclose(Tensor(win).numpy(), expected, rtol=1e-3, atol=1e-3)
+
   def test_kda_channel_decay(self):
     config = self._make_config(dim=4, hidden_dim=8, n_heads=2, head_dim=4, rope_dim=4, v_head_dim=4,
       ssm=SSMConfig(conv_kernel=2, state_size=2, group_count=2, time_step_rank=2, inner_size=4, kda=True))

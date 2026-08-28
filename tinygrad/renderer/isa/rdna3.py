@@ -1248,6 +1248,27 @@ def _fused_mulacc(ctx:IselContext, a:UOp, b:UOp, c:UOp) -> UOp|None:
   # VOP3 FMA when the addend remains live elsewhere.
   return a.ins(AMDOps.FMAC, src=(b, *a.src)) if _is_foldable(ctx, c, b) else a.ins(AMDOps.MULACC, src=(*a.src, b))
 
+def _protect_loop_invariant_fmac(lst:list[UOp]) -> list[UOp]:
+  """VOP2 FMAC overwrites src0. A graph-single-use addend defined outside the active loop
+  is still reused on every iteration."""
+  active:list[tuple[UOp, set[UOp]]] = []
+  out:list[UOp] = []
+  remap:dict[UOp, UOp] = {}
+  for old in lst:
+    u = old.replace(src=tuple(remap.get(s, s) for s in old.src))
+    if u.op is Ops.RANGE:
+      if active: active[-1][1].add(u)
+      active.append((u, set()))
+    elif u.op is Ops.INS and u.arg is AMDOps.FMAC and active and u.src[0] not in active[-1][1]:
+      u = u.replace(src=(*u.src[1:], u.src[0]), arg=AMDOps.MULACC)
+    out.append(u)
+    if u is not old: remap[old] = u
+    if u.op is Ops.END:
+      assert active and active[-1][0] is u.src[1]
+      active.pop()
+    elif active: active[-1][1].add(u)
+  return out
+
 def _promote_f16_unary(x:UOp, d:UOp) -> UOp:
   return UOp(x.op, dtypes.float32, (d.cast(dtypes.float32),)).cast(dtypes.float16)
 
@@ -3144,6 +3165,7 @@ class AMDRenderer(ISARenderer):
     return None
 
   def prepare_pre_regalloc(self, lst:list[UOp]) -> tuple[list[UOp], dict]:
+    lst = _protect_loop_invariant_fmac(lst)
     # Unroll lowers WMMA cin to zero PACKs + ADD into phi. Those PACKs must run each K
     # iteration: if they stay pre-loop, two-address WMMA keeps ACC across iters and the
     # phi ADDs double-count (test_tensor_cores_unroll_phi).

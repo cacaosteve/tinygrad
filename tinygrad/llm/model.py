@@ -287,16 +287,12 @@ class GatedDeltaNetBlock(FFNBlock):
     T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
 
     # input processing
-    # Keep the direct renderer's independent reduction producers behind explicit storage boundaries.
-    # Without these, the input/QKV and alpha reductions can be fused into graphs it cannot yet lower correctly.
     direct_isa = amd_direct_isa(self.recurrent_state.device)
     x = x.half()
-    if direct_isa: x = x.clone(self.recurrent_state.device)
     out_gate = self.ssm_g_b(self.ssm_g_a(x)) if is_kda else self.attn_gate(x)
     out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
     beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
     alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)
-    if direct_isa: alpha = alpha.clone(self.recurrent_state.device)
     log_alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, self.num_v_heads, -1) *
                  self.ssm_a.reshape(self.num_v_heads, -1))
 
@@ -306,9 +302,7 @@ class GatedDeltaNetBlock(FFNBlock):
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
     win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
     win = win.after(win[:, :self.ssm_conv_kernel-1].store(conv_state.cast(win.dtype).uop))
-    qkv = self.attn_qkv(x)
-    if direct_isa: qkv = qkv.clone(self.recurrent_state.device)
-    win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(qkv.cast(win.dtype).uop))
+    win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(self.attn_qkv(x).cast(win.dtype).uop))
     conv_window = Tensor(win)
     # the last conv_kernel-1 columns of the window become the next conv state
     conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)

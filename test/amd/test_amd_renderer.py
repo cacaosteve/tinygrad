@@ -1945,6 +1945,23 @@ class TestAMDRenderer(unittest.TestCase):
     out = _REN.after_pre_regalloc([acc0, acc1, c0, c1, s0, s1])
     self.assertEqual(out, [acc0, acc1, c0, s0, c1, s1])
 
+  def test_loop_invariant_fmac_uses_nondestructive_fma(self):
+    inv = UOp(Ops.INS, dtypes.float32, (UOp.const(0.8, dtypes.float32),), AMDOps.MOV, (Register("inv", 1),))
+    factor = UOp(Ops.INS, dtypes.float32, (UOp.const(0.1, dtypes.float32),), AMDOps.MOV, (Register("factor", 3),))
+    rng = UOp(Ops.RANGE, dtypes.uint32, (UOp.const(8, dtypes.uint32),), (0, AxisType.REDUCE), (Register("r", 0),))
+    varying = UOp(Ops.INS, dtypes.float32, (rng,), AMDOps.CAST, (Register("varying", 2),))
+    unsafe = UOp(Ops.INS, dtypes.float32, (inv, varying, factor), AMDOps.FMAC, (Register("unsafe", 4),))
+    consumer = UOp(Ops.INS, dtypes.float32, (unsafe, factor), AMDOps.MUL, (Register("consumer", 5),))
+    accumulator = UOp(Ops.INS, dtypes.float32, (rng,), AMDOps.CAST, (Register("acc", 6),))
+    safe = UOp(Ops.INS, dtypes.float32, (accumulator, varying, factor), AMDOps.FMAC, (Register("safe", 7),))
+    end = UOp(Ops.END, dtypes.void, (safe, rng))
+    out = amd_lib._protect_loop_invariant_fmac([inv, factor, rng, varying, unsafe, consumer, accumulator, safe, end])
+    converted = out[4]
+    self.assertIs(converted.arg, AMDOps.MULACC)
+    self.assertEqual(converted.src, (varying, factor, inv))
+    self.assertIs(out[5].src[0], converted)
+    self.assertIs(out[7].arg, AMDOps.FMAC)
+
   def test_store_addr_cache_invalidates_on_reused_index_reg(self):
     # Regalloc may assign two different store indices to the same VGPR. The second
     # index must rescale TMP_VADDR instead of reusing the first store's cached base.
