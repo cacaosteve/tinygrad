@@ -31,10 +31,12 @@ def amd_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   if device is None or device.split(":")[0] != "AMD": return False
   # @function contexts set ALLOW_DEVICE_USAGE=0 (scheduling must not open devices); the device is always open here
   with Context(ALLOW_DEVICE_USAGE=1):
-    return (t:=getattr(Device[device], "target", None)) is not None and t[0] == 11
+    amd_device = Device[device]
+    # The LLVM IR renderer cannot lower the lane-level CUSTOM operations used by these kernels.
+    return (t:=getattr(amd_device, "target", None)) is not None and t[0] == 11 and amd_device.renderer.__class__.__name__ != "AMDLLVMRenderer"
 
 @functools.cache
-def _amd_direct_isa(device:str|tuple[str, ...]|None) -> bool:
+def amd_direct_isa(device:str|tuple[str, ...]|None) -> bool:
   if isinstance(device, tuple): device = device[0]
   if device is None or device.split(":")[0] != "AMD": return False
   with Context(ALLOW_DEVICE_USAGE=1): return Device[device].renderer.__class__.__name__ == "AMDRenderer"
@@ -438,7 +440,9 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   for j in range(SEC):
     for h in range(G):
       beta = valids[j].where(((scores[j][h]-row_max[h])*LOG2E).exp2(), UOp.const(0, dtypes.float))
-      accs[h] = [a + beta*v for a, v in zip(accs[h], vfrags[j])]
+      # Invalid physical-cache rows are still speculatively loaded. Mask before the multiply so an
+      # uninitialized NaN cannot leak through 0*NaN into the partial accumulator.
+      accs[h] = [a + beta*valids[j].where(v, UOp.const(0, dtypes.float)) for a, v in zip(accs[h], vfrags[j])]
       row_sums[h] = row_sums[h] + beta
   # exchange across the block's waves through LDS (fp16 halves LDS so more blocks fit per CU)
   acc_lds = UOp.placeholder((WAVES, G, D), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)
@@ -501,8 +505,8 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   chunks = min(256, max_kv_len // 64)
   partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
-  # 16 waves is fastest through AMDLLVM. Direct ISA currently tops out at eight for this LDS exchange mapping.
-  waves = 8 if _amd_direct_isa(q.device) else 16
+  # Eight waves keeps the LDS exchange mapping correct for both direct ISA and HIP.
+  waves = 8
   fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=64, waves=waves)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len+63)//64
@@ -599,7 +603,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   if resolve(T_real == 1): return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, assigned_kv.shape[3]))
   # The direct-ISA renderer does not yet preserve the hand WMMA kernel's value accumulator across multiple N tiles.
   # Keep prefill correct through the generic lowering until nested WMMA loop-carried state is supported there.
-  if _amd_direct_isa(q.device):
+  if amd_direct_isa(q.device):
     k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
     return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
@@ -620,25 +624,31 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
-  assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
+  assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and \
+    (key_dim <= 32 or key_dim % 32 == 0) and value_dim % row_tile == 0
   batch, heads, tokens, value_dim, key_dim = cast(tuple[int, int, int, int, int], (batch, heads, tokens, value_dim, key_dim))
+  key_chunks = (key_dim + 31) // 32
   core, v = (x.reshape(batch*heads, tokens, value_dim) for x in (core, v))
   q, k = (x.reshape(batch*heads, tokens, key_dim) for x in (q, k))
   beta, kq = (x.reshape(batch*heads, tokens) for x in (beta, kq))
   alpha, state = alpha.reshape(batch*heads, tokens, alpha_dim), state.reshape(batch*heads, value_dim, key_dim)
   bh_row, lane = UOp.range(batch*heads*value_dim//row_tile, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   bh, row_base = bh_row // (value_dim//row_tile), (bh_row % (value_dim//row_tile))*row_tile
-  rows, cols = tuple(row_base+i for i in range(row_tile)), tuple(lane + i*32 for i in range(key_dim//32))
-  current = UOp.placeholder((row_tile*key_dim//32,), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
+  rows = tuple(row_base+i for i in range(row_tile))
+  raw_cols = tuple(lane+i*32 for i in range(key_chunks))
+  col_valids = tuple(col < key_dim for col in raw_cols)
+  cols = tuple(col.valid(valid) for col,valid in zip(raw_cols, col_valids))
+  current = UOp.placeholder((row_tile*key_chunks,), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
   initial = None if start_pos is None else start_pos.eq(0)
-  current = current.after(current.store(UOp.stack(*(state[bh, row, col].float() if initial is None else
-    initial.where(0, state[bh, row, col].float()) for row in rows for col in cols))))
+  current = current.after(current.store(UOp.stack(*(valid.where(
+    state[bh, row, col].float() if initial is None else initial.where(0, state[bh, row, col].float()), UOp.const(0, dtypes.float32))
+    for row in rows for col,valid in zip(cols, col_valids)))))
   token = UOp.range(tokens, 2, AxisType.REDUCE)
-  keys = tuple(k[bh, token, col].load() for col in cols)
-  queries = tuple(q[bh, token, col].load() for col in cols)
+  keys = tuple(valid.where(k[bh, token, col].load(), UOp.const(0, dtypes.float32)) for col,valid in zip(cols, col_valids))
+  queries = tuple(valid.where(q[bh, token, col].load(), UOp.const(0, dtypes.float32)) for col,valid in zip(cols, col_valids))
   updates, stores = [], []
   for row_idx,row in enumerate(rows):
-    previous = tuple(current.after(token)[row_idx*key_dim//32+i].load() for i in range(key_dim//32))
+    previous = tuple(current.after(token)[row_idx*key_chunks+i].load() for i in range(key_chunks))
     av, bv = alpha[bh, token, row if alpha_dim > 1 else 0].load(), beta[bh, token].load()
     state_k = warp_reduce(sum((x*y for x,y in zip(previous, keys)), UOp.const(0, dtypes.float32)), full_wave=True)
     state_q = warp_reduce(sum((x*y for x,y in zip(previous, queries)), UOp.const(0, dtypes.float32)), full_wave=True)
@@ -646,7 +656,7 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
     updates += [x*av + delta*y for x,y in zip(previous, keys)]
     stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q*av + delta*kq[bh, token]))
   step = UOp.group(*stores, current.store(UOp.stack(*updates))).end(token)
-  state_stores = (state[bh, row, col].store(current.after(step)[row_idx*key_dim//32+i].load().cast(state.dtype))
+  state_stores = (state[bh, row, col].store(current.after(step)[row_idx*key_chunks+i].load().cast(state.dtype))
                   for row_idx,row in enumerate(rows) for i,col in enumerate(cols))
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
@@ -655,7 +665,7 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
   assert alpha.shape[:3] == (batch, heads, tokens) and (len(alpha.shape) == 3 or alpha.shape[-1] in (1, value_dim))
-  assert key_dim % 32 == 0 and value_dim % 4 == 0
+  assert (key_dim <= 32 or key_dim % 32 == 0) and value_dim % 4 == 0
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
   if start_pos is None: return Tensor.custom_kernel(*srcs, fxn=_gated_delta_prefill_kernel)[0]

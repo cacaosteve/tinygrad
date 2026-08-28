@@ -97,11 +97,17 @@ class TestQ8Quantize(unittest.TestCase):
   def test_attention_decode_multiple_chunks_and_gqa_heads(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     rng, valid = np.random.default_rng(42), 129
-    q, kv = Tensor.zeros(1, 32, 1, 64), rng.normal(size=(2, 1, 8, valid, 64)).astype(np.float32)
+    q_np, kv = rng.normal(size=(1, 32, 1, 64)).astype(np.float32), rng.normal(size=(2, 1, 8, valid, 64)).astype(np.float32)
+    q = Tensor(q_np)
     cache = Tensor.empty(2, 1, 8, 256, 64, dtype=dtypes.half).contiguous()
     assigned = Tensor(cache.uop.after(cache[:, :, :, :valid, :].uop.store(Tensor(kv).cast(dtypes.half).uop)))
     out = flash_attention(q, assigned, valid).realize().numpy()
-    expected = np.repeat(kv[1].astype(np.float16).astype(np.float32).mean(2), 4, axis=1)[:, :, None, :]
+    qh = q_np.astype(np.float16).astype(np.float32)
+    kh, vh = (np.repeat(x.astype(np.float16).astype(np.float32), 4, axis=1) for x in kv)
+    scores = np.einsum("bhqd,bhkd->bhqk", qh, kh) / np.sqrt(64)
+    probs = np.exp(scores - scores.max(-1, keepdims=True))
+    probs /= probs.sum(-1, keepdims=True)
+    expected = np.einsum("bhqk,bhkd->bhqd", probs, vh)
     np.testing.assert_allclose(out, expected, rtol=5e-3, atol=5e-3)
 
   def test_prefill_attention_unaligned_start(self):

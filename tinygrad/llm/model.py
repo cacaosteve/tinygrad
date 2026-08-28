@@ -2,7 +2,7 @@ from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, amd_direct_isa
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -287,11 +287,16 @@ class GatedDeltaNetBlock(FFNBlock):
     T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
 
     # input processing
+    # Keep the direct renderer's independent reduction producers behind explicit storage boundaries.
+    # Without these, the input/QKV and alpha reductions can be fused into graphs it cannot yet lower correctly.
+    direct_isa = amd_direct_isa(self.recurrent_state.device)
     x = x.half()
+    if direct_isa: x = x.clone(self.recurrent_state.device)
     out_gate = self.ssm_g_b(self.ssm_g_a(x)) if is_kda else self.attn_gate(x)
     out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
     beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
     alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)
+    if direct_isa: alpha = alpha.clone(self.recurrent_state.device)
     log_alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, self.num_v_heads, -1) *
                  self.ssm_a.reshape(self.num_v_heads, -1))
 
@@ -301,7 +306,9 @@ class GatedDeltaNetBlock(FFNBlock):
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
     win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
     win = win.after(win[:, :self.ssm_conv_kernel-1].store(conv_state.cast(win.dtype).uop))
-    win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(self.attn_qkv(x).cast(win.dtype).uop))
+    qkv = self.attn_qkv(x)
+    if direct_isa: qkv = qkv.clone(self.recurrent_state.device)
+    win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(qkv.cast(win.dtype).uop))
     conv_window = Tensor(win)
     # the last conv_kernel-1 columns of the window become the next conv state
     conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
@@ -323,7 +330,8 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
-    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
+    if (self.head_k_dim % 32 == 0 or self.head_k_dim < 32 and direct_isa) and self.head_v_dim % 4 == 0 and \
+       amd_custom_kernels_supported(state.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:

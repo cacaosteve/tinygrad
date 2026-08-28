@@ -13,7 +13,7 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BACKENDS = {
   "direct": {"DEV": "AMD:AMD"},
-  "hip": {"DEV": "AMD"},
+  "hip": {"DEV": "AMD:HIP"},
   "llvm": {"DEV": "AMD:LLVM"},
 }
 QUANT_OVERRIDES = {"MV_FORCE_GROUP": "32", "MV_FORCE_UNROLL_INNER": "-1"}
@@ -21,11 +21,13 @@ QUANT_TYPES = [(qtype, 8192, 2048) for qtype in ("Q4_K", "Q5_K", "Q6_K", "Q8_0",
 Q6_SHAPES = [("Q6_K", rows, cols) for rows, cols in (
   (4096, 4096), (11008, 4096), (4096, 11008), (32000, 4096))]
 ORDINARY_CASES = ("elementwise", "reduce", "gemv", "gemm")
+ATTENTION_CASES = ("decode", "prefill")
 
 
 def run_probe(backend: str, suite: str, label: str, cmd: list[str], same_layout: bool = False) -> None:
   env = os.environ.copy()
-  env.update({"PYTHONPATH": str(ROOT), "CCACHE": "0", **BACKENDS[backend], **(QUANT_OVERRIDES if same_layout else {})})
+  env.update({"PYTHONPATH": str(ROOT), "CCACHE": "0", "CACHELEVEL": "0", "PARALLEL": "0", **BACKENDS[backend],
+              **(QUANT_OVERRIDES if same_layout else {})})
   for key in ("MV_FORCE_GROUP", "MV_FORCE_UNROLL_INNER"):
     if not same_layout: env.pop(key, None)
   try:
@@ -37,7 +39,8 @@ def run_probe(backend: str, suite: str, label: str, cmd: list[str], same_layout:
       "backend": backend, "suite": suite, "label": label, "renderer": data["renderer"],
       "shape": data["shape"], "first_call_ms": data["first_call_ms"], "capture_call_ms": data["capture_call_ms"],
       "median_us": data["median_us"], "best_us": data["best_us"], "checksum": data["checksum"], "first8": data["first8"],
-      "max_abs_error_first16": data.get("max_abs_error_first16"), "global_size": program.get("global_size"),
+      "max_abs_error": data.get("max_abs_error"), "max_abs_error_first16": data.get("max_abs_error_first16"),
+      "global_size": program.get("global_size"),
       "local_size": program.get("local_size"), "binary_bytes": program.get("binary_bytes"), "max_vgpr": program.get("max_vgpr"),
       "max_sgpr": program.get("max_sgpr"), "private_segment_size": program.get("private_segment_size"),
     }
@@ -51,7 +54,7 @@ def run_probe(backend: str, suite: str, label: str, cmd: list[str], same_layout:
 
 def main() -> None:
   parser = argparse.ArgumentParser()
-  parser.add_argument("--suite", choices=("quant-types", "q6-shapes", "ordinary", "all"), default="all")
+  parser.add_argument("--suite", choices=("quant-types", "q6-shapes", "ordinary", "attention", "all"), default="all")
   parser.add_argument("--backend", action="append", choices=tuple(BACKENDS), dest="backends")
   args = parser.parse_args()
   backends = args.backends or list(BACKENDS)
@@ -73,6 +76,11 @@ def main() -> None:
       for backend in backends:
         run_probe(backend, "ordinary", case, ["extra/bench_backend_kernels.py", "--case", case,
           "--warmup", "50", "--batch", "20", "--rounds", "5"])
+  if args.suite in ("attention", "all"):
+    for case in ATTENTION_CASES:
+      for backend in backends:
+        run_probe(backend, "attention", case, ["extra/bench_amd_attention.py", "--case", case,
+          "--warmup", "3", "--warmup-seconds", "1", "--batch", "20", "--rounds", "5"])
 
 
 if __name__ == "__main__": main()
