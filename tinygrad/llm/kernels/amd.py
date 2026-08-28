@@ -601,8 +601,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
   T_real, q_start = q.shape[2], None
   if resolve(T_real == 1): return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, assigned_kv.shape[3]))
-  # The direct-ISA renderer does not yet preserve the hand WMMA kernel's value accumulator across multiple N tiles.
-  # Keep prefill correct through the generic lowering until nested WMMA loop-carried state is supported there.
+  # Direct ISA can render the hand WMMA prefill correctly, but its per-tile REG scratch
+  # traffic is currently much slower than the generic fused attention lowering.
   if amd_direct_isa(q.device):
     k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)

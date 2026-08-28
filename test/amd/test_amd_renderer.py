@@ -3066,6 +3066,15 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertNotIn("SCRATCH_STORE_B32", inst_names)
     self.assertNotIn("SCRATCH_LOAD_B32", inst_names)
 
+  def test_dynamic_reg_access_keeps_constant_zero_init(self):
+    scratch = UOp.placeholder((16,), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
+    zero = UOp(Ops.INS, dtypes.float32, (UOp.const(0.0, dtypes.float32),), AMDOps.MOV)
+    init = UOp(Ops.INS, dtypes.void, (scratch, UOp.const(0, dtypes.int32), zero), AMDOps.SSTORE)
+    idx = UOp.range(16, 0, AxisType.REDUCE)
+    load = UOp(Ops.INS, dtypes.float32, (scratch, idx, UOp.const(True, dtypes.bool)), AMDOps.SLOAD)
+    update = UOp(Ops.INS, dtypes.void, (scratch, idx, load + UOp.const(1.0, dtypes.float32)), AMDOps.SSTORE)
+    self.assertNotIn(init, amd_lib._compute_amd_skip([init, idx, load, update]))
+
   def test_gated_store_materialized_bool_rebuilds_vcc(self):
     inst_names = [getattr(i, "op_name", "") for i in _REN._insts_from_linear(_late_gated_store_linear(True))]
     self.assertLess(inst_names.index("V_CMP_NE_U32_E32"), inst_names.index("S_AND_SAVEEXEC_B64"))

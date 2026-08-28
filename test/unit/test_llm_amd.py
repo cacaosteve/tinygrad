@@ -1,7 +1,7 @@
-import unittest
+import functools, unittest
 import numpy as np
 from tinygrad import Context, Tensor, UOp, dtypes, nn
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, q8_quantize, flash_attention
+from tinygrad.llm.kernels.amd import Linear, _amd_flash_attention, amd_custom_kernels_supported, q8_quantize, flash_attention
 from tinygrad.llm.gguf import ggml_data_to_tensor
 
 class TestQ8Quantize(unittest.TestCase):
@@ -109,6 +109,17 @@ class TestQ8Quantize(unittest.TestCase):
     probs /= probs.sum(-1, keepdims=True)
     expected = np.einsum("bhqk,bhkd->bhqd", probs, vh)
     np.testing.assert_allclose(out, expected, rtol=5e-3, atol=5e-3)
+
+  def test_prefill_attention_multiple_tiles(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    q = Tensor.zeros(1, 4, 32, 64)
+    k = Tensor.zeros(1, 1, 64, 64, dtype=dtypes.half)
+    v = Tensor.cat(Tensor.ones(1, 1, 32, 64, dtype=dtypes.half), Tensor.ones(1, 1, 32, 64, dtype=dtypes.half) * 3, dim=2)
+    out_buf = Tensor.empty(4, 32, 64, dtype=dtypes.float32)
+    out = Tensor.custom_kernel(out_buf, q.half().reshape(4, 32, 64), Tensor.stack(k, v),
+                               fxn=functools.partial(_amd_flash_attention, valid_kv_len=64))[0].reshape(1, 4, 32, 64).numpy()
+    expected = np.array([(32 + (i+1)*3) / (33+i) for i in range(32)], dtype=np.float32)[None, None, :, None]
+    np.testing.assert_allclose(out, np.broadcast_to(expected, out.shape), rtol=2e-3, atol=2e-3)
 
   def test_prefill_attention_unaligned_start(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")

@@ -528,6 +528,11 @@ def _is_identity_load(val:UOp, addr:UOp) -> bool:
 
 def _compute_amd_skip(uops:list[UOp]) -> set[UOp]:
   buffer_offset_stores: dict[tuple[UOp, int], list[tuple[UOp, bool, bool]]] = {}
+  # A dynamic REG access can alias every constant offset in its buffer. In particular,
+  # hand WMMA kernels zero each accumulator slot with constant stores, then access the
+  # tile through loop-varying indices. Those zero stores are live across outer loops.
+  dynamic_buffers = {buf for u in uops if u.op is Ops.INS and u.arg in (AMDOps.SLOAD, AMDOps.SSTORE) and len(u.src) >= 2 and
+                     (buf:=_reg_buffer_base(u.src[0])) is not None and _const_int(u.src[1]) is None}
   for u in uops:
     if u.op is Ops.INS and u.arg is AMDOps.SSTORE and len(u.src) >= 3:
       if (key:=_reg_mem_key(u.src[0], u.src[1])) is None: continue
@@ -542,7 +547,7 @@ def _compute_amd_skip(uops:list[UOp]) -> set[UOp]:
     else: continue
     buffer_offset_stores.setdefault(key, []).append((u, is_identity, is_zero))
   dead_offsets = {key for key, stores in buffer_offset_stores.items()
-                  if all(is_identity or is_zero for _, is_identity, is_zero in stores)}
+                  if key[0] not in dynamic_buffers and all(is_identity or is_zero for _, is_identity, is_zero in stores)}
   skip: set[UOp] = set()
   identity_loads: set[UOp] = set()
   for key, stores in buffer_offset_stores.items():
