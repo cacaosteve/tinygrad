@@ -2173,6 +2173,17 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertNotIn("GLOBAL_LOAD_U16", inst_names)
     self.assertNotIn("GLOBAL_STORE_B16", inst_names)
 
+  def test_wmma_scalar_fragment_recoalesces_to_wide_load(self):
+    buf = UOp.placeholder((256,), dtypes.half, slot=0)
+    base = UOp(Ops.INS, dtypes.int32, arg=AMDOps.DEFINE, tag=(Register("base", 260),))
+    elems = tuple(buf.index(base + UOp.const(16+i, dtypes.int32)).load() for i in range(16))
+    loads = amd_lib._wmma_ab_vec_loads(elems)
+    self.assertIsNotNone(loads)
+    assert loads is not None
+    self.assertEqual(len(loads), 1)
+    self.assertIs(loads[0].op, Ops.LOAD)
+    self.assertEqual(loads[0].max_numel(), 16)
+
   def test_half_matmul_uses_wide_global_load(self):
     # Register path: contiguous operand B128; strided WMMA operand stays U16.
     import os

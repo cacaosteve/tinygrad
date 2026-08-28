@@ -864,19 +864,39 @@ def _wmma_ab_from_lds(wmma:UOp) -> bool:
 
 def _wmma_ab_vec_loads(elems:tuple[UOp, ...]) -> tuple[UOp, ...]|None:
   # STACK of INDEX(half×n LOAD, 0..n-1)... → PACK srcs are the Ops.LOAD nodes (isel tags them once).
+  # Shape tracking can canonicalize INDEX(vec_load, lane) into RESHAPE(SHRINK(vec_load, lane, 1));
+  # recognize both forms so a WMMA fragment remains two B128s instead of sixteen U16 loads.
+  def vec_lane(e:UOp) -> tuple[UOp, int]|None:
+    while e.op in (Ops.RESHAPE, Ops.NOOP) and e.src and e.max_numel() == 1: e = e.src[0]
+    if e.op is Ops.INDEX and len(e.src) == 2 and (lane:=_lane_const(e.src[1])) is not None and e.src[0].op is Ops.LOAD:
+      return e.src[0], lane
+    if e.op is Ops.SHRINK and len(e.src) > 2 and _const_value(e.src[2]) == 1 and \
+       (lane:=_const_int(e.src[1])) is not None and e.src[0].op is Ops.LOAD:
+      return e.src[0], lane
+    return None
   if len(elems) != 16: return None
+  # WMMA expansion may scalarize a formerly coalesced LOAD before ISA selection. Rebuild one
+  # half×16 load when all fragment elements are unconditional adjacent reads from the same buffer.
+  scalar_addrs = [e.src[0] for e in elems if e.op is Ops.LOAD and e.dtype is dtypes.half and len(e.src) == 1 and
+                  e.src[0].op is Ops.INDEX and len(e.src[0].src) == 2]
+  if len(scalar_addrs) == 16:
+    peeled = [_peel_add_imm(a.src[1], 1, max_byte=0x7fffffff, deep=True) for a in scalar_addrs]
+    base, first = peeled[0]
+    if all(a.src[0] is scalar_addrs[0].src[0] and b is base and off == first+i
+           for i,(a,(b,off)) in enumerate(zip(scalar_addrs, peeled))):
+      start = base + _tconst(first, base.dtype) if first else base
+      ptr = UOp(Ops.SHRINK, dtypes.half, (scalar_addrs[0].src[0], start, _tconst(16, dtypes.int32)))
+      return (UOp(Ops.LOAD, dtypes.half, (ptr,)),)
   loads: list[UOp] = []
   i = 0
   while i < 16:
-    e = elems[i]
-    if e.op is not Ops.INDEX or len(e.src) != 2 or (lane0:=_lane_const(e.src[1])) is None: return None
-    base = e.src[0]
-    if lane0 != 0 or base.op is not Ops.LOAD: return None
+    if (got:=vec_lane(elems[i])) is None: return None
+    base, lane0 = got
+    if lane0 != 0: return None
     n = base.max_numel()
     if n < 2 or i + n > 16: return None
     for j in range(n):
-      ej = elems[i + j]
-      if ej.op is not Ops.INDEX or ej.src[0] is not base or _lane_const(ej.src[1]) != j: return None
+      if (got:=vec_lane(elems[i+j])) is None or got != (base, j): return None
     loads.append(base)
     i += n
   return tuple(loads) if loads else None
@@ -1037,7 +1057,9 @@ def _amd_custom_intrinsic(x:UOp) -> UOp|None:
   if arg == AMD_BYTE_PERM: return x.ins(AMDOps.BYTE_PERM)
   if arg == AMD_PACKED_U8X16_LOAD and len(x.src) == 1 and x.src[0].op is Ops.SHRINK:
     ptr = x.src[0]
-    return x.ins(AMDOps.LOAD, src=(ptr.src[0], ptr.src[1], _load_count_src(4), _tconst(0, dtypes.int32).rtag("byte_addr")))
+    src:tuple[UOp, ...] = (ptr.src[0], ptr.src[1], _load_count_src(4))
+    if ptr.src[0].dtype is dtypes.uint8: src += (_tconst(0, dtypes.int32).rtag("byte_addr"),)
+    return x.ins(AMDOps.LOAD, src=src)
   if arg == AMD_MBCNT_LO and len(x.src) == 1: return x.src[0]
   if isinstance(arg, str) and arg.startswith(AMD_SWIZZLE_PREFIX) and arg.endswith("))"):
     try: offset = int(arg[len(AMD_SWIZZLE_PREFIX):-2])
