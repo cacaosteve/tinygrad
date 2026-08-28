@@ -3087,8 +3087,8 @@ class AMDRenderer(ISARenderer):
     # Broad unrolling of complex quantized reductions explodes native ISA. It is still valuable
     # for small-output quantized projections, where the 32-way loop is on the decoder's critical path.
     ast_uops = ast.toposort()
-    output_size = next((n for u in ast_uops if u.op is Ops.PARAM and getattr(u.arg, "slot", None) == 0 and len(u.src) and
-                        (n:=_const_value(u.src[0])) is not None), None)
+    output_size = next((n for u in ast_uops if u.op is Ops.PARAM and getattr(u.arg, "slot", None) == 0 and
+                        isinstance((n:=getattr(u.arg, "size", None)), int)), None)
     quant_buffers = sum(u.op is Ops.PARAM and u.dtype is dtypes.uchar for u in ast_uops)
     small_quant_projection = size == 32 and isinstance(output_size, int) and 0 < output_size <= 512 and \
                              quant_buffers > 0
