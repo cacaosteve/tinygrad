@@ -58,6 +58,7 @@ class ISARenderer(Renderer):
   def prepare_pre_regalloc(self, lst:list[UOp]) -> tuple[list[UOp], dict]: return lst, {}
   def is_two_address(self, x:UOp) -> bool: return False
   def prefer_phys(self, x:UOp, src_phys:list) -> Register|None: return None
+  def loop_end(self, x:UOp) -> UOp|None: return x.src[1] if x.op is Ops.END else None
   def rematerialize(self, x:UOp) -> bool: return False
   # If True, a rematerialized value stays in its phys reg across uses (no re-remat each time).
   def keep_remat(self, x:UOp) -> bool: return False

@@ -573,6 +573,12 @@ def _range_program():
              arg=KernelInfo(name="amd_asm_range"), tag=1)
   return _to_prg(sink)
 
+def _boundless_loop_program(name:str, renderer=_REN):
+  from test.backend.test_wait_loop import wait_loop_kernel, loop_in_loop_kernel
+  fxn = {"wait":wait_loop_kernel, "nested":loop_in_loop_kernel}[name]
+  to_program_cache.clear()
+  return to_program(fxn(UOp.placeholder((1,), dtypes.int32, 0)), renderer)
+
 def _long_branch_program():
   base, loop, exit_label = _range_program(), ".HW_LONG_LOOP", ".HW_LONG_EXIT"
   prefix = (UOp(Ops.INS, arg=amd_lib.r3.s_mov_b32(amd_lib.s[100], 0)),
@@ -2875,6 +2881,46 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(names.count("S_CBRANCH_SCC0"), 1)
     self.assertNotIn("S_CBRANCH_SCC1", names)
 
+  def test_boundless_loop_preserves_old_accumulator_condition(self):
+    prg = _boundless_loop_program("wait")
+    _check_elf(self, prg)
+    lin = _prg_lin(prg).src
+    cmp_i = next(i for i,u in enumerate(lin) if u.op is Ops.INS and u.arg is AMDOps.CMPLT)
+    branch_i = next(i for i,u in enumerate(lin) if u.op is Ops.INS and u.arg is AMDOps.CBRANCH_VCCNZ)
+    acc = greg(lin[cmp_i].src[0])
+    update_i = next(i for i in range(cmp_i+1, branch_i) if lin[i].op is Ops.INS and lin[i].arg is AMDOps.MOV and greg(lin[i]) == acc)
+    self.assertLess(cmp_i, update_i)
+    self.assertLess(update_i, branch_i)
+    self.assertIn("S_CBRANCH_VCCNZ", _amd_inst_names(prg))
+
+  def test_nested_boundless_loop_rematerializes_outer_vcc(self):
+    names = _amd_inst_names(_boundless_loop_program("nested"))
+    branches = [i for i,n in enumerate(names) if n == "S_CBRANCH_VCCNZ"]
+    self.assertEqual(len(branches), 2)
+    self.assertTrue(any(names[i].startswith("V_CMP_") for i in range(branches[0]+1, branches[1])))
+
+  def test_boundless_loop_accumulator_spills_to_scratch(self):
+    for name in ("wait", "nested"):
+      with self.subTest(name=name):
+        prg = _boundless_loop_program(name, OneVGPRAMDRenderer(_GFX11))
+        _check_elf(self, prg)
+        ops = _lin_ops(prg)
+        self.assertIn(AMDOps.SPILL, ops)
+        self.assertIn(AMDOps.FILL, ops)
+        self.assertGreaterEqual(_amd_desc(prg).private_segment_fixed_size, 4)
+
+  def test_long_boundless_loop_branch_uses_vccz_trampoline(self):
+    start, end = ".LONG_VCC_START", ".LONG_VCC_END"
+    label0 = UOp(Ops.INS, dtypes.void, arg=AMDOps.LABEL, tag=start)
+    cbranch = UOp(Ops.INS, dtypes.void, arg=AMDOps.CBRANCH_VCCNZ, tag=end)
+    padding = tuple(UOp(Ops.INS, dtypes.void, arg=amd_lib.r3.s_nop(0)) for _ in range(0x8001))
+    label1 = UOp(Ops.INS, dtypes.void, arg=AMDOps.LABEL, tag=end)
+    names = [getattr(i, "op_name", "") for i in _REN._insts_from_linear(UOp(Ops.LINEAR, src=(label0, cbranch) + padding + (label1,)))]
+    self.assertEqual(names.count("S_GETPC_B64"), 1)
+    self.assertEqual(names.count("S_SETPC_B64"), 1)
+    self.assertEqual(names.count("S_CBRANCH_VCCZ"), 1)
+    self.assertNotIn("S_CBRANCH_VCCNZ", names)
+
   def test_loop_compare_scalarizes_vgpr_bound(self):
     acc = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.MOV, tag=(Register("s6", 6),))
     bound = UOp(Ops.INS, dtypes.uint32, arg=AMDOps.ADD, tag=(Register("v3", 256+3),))
@@ -3320,6 +3366,16 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(4096, dtype=dtypes.float32, device="AMD").contiguous().realize()
     out = Tensor.custom_kernel(out, inp, fxn=_custom_renderer_long_lived_spills)[0].realize()
     self.assertEqual(out.tolist(), [float(x + x // 64 + 1) for x in range(4096)])
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_spilled_boundless_loops(self):
+    for name,expected in (("wait", 10), ("nested", 12)):
+      with self.subTest(name=name):
+        out = Tensor.empty(1, dtype=dtypes.int32, device="AMD").contiguous().realize()
+        prg = _boundless_loop_program(name, OneVGPRAMDRenderer(Target("AMD", arch=Device["AMD"].arch)))
+        _amd_rt(prg)(out._buffer().ensure_allocated().get_buf("AMD"), global_size=prg.arg.global_size,
+                     local_size=prg.arg.local_size, vals=(), wait=True)
+        self.assertEqual(out.item(), expected)
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_bitcast_spill(self):

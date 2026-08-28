@@ -12,7 +12,7 @@ from tinygrad.runtime.autogen.amd.rdna3.enum import VOPDOp
 from tinygrad.codegen.decomp.op import fast_idiv
 from tinygrad.codegen.opt import tc
 from tinygrad.schedule.rangeify import BufferizeOpts
-from tinygrad.uop import Ops, FastEnum, auto
+from tinygrad.uop import Ops, GroupOp, FastEnum, auto
 from tinygrad.uop.divandmod import affine_int_bounds
 from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
 
@@ -100,8 +100,10 @@ class AMDOps(FastEnum):
   FILL = auto()
   SPILL = auto()
   CMP_GE = auto()
+  LOOP_CMP = auto()
   BRANCH = auto()
   CBRANCH_SCC1 = auto()
+  CBRANCH_VCCNZ = auto()
   IF_MASK = auto()
   END_MASK = auto()
   PACK_F16 = auto()
@@ -1118,6 +1120,7 @@ def _wants_uniform_sgpr(x:UOp) -> bool:
 
 def _alloc_vregs(ctx:IselContext, x:UOp, sgpr_pool:tuple[Register, ...], vgpr_pool:tuple[Register, ...]) -> UOp|None:
   scalar_pool = SGPR32 if sgpr_pool == SGPR else sgpr_pool
+  if x.arg is AMDOps.LOOP_CMP: return None
   if getenv("AMD_UNIFORM_INT", 1) and (uniform_extract:=_uniform_byte_extract(ctx, x)) is not None: return uniform_extract
   if isinstance(x.tag, tuple):
     if getenv("AMD_UNIFORM_INT", 1) and _wants_uniform_sgpr(x) and not all(c.index < 256 for c in x.tag[0].cons):
@@ -1263,8 +1266,9 @@ def _protect_loop_invariant_fmac(lst:list[UOp]) -> list[UOp]:
       u = u.replace(src=(*u.src[1:], u.src[0]), arg=AMDOps.MULACC)
     out.append(u)
     if u is not old: remap[old] = u
-    if u.op is Ops.END:
-      assert active and active[-1][0] is u.src[1]
+    loop_end = u.src[1] if u.op is Ops.END else u.src[3] if u.op is Ops.INS and u.arg is AMDOps.LOOP_CMP else None
+    if loop_end is not None:
+      assert active and active[-1][0] is loop_end
       active.pop()
     elif active: active[-1][1].add(u)
   return out
@@ -1335,7 +1339,8 @@ def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Regis
     (UPat(Ops.RANGE, src=(UPat.cvar("c"),), allow_any_len=True, name="x"), lambda c,x:
      x.replace(dtype=dtypes.uint32, src=(_tconst(c.arg, dtypes.uint32).rtag(),) + x.src[1:])),
     (UPat(Ops.RANGE, name="x"), lambda ctx,x,sgpr_pool=sgpr_pool:
-     x.replace(dtype=dtypes.uint32, tag=(ctx.vreg(sgpr_pool),)) if not isinstance(x.tag, tuple) else None),
+     x.replace(dtype=dtypes.void if x.dtype is dtypes.void else dtypes.uint32, tag=(ctx.vreg(sgpr_pool),))
+     if not isinstance(x.tag, tuple) else None),
     (UPat(Ops.PARAM, name="x"), lambda ctx,x:
      UOp(Ops.INS, dtypes.uint64 if x.arg.addrspace is not AddrSpace.ALU else dtypes.uint32,
          (_tconst(_kernarg_offset(ctx, x), dtypes.int32).rtag(),), AMDOps.KERNARG, None)
@@ -1345,6 +1350,11 @@ def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Regis
      None if x.tag is not None else
      UOp(Ops.INS, dtypes.uint32, (x.rtag(),), AMDOps.MOV,
          (ctx.vreg(vgpr_pool if x.arg.startswith("lidx") else _special_reg(x.arg, ctx)),))),
+    # A boundless RANGE is a loop label whose END carries the backedge condition.
+    # Preserve the comparison operands and the RANGE edge until after regalloc so
+    # the compare can be emitted immediately before the VCC conditional branch.
+    (UPat(Ops.END, src=(UPat(), UPat(), UPat(GroupOp.Comparison, name="cond")), name="x"),
+     lambda x,cond: cond.ins(AMDOps.LOOP_CMP, tag=cond.op, src=cond.src + x.src[:2])),
     (UPat(Ops.INDEX, name="x"), _extract_vec_lane),
     (UPat(Ops.STACK, name="x"), _pack_vec),
     # Int/bool CONST stay as CONST (_src inlines / _vgpr_data temps at use). Avoids
@@ -1386,8 +1396,9 @@ def _loop_label(x:UOp) -> str: return "_".join(str(i) for i in x.arg[:-1])
 
 def _lower_range(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
   loop_label = _loop_label(x)
-  acc = x.ins(AMDOps.MOV, dtype=dtypes.uint32, src=(_tconst(0, dtypes.uint32).rtag(),))
   label = UOp(Ops.INS, dtypes.void, arg=AMDOps.LABEL, tag=f".LOOP_{loop_label}")
+  if x.dtype is dtypes.void: return label, [label]
+  acc = x.ins(AMDOps.MOV, dtype=dtypes.uint32, src=(_tconst(0, dtypes.uint32).rtag(),))
   cmp = UOp(Ops.INS, dtypes.void, (acc, x.src[0]), AMDOps.CMP_GE)
   jump_out = UOp(Ops.INS, dtypes.void, (cmp,), AMDOps.CBRANCH_SCC1, tag=f".LOOP_OUT_{loop_label}")
   ctx.loop_label[acc] = loop_label
@@ -1401,6 +1412,15 @@ def _lower_end(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
     jmp,
     UOp(Ops.INS, dtypes.void, arg=AMDOps.LABEL, tag=f".LOOP_OUT_{loop_label}")]
 
+def _lower_loop_cmp(x:UOp) -> tuple[UOp, list[UOp]]:
+  if len(x.src) == 3 and x.src[0].op is Ops.INS and x.src[0].arg in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ):
+    cmp, loop = x.src[0], x.src[2]
+  else:
+    cmp_op = {Ops.CMPLT:AMDOps.CMPLT, Ops.CMPNE:AMDOps.CMPNE, Ops.CMPEQ:AMDOps.CMPEQ}[x.tag]
+    cmp, loop = UOp(Ops.INS, dtypes.bool, x.src[:2], cmp_op), x.src[3]
+  branch = UOp(Ops.INS, dtypes.void, (cmp,), AMDOps.CBRANCH_VCCNZ, tag=loop.tag)
+  return branch, [branch] if len(x.src) == 3 else [cmp, branch]
+
 def _lower_reg_store(x:UOp) -> tuple[UOp, list[UOp]]:
   acc, val = x.src
   if acc.op is Ops.INS and acc.arg is AMDOps.FILL:
@@ -1413,6 +1433,7 @@ def _lower_reg_store(x:UOp) -> tuple[UOp, list[UOp]]:
   return st, [st]
 
 post_regalloc_matcher = PatternMatcher([
+  (UPat(Ops.INS, arg=AMDOps.LOOP_CMP, name="x"), _lower_loop_cmp),
   (UPat(Ops.RANGE, name="x"), lambda ctx,x: _lower_range(ctx, x)),
   (UPat(Ops.END, name="x"), lambda ctx,x: _lower_end(ctx, x)),
   (UPat(Ops.INS, arg=AMDOps.REG_STORE, name="x"), lambda x: _lower_reg_store(x)),
@@ -1513,6 +1534,28 @@ def _lower_late_endif(x:UOp) -> tuple[UOp, list[UOp]]:
   mend = UOp(Ops.INS, dtypes.void, x.src, AMDOps.END_MASK)
   return mend, [mend]
 
+def _schedule_loop_cmps(lst:list[UOp]) -> list[UOp]:
+  """Evaluate a boundless-loop condition before a REG_STORE mutates one of its operands.
+
+  REG buffers are promoted to physical registers and REG_STORE is an implicit write. The
+  graph can legally compare the old value after storing the new one, so make the VCC write
+  explicit before regalloc and place it ahead of the clobber. The branch stays after it.
+  """
+  out:list[UOp] = []
+  cmp_ops = {Ops.CMPLT:AMDOps.CMPLT, Ops.CMPNE:AMDOps.CMPNE, Ops.CMPEQ:AMDOps.CMPEQ}
+  for u in lst:
+    if u.op is not Ops.INS or u.arg is not AMDOps.LOOP_CMP:
+      out.append(u)
+      continue
+    cmp = UOp(Ops.INS, dtypes.bool, u.src[:2], cmp_ops[u.tag])
+    cond_regs = {r for s in u.src[:2] if isinstance((r:=greg(s)), Register)}
+    dep_reg = greg(u.src[2])
+    insert = next((i for i in range(len(out)-1, -1, -1) if isinstance(dep_reg, Register) and
+                   out[i].op is Ops.INS and out[i].arg is AMDOps.REG_STORE and greg(out[i].src[0]) == dep_reg and dep_reg in cond_regs), len(out))
+    out.insert(insert, cmp)
+    out.append(u.replace(src=(cmp, u.src[2], u.src[3])))
+  return out
+
 pre_regalloc_matcher = PatternMatcher([
   (UPat(Ops.INDEX, name="x"), _lower_late_index),
   (UPat(Ops.STORE, src=(UPat.var("a"), UPat.var("val"), UPat.var("gate", dtype=dtypes.bool)), name="x"), _lower_late_store),
@@ -1590,7 +1633,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
   if u.op is not Ops.INS or (skip and u in skip): return []
   if isinstance(u.arg, Inst): return [u.arg]
   match u.arg:
-    case (AMDOps.LABEL | AMDOps.BRANCH | AMDOps.CBRANCH_SCC1 | AMDOps.DEFINE | AMDOps.SCRATCH_BASE |
+    case (AMDOps.LABEL | AMDOps.BRANCH | AMDOps.CBRANCH_SCC1 | AMDOps.CBRANCH_VCCNZ | AMDOps.DEFINE | AMDOps.SCRATCH_BASE |
           AMDOps.SCRATCH_SIZE | AMDOps.SCRATCH_ADDR | AMDOps.LDS_BASE):
       return []
     case AMDOps.KERNARG:
@@ -2123,7 +2166,7 @@ def _prefetch_next_a_b128_before_pack(ops:list[UOp]) -> list[UOp]:
       v = out[j]
       if v.op is Ops.INS and v.arg is AMDOps.LOAD and v.dtype is dtypes.half and _elem_count(v) >= 8:
         break
-      if v.op is Ops.INS and v.arg in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.STORE,
+      if v.op is Ops.INS and v.arg in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ, AMDOps.STORE,
                                        AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER):
         j = -1
         break
@@ -2500,10 +2543,11 @@ def insts_from_linear(lin:UOp):
       targets[u.tag] = len(items)
       oi += 1
       continue
-    if u.op is Ops.INS and u.arg in (AMDOps.BRANCH, AMDOps.CBRANCH_SCC1):
+    if u.op is Ops.INS and u.arg in (AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ):
       flush("vm", "lgkm", "vs")
       store_addr_cache.clear()
-      inst = r3.s_branch(0) if u.arg is AMDOps.BRANCH else r3.s_cbranch_scc1(0)
+      inst = r3.s_branch(0) if u.arg is AMDOps.BRANCH else \
+             r3.s_cbranch_scc1(0) if u.arg is AMDOps.CBRANCH_SCC1 else r3.s_cbranch_vccnz(0)
       items.append((inst, u.tag))
       oi += 1
       continue
@@ -2642,7 +2686,7 @@ def insts_from_linear(lin:UOp):
   # long forms fixed at 24 bytes (28 with the inverted conditional) so label layout is stable.
   long_branches: set[int] = set()
   while True:
-    sizes = [(28 if getattr(item[0], "op_name", "") == "S_CBRANCH_SCC1" else 24) if i in long_branches else
+    sizes = [(28 if getattr(item[0], "op_name", "").startswith("S_CBRANCH_") else 24) if i in long_branches else
              (4 if isinstance(item, tuple) else len(item.to_bytes())) for i,item in enumerate(items)]
     positions = [0]
     for sz in sizes: positions.append(positions[-1] + sz)
@@ -2666,7 +2710,7 @@ def insts_from_linear(lin:UOp):
       inst.simm16 = ((target_byte - (positions[i] + 4)) // 4) & 0xffff
       insts.append(inst)
       continue
-    conditional = getattr(inst, "op_name", "") == "S_CBRANCH_SCC1"
+    conditional = getattr(inst, "op_name", "").startswith("S_CBRANCH_")
     getpc_byte = positions[i] + (4 if conditional else 0)
     delta = (target_byte - (getpc_byte + 4)) & 0xffffffffffffffff
     long = [r3.s_getpc_b64(TMP_BRANCH),
@@ -2675,7 +2719,9 @@ def insts_from_linear(lin:UOp):
     while sum(len(x.to_bytes()) for x in long) < 20: long.append(r3.s_nop(0))
     long.append(r3.s_setpc_b64(ssrc0=TMP_BRANCH))
     if sum(len(x.to_bytes()) for x in long) != 24: raise CompileError("invalid long branch size")
-    if conditional: insts.append(r3.s_cbranch_scc0(sum(len(x.to_bytes()) for x in long) // 4))
+    if conditional:
+      inverse = r3.s_cbranch_scc0 if inst.op_name == "S_CBRANCH_SCC1" else r3.s_cbranch_vccz
+      insts.append(inverse(sum(len(x.to_bytes()) for x in long) // 4))
     insts.extend(long)
   return insts
 
@@ -3197,6 +3243,9 @@ class AMDRenderer(ISARenderer):
     if x.arg in (AMDOps.WMMA, AMDOps.FMAC): return True
     # PACK_F16(half×16 LOAD) — coalesce onto the load (hand FA/FB).
     return x.arg is AMDOps.PACK_F16 and _pack_f16_is_vec_load(x) and len(x.src) == 1
+  def loop_end(self, x:UOp) -> UOp|None:
+    if x.op is Ops.INS and x.arg is AMDOps.LOOP_CMP: return x.src[2] if len(x.src) == 3 else x.src[3]
+    return super().loop_end(x)
   def prefer_phys(self, x:UOp, src_phys:list) -> Register|None:
     # EXTRACT from a multi-VGPR value → alias onto its source lane. Besides WMMA
     # float stores, packed quantized byte loads use uint32 lanes exactly once.
@@ -3221,6 +3270,7 @@ class AMDRenderer(ISARenderer):
     5. AMD_D16_HI: keep each fused lo LOAD before its hi — post-regalloc-only reorder lets lo
        dest-as-addr reuse hi's still-live index VGPR (MMU on gfx1100).
     6. Hoist independent scalar VMEM reads in kernels without WMMA or wide global loads.
+    7. Put a boundless-loop compare before any REG_STORE that mutates its old-value operand.
     """
     lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
     lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
@@ -3245,7 +3295,7 @@ class AMDRenderer(ISARenderer):
     d16_hi_lo = _d16_hi_lo_map(lst)
     lst = _order_d16_lo_before_hi(lst, d16_hi_lo)
     if getenv("AMD_SCHEDULE_VMEM", 1): lst = _schedule_scalar_vmem(lst, d16_hi_lo)
-    return lst
+    return _schedule_loop_cmps(lst)
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True
     if x.op is not Ops.INS or x.dtype not in (dtypes.int32, dtypes.uint32): return False
@@ -3293,7 +3343,7 @@ class AMDRenderer(ISARenderer):
     for u in uops:
       if u.op is not Ops.INS: continue
       if u.arg is AMDOps.LABEL: ret.append(f"{u.tag}:")
-      elif u.arg in (AMDOps.BRANCH, AMDOps.CBRANCH_SCC1): ret.append(f"  {u.arg.name.lower()} {u.tag}")
+      elif u.arg in (AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ): ret.append(f"  {u.arg.name.lower()} {u.tag}")
       else: ret.append(f"  {u.arg.name.lower()} " + ", ".join(str(greg(s) or s.arg) for s in u.src))
     return "\n".join(ret)
 

@@ -83,9 +83,10 @@ class LinearScanRegallocContext:
 
     for i,u in enumerate(uops):
       if u.op in PSEUDO_OPS: continue
+      loop_end = ren.loop_end(u)
       pinned = set()
       for s in u.src:
-        if u.op is Ops.END: continue
+        if loop_end is not None: continue
         if not isinstance(v:=greg(s), Register): continue
         # Remat usually rebuilds at every use; keep_remat ops reuse the phys reg.
         if v in self.remat and not ren.keep_remat(self.vdef(v)): live.pop(v, None)
@@ -134,7 +135,7 @@ class LinearScanRegallocContext:
           live_in[v] = live[v]
         live_ins.append(live_in)
 
-      if u.op is Ops.END:
+      if loop_end is not None:
         # loop-carried restores need exact phys regs
         for v,r in live_ins.pop().items():
           if v not in live or live[v] != r: live[v] = fill(v, i, (r,), pin=False)
@@ -199,7 +200,11 @@ def wide_regalloc_rewrite(ctx, x:UOp):
                   for j in range(len(x.src)))
     if not spilled and i not in (ctx.first_real_idx, ctx.last_real_idx): return None
   nsrc = []
+  loop_end = ctx.ren.loop_end(ctx.uops[i])
   for j,su in enumerate(x.src):
+    if loop_end is not None:
+      nsrc.append(su)
+      continue
     vr = greg(ctx.uops[i].src[j]) if i in ctx.reals else None
     if isinstance(vr, Register) and vr in ctx.remat:
       # Actual remat runs in `before` via insert_before; source is just a bind to that phys.
