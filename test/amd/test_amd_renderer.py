@@ -22,8 +22,8 @@ _REN = AMDRenderer(_GFX11)
 
 def _uop(op, dtype=None, src=(), arg=None, tag=None):
   """Build the low-level test fixtures using the current dtype-less UOp API."""
+  if op is Ops.INS: return UOp(op, src=src, arg=(arg, dtypes.void if dtype is None else dtype), tag=tag)
   if dtype is None: return UOp(op, src=src, arg=arg, tag=tag)
-  if op is Ops.INS: return UOp(op, src=src, arg=(arg, dtype), tag=tag)
   if op in (Ops.CAST, Ops.BITCAST): return UOp(op, src=src, arg=dtype, tag=tag)
   if op is Ops.CONST: return UOp.cconst(arg, dtype).rtag(tag)
   if op is Ops.NOOP and dtype is not dtypes.void: return UOp(Ops.BITCAST, src=src, arg=dtype, tag=tag)
@@ -919,6 +919,19 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(names.count("DS_SWIZZLE_B32"), 5)
     self.assertNotIn("DS_STORE_B32", names)
     self.assertNotIn("S_BARRIER", names)
+
+  def test_q6_wmma_uses_wide_quant_loads(self):
+    from tinygrad.llm.kernels.amd import _q6_linear_f16_wmma_kernel
+    rows, cols, tokens = 8192, 2048, 16
+    out = UOp.placeholder((tokens, rows), dtypes.float32, 0)
+    raw = UOp.placeholder((rows*cols//256*53,), dtypes.uint32, 1)
+    x = UOp.placeholder((tokens, cols), dtypes.float16, 2)
+    prg = _to_prg(_q6_linear_f16_wmma_kernel(out, raw, x, rows, cols, direct_isa=True))
+    names = _amd_inst_names(prg)
+    # Four packed quant loads plus four activation loads; only scale and d remain scalar.
+    self.assertEqual(names.count("GLOBAL_LOAD_B128"), 8)
+    self.assertEqual(names.count("GLOBAL_LOAD_B32"), 2)
+    self.assertNotIn("SCRATCH_STORE_B32", names)
 
   def test_large_q6_gemv_upcasts_two_rows_and_reduces_each(self):
     rows, cols = 16384, 2048

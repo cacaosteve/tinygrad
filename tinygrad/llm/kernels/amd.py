@@ -338,11 +338,15 @@ def _q6_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
     scale_idx = subgroup*2 + half
     scale = ((raw[base+48+scale_idx//4] >> ((scale_idx%4)*8).cast(dtypes.uint32)) & 255).cast(dtypes.uint8).bitcast(dtypes.int8).float()
     d = _half(raw[base+52] & 0xffff)
+    # Each half consumes four consecutive low/high words. Keep that width explicit for direct ISA so the
+    # renderer emits two b128 loads instead of eight scalar b32 loads per dequantized 32-value subgroup.
+    ql = _amd_load(raw[base+(subgroup//4)*16+(subgroup%2)*8+half*4], 4, packed_u32=direct_isa)
+    qh = _amd_load(raw[base+32+(subgroup//4)*8+half*4], 4, packed_u32=direct_isa)
     values:list[UOp] = []
     for word_idx in range(half*4, half*4+4):
       within = (subgroup*32 + word_idx*4) % 128
-      low = raw[base+(subgroup//4)*16+(subgroup%2)*8+(word_idx//4)*4+word_idx%4] >> ((within//64)*4).cast(dtypes.uint32)
-      high = raw[base+32+(subgroup//4)*8+(word_idx//4)*4+word_idx%4] >> ((within//32)*2).cast(dtypes.uint32)
+      low = ql[word_idx%4] >> ((within//64)*4).cast(dtypes.uint32)
+      high = qh[word_idx%4] >> ((within//32)*2).cast(dtypes.uint32)
       packed = (low & 0x0f0f0f0f) | ((high & 0x03030303) << 4)
       values.extend(((packed >> (byte*8)) & 255).float() for byte in range(4))
     if direct_isa:
