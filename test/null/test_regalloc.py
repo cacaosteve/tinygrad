@@ -19,9 +19,9 @@ class TestRegalloc(unittest.TestCase):
     to_program_cache.clear()
     lin = to_program(sink, renderer).src[1].src
 
-    sub = [i for i,u in enumerate(lin) if u.op is Ops.INS and u.arg is X86Ops.SUBi]
-    add = [i for i,u in enumerate(lin) if u.op is Ops.INS and u.arg is X86Ops.ADDi]
-    ret = next(i for i,u in enumerate(lin) if u.op is Ops.INS and u.arg is X86Ops.RET)
+    sub = [i for i,u in enumerate(lin) if u.op is Ops.INS and u.arg[0] is X86Ops.SUBi]
+    add = [i for i,u in enumerate(lin) if u.op is Ops.INS and u.arg[0] is X86Ops.ADDi]
+    ret = next(i for i,u in enumerate(lin) if u.op is Ops.INS and u.arg[0] is X86Ops.RET)
     self.assertEqual(len(sub), 1)
     self.assertEqual(len(add), 1)
     self.assertLess(sub[0], add[0])

@@ -129,23 +129,27 @@ def _const_value(x:UOp):
 
 def _tconst(value, dtype:DType, tag=None) -> UOp:
   """Typed bare constant for renderer-internal graphs, after the program spec boundary."""
-  return UOp(Ops.CONST, dtype, arg=dtype.const(value), tag=tag)
+  return UOp.cconst(value, dtype).rtag(tag)
+
+def _iop(u:UOp):
+  """Instruction selector carried by the dtype-less UOp INS argument."""
+  return u.arg[0] if u.op is Ops.INS else None
 
 def _elem_count(u:UOp) -> int:
   """Logical vector element count. INS shape is always scalar; width lives in the opcode/srcs."""
   if u.op is Ops.AFTER: return _elem_count(u.src[0])
   if u.op is Ops.SHRINK and len(u.src) > 2 and (n:=_const_value(u.src[2])) is not None: return int(n)
   if u.op is Ops.INS:
-    if u.arg is AMDOps.WMMA: return 8
-    if u.arg is AMDOps.PACK: return len(u.src)
-    if u.arg is AMDOps.PACK_F16:
+    if _iop(u) is AMDOps.WMMA: return 8
+    if _iop(u) is AMDOps.PACK: return len(u.src)
+    if _iop(u) is AMDOps.PACK_F16:
       # Vec-load form: srcs are half×n LOAD/LLOAD (see _wmma_ab_vec_loads); else EXTRACT/scalar list.
       if _pack_f16_is_vec_load(u): return sum(_elem_count(s) for s in u.src)
       return len(u.src)
-    if u.arg is AMDOps.EXTRACT: return 1
-    if u.arg in (AMDOps.LOAD, AMDOps.LLOAD, AMDOps.SLOAD):
+    if _iop(u) is AMDOps.EXTRACT: return 1
+    if _iop(u) in (AMDOps.LOAD, AMDOps.LLOAD, AMDOps.SLOAD):
       return int(n) if len(u.src) > 2 and (n:=_const_value(u.src[2])) is not None else 1
-    if u.arg is AMDOps.MOV and u.src and u.src[0].op is not Ops.SPECIAL: return _elem_count(u.src[0])
+    if _iop(u) is AMDOps.MOV and u.src and u.src[0].op is not Ops.SPECIAL: return _elem_count(u.src[0])
     return 1
   try: return u.max_numel()
   except (ValueError, RuntimeError): return 1
@@ -154,19 +158,19 @@ def _reg_slots(u:UOp) -> int:
   """VGPR/SGPR slots occupied by u. PACK_F16 packs 2 halves per slot."""
   if u.op is Ops.AFTER: return _reg_slots(u.src[0])
   if u.op is Ops.INS:
-    if u.arg is AMDOps.WMMA: return 8
-    if u.arg is AMDOps.PACK: return len(u.src)
-    if u.arg is AMDOps.PACK_F16:
+    if _iop(u) is AMDOps.WMMA: return 8
+    if _iop(u) is AMDOps.PACK: return len(u.src)
+    if _iop(u) is AMDOps.PACK_F16:
       if _pack_f16_is_vec_load(u): return sum(_reg_slots(s) for s in u.src)
       return max(1, len(u.src) // 2)
-    if u.arg is AMDOps.EXTRACT: return 1
-    if u.arg is AMDOps.FILL:
+    if _iop(u) is AMDOps.EXTRACT: return 1
+    if _iop(u) is AMDOps.FILL:
       return int(n) if len(u.src) > 1 and (n:=_const_value(u.src[1])) is not None else 1
-    if u.arg in (AMDOps.LOAD, AMDOps.LLOAD, AMDOps.SLOAD):
+    if _iop(u) in (AMDOps.LOAD, AMDOps.LLOAD, AMDOps.SLOAD):
       return max(1, (u.dtype.itemsize * _elem_count(u) + 3) // 4)
-    if u.arg in (AMDOps.STORE, AMDOps.LSTORE, AMDOps.SSTORE): return _reg_slots(u.src[2])
-    if u.arg is AMDOps.SPILL: return _reg_slots(u.src[1])
-    if u.arg is AMDOps.MOV and u.src and u.src[0].op is not Ops.SPECIAL: return _reg_slots(u.src[0])
+    if _iop(u) in (AMDOps.STORE, AMDOps.LSTORE, AMDOps.SSTORE): return _reg_slots(u.src[2])
+    if _iop(u) is AMDOps.SPILL: return _reg_slots(u.src[1])
+    if _iop(u) is AMDOps.MOV and u.src and u.src[0].op is not Ops.SPECIAL: return _reg_slots(u.src[0])
     return max(1, (u.dtype.itemsize + 3) // 4)
   return max(1, (u.dtype.itemsize * _elem_count(u) + 3) // 4)
 
@@ -333,21 +337,21 @@ def _wait_for_domain(domain:str, cnt:int=0):
 
 def _wait_domain_for_load(u:UOp) -> str|None:
   if u.op is not Ops.INS: return None
-  if u.arg in (AMDOps.LOAD, AMDOps.SLOAD, AMDOps.FILL): return "vm"
-  if u.arg in (AMDOps.KERNARG, AMDOps.LLOAD, AMDOps.SWIZZLE): return "lgkm"
+  if _iop(u) in (AMDOps.LOAD, AMDOps.SLOAD, AMDOps.FILL): return "vm"
+  if _iop(u) in (AMDOps.KERNARG, AMDOps.LLOAD, AMDOps.SWIZZLE): return "lgkm"
   return None
 
 def _wait_domain_for_store(u:UOp) -> str|None:
   # RDNA3: vector store completion is vscnt. Track global stores for end/branch drain only
   # (hand-kernel style). Scratch uses inline vscnt; LDS stores scoreboard on lgkm (flush before BARRIER).
   if u.op is not Ops.INS: return None
-  if u.arg is AMDOps.STORE: return "vs"
-  if u.arg is AMDOps.LSTORE: return "lgkm"
+  if _iop(u) is AMDOps.STORE: return "vs"
+  if _iop(u) is AMDOps.LSTORE: return "lgkm"
   return None
 
 def _store_src_regs(u:UOp) -> set[int]:
   # Sentinel: any outstanding global/LDS store. Do not scoreboard TMP_VADDR — addr is sampled at issue.
-  if u.arg in (AMDOps.STORE, AMDOps.LSTORE): return {-1}
+  if _iop(u) in (AMDOps.STORE, AMDOps.LSTORE): return {-1}
   return set()
 
 def _needs_vm_flush(u:UOp) -> bool:
@@ -355,9 +359,9 @@ def _needs_vm_flush(u:UOp) -> bool:
   # ALU must enter flush_regs: independent address ALU still overlaps VMEM, while an
   # integer consumer of a dest-as-address LOAD must wait before reading that VGPR.
   if u.op is not Ops.INS: return False
-  if u.arg in (AMDOps.WMMA, AMDOps.STORE, AMDOps.ATOMIC_ADD, AMDOps.SSTORE, AMDOps.SPILL): return True
-  if u.arg in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV): return False
-  if u.arg in (AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL,
+  if _iop(u) in (AMDOps.WMMA, AMDOps.STORE, AMDOps.ATOMIC_ADD, AMDOps.SSTORE, AMDOps.SPILL): return True
+  if _iop(u) in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV): return False
+  if _iop(u) in (AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL,
                AMDOps.CMP_GE, AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ):
     return True
   return True
@@ -448,8 +452,8 @@ def _sgpr_data(tmp:Reg, data:UOp) -> tuple[list, Reg|int|float]:
 
 def _buf_ref(x:UOp, lds:bool) -> bool:
   if x.op is Ops.AFTER: return _buf_ref(x.src[0], lds)
-  if lds: return (x.op is Ops.BUFFER and x.addrspace is AddrSpace.LOCAL) or (x.op is Ops.INS and x.arg is AMDOps.LDS_BASE)
-  return (x.op is Ops.BUFFER and x.addrspace is AddrSpace.REG) or (x.op is Ops.INS and x.arg is AMDOps.SCRATCH_ADDR)
+  if lds: return (x.op is Ops.BUFFER and x.addrspace is AddrSpace.LOCAL) or (x.op is Ops.INS and _iop(x) is AMDOps.LDS_BASE)
+  return (x.op is Ops.BUFFER and x.addrspace is AddrSpace.REG) or (x.op is Ops.INS and _iop(x) is AMDOps.SCRATCH_ADDR)
 def _is_lds_ref(x:UOp) -> bool: return _buf_ref(x, True)
 def _is_scratch_ref(x:UOp) -> bool: return _buf_ref(x, False)
 
@@ -478,18 +482,18 @@ def _lds_offsets(ctx:IselContext) -> dict[int, int]:
 
 def _lds_base(ctx:IselContext, x:UOp) -> UOp|None:
   if x.addrspace is not AddrSpace.LOCAL: return None
-  return UOp(Ops.INS, dtypes.uint32,
-             (_tconst(_lds_size_bytes(x), dtypes.int32).rtag(), _tconst(_lds_offsets(ctx)[x.arg.slot], dtypes.int32).rtag()),
-             AMDOps.LDS_BASE)
+  return UOp(Ops.INS,
+             src=(_tconst(_lds_size_bytes(x), dtypes.int32).rtag(), _tconst(_lds_offsets(ctx)[x.arg.slot], dtypes.int32).rtag()),
+             arg=(AMDOps.LDS_BASE, dtypes.uint32))
 
 def _lds_base_offset(x:UOp) -> int:
   if x.op is Ops.AFTER: return _lds_base_offset(x.src[0])
-  if x.op is Ops.INS and x.arg is AMDOps.LDS_BASE: return _const_int(x.src[1]) or 0
+  if x.op is Ops.INS and _iop(x) is AMDOps.LDS_BASE: return _const_int(x.src[1]) or 0
   return 0
 
 def _scratch_base_offset(x:UOp) -> int:
   if x.op is Ops.AFTER: return _scratch_base_offset(x.src[0])
-  if x.op is Ops.INS and x.arg is AMDOps.SCRATCH_ADDR: return _const_int(x.src[0]) or 0
+  if x.op is Ops.INS and _iop(x) is AMDOps.SCRATCH_ADDR: return _const_int(x.src[0]) or 0
   return 0
 
 def _local_addr(base:UOp, idx:UOp, itemsize:int) -> tuple[list, Reg]:
@@ -513,12 +517,12 @@ def _reg_mem_key(base:UOp, idx:UOp) -> tuple[UOp, int]|None:
 
 def _is_zero_val(val:UOp) -> bool:
   if (c:=_unwrap_const(val)) is not None: return c.val == 0
-  if val.op is Ops.INS and val.arg is AMDOps.MOV and val.src and (c:=_unwrap_const(val.src[0])) is not None:
+  if val.op is Ops.INS and _iop(val) is AMDOps.MOV and val.src and (c:=_unwrap_const(val.src[0])) is not None:
     return c.val == 0
   return False
 
 def _is_identity_sload(val:UOp, key:tuple[UOp, int]) -> bool:
-  return val.op is Ops.INS and val.arg is AMDOps.SLOAD and _reg_mem_key(val.src[0], val.src[1]) == key
+  return val.op is Ops.INS and _iop(val) is AMDOps.SLOAD and _reg_mem_key(val.src[0], val.src[1]) == key
 
 def _is_identity_load(val:UOp, addr:UOp) -> bool:
   if val.op is not Ops.LOAD or not val.src: return False
@@ -531,10 +535,10 @@ def _compute_amd_skip(uops:list[UOp]) -> set[UOp]:
   # A dynamic REG access can alias every constant offset in its buffer. In particular,
   # hand WMMA kernels zero each accumulator slot with constant stores, then access the
   # tile through loop-varying indices. Those zero stores are live across outer loops.
-  dynamic_buffers = {buf for u in uops if u.op is Ops.INS and u.arg in (AMDOps.SLOAD, AMDOps.SSTORE) and len(u.src) >= 2 and
+  dynamic_buffers = {buf for u in uops if u.op is Ops.INS and _iop(u) in (AMDOps.SLOAD, AMDOps.SSTORE) and len(u.src) >= 2 and
                      (buf:=_reg_buffer_base(u.src[0])) is not None and _const_int(u.src[1]) is None}
   for u in uops:
-    if u.op is Ops.INS and u.arg is AMDOps.SSTORE and len(u.src) >= 3:
+    if u.op is Ops.INS and _iop(u) is AMDOps.SSTORE and len(u.src) >= 3:
       if (key:=_reg_mem_key(u.src[0], u.src[1])) is None: continue
       val = u.src[2]
       is_identity, is_zero = _is_identity_sload(val, key), _is_zero_val(val)
@@ -555,7 +559,7 @@ def _compute_amd_skip(uops:list[UOp]) -> set[UOp]:
       if is_identity:
         skip.add(store)
         val = store.src[2] if store.op is Ops.INS else store.src[1]
-        if val.op is Ops.INS and val.arg is AMDOps.SLOAD: identity_loads.add(val)
+        if val.op is Ops.INS and _iop(val) is AMDOps.SLOAD: identity_loads.add(val)
         elif val.op is Ops.LOAD: identity_loads.add(val)
       elif key in dead_offsets and is_zero: skip.add(store)
   for u in uops:
@@ -568,7 +572,7 @@ def _d16_hi_lo_map(uops:list[UOp]) -> dict[UOp, UOp]:
   pairs: dict[UOp, UOp] = {}
   candidates: set[UOp] = set()
   for u in uops:
-    if u.op is not Ops.INS or u.arg is not AMDOps.PACK_F16: continue
+    if u.op is not Ops.INS or _iop(u) is not AMDOps.PACK_F16: continue
     if _pack_f16_is_vec_load(u) or len(u.src) < 2 or len(u.src) % 2: continue
     for i in range(len(u.src) // 2):
       lo, hi = u.src[2 * i], u.src[2 * i + 1]
@@ -596,18 +600,18 @@ def _amd_fused_d16(ctx:PreRegAllocContext) -> set[UOp]:
 
 def _const_int(x:UOp) -> int|None:
   if (c:=_unwrap_const(x)) is not None: return int(c.val)
-  if x.op is Ops.INS and x.arg is AMDOps.MOV and x.src and (c:=_unwrap_const(x.src[0])) is not None: return int(c.val)
+  if x.op is Ops.INS and _iop(x) is AMDOps.MOV and x.src and (c:=_unwrap_const(x.src[0])) is not None: return int(c.val)
   return None
 
 def _is_wmma_acc_reload_pack(cin:UOp, ctx:PreRegAllocContext|None=None) -> bool:
-  if cin.op is not Ops.INS or cin.arg is not AMDOps.PACK or len(cin.src) != 8: return False
-  if all(s.op is Ops.INS and s.arg is AMDOps.SLOAD for s in cin.src): return True
+  if cin.op is not Ops.INS or _iop(cin) is not AMDOps.PACK or len(cin.src) != 8: return False
+  if all(s.op is Ops.INS and _iop(s) is AMDOps.SLOAD for s in cin.src): return True
   # LDS product-16: cin is PACK of zero MOVs (register path uses SLOAD reload).
-  if all(s.op is Ops.INS and s.arg is AMDOps.MOV and s.src and s.src[0].dtype is dtypes.float and
+  if all(s.op is Ops.INS and _iop(s) is AMDOps.MOV and s.src and s.src[0].dtype is dtypes.float and
          _const_value(s.src[0]) == 0.0 for s in cin.src):
     return True
   # SLOAD may already have been rewritten to EXTRACT from the zero-init packs
-  if ctx is not None and all(s.op is Ops.INS and s.arg is AMDOps.EXTRACT for s in cin.src):
+  if ctx is not None and all(s.op is Ops.INS and _iop(s) is AMDOps.EXTRACT for s in cin.src):
     tiles = ctx.scratch.get("wmma_acc_tiles") or {}
     tile_inits = set(tiles.values())
     return bool(tile_inits) and all(s.src[0] in tile_inits for s in cin.src)
@@ -618,18 +622,18 @@ def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
   if (cached:=ctx.scratch.get("wmma_acc_buffers")) is not None: return cached
   bufs: set[UOp] = set()
   for u in ctx.uops or []:
-    if u.op is not Ops.INS or u.arg is not AMDOps.WMMA: continue
+    if u.op is not Ops.INS or _iop(u) is not AMDOps.WMMA: continue
     pack = u.src[0]
     if not _is_wmma_acc_reload_pack(pack): continue
     for slot in pack.src:
-      if slot.op is Ops.INS and slot.arg is AMDOps.SLOAD:
+      if slot.op is Ops.INS and _iop(slot) is AMDOps.SLOAD:
         if (base:=_reg_buffer_base(slot.src[0])) is None: continue
         if 64 < base.max_numel() <= 128: bufs.add(base)
   # LDS zero-cin path: packs are MOV zeros, so discover oversized REG via SLOAD/SSTORE traffic.
-  if not bufs and any(u.op is Ops.INS and u.arg is AMDOps.WMMA and _is_wmma_acc_reload_pack(u.src[0])
+  if not bufs and any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA and _is_wmma_acc_reload_pack(u.src[0])
                       for u in (ctx.uops or []) if u.src):
     for u in ctx.uops or []:
-      if u.op is not Ops.INS or u.arg not in (AMDOps.SLOAD, AMDOps.SSTORE): continue
+      if u.op is not Ops.INS or _iop(u) not in (AMDOps.SLOAD, AMDOps.SSTORE): continue
       if (base:=_reg_buffer_base(u.src[0])) is None: continue
       if 64 < base.max_numel() <= 128: bufs.add(base)
   ctx.scratch["wmma_acc_buffers"] = bufs
@@ -655,14 +659,14 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
   idx_map: dict[int, tuple[UOp, int]] = {}
   next_tile = 0
   for u in uops:
-    if u.op is not Ops.INS or u.arg is not AMDOps.WMMA: continue
+    if u.op is not Ops.INS or _iop(u) is not AMDOps.WMMA: continue
     pack = u.src[0]
     if not _is_wmma_acc_reload_pack(pack): continue
     if not isinstance(pack.tag, tuple) or not pack.tag: continue
     if (tid:=id(pack.tag)) in seen: continue
     # SLOAD-cin: tile from REG indices. Zero-MOV cin: enumerate in expand order.
     sload_idxs: list[int|None] = []
-    if all(s.op is Ops.INS and s.arg is AMDOps.SLOAD for s in pack.src):
+    if all(s.op is Ops.INS and _iop(s) is AMDOps.SLOAD for s in pack.src):
       if not any((b:=_reg_buffer_base(s.src[0])) is not None and b in bufs for s in pack.src): continue
       sload_idxs = [_const_int(s.src[1]) for s in pack.src]
       if any(i is None for i in sload_idxs): continue
@@ -671,7 +675,7 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
       tile = next_tile
       next_tile += 1
     seen.add(tid)
-    init = UOp(Ops.INS, dtypes.float, tuple(_tconst(0.0, dtypes.float32) for _ in range(8)), AMDOps.PACK, pack.tag)
+    init = UOp(Ops.INS, src=tuple(_tconst(0.0, dtypes.float32) for _ in range(8)), arg=(AMDOps.PACK, dtypes.float), tag=pack.tag)
     inits.append(init)
     tiles[tile] = init
     for lane, idx in enumerate(sload_idxs):
@@ -683,19 +687,19 @@ def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
   bases, bad, seen_store = set(), set(), set()
   wmma_bufs = _wmma_acc_buffers(ctx)
   for u in ctx.uops or []:
-    if u.op is not Ops.INS or u.arg not in (AMDOps.SLOAD, AMDOps.SSTORE): continue
+    if u.op is not Ops.INS or _iop(u) not in (AMDOps.SLOAD, AMDOps.SSTORE): continue
     if (base:=_reg_buffer_base(u.src[0])) is None: continue
     bases.add(base)
     if base in wmma_bufs: continue  # handled by WMMA ACC aliasing
     idx = _const_int(u.src[1])
-    dt = u.dtype if u.arg is AMDOps.SLOAD else u.src[2].dtype
-    n = _elem_count(u) if u.arg is AMDOps.SLOAD else _elem_count(u.src[2])
+    dt = u.dtype if _iop(u) is AMDOps.SLOAD else u.src[2].dtype
+    n = _elem_count(u) if _iop(u) is AMDOps.SLOAD else _elem_count(u.src[2])
     if idx is None or idx < 0 or idx >= base.max_numel() or base.max_numel() > 64 or n != 1 or dt.itemsize > 4:
       bad.add(base)
       continue
     key = (base, idx)
-    if u.arg is AMDOps.SLOAD and key not in seen_store: bad.add(base)
-    if u.arg is AMDOps.SSTORE: seen_store.add(key)
+    if _iop(u) is AMDOps.SLOAD and key not in seen_store: bad.add(base)
+    if _iop(u) is AMDOps.SSTORE: seen_store.add(key)
   ctx.scratch["reg_promotable"] = promotable = bases - bad
   ctx.scratch["reg_values"] = {}
   ctx.scratch["reg_n"] = 0
@@ -709,14 +713,14 @@ def _reg_promote_slot(ctx:PreRegAllocContext, base:UOp, idx:UOp) -> tuple[UOp, i
 def _new_promoted_reg(ctx:PreRegAllocContext, val:UOp) -> UOp:
   n = ctx.scratch["reg_n"]
   ctx.scratch["reg_n"] = n + 1
-  return UOp(Ops.INS, val.dtype, (val,), AMDOps.MOV, (Register(f"reg{n}", 0, _cons=VGPR),))
+  return UOp(Ops.INS, src=(val,), arg=(AMDOps.MOV, val.dtype), tag=(Register(f"reg{n}", 0, _cons=VGPR),))
 
 def _peel_add_imm(idx:UOp, itemsize:int, max_byte:int=0xffff, deep:bool=False) -> tuple[UOp, int]:
   """Peel ADD+imm from an index into a byte offset. Keeps one address base live.
   deep=True folds nested ADD+const chains (WMMA C stores: ADD(ADD(base,1024),16))."""
   total, cur = 0, idx
   while True:
-    is_add = cur.op is Ops.ADD or (cur.op is Ops.INS and cur.arg is AMDOps.ADD)
+    is_add = cur.op is Ops.ADD or (cur.op is Ops.INS and _iop(cur) is AMDOps.ADD)
     if not is_add or len(cur.src) != 2: break
     peeled = False
     for base_i, imm_i in ((0, 1), (1, 0)):
@@ -746,9 +750,9 @@ def _lds_byte_off(u:UOp) -> int:
 def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
   n = x.max_numel()
   if alt is not None and gate is not None:
-    raw = UOp(Ops.LOAD, x.dtype, (a,))
+    raw = UOp(Ops.LOAD, src=(a,))
     if n == 1: return gate.where(raw, alt)
-    return UOp(Ops.STACK, x.dtype, tuple(
+    return UOp(Ops.STACK, src=tuple(
       gate.where(raw.index(_tconst(i, dtypes.weakint)), alt.index(_tconst(i, dtypes.weakint)) if alt.max_numel() > 1 else alt)
       for i in range(n)))
   count = _load_count_src(n)
@@ -813,7 +817,7 @@ def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
 
 def _lane_const(x:UOp) -> int|None:
   if (c:=_unwrap_const(x)) is not None: return int(c.val)
-  if x.op is Ops.INS and x.arg is AMDOps.MOV and len(x.src) == 1 and (c:=_unwrap_const(x.src[0])) is not None: return int(c.val)
+  if x.op is Ops.INS and _iop(x) is AMDOps.MOV and len(x.src) == 1 and (c:=_unwrap_const(x.src[0])) is not None: return int(c.val)
   return None
 
 def _extract_vec_lane(ctx:IselContext, x:UOp) -> UOp|None:
@@ -821,7 +825,7 @@ def _extract_vec_lane(ctx:IselContext, x:UOp) -> UOp|None:
   # INDEX into memory is an address. Only ALU values use INDEX as vector lane access.
   if x.src[0].addrspace not in (None, AddrSpace.ALU): return None
   if x.src[0].op is Ops.WMMA:
-    return UOp(Ops.INS, dtypes.float32, (x.src[0], _tconst(lane, dtypes.int32).rtag()), AMDOps.EXTRACT)
+    return UOp(Ops.INS, src=(x.src[0], _tconst(lane, dtypes.int32).rtag()), arg=(AMDOps.EXTRACT, dtypes.float32))
   n = _elem_count(x.src[0])
   if n == 1 and lane == 0 and x.src[0].addrspace in (None, AddrSpace.ALU): return x.src[0]
   if n == 1: return None
@@ -830,34 +834,34 @@ def _extract_vec_lane(ctx:IselContext, x:UOp) -> UOp|None:
     raise CompileError(f"no extract from {x.src[0].dtype}")
   if not 0 <= lane < n: raise CompileError(f"lane {lane} oob for {x.src[0].dtype} x{n}")
   if sc is dtypes.uint8 and getenv("AMD_UNIFORM_INT", 1) and x.src[0].op is Ops.INS and \
-     x.src[0].arg is AMDOps.LOAD and all(_is_scalar_source(s) for s in x.src[0].src):
-    return _uniform_byte_extract(ctx, UOp(Ops.INS, sc, (x.src[0], _tconst(lane, dtypes.int32).rtag()), AMDOps.EXTRACT))
-  return UOp(Ops.INS, sc, (x.src[0], _tconst(lane, dtypes.int32).rtag()), AMDOps.EXTRACT)
+     _iop(x.src[0]) is AMDOps.LOAD and all(_is_scalar_source(s) for s in x.src[0].src):
+    return _uniform_byte_extract(ctx, UOp(Ops.INS, src=(x.src[0], _tconst(lane, dtypes.int32).rtag()), arg=(AMDOps.EXTRACT, sc)))
+  return UOp(Ops.INS, src=(x.src[0], _tconst(lane, dtypes.int32).rtag()), arg=(AMDOps.EXTRACT, sc))
 
 def _pack_vec(x:UOp) -> UOp|None:
   if x.max_numel() == 1 and len(x.src) == 1: return x.src[0]
   if x.max_numel() == 1: return None
   if len(x.src) != x.max_numel(): raise CompileError(f"pack size {len(x.src)} != {x.max_numel()}")
   if x.dtype is dtypes.float32:
-    return UOp(Ops.INS, dtypes.float32, x.src, AMDOps.PACK, x.tag)
+    return UOp(Ops.INS, src=x.src, arg=(AMDOps.PACK, dtypes.float32), tag=x.tag)
   if x.dtype is dtypes.float16:
     if len(x.src) % 2: raise CompileError(f"half pack needs even len, got {len(x.src)}")
-    return UOp(Ops.INS, dtypes.half, x.src, AMDOps.PACK_F16, x.tag)
+    return UOp(Ops.INS, src=x.src, arg=(AMDOps.PACK_F16, dtypes.half), tag=x.tag)
   raise CompileError(f"no pack {x.dtype}")
 
 def _pack_f16_is_vec_load(u:UOp) -> bool:
   """PACK_F16(half×n LOAD/LLOAD, ...) from _wmma_ab_vec_loads — not scalar-LOAD B packs."""
   def is_vec_mem(s:UOp) -> bool:
     if s.op is Ops.LOAD and s.max_numel() >= 2: return True
-    return s.op is Ops.INS and s.arg in (AMDOps.LOAD, AMDOps.LLOAD) and _elem_count(s) >= 2
+    return s.op is Ops.INS and _iop(s) in (AMDOps.LOAD, AMDOps.LLOAD) and _elem_count(s) >= 2
   return bool(u.src) and all(is_vec_mem(s) for s in u.src)
 
 def _wmma_ab_from_lds(wmma:UOp) -> bool:
   """True if WMMA A/B is staged from LDS (TC_LDS_AB), not unrelated LLOAD elsewhere in the kernel."""
   def from_lds(x:UOp, depth:int=0) -> bool:
     if depth > 6 or x.op is not Ops.INS: return False
-    if x.arg is AMDOps.LLOAD: return True
-    if x.arg in (AMDOps.PACK_F16, AMDOps.EXTRACT, AMDOps.MOV):
+    if _iop(x) is AMDOps.LLOAD: return True
+    if _iop(x) in (AMDOps.PACK_F16, AMDOps.EXTRACT, AMDOps.MOV):
       return any(from_lds(s, depth + 1) for s in x.src)
     return False
   return len(wmma.src) >= 3 and (from_lds(wmma.src[1]) or from_lds(wmma.src[2]))
@@ -885,8 +889,8 @@ def _wmma_ab_vec_loads(elems:tuple[UOp, ...]) -> tuple[UOp, ...]|None:
     if all(a.src[0] is scalar_addrs[0].src[0] and b is base and off == first+i
            for i,(a,(b,off)) in enumerate(zip(scalar_addrs, peeled))):
       start = base + _tconst(first, base.dtype) if first else base
-      ptr = UOp(Ops.SHRINK, dtypes.half, (scalar_addrs[0].src[0], start, _tconst(16, dtypes.int32)))
-      return (UOp(Ops.LOAD, dtypes.half, (ptr,)),)
+      ptr = UOp(Ops.SHRINK, src=(scalar_addrs[0].src[0], start, _tconst(16, dtypes.int32)))
+      return (UOp(Ops.LOAD, src=(ptr,)),)
   loads: list[UOp] = []
   i = 0
   while i < 16:
@@ -904,17 +908,17 @@ def _wmma_ab_vec_loads(elems:tuple[UOp, ...]) -> tuple[UOp, ...]|None:
 def _wmma_stack_operand(src:UOp, idx:int) -> UOp:
   # Coalesced half×16 frag may arrive as Ops.LOAD (STACK folded) or STACK of INDEX.
   if idx < 2 and src.dtype is dtypes.half and src.max_numel() == 16 and src.op is Ops.LOAD:
-    return UOp(Ops.INS, dtypes.half, (src,), AMDOps.PACK_F16)
-  if idx < 2 and src.op is Ops.INS and src.arg is AMDOps.LOAD and _elem_count(src) == 16:
-    return UOp(Ops.INS, dtypes.half, (src,), AMDOps.PACK_F16)
+    return UOp(Ops.INS, src=(src,), arg=(AMDOps.PACK_F16, dtypes.half))
+  if idx < 2 and src.op is Ops.INS and _iop(src) is AMDOps.LOAD and _elem_count(src) == 16:
+    return UOp(Ops.INS, src=(src,), arg=(AMDOps.PACK_F16, dtypes.half))
   if src.op is not Ops.STACK: raise CompileError(f"wmma src must be stack, got {src.op}")
   n, sc = len(src.src), src.dtype
   if idx < 2 and n == 16 and sc is dtypes.half:
     if (loads := _wmma_ab_vec_loads(src.src)) is not None:
-      return UOp(Ops.INS, dtypes.half, loads, AMDOps.PACK_F16)
-    return UOp(Ops.INS, dtypes.half, src.src, AMDOps.PACK_F16)
+      return UOp(Ops.INS, src=loads, arg=(AMDOps.PACK_F16, dtypes.half))
+    return UOp(Ops.INS, src=src.src, arg=(AMDOps.PACK_F16, dtypes.half))
   if idx == 2 and n == 8 and sc is dtypes.float:
-    return UOp(Ops.INS, dtypes.float, src.src, AMDOps.PACK)
+    return UOp(Ops.INS, src=src.src, arg=(AMDOps.PACK, dtypes.float))
   raise CompileError(f"bad wmma stack idx={idx} len={n} dtype={src.dtype}")
 
 def _isel_wmma(ctx:IselContext, x:UOp) -> UOp:
@@ -922,7 +926,7 @@ def _isel_wmma(ctx:IselContext, x:UOp) -> UOp:
   # accumulator is the init STACK for the first WMMA, or a chained prior WMMA result when UNROLL
   # fuses K iterations. is_two_address coalesces dst with src[0] (=acc), so the chain shares one reg.
   cin = x.src[2]
-  if cin.op is Ops.WMMA or (cin.op is Ops.INS and cin.arg is AMDOps.WMMA):
+  if cin.op is Ops.WMMA or (cin.op is Ops.INS and _iop(cin) is AMDOps.WMMA):
     c = cin
   else:
     # fresh zero accumulator. WMMA is two-address (D is written over C), so each independent output
@@ -930,7 +934,7 @@ def _isel_wmma(ctx:IselContext, x:UOp) -> UOp:
     # tiles and dedups to one UOp -> one reg, which the two-address coalesce can only satisfy for one
     # tile. pre-assign a unique vreg so each tile's accumulator stays distinct.
     c = _wmma_stack_operand(cin, 2).replace(tag=(ctx.vreg(WMMA_ACC_VGPR),))
-  return UOp(Ops.INS, dtypes.float if x.dtype is dtypes.float else x.dtype, (c, a, b), AMDOps.WMMA, x.tag)
+  return UOp(Ops.INS, src=(c, a, b), arg=(AMDOps.WMMA, dtypes.float if x.dtype is dtypes.float else x.dtype), tag=x.tag)
 
 def _wmma_inst(u:UOp):
   dt_in, dt_out = u.src[1].dtype, u.dtype
@@ -941,10 +945,10 @@ def _pack_f16_half2_load(lo:UOp, hi:UOp) -> tuple[UOp, int]|None:
   # EXTRACT(LLOAD, 2k)/EXTRACT(LLOAD, 2k+1) rebuilds the same half2 VGPR word — MOV it.
   # LLOAD-only: global LOAD shares the general VGPR pool with EXTRACT; hi LSHR can
   # clobber the load before PACK MOVs it. Keep global half pairs on the v_pack path instead.
-  if not (lo.op is Ops.INS and lo.arg is AMDOps.EXTRACT and hi.op is Ops.INS and hi.arg is AMDOps.EXTRACT): return None
+  if not (lo.op is Ops.INS and _iop(lo) is AMDOps.EXTRACT and hi.op is Ops.INS and _iop(hi) is AMDOps.EXTRACT): return None
   if lo.src[0] is not hi.src[0]: return None
   base = lo.src[0]
-  if base.op is not Ops.INS or base.arg is not AMDOps.LLOAD: return None
+  if base.op is not Ops.INS or _iop(base) is not AMDOps.LLOAD: return None
   if not isinstance(greg(base), Register): return None
   lo_lane, hi_lane = _lane_const(lo.src[1]), _lane_const(hi.src[1])
   if lo_lane is None or hi_lane != lo_lane + 1 or lo_lane % 2: return None
@@ -955,7 +959,7 @@ def _pack_f16_d16_hi_pair(lo:UOp, hi:UOp) -> bool:
   # AMD_D16_HI=1 only: default stays u16+v_pack. Mock D16_HI is incomplete (ones@ones NaNs).
   # Hi LOADs emit d16_hi into lo; PACK MOVs. lo-before-hi must be pre-regalloc.
   if not getenv("AMD_D16_HI", 0): return False
-  if not (lo.op is Ops.INS and lo.arg is AMDOps.LOAD and hi.op is Ops.INS and hi.arg is AMDOps.LOAD): return False
+  if not (lo.op is Ops.INS and _iop(lo) is AMDOps.LOAD and hi.op is Ops.INS and _iop(hi) is AMDOps.LOAD): return False
   if _elem_count(lo) != 1 or _elem_count(hi) != 1: return False
   if lo.dtype is not dtypes.half or hi.dtype is not dtypes.half: return False
   if _is_lds_ref(lo.src[0]) or _is_scratch_ref(lo.src[0]): return False
@@ -979,7 +983,7 @@ def _pack_f16_identity_load(u:UOp) -> UOp|None:
 def _pack_f16_insts(u:UOp) -> list:
   # Vec-load form: PACK_F16(LOAD/LLOAD[, ...]) — bitcast half2 words into WMMA src VGPRs.
   if _pack_f16_is_vec_load(u) or (len(u.src) == 1 and u.src[0].op is Ops.INS and
-      u.src[0].arg in (AMDOps.LOAD, AMDOps.LLOAD) and _reg_slots(u.src[0]) == _reg_slots(u)):
+      _iop(u.src[0]) in (AMDOps.LOAD, AMDOps.LLOAD) and _reg_slots(u.src[0]) == _reg_slots(u)):
     ret: list = []
     off = 0
     for src in u.src:
@@ -1125,55 +1129,56 @@ def _is_scalar_source(x:UOp) -> bool:
   return isinstance((reg:=greg(x)), Register) and all(c.index < 256 for c in reg.cons)
 
 def _uniform_byte_extract(ctx:IselContext, x:UOp) -> UOp|None:
-  if x.arg is not AMDOps.EXTRACT or not x.src or x.src[0].op is not Ops.INS or x.src[0].arg is not AMDOps.LOAD or \
+  if _iop(x) is not AMDOps.EXTRACT or not x.src or x.src[0].op is not Ops.INS or _iop(x.src[0]) is not AMDOps.LOAD or \
      x.src[0].dtype is not dtypes.uint8 or not all(_is_scalar_source(s) for s in x.src[0].src): return None
   if (lane:=_const_int(x.src[1])) is None: return None
   collects = ctx.scratch.setdefault("uniform_byte_collects", {})
   word_lane = lane // 4
-  word = collects.setdefault((x.src[0], word_lane), UOp(Ops.INS, dtypes.uint32,
-    (x.src[0], _tconst(word_lane, dtypes.int32).rtag()), AMDOps.COLLECT))
-  return UOp(Ops.INS, x.dtype,
-    (word, _tconst((lane % 4) * 8, dtypes.uint32).rtag(), _tconst(8, dtypes.uint32).rtag()), AMDOps.BFE)
+  word = collects.setdefault((x.src[0], word_lane), UOp(Ops.INS,
+    src=(x.src[0], _tconst(word_lane, dtypes.int32).rtag()), arg=(AMDOps.COLLECT, dtypes.uint32)))
+  return UOp(Ops.INS,
+    src=(word, _tconst((lane % 4) * 8, dtypes.uint32).rtag(), _tconst(8, dtypes.uint32).rtag()), arg=(AMDOps.BFE, x.dtype))
 
 def _wants_uniform_sgpr(x:UOp) -> bool:
-  if x.arg is AMDOps.COLLECT: return True
-  if x.arg is AMDOps.EXTRACT and x.src and x.src[0].op is Ops.INS and x.src[0].arg is AMDOps.LOAD and \
+  if _iop(x) is AMDOps.COLLECT: return True
+  if _iop(x) is AMDOps.EXTRACT and x.src and x.src[0].op is Ops.INS and _iop(x.src[0]) is AMDOps.LOAD and \
      x.src[0].dtype is dtypes.uint8 and all(_is_scalar_source(s) for s in x.src[0].src):
     return True
-  if x.arg is AMDOps.CAST and (not x.src or x.src[0].dtype not in dtypes.ints): return False
-  return x.dtype in dtypes.ints and x.arg in (AMDOps.MOV, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.CAST,
+  if _iop(x) is AMDOps.CAST and (not x.src or x.src[0].dtype not in dtypes.ints): return False
+  return x.dtype in dtypes.ints and _iop(x) in (AMDOps.MOV, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.CAST,
     AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE, AMDOps.LSHL_OR, AMDOps.LSHL_ADD) and \
     all(_is_scalar_source(s) for s in x.src)
 
 def _alloc_vregs(ctx:IselContext, x:UOp, sgpr_pool:tuple[Register, ...], vgpr_pool:tuple[Register, ...]) -> UOp|None:
   scalar_pool = SGPR32 if sgpr_pool == SGPR else sgpr_pool
-  if x.arg is AMDOps.LOOP_CMP: return None
+  if x.op is Ops.BUFFER:
+    return x.replace(src=tuple(s.rtag() for s in x.src), tag=None) if x.addrspace is AddrSpace.REG else None
+  iop = _iop(x)
+  if iop is AMDOps.LOOP_CMP: return None
   if getenv("AMD_UNIFORM_INT", 1) and (uniform_extract:=_uniform_byte_extract(ctx, x)) is not None: return uniform_extract
   if isinstance(x.tag, tuple):
     if getenv("AMD_UNIFORM_INT", 1) and _wants_uniform_sgpr(x) and not all(c.index < 256 for c in x.tag[0].cons):
       return x.replace(tag=(ctx.vreg(scalar_pool),))
     return None
-  if x.op is Ops.BUFFER:
-    return x.replace(src=tuple(s.rtag() for s in x.src), tag=None) if x.addrspace is AddrSpace.REG else None
-  if x.arg in (AMDOps.DEFINE, AMDOps.SCRATCH_SIZE, AMDOps.SCRATCH_ADDR, AMDOps.LDS_BASE,
+  if iop in (AMDOps.DEFINE, AMDOps.SCRATCH_SIZE, AMDOps.SCRATCH_ADDR, AMDOps.LDS_BASE,
                AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ) or x.dtype is dtypes.void:
-    return x.replace(tag=None) if x.arg in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ) and x.tag is not None else None
-  if x.arg is AMDOps.KERNARG: return x.replace(tag=(ctx.vreg(sgpr_pool),))
+    return x.replace(tag=None) if iop in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ) and x.tag is not None else None
+  if iop is AMDOps.KERNARG: return x.replace(tag=(ctx.vreg(sgpr_pool),))
   if x.op is Ops.PARAM:
     if x.arg.addrspace is AddrSpace.ALU: return x.replace(src=tuple(s.rtag() for s in x.src), tag=(ctx.vreg(sgpr_pool),))
-    return x.replace(dtype=dtypes.uint64, src=tuple(s.rtag() for s in x.src), tag=(ctx.vreg(sgpr_pool),))
+    return x.replace(src=tuple(s.rtag() for s in x.src), tag=(ctx.vreg(sgpr_pool),))
   if x.op is Ops.SPECIAL:
     # gidx → WGID SGPR (s2 or s15). lidx → normal VGPR; MOV emit unpacks from packed v0.
     if x.arg.startswith("gidx"): return x.replace(tag=(ctx.vreg(_special_reg(x.arg, ctx)),))
     return None
-  if x.arg is AMDOps.PACK_F16:
+  if iop is AMDOps.PACK_F16:
     # Vec-load PACK shares the general VGPR pool with its LOAD so two-address coalesce can alias.
     if _pack_f16_is_vec_load(x):
       return x.replace(tag=(ctx.vreg(vgpr_pool),))
     if (base := _pack_f16_identity_load(x)) is not None and isinstance(base.tag, tuple):
       return x.replace(tag=base.tag)
     return x.replace(tag=(ctx.vreg(PACK_F16_VGPR_UP16 if _allow_upcast16() else PACK_F16_VGPR),))
-  if x.arg is AMDOps.LLOAD:
+  if iop is AMDOps.LLOAD:
     return x.replace(tag=(ctx.vreg(LLOAD_VGPR_UP16 if _allow_upcast16() else LLOAD_VGPR),))
   if getenv("AMD_UNIFORM_INT", 1) and _wants_uniform_sgpr(x): return x.replace(tag=(ctx.vreg(scalar_pool),))
   return x.replace(tag=(ctx.vreg(vgpr_pool),))
@@ -1181,23 +1186,23 @@ def _alloc_vregs(ctx:IselContext, x:UOp, sgpr_pool:tuple[Register, ...], vgpr_po
 def _gated_load(addr:UOp, alt:UOp, gate:UOp, x:UOp) -> UOp|None:
   if addr.op is not Ops.INDEX or len(addr.src) != 2: return None
   safe_addr = addr.replace(src=(addr.src[0], gate.where(addr.src[1], addr.src[1].const_like(0))))
-  return gate.where(safe_addr.load(dtype=x.dtype), alt.cast(x.dtype) if alt.dtype != x.dtype else alt)
+  return gate.where(safe_addr.load(), alt.cast(x.dtype) if alt.dtype != x.dtype else alt)
 
 def _pow2_cmod(x:UOp, c:UOp) -> UOp|None:
-  if c.arg <= 0 or c.arg & (c.arg - 1) or (x.dtype not in dtypes.uints and x.vmin < 0): return None
-  return x & _tconst(c.arg - 1, x.dtype)
+  if c.val <= 0 or c.val & (c.val - 1) or (x.dtype not in dtypes.uints and x.vmin < 0): return None
+  return x & _tconst(c.val - 1, x.dtype)
 
 class _AMDFastDivRenderer(Renderer):
   def __init__(self): super().__init__(Target("NULL", ""))
   def supported_dtypes(self) -> set[DType]: return {dtypes.int32, dtypes.uint32}
 
 def _const_cdiv(x:UOp, c:UOp) -> UOp|None:
-  return fast_idiv(_AMDFastDivRenderer(), x, c.arg) if c.arg > 0 and x.vmin >= 0 else None
+  return fast_idiv(_AMDFastDivRenderer(), x, c.val) if c.val > 0 and x.vmin >= 0 else None
 
 def _const_cmod(x:UOp, c:UOp) -> UOp|None:
-  if c.arg <= 0 or x.vmin < 0: return None
+  if c.val <= 0 or x.vmin < 0: return None
   if (q:=_const_cdiv(x, c)) is None: return None
-  return x - q * _tconst(c.arg, x.dtype)
+  return x - q * _tconst(c.val, x.dtype)
 
 def _bool_not(x:UOp) -> UOp:
   return x.where(_tconst(False, dtypes.bool), _tconst(True, dtypes.bool))
@@ -1239,10 +1244,10 @@ def _var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
 def _narrow_var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
   if x.dtype != d.dtype or x.dtype not in dtypes.ints or x.dtype.itemsize >= 4: return None
   wide = dtypes.int32 if x.dtype in dtypes.sints else dtypes.uint32
-  return UOp(op.op, wide, (x.cast(wide), d.cast(wide))).cast(x.dtype)
+  return UOp(op.op, src=(x.cast(wide), d.cast(wide))).cast(x.dtype)
 
 def _cmp_bool_const(x:UOp, m:UOp, c:UOp) -> UOp:
-  keep = (x.op is Ops.CMPNE and c.arg is False) or (x.op is Ops.CMPEQ and c.arg is True)
+  keep = (x.op is Ops.CMPNE and c.val is False) or (x.op is Ops.CMPEQ and c.val is True)
   return m if keep else m.where(_tconst(False, dtypes.bool), _tconst(True, dtypes.bool))
 
 def _bool_flag(x:UOp) -> UOp:
@@ -1268,7 +1273,7 @@ def _cast_store_value(x:UOp, a:UOp, val:UOp) -> UOp|None:
 
 def _materialize_bool_where(m:UOp, a:UOp, b:UOp) -> UOp|None:
   if m.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): return None
-  return UOp(Ops.WHERE, a.dtype, (UOp(Ops.CMPNE, dtypes.bool, (m, _tconst(False, dtypes.bool))), a, b))
+  return UOp(Ops.WHERE, src=(UOp(Ops.CMPNE, src=(m, _tconst(False, dtypes.bool))), a, b))
 
 def _is_foldable(ctx:IselContext, x:UOp, s:UOp) -> bool: return len(ctx.uses[s]) == x.src.count(s) == 1
 
@@ -1289,11 +1294,11 @@ def _protect_loop_invariant_fmac(lst:list[UOp]) -> list[UOp]:
     if u.op is Ops.RANGE:
       if active: active[-1][1].add(u)
       active.append((u, set()))
-    elif u.op is Ops.INS and u.arg is AMDOps.FMAC and active and u.src[0] not in active[-1][1]:
-      u = u.replace(src=(*u.src[1:], u.src[0]), arg=AMDOps.MULACC)
+    elif u.op is Ops.INS and _iop(u) is AMDOps.FMAC and active and u.src[0] not in active[-1][1]:
+      u = u.replace(src=(*u.src[1:], u.src[0]), arg=(AMDOps.MULACC, u.dtype))
     out.append(u)
     if u is not old: remap[old] = u
-    loop_end = u.src[1] if u.op is Ops.END else u.src[3] if u.op is Ops.INS and u.arg is AMDOps.LOOP_CMP else None
+    loop_end = u.src[1] if u.op is Ops.END else u.src[3] if u.op is Ops.INS and _iop(u) is AMDOps.LOOP_CMP else None
     if loop_end is not None:
       assert active and active[-1][0] is loop_end
       active.pop()
@@ -1301,21 +1306,19 @@ def _protect_loop_invariant_fmac(lst:list[UOp]) -> list[UOp]:
   return out
 
 def _promote_f16_unary(x:UOp, d:UOp) -> UOp:
-  return UOp(x.op, dtypes.float32, (d.cast(dtypes.float32),)).cast(dtypes.float16)
+  return UOp(x.op, src=(d.cast(dtypes.float32),)).cast(dtypes.float16)
 
 def _int_cast(y:UOp, x:UOp) -> UOp|None:
-  if x.dtype.itemsize == y.dtype.itemsize: return x.replace(op=Ops.NOOP)
+  if x.dtype.itemsize == y.dtype.itemsize: return x.replace(op=Ops.BITCAST)
   return x.ins(AMDOps.CAST, src=(y,))
 
 def _fuse_signed_byte_load_cast(x:UOp, y:UOp) -> UOp|None:
   if len(y.src) != 1 or (ld := y.src[0]).op is not Ops.LOAD or ld.dtype is not dtypes.uint8: return None
-  return ld.replace(dtype=dtypes.int8).cast(x.dtype)
+  return ld.bitcast(dtypes.int8).cast(x.dtype)
 
 pre_isel_matcher = PatternMatcher([
-  # Renderer legalization runs after the spec check. Canonical constants now arrive as
-  # CAST(CONST(weak)); recover a typed bare CONST so the existing immediate isel paths apply.
-  (UPat.cvar("c").cast(name="x"), lambda c,x: _tconst(c.val, x.dtype)),
-  (UPat(Ops.AND, dtype=dtypes.uint8, src=(UPat(Ops.SHR, src=(UPat.var("value"), UPat.var("shift"))), UPat.cvar("mask")),
+  (UPat(Ops.AND, dtype=dtypes.uint8,
+   src=(UPat(Ops.SHR, src=(UPat.var("value"), UPat.var("shift"))), UPat.cvar().cast(name="mask")),
    name="x"), _bitfield_extract),
   (UPat(Ops.OR, dtype=(dtypes.uint8, dtypes.uint32), src=(UPat(Ops.SHL, src=(UPat.var("value"), UPat.var("shift"))), UPat.var("other")),
    name="x"), _lshl_or),
@@ -1329,13 +1332,14 @@ pre_isel_matcher = PatternMatcher([
   (UPat(Ops.INDEX, name="addr").load(UPat.var("alt"), UPat.var("gate", dtype=dtypes.bool), name="x"), _gated_load),
   (UPat((Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.TRUNC, Ops.SIN), dtype=dtypes.float16, src=(UPat.var("d"),), name="x"),
    _promote_f16_unary),
-  (UPat(Ops.CDIV, src=(UPat.var("x", dtypes.ints), UPat.cvar("c"))), _const_cdiv),
-  (UPat(Ops.CMOD, src=(UPat.var("x", dtypes.ints), UPat.cvar("c"))), _pow2_cmod),
-  (UPat(Ops.CMOD, src=(UPat.var("x", dtypes.ints), UPat.cvar("c"))), _const_cmod),
+  (UPat(Ops.CDIV, src=(UPat.var("x", dtypes.ints), UPat.cvar().cast(name="c"))), _const_cdiv),
+  (UPat(Ops.CMOD, src=(UPat.var("x", dtypes.ints), UPat.cvar().cast(name="c"))), _pow2_cmod),
+  (UPat(Ops.CMOD, src=(UPat.var("x", dtypes.ints), UPat.cvar().cast(name="c"))), _const_cmod),
   (UPat((Ops.CDIV, Ops.CMOD), src=(UPat.var("x", dtypes.ints), UPat.var("d", dtypes.ints)), name="op"), _narrow_var_divmod),
   (UPat((Ops.CDIV, Ops.CMOD), src=(UPat.var("x", (dtypes.int32, dtypes.uint32)), UPat.var("d", (dtypes.int32, dtypes.uint32))), name="op"),
    _var_divmod),
-  (UPat((Ops.CMPNE, Ops.CMPEQ), src=(UPat((Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ), name="m"), UPat.cvar("c", dtypes.bool)), name="x"),
+  (UPat((Ops.CMPNE, Ops.CMPEQ),
+   src=(UPat((Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ), name="m"), UPat.cvar("c").cast(dtypes.bool, name="c")), name="x"),
    _cmp_bool_const),
   (UPat((Ops.AND, Ops.OR, Ops.XOR, Ops.CMPNE, Ops.CMPEQ), dtype=dtypes.bool, name="x"), _materialize_compare_flags),
   (UPat(Ops.STORE, name="x"), _materialize_store_compare_flag),
@@ -1349,34 +1353,33 @@ pre_isel_matcher = PatternMatcher([
   (UPat.var("y", dtypes.ints).cast(dtypes.ints, name="x"), _int_cast),
   (UPat.var("y", dtypes.ints).cast(dtypes.float16), lambda y: y.cast(dtypes.float32).cast(dtypes.float16)),
   (UPat.var("y", dtypes.float16).cast(dtypes.ints, name="x"), lambda y,x: y.cast(dtypes.float32).cast(x.dtype)),
-  (UPat(Ops.BITCAST, name="x"), lambda x: x.replace(op=Ops.NOOP)),
 ])
 
 def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Register, ...]=VGPR) -> PatternMatcher:
   return PatternMatcher([
     # Regalloc creates canonical CAST(CONST(weak)) stack offsets after pre-isel has run.
-    (UPat((Ops.ADD, Ops.SUB), src=(UPat(Ops.INS, arg=AMDOps.SCRATCH_BASE), UPat.cvar("size").cast())),
-     lambda size: UOp(Ops.INS, dtypes.void, (size,), AMDOps.SCRATCH_SIZE)),
-    (UPat((Ops.ADD, Ops.SUB), src=(UPat(Ops.INS, arg=AMDOps.SCRATCH_BASE), UPat.cvar()), name="x"),
-     lambda x: UOp(Ops.INS, dtypes.void, (x.src[1],), AMDOps.SCRATCH_SIZE)),
-    (UPat(Ops.INDEX, src=(UPat(Ops.INS, arg=AMDOps.SCRATCH_BASE), UPat.cvar("off").cast())),
-     lambda off: UOp(Ops.INS, dtypes.uint32, (off,), AMDOps.SCRATCH_ADDR)),
-    (UPat(Ops.INDEX, src=(UPat(Ops.INS, arg=AMDOps.SCRATCH_BASE), UPat.cvar("off")), name="x"),
-     lambda off,x: UOp(Ops.INS, dtypes.uint32, (off,), AMDOps.SCRATCH_ADDR)),
-    (UPat(Ops.RANGE, src=(UPat.cvar("c"),), allow_any_len=True, name="x"), lambda c,x:
-     x.replace(dtype=dtypes.uint32, src=(_tconst(c.arg, dtypes.uint32).rtag(),) + x.src[1:])),
+    (UPat((Ops.ADD, Ops.SUB), src=(UPat(Ops.INS, arg=(AMDOps.SCRATCH_BASE, dtypes.uint32)), UPat.cvar("size").cast())),
+     lambda size: UOp(Ops.INS, src=(size,), arg=(AMDOps.SCRATCH_SIZE, dtypes.void))),
+    (UPat((Ops.ADD, Ops.SUB), src=(UPat(Ops.INS, arg=(AMDOps.SCRATCH_BASE, dtypes.uint32)), UPat.cvar()), name="x"),
+     lambda x: UOp(Ops.INS, src=(x.src[1],), arg=(AMDOps.SCRATCH_SIZE, dtypes.void))),
+    (UPat(Ops.INDEX, src=(UPat(Ops.INS, arg=(AMDOps.SCRATCH_BASE, dtypes.uint32)), UPat.cvar("off").cast())),
+     lambda off: UOp(Ops.INS, src=(off,), arg=(AMDOps.SCRATCH_ADDR, dtypes.uint32))),
+    (UPat(Ops.INDEX, src=(UPat(Ops.INS, arg=(AMDOps.SCRATCH_BASE, dtypes.uint32)), UPat.cvar("off")), name="x"),
+     lambda off,x: UOp(Ops.INS, src=(off,), arg=(AMDOps.SCRATCH_ADDR, dtypes.uint32))),
+    (UPat(Ops.RANGE, src=(UPat.cvar().cast(name="c"),), allow_any_len=True, name="x"), lambda c,x:
+     x.replace(src=(_tconst(c.val, dtypes.uint32).rtag(),) + x.src[1:])),
     (UPat(Ops.RANGE, name="x"), lambda ctx,x,sgpr_pool=sgpr_pool:
-     x.replace(dtype=dtypes.void if x.dtype is dtypes.void else dtypes.uint32, tag=(ctx.vreg(sgpr_pool),))
+     x.replace(tag=(ctx.vreg(sgpr_pool),))
      if not isinstance(x.tag, tuple) else None),
     (UPat(Ops.PARAM, name="x"), lambda ctx,x:
-     UOp(Ops.INS, dtypes.uint64 if x.arg.addrspace is not AddrSpace.ALU else dtypes.uint32,
-         (_tconst(_kernarg_offset(ctx, x), dtypes.int32).rtag(),), AMDOps.KERNARG, None)
+     UOp(Ops.INS, src=(_tconst(_kernarg_offset(ctx, x), dtypes.int32).rtag(),),
+         arg=(AMDOps.KERNARG, dtypes.uint64 if x.arg.addrspace is not AddrSpace.ALU else dtypes.uint32))
      if not isinstance(x.tag, tuple) else None),
     (UPat(Ops.BUFFER, name="x"), lambda ctx,x: _lds_base(ctx, x)),
     (UPat(Ops.SPECIAL, name="x"), lambda ctx,x,vgpr_pool=vgpr_pool:
      None if x.tag is not None else
-     UOp(Ops.INS, dtypes.uint32, (x.rtag(),), AMDOps.MOV,
-         (ctx.vreg(vgpr_pool if x.arg.startswith("lidx") else _special_reg(x.arg, ctx)),))),
+     UOp(Ops.INS, src=(x.rtag(),), arg=(AMDOps.MOV, dtypes.uint32),
+         tag=(ctx.vreg(vgpr_pool if x.arg.startswith("lidx") else _special_reg(x.arg, ctx)),))),
     # A boundless RANGE is a loop label whose END carries the backedge condition.
     # Preserve the comparison operands and the RANGE edge until after regalloc so
     # the compare can be emitted immediately before the VCC conditional branch.
@@ -1386,7 +1389,7 @@ def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Regis
     (UPat(Ops.STACK, name="x"), _pack_vec),
     # Int/bool CONST stay as CONST (_src inlines / _vgpr_data temps at use). Avoids
     # long-lived VGPR MOVs that dominate UPCAST4 spill. Float still needs a MOV VGPR.
-    (UPat.cvar("x", (dtypes.float16, dtypes.float32)), lambda x:
+    (UPat.cvar().cast((dtypes.float16, dtypes.float32), name="x"), lambda x:
      x.ins(AMDOps.MOV, src=(x.rtag(),)) if not x.tag else None),
     ((UPat(Ops.MUL, (dtypes.float16, dtypes.float32), name="a") + UPat.var("b")).named("c"), _fused_mulacc),
     ((UPat(dtype=dtypes.ints+(dtypes.bool, dtypes.float16, dtypes.float32)) + UPat()).named("x"), lambda x: x.ins(AMDOps.ADD)),
@@ -1423,54 +1426,54 @@ def _loop_label(x:UOp) -> str: return "_".join(str(i) for i in x.arg[:-1])
 
 def _lower_range(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
   loop_label = _loop_label(x)
-  label = UOp(Ops.INS, dtypes.void, arg=AMDOps.LABEL, tag=f".LOOP_{loop_label}")
+  label = UOp(Ops.INS, arg=(AMDOps.LABEL, dtypes.void), tag=f".LOOP_{loop_label}")
   if x.dtype is dtypes.void: return label, [label]
   acc = x.ins(AMDOps.MOV, dtype=dtypes.uint32, src=(_tconst(0, dtypes.uint32).rtag(),))
-  cmp = UOp(Ops.INS, dtypes.void, (acc, x.src[0]), AMDOps.CMP_GE)
-  jump_out = UOp(Ops.INS, dtypes.void, (cmp,), AMDOps.CBRANCH_SCC1, tag=f".LOOP_OUT_{loop_label}")
+  cmp = UOp(Ops.INS, src=(acc, x.src[0]), arg=(AMDOps.CMP_GE, dtypes.void))
+  jump_out = UOp(Ops.INS, src=(cmp,), arg=(AMDOps.CBRANCH_SCC1, dtypes.void), tag=f".LOOP_OUT_{loop_label}")
   ctx.loop_label[acc] = loop_label
   return acc, [acc, label, cmp, jump_out]
 
 def _lower_end(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
   loop_label = ctx.loop_label[x.src[1]]
-  jmp = UOp(Ops.INS, dtypes.void, arg=AMDOps.BRANCH, tag=f".LOOP_{loop_label}")
+  jmp = UOp(Ops.INS, arg=(AMDOps.BRANCH, dtypes.void), tag=f".LOOP_{loop_label}")
   return jmp, [
     x.src[1].ins(AMDOps.ADD, dtype=dtypes.uint32, src=(x.src[1], _tconst(1, dtypes.uint32).rtag())),
     jmp,
-    UOp(Ops.INS, dtypes.void, arg=AMDOps.LABEL, tag=f".LOOP_OUT_{loop_label}")]
+    UOp(Ops.INS, arg=(AMDOps.LABEL, dtypes.void), tag=f".LOOP_OUT_{loop_label}")]
 
 def _lower_loop_cmp(x:UOp) -> tuple[UOp, list[UOp]]:
-  if len(x.src) == 3 and x.src[0].op is Ops.INS and x.src[0].arg in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ):
+  if len(x.src) == 3 and x.src[0].op is Ops.INS and _iop(x.src[0]) in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ):
     cmp, loop = x.src[0], x.src[2]
   else:
     cmp_op = {Ops.CMPLT:AMDOps.CMPLT, Ops.CMPNE:AMDOps.CMPNE, Ops.CMPEQ:AMDOps.CMPEQ}[x.tag]
-    cmp, loop = UOp(Ops.INS, dtypes.bool, x.src[:2], cmp_op), x.src[3]
-  branch = UOp(Ops.INS, dtypes.void, (cmp,), AMDOps.CBRANCH_VCCNZ, tag=loop.tag)
+    cmp, loop = UOp(Ops.INS, src=x.src[:2], arg=(cmp_op, dtypes.bool)), x.src[3]
+  branch = UOp(Ops.INS, src=(cmp,), arg=(AMDOps.CBRANCH_VCCNZ, dtypes.void), tag=loop.tag)
   return branch, [branch] if len(x.src) == 3 else [cmp, branch]
 
 def _lower_reg_store(x:UOp) -> tuple[UOp, list[UOp]]:
   acc, val = x.src
-  if acc.op is Ops.INS and acc.arg is AMDOps.FILL:
+  if acc.op is Ops.INS and _iop(acc) is AMDOps.FILL:
     # spilled acc: write update back to scratch slot
-    sp = UOp(Ops.INS, dtypes.void, (acc.src[0], val), AMDOps.SPILL)
+    sp = UOp(Ops.INS, src=(acc.src[0], val), arg=(AMDOps.SPILL, dtypes.void))
     return sp, [sp]
   if not isinstance(greg(acc), Register) or greg(acc).index < 256:
     raise CompileError(f"bad reg store acc {acc}")
-  st = UOp(Ops.INS, val.dtype, (val,), AMDOps.MOV, (greg(acc),))
+  st = UOp(Ops.INS, src=(val,), arg=(AMDOps.MOV, val.dtype), tag=(greg(acc),))
   return st, [st]
 
 post_regalloc_matcher = PatternMatcher([
-  (UPat(Ops.INS, arg=AMDOps.LOOP_CMP, name="x"), _lower_loop_cmp),
+  (UPat(Ops.INS, arg=(AMDOps.LOOP_CMP, dtypes.bool), name="x"), _lower_loop_cmp),
   (UPat(Ops.RANGE, name="x"), lambda ctx,x: _lower_range(ctx, x)),
   (UPat(Ops.END, name="x"), lambda ctx,x: _lower_end(ctx, x)),
-  (UPat(Ops.INS, arg=AMDOps.REG_STORE, name="x"), lambda x: _lower_reg_store(x)),
-  (UPat((Ops.CONST, Ops.NOOP, Ops.AFTER, Ops.SPECIAL, Ops.SINK, Ops.GROUP), name="x"), lambda x: (x, [])),
+  (UPat(Ops.INS, arg=(AMDOps.REG_STORE, dtypes.void), name="x"), lambda x: _lower_reg_store(x)),
+  (UPat((Ops.CONST, Ops.CAST, Ops.BITCAST, Ops.NOOP, Ops.AFTER, Ops.SPECIAL, Ops.SINK, Ops.GROUP), name="x"), lambda x: (x, [])),
 ])
 
 def _vcc_rematerialize(ctx, x:UOp):
   _flags = (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ)
-  flag_def = x if x.arg in _flags else \
-             x.src[0] if x.arg in (AMDOps.WHERE, AMDOps.IF_MASK) and x.src[0].op is Ops.INS and x.src[0].arg in _flags else None
+  flag_def = x if x.op is Ops.INS and _iop(x) in _flags else \
+             x.src[0] if _iop(x) in (AMDOps.WHERE, AMDOps.IF_MASK) and x.src[0].op is Ops.INS and _iop(x.src[0]) in _flags else None
   if flag_def is None: return None
   # VCC is implicit; rematerialize compares before WHERE/IF_MASK consumers
   if flag_def is not x: return x, [flag_def, x]
@@ -1482,16 +1485,16 @@ def _vcc_rematerialize(ctx, x:UOp):
 
 def _lower_late_index(x:UOp) -> tuple[UOp, list[UOp]]: return x, []
 def _store_addr(a:UOp) -> UOp:
-  return a if a.op in (Ops.INDEX, Ops.SHRINK) else UOp(Ops.INDEX, a.dtype, (a, _tconst(0, dtypes.int32).rtag()))
+  return a if a.op in (Ops.INDEX, Ops.SHRINK) else UOp(Ops.INDEX, src=(a, _tconst(0, dtypes.int32).rtag()))
 
 def _lower_late_store(ctx, x:UOp, a:UOp, val:UOp, gate:UOp|None=None) -> tuple[UOp, list[UOp]]:
   if x in _amd_skip(ctx): return x, []
   st = _store_ins(x, _store_addr(a), val)
   if gate is None: return st, [st]
-  mif = UOp(Ops.INS, dtypes.void, (gate,), AMDOps.IF_MASK)
+  mif = UOp(Ops.INS, src=(gate,), arg=(AMDOps.IF_MASK, dtypes.void))
   remat = _vcc_rematerialize(ctx, mif)
   pre = remat[1] if remat is not None else [mif]
-  mend = UOp(Ops.INS, dtypes.void, (mif,), AMDOps.END_MASK)
+  mend = UOp(Ops.INS, src=(mif,), arg=(AMDOps.END_MASK, dtypes.void))
   return mend, [*pre, st, mend]
 
 def _promote_wmma_acc_pack(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|None:
@@ -1516,7 +1519,7 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
   if x in _amd_fused_d16(ctx):
     nx = x.replace(tag=None)
     return nx, [nx]
-  if x.arg is AMDOps.SSTORE:
+  if _iop(x) is AMDOps.SSTORE:
     if (buf:=_reg_buffer_base(x.src[0])) is not None and buf in _wmma_acc_buffers(ctx):
       return x, []  # acc stays in WMMA VGPR across K-loop
     if (slot:=_reg_promote_slot(ctx, x.src[0], x.src[1])) is None: return None
@@ -1526,9 +1529,9 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
       reg_values[slot] = acc = _new_promoted_reg(ctx, val)
       return acc, [acc]
     acc = reg_values[slot]
-    st = UOp(Ops.INS, dtypes.void, (acc, val), AMDOps.REG_STORE)
+    st = UOp(Ops.INS, src=(acc, val), arg=(AMDOps.REG_STORE, dtypes.void))
     return acc, [st]
-  if x.arg is AMDOps.SLOAD:
+  if _iop(x) is AMDOps.SLOAD:
     if (buf:=_reg_buffer_base(x.src[0])) is not None and buf in _wmma_acc_buffers(ctx):
       # Loop-body SLOADs only feed WMMA PACK (redirected); post-loop reads need EXTRACT.
       if not ctx.scratch.get("wmma_past_acc"): return x, []
@@ -1542,8 +1545,8 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
         if (init:=tiles.get(tile)) is None: return None
       n = ctx.scratch.get("wmma_ext_n", 0)
       ctx.scratch["wmma_ext_n"] = n + 1
-      ext = UOp(Ops.INS, dtypes.float32, (init, _tconst(lane, dtypes.int32).rtag()), AMDOps.EXTRACT,
-                (Register(f"wmma_ext{n}", 0, _cons=VGPR),))
+      ext = UOp(Ops.INS, src=(init, _tconst(lane, dtypes.int32).rtag()), arg=(AMDOps.EXTRACT, dtypes.float32),
+                tag=(Register(f"wmma_ext{n}", 0, _cons=VGPR),))
       return ext, [ext]
     if (slot:=_reg_promote_slot(ctx, x.src[0], x.src[1])) is None: return None
     loaded = ctx.scratch["reg_values"].get(slot)
@@ -1552,13 +1555,13 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
   return None
 
 def _lower_late_if(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
-  mif = UOp(Ops.INS, dtypes.void, (x.src[0],), AMDOps.IF_MASK)
+  mif = UOp(Ops.INS, src=(x.src[0],), arg=(AMDOps.IF_MASK, dtypes.void))
   remat = _vcc_rematerialize(ctx, mif)
   return remat if remat is not None else (mif, [mif])
 
 def _lower_late_endif(x:UOp) -> tuple[UOp, list[UOp]]:
   # Keep END_MASK after the guarded store. Source-less INS nodes are hoisted before regalloc.
-  mend = UOp(Ops.INS, dtypes.void, x.src, AMDOps.END_MASK)
+  mend = UOp(Ops.INS, src=x.src, arg=(AMDOps.END_MASK, dtypes.void))
   return mend, [mend]
 
 def _schedule_loop_cmps(lst:list[UOp]) -> list[UOp]:
@@ -1571,14 +1574,14 @@ def _schedule_loop_cmps(lst:list[UOp]) -> list[UOp]:
   out:list[UOp] = []
   cmp_ops = {Ops.CMPLT:AMDOps.CMPLT, Ops.CMPNE:AMDOps.CMPNE, Ops.CMPEQ:AMDOps.CMPEQ}
   for u in lst:
-    if u.op is not Ops.INS or u.arg is not AMDOps.LOOP_CMP:
+    if u.op is not Ops.INS or _iop(u) is not AMDOps.LOOP_CMP:
       out.append(u)
       continue
-    cmp = UOp(Ops.INS, dtypes.bool, u.src[:2], cmp_ops[u.tag])
+    cmp = UOp(Ops.INS, src=u.src[:2], arg=(cmp_ops[u.tag], dtypes.bool))
     cond_regs = {r for s in u.src[:2] if isinstance((r:=greg(s)), Register)}
     dep_reg = greg(u.src[2])
     insert = next((i for i in range(len(out)-1, -1, -1) if isinstance(dep_reg, Register) and
-                   out[i].op is Ops.INS and out[i].arg is AMDOps.REG_STORE and greg(out[i].src[0]) == dep_reg and dep_reg in cond_regs), len(out))
+                   out[i].op is Ops.INS and _iop(out[i]) is AMDOps.REG_STORE and greg(out[i].src[0]) == dep_reg and dep_reg in cond_regs), len(out))
     out.insert(insert, cmp)
     out.append(u.replace(src=(cmp, u.src[2], u.src[3])))
   return out
@@ -1588,7 +1591,7 @@ pre_regalloc_matcher = PatternMatcher([
   (UPat(Ops.STORE, src=(UPat.var("a"), UPat.var("val"), UPat.var("gate", dtype=dtypes.bool)), name="x"), _lower_late_store),
   (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), name="a"), UPat.var("val")), name="x"), _lower_late_store),
   (UPat(Ops.STORE, src=(UPat.var("a"), UPat.var("val")), name="x"), _lower_late_store),
-  (UPat(Ops.INS, arg=AMDOps.PACK, name="x"), _promote_wmma_acc_pack),
+  (UPat(Ops.INS, arg=(AMDOps.PACK, dtypes.float), name="x"), _promote_wmma_acc_pack),
   (UPat(Ops.BUFFER, name="x"), _promote_reg_buffer),
   (UPat(Ops.INS, name="x"), _promote_reg_access),
   (UPat(Ops.IF, name="x"), _lower_late_if),
@@ -1603,11 +1606,15 @@ _ALU2: dict[AMDOps, tuple] = {
   AMDOps.MUL: (r3.v_mul_f16_e32, r3.v_mul_f32_e32, r3.s_mul_i32, r3.v_mul_lo_u32),
 }
 def _alu2(u:UOp):
-  f16, f32, sgpr, vint = _ALU2[u.arg]
+  f16, f32, sgpr, vint = _ALU2[_iop(u)]
   d = _dst(u)
   sc = u.dtype
-  if sc is dtypes.float16: return [f16(d, _src(u.src[0]), _src(u.src[1]))]
-  if sc is dtypes.float32: return [f32(d, _src(u.src[0]), _src(u.src[1]))]
+  if sc in (dtypes.float16, dtypes.float32):
+    inst, a, b = (f16 if sc is dtypes.float16 else f32), _src(u.src[0]), _src(u.src[1])
+    if isinstance(b, Reg) and b.offset >= 256: return [inst(d, a, b)]
+    if _iop(u) in (AMDOps.ADD, AMDOps.MUL) and isinstance(a, Reg) and a.offset >= 256: return [inst(d, b, a)]
+    pre, b = _vgpr_data(TMP_VDATA, u.src[1])
+    return pre + [inst(d, a, b)]
   if greg(u).index < 256: return [sgpr(d, _src(u.src[0]), _src(u.src[1]))]
   # VOP: one src must be VGPR; materialize src0 if it's an imm/SGPR.
   pre, a = _vgpr_data(TMP_VDATA, u.src[0])
@@ -1658,8 +1665,8 @@ _MASKED_MEM = (AMDOps.LOAD, AMDOps.STORE, AMDOps.LLOAD, AMDOps.LSTORE, AMDOps.SL
 def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_cache:_StoreAddrCache|None=None,
                   d16_hi_lo:dict[UOp, UOp]|None=None, byte_scaled:set[int]|None=None):
   if u.op is not Ops.INS or (skip and u in skip): return []
-  if isinstance(u.arg, Inst): return [u.arg]
-  match u.arg:
+  if isinstance(_iop(u), Inst): return [_iop(u)]
+  match _iop(u):
     case (AMDOps.LABEL | AMDOps.BRANCH | AMDOps.CBRANCH_SCC1 | AMDOps.CBRANCH_VCCNZ | AMDOps.DEFINE | AMDOps.SCRATCH_BASE |
           AMDOps.SCRATCH_SIZE | AMDOps.SCRATCH_ADDR | AMDOps.LDS_BASE):
       return []
@@ -1762,9 +1769,13 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if u.dtype is dtypes.float32: return [r3.v_fma_f32(_dst(u), _src(u.src[0]), _src(u.src[1]), _src(u.src[2]))]
       raise CompileError(f"f16/f32 mulacc only, got {u.dtype}")
     case AMDOps.FMAC:
-      if u.dtype is dtypes.float16: return [r3.v_fmac_f16_e32(_dst(u), _src(u.src[1]), _src(u.src[2]))]
-      if u.dtype is dtypes.float32: return [r3.v_fmac_f32_e32(_dst(u), _src(u.src[1]), _src(u.src[2]))]
-      raise CompileError(f"f16/f32 fmac only, got {u.dtype}")
+      a, b = _src(u.src[1]), _src(u.src[2])
+      inst = r3.v_fmac_f16_e32 if u.dtype is dtypes.float16 else r3.v_fmac_f32_e32 if u.dtype is dtypes.float32 else None
+      if inst is None: raise CompileError(f"f16/f32 fmac only, got {u.dtype}")
+      if isinstance(b, Reg) and b.offset >= 256: return [inst(_dst(u), a, b)]
+      if isinstance(a, Reg) and a.offset >= 256: return [inst(_dst(u), b, a)]
+      pre, b = _vgpr_data(TMP_VDATA, u.src[2])
+      return pre + [inst(_dst(u), a, b)]
     case AMDOps.CAST:
       cast_src = _src(u.src[0])
       if greg(u).index < 256:
@@ -1786,7 +1797,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
         return pre + [r3.v_cvt_f16_f32_e32(_dst(u), cast_src)]
       if u.dtype is dtypes.float32 and u.src[0].dtype in dtypes.ints:
         if u.src[0].dtype in dtypes.sints and u.src[0].dtype.itemsize < 4:
-          if u.src[0].op is Ops.INS and u.src[0].arg is AMDOps.LOAD:
+          if u.src[0].op is Ops.INS and _iop(u.src[0]) is AMDOps.LOAD:
             return pre + [r3.v_cvt_f32_i32_e32(_dst(u), cast_src)]
           # Narrow signed values normally arrive sign-extended from i8/i16 loads, but a
           # BITCAST from u8/u16 is a register no-op and leaves the high bits clear.
@@ -1807,9 +1818,9 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
                     r3.v_sub_f32_e32(dst, 1.0, dst), r3.v_fma_f32(dst, TMP_VADDR, dst, TMP_VADDR),
                     r3.v_cmp_eq_f32_e32(dst, dst), r3.v_cndmask_b32_e32(dst, TMP_VADDR, dst)]
     case AMDOps.EXP2 | AMDOps.LOG2 | AMDOps.SQRT | AMDOps.TRUNC:
-      if u.dtype is not dtypes.float32: raise CompileError(f"f32 {u.arg.name} only, got {u.dtype}")
+      if u.dtype is not dtypes.float32: raise CompileError(f"f32 {_iop(u).name} only, got {u.dtype}")
       pre, val = _vgpr_data(TMP_VDATA, u.src[0])
-      return pre + [_F32_UNARY[u.arg](_dst(u), val)]
+      return pre + [_F32_UNARY[_iop(u)](_dst(u), val)]
     case AMDOps.SIN:
       if u.dtype is not dtypes.float32: raise CompileError(f"f32 sin only, got {u.dtype}")
       val = _src(u.src[0])
@@ -2018,13 +2029,13 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       pre1, b = _sgpr_data(TMP_SDATA1, u.src[1])
       return pre0 + pre1 + [r3.s_cmp_ge_u32(a, b)]
     case AMDOps.IF_MASK:
-      if u.src[0].op is Ops.INS and u.src[0].arg in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ):
+      if u.src[0].op is Ops.INS and _iop(u.src[0]) in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ):
         return [r3.s_and_saveexec_b64(TMP_EXEC, VCC)]
       pre, gate = _vgpr_data(TMP_VDATA, u.src[0])
       return pre + [r3.v_cmp_ne_u32_e32(0, gate), r3.s_and_saveexec_b64(TMP_EXEC, VCC)]
     case AMDOps.END_MASK:
       return [r3.s_mov_b64(EXEC, TMP_EXEC)]
-  raise CompileError(f"cannot encode {u.arg}")
+  raise CompileError(f"cannot encode {_iop(u)}")
 
 def _hoist_lloads_before_extracts(ops:list[UOp]) -> list[UOp]:
   # Hand kernel: issue all ds_loads, one lgkmcnt, then use. Linearize emits LLOAD+EXTRACT pairs;
@@ -2033,14 +2044,14 @@ def _hoist_lloads_before_extracts(ops:list[UOp]) -> list[UOp]:
   i = 0
   while i < len(ops):
     u = ops[i]
-    if u.op is Ops.INS and u.arg is AMDOps.LLOAD:
+    if u.op is Ops.INS and _iop(u) is AMDOps.LLOAD:
       j, lloads, extracts = i, [], []
       while j < len(ops):
         v = ops[j]
-        if v.op is Ops.INS and v.arg is AMDOps.LLOAD:
+        if v.op is Ops.INS and _iop(v) is AMDOps.LLOAD:
           lloads.append(v)
           j += 1
-        elif v.op is Ops.INS and v.arg is AMDOps.EXTRACT:
+        elif v.op is Ops.INS and _iop(v) is AMDOps.EXTRACT:
           extracts.append(v)
           j += 1
         else: break
@@ -2066,7 +2077,7 @@ def _sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
   i = 0
   while i < len(out):
     u = out[i]
-    if not (u.op is Ops.INS and u.arg is AMDOps.WMMA):
+    if not (u.op is Ops.INS and _iop(u) is AMDOps.WMMA):
       i += 1
       continue
     wmma_dst = _reg_idxs(u)
@@ -2075,20 +2086,20 @@ def _sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
     end = i + 1
     while end < len(out):
       v = out[end]
-      if not (v.op is Ops.INS and v.arg is AMDOps.EXTRACT): break
+      if not (v.op is Ops.INS and _iop(v) is AMDOps.EXTRACT): break
       if not (_reg_idxs(v.src[0]) & wmma_dst): break
       end += 1
     block = end - i
     j = end
     while j < len(out):
       v = out[j]
-      if v.op is not Ops.INS or v.arg not in _SINKABLE_PAST_WMMA: break
+      if v.op is not Ops.INS or _iop(v) not in _SINKABLE_PAST_WMMA: break
       # Keep tile-local schedule: don't sink past scalar half A loads. Otherwise all A packs
       # first and B B128 lands after a full wait — loses A/B VMEM overlap vs LLVM.
-      if v.arg is AMDOps.LOAD and v.dtype is dtypes.half and _elem_count(v) == 1: break
+      if _iop(v) is AMDOps.LOAD and v.dtype is dtypes.half and _elem_count(v) == 1: break
       # Don't sink past scalar B packs — that forces wait on the prefetched next B tile before
       # WMMA0, killing the VMEM overlap _prefetch_next_bu16_before_pack set up.
-      if v.arg is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(v): break
+      if _iop(v) is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(v): break
       v_dst = _reg_idxs(v)
       v_src = set().union(*(_reg_idxs(s) for s in v.src))
       if v_src & wmma_dst: break
@@ -2107,7 +2118,7 @@ def _sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
   return out
 
 def _is_addr_alu(u:UOp) -> bool:
-  return (u.op is Ops.INS and u.arg in (AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR,
+  return (u.op is Ops.INS and _iop(u) in (AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR,
                                         AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.MOV) and
           u.dtype in dtypes.ints)
 
@@ -2119,32 +2130,32 @@ def _hoist_b_between_a_and_pack(ops:list[UOp]) -> list[UOp]:
   Regalloc then gives B distinct VGPRs from live A dests. Post-regalloc hoist alone cannot:
   B addr ADDs otherwise reuse A's load VGPRs (dest-as-addr band).
   """
-  if not any(u.op is Ops.INS and u.arg is AMDOps.WMMA for u in ops): return ops
+  if not any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops): return ops
   out = list(ops)
   i = 0
   while i < len(out):
     u = out[i]
-    if not (u.op is Ops.INS and u.arg is AMDOps.LOAD and u.dtype is dtypes.half and _elem_count(u) >= 8):
+    if not (u.op is Ops.INS and _iop(u) is AMDOps.LOAD and u.dtype is dtypes.half and _elem_count(u) >= 8):
       i += 1
       continue
     start = i
     while start > 0 and _is_addr_alu(out[start - 1]): start -= 1
     end = i + 1
-    if end < len(out) and out[end].op is Ops.INS and out[end].arg is AMDOps.PACK_F16 and _pack_f16_is_vec_load(out[end]):
+    if end < len(out) and out[end].op is Ops.INS and _iop(out[end]) is AMDOps.PACK_F16 and _pack_f16_is_vec_load(out[end]):
       end += 1
     j = start - 1
-    while j >= 0 and out[j].op is Ops.INS and out[j].arg is AMDOps.EXTRACT: j -= 1
-    if j < 0 or not (out[j].op is Ops.INS and out[j].arg is AMDOps.WMMA):
+    while j >= 0 and out[j].op is Ops.INS and _iop(out[j]) is AMDOps.EXTRACT: j -= 1
+    if j < 0 or not (out[j].op is Ops.INS and _iop(out[j]) is AMDOps.WMMA):
       i += 1
       continue
     wmma_i = j
     j -= 1
-    if j < 0 or not (out[j].op is Ops.INS and out[j].arg is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(out[j])):
+    if j < 0 or not (out[j].op is Ops.INS and _iop(out[j]) is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(out[j])):
       i += 1
       continue
     pack_a_i = j
     k = pack_a_i - 1
-    while k >= 0 and out[k].op is Ops.INS and out[k].arg is AMDOps.LOAD and \
+    while k >= 0 and out[k].op is Ops.INS and _iop(out[k]) is AMDOps.LOAD and \
           out[k].dtype is dtypes.half and _elem_count(out[k]) == 1:
       k -= 1
     if k + 1 >= pack_a_i:
@@ -2173,15 +2184,15 @@ def _prefetch_next_a_b128_before_pack(ops:list[UOp]) -> list[UOp]:
   becomes:      A0 → A1_addr* → A1 → PACK_A0 → WMMA* → …
   Regalloc must give A0/A1 distinct VGPRs; soft waitcnt leaves A1 in flight into WMMA.
   """
-  if not any(u.op is Ops.INS and u.arg is AMDOps.WMMA for u in ops): return ops
+  if not any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops): return ops
   out = list(ops)
   i = 0
   while i < len(out):
     u = out[i]
-    if not (u.op is Ops.INS and u.arg is AMDOps.PACK_F16 and _pack_f16_is_vec_load(u)):
+    if not (u.op is Ops.INS and _iop(u) is AMDOps.PACK_F16 and _pack_f16_is_vec_load(u)):
       i += 1
       continue
-    if i + 1 >= len(out) or not (out[i + 1].op is Ops.INS and out[i + 1].arg is AMDOps.WMMA):
+    if i + 1 >= len(out) or not (out[i + 1].op is Ops.INS and _iop(out[i + 1]) is AMDOps.WMMA):
       i += 1
       continue
     if out[i + 1].src[1] is not u and out[i + 1].src[2] is not u:
@@ -2191,9 +2202,9 @@ def _prefetch_next_a_b128_before_pack(ops:list[UOp]) -> list[UOp]:
     j = i + 1
     while j < len(out):
       v = out[j]
-      if v.op is Ops.INS and v.arg is AMDOps.LOAD and v.dtype is dtypes.half and _elem_count(v) >= 8:
+      if v.op is Ops.INS and _iop(v) is AMDOps.LOAD and v.dtype is dtypes.half and _elem_count(v) >= 8:
         break
-      if v.op is Ops.INS and v.arg in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ, AMDOps.STORE,
+      if v.op is Ops.INS and _iop(v) in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ, AMDOps.STORE,
                                        AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER):
         j = -1
         break
@@ -2233,26 +2244,26 @@ def _prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
   becomes:      B0_u16* → B1_addr* → B1_u16* → PACK_B0 → WMMA → EXTRACT* → PACK_B1
   Regalloc assigns B0/B1 distinct VGPRs; soft wait on PACK_B0 leaves B1 in flight through WMMA0.
   """
-  if not any(u.op is Ops.INS and u.arg is AMDOps.WMMA for u in ops): return ops
+  if not any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops): return ops
   out = list(ops)
   i = 0
   while i < len(out):
     u = out[i]
-    if not (u.op is Ops.INS and u.arg is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(u)):
+    if not (u.op is Ops.INS and _iop(u) is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(u)):
       i += 1
       continue
-    if i + 1 >= len(out) or not (out[i + 1].op is Ops.INS and out[i + 1].arg is AMDOps.WMMA):
+    if i + 1 >= len(out) or not (out[i + 1].op is Ops.INS and _iop(out[i + 1]) is AMDOps.WMMA):
       i += 1
       continue
     if out[i + 1].src[1] is not u and out[i + 1].src[2] is not u:
       i += 1
       continue
     # Insert before optional PACK_A (vec) that sits between B0 U16 and PACK_B0.
-    insert_at = i - 1 if (i > 0 and out[i - 1].op is Ops.INS and out[i - 1].arg is AMDOps.PACK_F16 and
+    insert_at = i - 1 if (i > 0 and out[i - 1].op is Ops.INS and _iop(out[i - 1]) is AMDOps.PACK_F16 and
                           _pack_f16_is_vec_load(out[i - 1])) else i
     # Require a preceding scalar half load streak (current B tile).
     k = insert_at - 1
-    while k >= 0 and out[k].op is Ops.INS and out[k].arg is AMDOps.LOAD and \
+    while k >= 0 and out[k].op is Ops.INS and _iop(out[k]) is AMDOps.LOAD and \
           out[k].dtype is dtypes.half and _elem_count(out[k]) == 1:
       k -= 1
     if k + 1 >= insert_at:
@@ -2260,11 +2271,11 @@ def _prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
       continue
     wmma_i = i + 1
     j = wmma_i + 1
-    while j < len(out) and out[j].op is Ops.INS and out[j].arg is AMDOps.EXTRACT: j += 1
+    while j < len(out) and out[j].op is Ops.INS and _iop(out[j]) is AMDOps.EXTRACT: j += 1
     start = j
     while j < len(out) and _is_addr_alu(out[j]): j += 1
     load0 = j
-    while j < len(out) and out[j].op is Ops.INS and out[j].arg is AMDOps.LOAD and \
+    while j < len(out) and out[j].op is Ops.INS and _iop(out[j]) is AMDOps.LOAD and \
           out[j].dtype is dtypes.half and _elem_count(out[j]) == 1:
       j += 1
     if j == load0:
@@ -2275,7 +2286,7 @@ def _prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
     # with PACK_B1 so WMMA0 only consumes B0). Restores U16→B128 overlap at A-row transitions.
     j2 = end
     while j2 < len(out) and _is_addr_alu(out[j2]): j2 += 1
-    if j2 < len(out) and out[j2].op is Ops.INS and out[j2].arg is AMDOps.LOAD and \
+    if j2 < len(out) and out[j2].op is Ops.INS and _iop(out[j2]) is AMDOps.LOAD and \
        out[j2].dtype is dtypes.half and _elem_count(out[j2]) >= 8:
       end = j2 + 1
     mid, chunk = out[insert_at:start], out[start:end]
@@ -2295,41 +2306,41 @@ def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
   # Bubble LOAD/PACK_F16 (+ int addr) above preceding WMMAs when independent.
   # Must not clobber a WMMA's A/B/ACC — UPCAST≥4 reuses PACK VGPRs across tiles; hoisting
   # the next tile's load above a prior WMMA left only the last A in those regs (wrong results).
-  if not any(u.op is Ops.INS and u.arg is AMDOps.WMMA for u in ops): return ops
+  if not any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops): return ops
   out = list(ops)
   i = 0
   while i < len(out):
     u = out[i]
-    if not (u.op is Ops.INS and u.arg in (AMDOps.LOAD, AMDOps.PACK_F16)):
+    if not (u.op is Ops.INS and _iop(u) in (AMDOps.LOAD, AMDOps.PACK_F16)):
       i += 1
       continue
     # Only hoist wide B (half×8+) / vec-load packs above WMMA — not scalar A loads.
     # Hoisting scalar A above prior WMMA collapsed the schedule to all-A-then-B (no A/B overlap).
-    if u.arg is AMDOps.LOAD and u.dtype is dtypes.half and _elem_count(u) == 1:
+    if _iop(u) is AMDOps.LOAD and u.dtype is dtypes.half and _elem_count(u) == 1:
       i += 1
       continue
-    if u.arg is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(u):
+    if _iop(u) is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(u):
       i += 1
       continue
     # Grow a hoistable prefix of addr ALU ending at this LOAD/PACK (and following PACK).
     start = i
     while start > 0:
       p = out[start - 1]
-      if p.op is Ops.INS and p.arg in (AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR,
+      if p.op is Ops.INS and _iop(p) in (AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR,
                                        AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.MOV) and \
          p.dtype in dtypes.ints:
         start -= 1
         continue
       break
     end = i + 1
-    if end < len(out) and out[end].op is Ops.INS and out[end].arg is AMDOps.PACK_F16:
+    if end < len(out) and out[end].op is Ops.INS and _iop(out[end]) is AMDOps.PACK_F16:
       end += 1
     chunk_src = set().union(*(set().union(*(_reg_idxs(s) for s in out[k].src)) for k in range(start, end)))
     chunk_dst = set().union(*(_reg_idxs(out[k]) for k in range(start, end)))
     dest = start
     while dest > 0:
       p = out[dest - 1]
-      if p.op is Ops.INS and p.arg is AMDOps.EXTRACT:
+      if p.op is Ops.INS and _iop(p) is AMDOps.EXTRACT:
         # Walk through ACC EXTRACTs glued after WMMA, but never past EXTRACTs of a still-live
         # vector LOAD whose VGPRs the hoisted chunk would clobber (half 8×8: B addr ADDs into
         # A’s B128 dests → sq_intr hang / wrong mul).
@@ -2337,7 +2348,7 @@ def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
         if chunk_dst & (ext_src | _reg_idxs(p)): break
         dest -= 1
         continue
-      if p.op is Ops.INS and p.arg is AMDOps.WMMA:
+      if p.op is Ops.INS and _iop(p) is AMDOps.WMMA:
         wmma_src = set().union(*(_reg_idxs(s) for s in p.src))
         if _reg_idxs(p) & chunk_src: break
         if chunk_dst & (wmma_src | _reg_idxs(p)): break
@@ -2371,19 +2382,19 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
   Explicit SSA dependencies preserve value order; REG_STORE and all other implicit
   architectural state or memory side effects are hard boundaries.
   """
-  if any(u.op is Ops.INS and (u.arg is AMDOps.WMMA or (u.arg is AMDOps.LOAD and not _vmem_schedulable_load(u))) for u in ops): return ops
+  if any(u.op is Ops.INS and (_iop(u) is AMDOps.WMMA or (_iop(u) is AMDOps.LOAD and not _vmem_schedulable_load(u))) for u in ops): return ops
   fused_d16 = set(d16_hi_lo) | set(d16_hi_lo.values())
 
   def schedulable(u:UOp) -> bool:
-    if u.op is Ops.NOOP and u.dtype is not dtypes.void: return True  # value identity/bitcast, never a void ordering gate
+    if u.op is Ops.BITCAST or (u.op is Ops.NOOP and u.dtype is not dtypes.void): return True  # value alias, never a void ordering gate
     if u.op is Ops.AFTER and u.addrspace is AddrSpace.REG: return True  # register accumulator binding, not a memory/state boundary
-    if u in fused_d16 or u.op is not Ops.INS or u.arg not in _VMEM_SCHEDULABLE: return False
+    if u in fused_d16 or u.op is not Ops.INS or _iop(u) not in _VMEM_SCHEDULABLE: return False
     # Wide f32 and packed-byte loads have independent addresses and dedicated destination
     # VGPRs, so they can participate. Other wide/d16 loads retain emitter temp constraints.
-    return u.arg is not AMDOps.LOAD or _vmem_schedulable_load(u)
+    return _iop(u) is not AMDOps.LOAD or _vmem_schedulable_load(u)
 
   def schedule(segment:list[UOp]) -> list[UOp]:
-    loads = [i for i,u in enumerate(segment) if u.arg is AMDOps.LOAD]
+    loads = [i for i,u in enumerate(segment) if _iop(u) is AMDOps.LOAD]
     if len(loads) < 2: return segment
     deps:list[set[int]] = [set() for _ in segment]
     users:list[list[int]] = [[] for _ in segment]
@@ -2413,13 +2424,13 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
     alu_depth = [0] * len(segment)
     if use_alu_breadth:
       for i,u in enumerate(segment):
-        if u.arg is not AMDOps.LOAD and deps[i]: alu_depth[i] = max(alu_depth[d] + 1 for d in deps[i])
+        if _iop(u) is not AMDOps.LOAD and deps[i]: alu_depth[i] = max(alu_depth[d] + 1 for d in deps[i])
 
     indegree = [len(ds) for ds in deps]
     ready = [i for i,n in enumerate(indegree) if n == 0]
     scheduled:list[UOp] = []
     while ready:
-      i = min(ready, key=lambda j: (0 if segment[j].arg is AMDOps.LOAD else 1 if j in load_ancestors else 2,
+      i = min(ready, key=lambda j: (0 if _iop(segment[j]) is AMDOps.LOAD else 1 if j in load_ancestors else 2,
                                     alu_depth[j] if use_alu_breadth else 0, j))
       ready.remove(i)
       scheduled.append(segment[i])
@@ -2432,12 +2443,12 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
   segment:list[UOp] = []
   mask_depth = 0
   for u in ops:
-    if u.op is Ops.INS and u.arg is AMDOps.IF_MASK:
+    if u.op is Ops.INS and _iop(u) is AMDOps.IF_MASK:
       out.extend(schedule(segment))
       segment = []
       out.append(u)
       mask_depth += 1
-    elif u.op is Ops.INS and u.arg is AMDOps.END_MASK:
+    elif u.op is Ops.INS and _iop(u) is AMDOps.END_MASK:
       out.extend(segment)
       segment = []
       out.append(u)
@@ -2469,12 +2480,12 @@ def _tmp_vaddr_clause_safe(scales:list, loads:list) -> bool:
 
 def _clauseable_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   # Scalar half global LOAD with dest-as-addr (no mask/TMP). Streak → hoist scales + s_clause.
-  if u in skip or mask_depth or u.op is not Ops.INS or u.arg is not AMDOps.LOAD: return False
+  if u in skip or mask_depth or u.op is not Ops.INS or _iop(u) is not AMDOps.LOAD: return False
   return _reg_slots(u) == 1 and u.dtype is dtypes.half
 
 def _clauseable_wide_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   # Contiguous half×8+ global LOAD (A B128 pairs). Streak → one s_clause over all B128s.
-  if u in skip or mask_depth or u.op is not Ops.INS or u.arg is not AMDOps.LOAD: return False
+  if u in skip or mask_depth or u.op is not Ops.INS or _iop(u) is not AMDOps.LOAD: return False
   return u.dtype is dtypes.half and _elem_count(u) >= 8 and not _is_lds_ref(u.src[0]) and \
          not _is_scratch_ref(u.src[0])
 
@@ -2564,17 +2575,17 @@ def insts_from_linear(lin:UOp):
   oi = 0
   while oi < len(scheduled):
     u = scheduled[oi]
-    if u.op is Ops.INS and u.arg is AMDOps.LABEL:
+    if u.op is Ops.INS and _iop(u) is AMDOps.LABEL:
       flush("vm", "lgkm", "vs")
       store_addr_cache.clear()
       targets[u.tag] = len(items)
       oi += 1
       continue
-    if u.op is Ops.INS and u.arg in (AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ):
+    if u.op is Ops.INS and _iop(u) in (AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ):
       flush("vm", "lgkm", "vs")
       store_addr_cache.clear()
-      inst = r3.s_branch(0) if u.arg is AMDOps.BRANCH else \
-             r3.s_cbranch_scc1(0) if u.arg is AMDOps.CBRANCH_SCC1 else r3.s_cbranch_vccnz(0)
+      inst = r3.s_branch(0) if _iop(u) is AMDOps.BRANCH else \
+             r3.s_cbranch_scc1(0) if _iop(u) is AMDOps.CBRANCH_SCC1 else r3.s_cbranch_vccnz(0)
       items.append((inst, u.tag))
       oi += 1
       continue
@@ -2582,10 +2593,10 @@ def insts_from_linear(lin:UOp):
       # Soft wait on WMMA A/B/ACC srcs only — full vm drain killed prefetched next-B U16 overlap.
       # Also drain lgkm on WMMA srcs — TC_LDS_AB feeds A/B from DS_LOAD; skipping that wait
       # left WMMA reading in-flight LDS data (NaN/inf). Hand kernel waits lgkmcnt(0) first.
-      if u.op is Ops.INS and u.arg is AMDOps.WMMA:
+      if u.op is Ops.INS and _iop(u) is AMDOps.WMMA:
         flush_regs(set().union(*(_reg_idxs(s) for s in u.src)))
       else: flush_regs(set().union(*(_reg_idxs(s) for s in u.src), _reg_idxs(u)))
-    if u.op is Ops.INS and u.arg is AMDOps.IF_MASK:
+    if u.op is Ops.INS and _iop(u) is AMDOps.IF_MASK:
       store_addr_cache.clear()
       emitted = _emit_uop(u)
       for inst in emitted: emit(inst)
@@ -2596,13 +2607,13 @@ def insts_from_linear(lin:UOp):
       oi += 1
       continue
     # LDS stores must complete before s_barrier / next LLOAD (hand: waitcnt then barrier).
-    if u.op is Ops.INS and u.arg is AMDOps.BARRIER:
+    if u.op is Ops.INS and _iop(u) is AMDOps.BARRIER:
       flush("lgkm")
-    elif u.op is Ops.INS and u.arg is AMDOps.LLOAD and -1 in pending["lgkm"]:
+    elif u.op is Ops.INS and _iop(u) is AMDOps.LLOAD and -1 in pending["lgkm"]:
       flush("lgkm")
-    masked = mask_depth > 0 and u.op is Ops.INS and u.arg in _MASKED_MEM
+    masked = mask_depth > 0 and u.op is Ops.INS and _iop(u) in _MASKED_MEM
     if u in skip:
-      if u.op is Ops.INS and u.arg is AMDOps.END_MASK: mask_depth -= 1
+      if u.op is Ops.INS and _iop(u) is AMDOps.END_MASK: mask_depth -= 1
       oi += 1
       continue
     # Cluster contiguous A B128 (half×8+): one s_clause over the burst (LLVM B128×8).
@@ -2673,10 +2684,10 @@ def insts_from_linear(lin:UOp):
           oi = end
           continue
     if u in d16_hi_lo: flush_regs(_reg_idxs(d16_hi_lo[u]))
-    is_store = u.op is Ops.INS and u.arg is AMDOps.STORE
+    is_store = u.op is Ops.INS and _iop(u) is AMDOps.STORE
     emitted = _emit_uop(u, masked, with_store_cache=is_store)
     # VALU copy of an outstanding VMEM/LDS dest must wait first (PACK/MOV across pools).
-    if emitted and u.op is Ops.INS and u.arg in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV):
+    if emitted and u.op is Ops.INS and _iop(u) in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV):
       src = set().union(*(_reg_idxs(s) for s in u.src))
       for s in u.src:
         if s in d16_hi_lo: src |= _reg_idxs(d16_hi_lo[s])
@@ -2699,7 +2710,7 @@ def insts_from_linear(lin:UOp):
         saw_vm_wait0 = True
       else:
         vm_after_wait.append(inst)
-    if u.op is Ops.INS and u.arg is AMDOps.END_MASK: mask_depth -= 1
+    if u.op is Ops.INS and _iop(u) is AMDOps.END_MASK: mask_depth -= 1
     if (domain:=_wait_domain_for_load(u)) is not None:
       regs = _reg_idxs(d16_hi_lo[u]) if u in d16_hi_lo else _reg_idxs(u)
       if domain == "vm": note_vm(regs, vm_after_wait if saw_vm_wait0 else emitted)
@@ -3111,7 +3122,7 @@ def expand_wmma_lds_tiles(u, a, b, c, done_arg, unroll_axis, ctx):
     for i in range(i0, min(i0 + a_batch, ta)):
       aa_elems = a.src[i*_WMMA_AB_WIDTH:(i+1)*_WMMA_AB_WIDTH]
       if prev_batch is not None:
-        aa_elems = tuple(UOp(Ops.AFTER, e.dtype, (e, prev_batch)) for e in aa_elems)
+        aa_elems = tuple(UOp(Ops.AFTER, src=(e, prev_batch)) for e in aa_elems)
       aa = UOp.stack(*aa_elems)
       for j in range(tb):
         bb = UOp.stack(*b.src[j*_WMMA_AB_WIDTH:(j+1)*_WMMA_AB_WIDTH]) if b.op is Ops.STACK else b
@@ -3246,7 +3257,7 @@ class AMDRenderer(ISARenderer):
     # inits for two-address accumulate across K (TC_LDS_AB). Unrelated LLOAD elsewhere
     # must not suppress the UNROLL sink.
     if (loop_i := next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), None)) is not None:
-      zero_acc = {u.src[0] for u in lst if u.op is Ops.INS and u.arg is AMDOps.WMMA and
+      zero_acc = {u.src[0] for u in lst if u.op is Ops.INS and _iop(u) is AMDOps.WMMA and
                   _is_wmma_acc_reload_pack(u.src[0]) and not _wmma_ab_from_lds(u)}
       move_i = [i for i,u in enumerate(lst) if i < loop_i and u in zero_acc]
       if move_i:
@@ -3267,17 +3278,17 @@ class AMDRenderer(ISARenderer):
 
   def is_two_address(self, x:UOp) -> bool:
     if x.op is not Ops.INS: return False
-    if x.arg in (AMDOps.WMMA, AMDOps.FMAC): return True
+    if _iop(x) in (AMDOps.WMMA, AMDOps.FMAC): return True
     # PACK_F16(half×16 LOAD) — coalesce onto the load (hand FA/FB).
-    return x.arg is AMDOps.PACK_F16 and _pack_f16_is_vec_load(x) and len(x.src) == 1
+    return _iop(x) is AMDOps.PACK_F16 and _pack_f16_is_vec_load(x) and len(x.src) == 1
   def loop_end(self, x:UOp) -> UOp|None:
-    if x.op is Ops.INS and x.arg is AMDOps.LOOP_CMP: return x.src[2] if len(x.src) == 3 else x.src[3]
+    if x.op is Ops.INS and _iop(x) is AMDOps.LOOP_CMP: return x.src[2] if len(x.src) == 3 else x.src[3]
     return super().loop_end(x)
   def prefer_phys(self, x:UOp, src_phys:list) -> Register|None:
     # EXTRACT from a multi-VGPR value → alias onto its source lane. Besides WMMA
     # float stores, packed quantized byte loads use uint32 lanes exactly once.
-    if x.op is not Ops.INS or x.arg is not AMDOps.EXTRACT: return None
-    packed_bytes = x.dtype is dtypes.uint32 and x.src and x.src[0].op is Ops.INS and x.src[0].arg is AMDOps.LOAD and \
+    if x.op is not Ops.INS or _iop(x) is not AMDOps.EXTRACT: return None
+    packed_bytes = x.dtype is dtypes.uint32 and x.src and x.src[0].op is Ops.INS and _iop(x.src[0]) is AMDOps.LOAD and \
       _reg_slots(x.src[0]) == 4 and _is_byte_addr_load(x.src[0])
     if x.dtype is not dtypes.float32 and not packed_bytes: return None
     if not src_phys or src_phys[0] is None or not isinstance(x.tag, tuple): return None
@@ -3306,10 +3317,10 @@ class AMDRenderer(ISARenderer):
       for src in u.src: uses.setdefault(src, []).append(u)
     store_cast: dict[UOp, UOp] = {}  # store -> cast
     for u in lst:
-      if u.op is not Ops.INS or u.arg is not AMDOps.CAST: continue
+      if u.op is not Ops.INS or _iop(u) is not AMDOps.CAST: continue
       if u.dtype is not dtypes.float16 or not u.src or u.src[0].dtype is not dtypes.float32: continue
       us = uses.get(u, [])
-      if len(us) == 1 and us[0].op is Ops.INS and us[0].arg is AMDOps.STORE and len(us[0].src) > 2 and us[0].src[2] is u:
+      if len(us) == 1 and us[0].op is Ops.INS and _iop(us[0]) is AMDOps.STORE and len(us[0].src) > 2 and us[0].src[2] is u:
         store_cast[us[0]] = u
     if store_cast:
       skip = set(store_cast.values())
@@ -3326,8 +3337,8 @@ class AMDRenderer(ISARenderer):
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True
     if x.op is not Ops.INS or x.dtype not in (dtypes.int32, dtypes.uint32): return False
-    if x.arg is AMDOps.MOV and x.src: return self._pure_addr(x.src[0])
-    if x.arg in (AMDOps.ADD, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR):
+    if _iop(x) is AMDOps.MOV and x.src: return self._pure_addr(x.src[0])
+    if _iop(x) in (AMDOps.ADD, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR):
       return all(self._pure_addr(s) for s in x.src)
     return False
   def rematerialize(self, x:UOp) -> bool:
@@ -3336,22 +3347,22 @@ class AMDRenderer(ISARenderer):
     # Address remat defaults ON under LDS — EXTRACT-only leaves addr spills / wrong mock.
     # AMD_REMAT_ADDR=0 opts out.
     if getenv("TC_LDS_AB", 0) and getenv("AMD_REMAT", 1):
-      if (x.arg is AMDOps.EXTRACT and x.dtype is dtypes.half and x.src and
-          x.src[0].op is Ops.INS and x.src[0].arg is AMDOps.LLOAD):
+      if (_iop(x) is AMDOps.EXTRACT and x.dtype is dtypes.half and x.src and
+          x.src[0].op is Ops.INS and _iop(x.src[0]) is AMDOps.LLOAD):
         return True
-      if getenv("ALLOW_UPCAST16", 0) and x.arg is AMDOps.LLOAD and x.dtype is dtypes.half:
+      if getenv("ALLOW_UPCAST16", 0) and _iop(x) is AMDOps.LLOAD and x.dtype is dtypes.half:
         return True
     if not getenv("AMD_REMAT_ADDR", 1 if getenv("TC_LDS_AB", 0) else 0): return False
     if x.dtype not in (dtypes.int32, dtypes.uint32): return False
-    return x.arg is not AMDOps.MOV and self._pure_addr(x)
+    return _iop(x) is not AMDOps.MOV and self._pure_addr(x)
   def keep_remat(self, x:UOp) -> bool:
     # Pure-addr remats under TC_LDS: without sticky, SHR/AND remat ~60× and SHL/ADD flood the loop.
-    return x.op is Ops.INS and x.arg in (AMDOps.SHR, AMDOps.AND, AMDOps.SHL, AMDOps.ADD)
+    return x.op is Ops.INS and _iop(x) in (AMDOps.SHR, AMDOps.AND, AMDOps.SHL, AMDOps.ADD)
   def remat(self, x:UOp, reg:Register, src_regs:list[Register|None]) -> UOp:
-    nsrc = [s if r is None else UOp(Ops.INS, s.dtype, (), AMDOps.MOV, (r,)) for s, r in zip(x.src, src_regs)]
+    nsrc = [s if r is None else UOp(Ops.INS, arg=(AMDOps.MOV, s.dtype), tag=(r,)) for s, r in zip(x.src, src_regs)]
     return x.replace(src=tuple(nsrc), tag=(reg,))
-  def bind(self, dtype, reg:Register) -> UOp: return UOp(Ops.INS, dtype, (), AMDOps.MOV, (reg,))
-  def stack_pointer(self) -> UOp: return UOp(Ops.INS, dtypes.uint32, arg=AMDOps.SCRATCH_BASE)
+  def bind(self, dtype, reg:Register) -> UOp: return UOp(Ops.INS, arg=(AMDOps.MOV, dtype), tag=(reg,))
+  def stack_pointer(self) -> UOp: return UOp(Ops.INS, arg=(AMDOps.SCRATCH_BASE, dtypes.uint32))
   def register_slots(self, x:UOp, vreg:Register|None=None) -> int:
     if vreg is None: return 1
     if all(c.index < 256 for c in vreg.cons): return max(1, (x.dtype.itemsize + 3) // 4)
@@ -3359,19 +3370,19 @@ class AMDRenderer(ISARenderer):
   def spill_size(self, x:UOp, vreg:Register) -> int:
     # Scalar scratch transport uses B32 even for bool/int8/int16 SGPR values.
     return max(4, x.dtype.itemsize) if all(c.index < 256 for c in vreg.cons) else super().spill_size(x, vreg)
-  def copy(self, x:UOp, reg): return UOp(Ops.INS, x.dtype, (x,), AMDOps.MOV, (reg,))
+  def copy(self, x:UOp, reg): return UOp(Ops.INS, src=(x,), arg=(AMDOps.MOV, x.dtype), tag=(reg,))
   def spill(self, disp:UOp, x:UOp) -> UOp:
-    return UOp(Ops.INS, dtypes.void, (disp, x), AMDOps.SPILL)
+    return UOp(Ops.INS, src=(disp, x), arg=(AMDOps.SPILL, dtypes.void))
   def fill(self, disp:UOp, x:UOp, reg) -> UOp:
-    return UOp(Ops.INS, x.dtype, (disp, _tconst(_reg_slots(x), dtypes.int32).rtag()), AMDOps.FILL, (reg,))
+    return UOp(Ops.INS, src=(disp, _tconst(_reg_slots(x), dtypes.int32).rtag()), arg=(AMDOps.FILL, x.dtype), tag=(reg,))
 
   def asm_str(self, uops:list[UOp], function_name:str) -> str:
     ret = [f".{function_name}:"]
     for u in uops:
       if u.op is not Ops.INS: continue
-      if u.arg is AMDOps.LABEL: ret.append(f"{u.tag}:")
-      elif u.arg in (AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ): ret.append(f"  {u.arg.name.lower()} {u.tag}")
-      else: ret.append(f"  {u.arg.name.lower()} " + ", ".join(str(greg(s) or s.arg) for s in u.src))
+      if _iop(u) is AMDOps.LABEL: ret.append(f"{u.tag}:")
+      elif _iop(u) in (AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ): ret.append(f"  {_iop(u).name.lower()} {u.tag}")
+      else: ret.append(f"  {_iop(u).name.lower()} " + ", ".join(str(greg(s) or s.arg) for s in u.src))
     return "\n".join(ret)
 
   def render(self, uops:list[UOp]) -> str:
@@ -3384,7 +3395,7 @@ class AMDRenderer(ISARenderer):
     from tinygrad.renderer.amd.elf import assemble_linear
     insts = self._insts_from_linear(lin)
     insts.append(r3.s_endpgm())
-    nlin = lin.replace(src=tuple(UOp(Ops.INS, arg=i) for i in insts))
+    nlin = lin.replace(src=tuple(UOp(Ops.INS, arg=(i, dtypes.void)) for i in insts))
     return assemble_linear(prg, nlin, self.target.arch)
 
   def supported_dtypes(self):

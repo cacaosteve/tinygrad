@@ -456,7 +456,7 @@ class TestMovementOps(unittest.TestCase):
     from tinygrad.codegen.late.index_mops import pm_index_mops, _index_through_reshape
     buf1 = UOp.param(0, dtypes.float, shape=(1,))
     r0 = buf1.reshape(())
-    idx0 = UOp(Ops.INDEX, dtypes.float, src=(r0,))
+    idx0 = UOp(Ops.INDEX, src=(r0,))
     self.assertIsNone(_index_through_reshape(r0, idx0))
     self.assertEqual(graph_rewrite(idx0, pm_index_mops, name="test").op, Ops.INDEX)
     scalar = UOp.const(1.0, dtypes.float)

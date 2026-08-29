@@ -6,7 +6,7 @@ from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat
 from tinygrad.renderer.isa import ISARenderer, Register, greg
 from tinygrad.dtype import dtypes
 
-PSEUDO_OPS = {Ops.CONST, Ops.CAST, Ops.NOOP, Ops.AFTER, Ops.BARRIER, Ops.GROUP, Ops.STACK}
+PSEUDO_OPS = {Ops.CONST, Ops.CAST, Ops.BITCAST, Ops.NOOP, Ops.AFTER, Ops.BARRIER, Ops.GROUP, Ops.STACK}
 
 class LinearScanRegallocContext:
   # returns the uop that defines the virtual register
@@ -218,7 +218,7 @@ def wide_regalloc_rewrite(ctx, x:UOp):
   before = [wide_restore(ctx, vr, r, i) for vr,r in ctx.insert_before.get(i, [])]
   after = [ctx.ren.spill(ctx.spills[vr], nx) for vr in x.tag if vr in ctx.spills] if isinstance(x.tag, tuple) else []
   if ctx.stack_size > 0:
-    sp, offset = ctx.ren.stack_pointer(), UOp(Ops.CONST, ctx.ren.stack_pointer().dtype, arg=ctx.stack_size)
+    sp, offset = ctx.ren.stack_pointer(), UOp.cconst(ctx.stack_size, ctx.ren.stack_pointer().dtype)
     if i == ctx.first_real_idx: before = [ctx.ren.isel_matcher.rewrite(UOp(Ops.SUB, src=(sp, offset), tag=sp.tag))] + before
     elif i == ctx.last_real_idx: before += [ctx.ren.isel_matcher.rewrite(UOp(Ops.ADD, src=(sp, offset), tag=sp.tag))]
   return nx, before + [nx] + after

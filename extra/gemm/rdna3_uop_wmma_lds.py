@@ -86,7 +86,7 @@ def custom_gemm(C:UOp, A:UOp, B:UOp) -> UOp:
         A_in = As_r[wave_m, tm, lane16, la].contract(la)
         B_in = Bs_r[lb, wave_n, tn, lane16].contract(lb)
         acc_load = UOp.vectorize(*[acc.after(k_tile)[tm, tn, i] for i in range(8)])
-        out = UOp(Ops.WMMA, dtypes.float.vec(8), (A_in, B_in, acc_load), arg=WMMA_ARG)
+        out = UOp(Ops.WMMA, src=(A_in, B_in, acc_load), arg=WMMA_ARG)
         stores.extend([acc[tm, tn, i].store(out.index(i)) for i in range(8)])
     acc = acc.after(UOp.group(*stores).barrier().end(k_tile))
 

@@ -127,8 +127,8 @@ def _amd_load(ptr:UOp, lanes:int|None=None, packed_u32:bool=False) -> UOp:
   shrink = UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(lanes)))
   if packed_u32:
     assert lanes == 4 and ptr.dtype is dtypes.uint32
-    return UOp(Ops.CUSTOM, dtypes.uint32, (shrink,), arg=(AMD_PACKED_U32X4_LOAD, dtypes.uint32))
-  return shrink.load(dtype=ptr.dtype)
+    return UOp(Ops.CUSTOM, src=(shrink,), arg=(AMD_PACKED_U32X4_LOAD, dtypes.uint32))
+  return shrink.load()
 
 def _load_byte(raw:UOp, base:UOp, offset:UOp) -> UOp: return (raw[base + offset//4] >> ((offset&3)*8).cast(dtypes.uint32)) & 255
 def _half(value:UOp) -> UOp: return value.cast(dtypes.uint16).bitcast(dtypes.float16).float()
