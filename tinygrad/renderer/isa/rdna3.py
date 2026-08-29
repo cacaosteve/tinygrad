@@ -113,7 +113,8 @@ class AMDOps(FastEnum):
   BYTE_PERM = auto()
   BFE = auto()
   CVT_UBYTE_F32 = auto()
-  MUL_TO_F16 = auto()
+  FMA_TO_F16 = auto()
+  PACKED_F16_MUL_TO_F16 = auto()
   LSHL_OR = auto()
   LSHL_ADD = auto()
 
@@ -570,19 +571,6 @@ def _compute_amd_skip(uops:list[UOp]) -> set[UOp]:
   skip |= identity_loads
   return skip
 
-def _packed_mul_to_f16_skip(uops:list[UOp]) -> set[UOp]:
-  """MUL_TO_F16 pairs are emitted directly into their sole PACK_F16 destination."""
-  uses:dict[UOp, int] = {}
-  for u in uops:
-    for src in u.src: uses[src] = uses.get(src, 0) + 1
-  skip:set[UOp] = set()
-  for u in uops:
-    if u.op is not Ops.INS or _iop(u) is not AMDOps.PACK_F16 or len(u.src) < 2 or len(u.src) % 2: continue
-    for i in range(len(u.src) // 2):
-      pair = u.src[2*i:2*i+2]
-      if all(x.op is Ops.INS and _iop(x) is AMDOps.MUL_TO_F16 and len(x.src) == 2 and uses.get(x) == 1 for x in pair): skip.update(pair)
-  return skip
-
 def _d16_hi_lo_map(uops:list[UOp]) -> dict[UOp, UOp]:
   pairs: dict[UOp, UOp] = {}
   candidates: set[UOp] = set()
@@ -1017,13 +1005,6 @@ def _pack_f16_insts(u:UOp) -> list:
   ret = []
   for i in range(len(u.src) // 2):
     lo, hi = u.src[2*i], u.src[2*i+1]
-    if all(x.op is Ops.INS and _iop(x) is AMDOps.MUL_TO_F16 and len(x.src) == 2 for x in (lo, hi)):
-      dst = _reg_lane(greg(u), i)
-      pre0, a0 = _vgpr_data(TMP_VDATA, lo.src[0])
-      pre1, a1 = _vgpr_data(TMP_VDATA, hi.src[0])
-      ret += pre0 + [r3.v_fma_mixlo_f16(dst, a0, _src(lo.src[1]), 0.0, opsel=0, opsel_hi=0, opsel_hi2=0)]
-      ret += pre1 + [r3.v_fma_mixhi_f16(dst, a1, _src(hi.src[1]), 0.0, opsel=0, opsel_hi=0, opsel_hi2=0)]
-      continue
     if (got := _pack_f16_half2_load(lo, hi)) is not None:
       base, slot = got
       src_slot, dst_slot = _reg_lane(greg(base), slot), _reg_lane(greg(u), i)
@@ -1046,7 +1027,8 @@ AMD_DOT4 = "__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)"
 AMD_BYTE_PERM = "__builtin_amdgcn_perm({}, {}, {})"
 AMD_NONTEMPORAL_LOAD = "__builtin_nontemporal_load({0})"
 AMD_PACKED_U8X16_LOAD = "__builtin_nontemporal_load((const unsigned_int4*){0})"
-AMD_MUL_TO_F16 = "__builtin_amdgcn_fma_mixlo_f16({}, {}, 0.0)"
+AMD_FMA_TO_F16 = "__builtin_amdgcn_fma_mixlo_f16({}, {}, {})"
+AMD_PACKED_F16_MUL_TO_F16 = "__builtin_amdgcn_fma_mixlo_f16_packed({}, {}, {})"
 AMD_MBCNT_LO = "__builtin_amdgcn_mbcnt_lo(-1, 0)"
 AMD_SWIZZLE_PREFIX = "__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {0}), "
 
@@ -1082,7 +1064,8 @@ def _amd_custom_intrinsic(x:UOp) -> UOp|None:
   arg = _custom_name(x)
   if arg == AMD_DOT4: return x.ins(AMDOps.DOT4)
   if arg == AMD_BYTE_PERM: return x.ins(AMDOps.BYTE_PERM)
-  if arg == AMD_MUL_TO_F16: return x.ins(AMDOps.MUL_TO_F16)
+  if arg == AMD_FMA_TO_F16: return x.ins(AMDOps.FMA_TO_F16)
+  if arg == AMD_PACKED_F16_MUL_TO_F16: return x.ins(AMDOps.PACKED_F16_MUL_TO_F16)
   if arg == AMD_PACKED_U8X16_LOAD and len(x.src) == 1 and x.src[0].op is Ops.SHRINK:
     ptr = x.src[0]
     src:tuple[UOp, ...] = (ptr.src[0], ptr.src[1], _load_count_src(4))
@@ -1761,9 +1744,13 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if (byte:=_const_int(u.src[1])) is None or not 0 <= byte < 4: raise CompileError("bad ubyte lane")
       return [(r3.v_cvt_f32_ubyte0_e32, r3.v_cvt_f32_ubyte1_e32,
                r3.v_cvt_f32_ubyte2_e32, r3.v_cvt_f32_ubyte3_e32)[byte](_dst(u), _src(u.src[0]))]
-    case AMDOps.MUL_TO_F16:
+    case AMDOps.FMA_TO_F16:
       pre, a = _vgpr_data(TMP_VDATA, u.src[0])
-      return pre + [r3.v_fma_mixlo_f16(_dst(u), a, _src(u.src[1]), 0.0, opsel=0, opsel_hi=0, opsel_hi2=0)]
+      return pre + [r3.v_fma_mixlo_f16(_dst(u), a, _src(u.src[1]), _src(u.src[2]), opsel=0, opsel_hi=0, opsel_hi2=0)]
+    case AMDOps.PACKED_F16_MUL_TO_F16:
+      if (high:=_const_int(u.src[2])) not in (0, 1): raise CompileError("bad packed f16 lane")
+      pre, a = _vgpr_data(TMP_VDATA, u.src[0])
+      return pre + [r3.v_fma_mixlo_f16(_dst(u), a, _src(u.src[1]), 0.0, opsel=high, opsel_hi=1, opsel_hi2=0)]
     case AMDOps.LSHL_OR:
       if greg(u).index < 256:
         return [r3.s_lshl_b32(_dst(u), _src(u.src[0]), _src(u.src[1])),
@@ -2113,7 +2100,9 @@ def _hoist_lloads_before_extracts(ops:list[UOp]) -> list[UOp]:
 _SINKABLE_PAST_WMMA = frozenset({
   AMDOps.LOAD, AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV,
   # ADD excluded: sinking past loop S_ADD reorders the trip counter vs the last WMMA.
-  AMDOps.SUB, AMDOps.MUL, AMDOps.MUL_TO_F16, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE,
+  AMDOps.SUB, AMDOps.MUL, AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16, AMDOps.SHL, AMDOps.SHR,
+  AMDOps.AND, AMDOps.OR, AMDOps.XOR,
+  AMDOps.BFE,
   AMDOps.CVT_UBYTE_F32,
   AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
 })
@@ -2414,7 +2403,7 @@ def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
 _VMEM_SCHEDULABLE = {AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.COLLECT, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.MULACC, AMDOps.FMAC,
                      AMDOps.CAST, AMDOps.RECIPROCAL, AMDOps.EXP2, AMDOps.LOG2, AMDOps.SQRT, AMDOps.TRUNC, AMDOps.SIN,
                      AMDOps.MAX, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE, AMDOps.CVT_UBYTE_F32,
-                     AMDOps.MUL_TO_F16,
+                     AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16,
                      AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
                      AMDOps.LOAD, AMDOps.PACK_F16}
 
@@ -2574,7 +2563,7 @@ def _order_d16_lo_before_hi(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp
 
 def insts_from_linear(lin:UOp):
   ops = list(lin.src)
-  skip = _compute_amd_skip(ops) | _packed_mul_to_f16_skip(ops)  # fused d16 hi LOADs still emit (d16_hi into lo)
+  skip = _compute_amd_skip(ops)  # fused d16 hi LOADs still emit (d16_hi into lo)
   d16_hi_lo = _d16_hi_lo_map(ops)
   mask_depth = 0
   # vm: (dest_regs, n_vmem_ops) in issue order — soft vmcnt must count ops, not UOps

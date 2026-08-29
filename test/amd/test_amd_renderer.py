@@ -1149,17 +1149,19 @@ class TestAMDRenderer(unittest.TestCase):
     for byte in range(4): self.assertEqual(names.count(f"V_CVT_F32_UBYTE{byte}_E32"), 1)
     self.assertNotIn("V_CVT_F32_U32_E32", names)
 
-  def test_packed_mul_to_f16_uses_mixlo_mixhi(self):
-    a0 = _uop(Ops.INS, dtypes.float32, (UOp.const(2.0, dtypes.float32),), AMDOps.MOV, (Register("a0", 261),))
-    a1 = _uop(Ops.INS, dtypes.float32, (UOp.const(3.0, dtypes.float32),), AMDOps.MOV, (Register("a1", 262),))
+  def test_mixed_f16_custom_ops(self):
+    a = _uop(Ops.INS, dtypes.float32, (UOp.const(2.0, dtypes.float32),), AMDOps.MOV, (Register("a", 261),))
     scale = _uop(Ops.INS, dtypes.float32, (UOp.const(4.0, dtypes.float32),), AMDOps.MOV, (Register("scale", 263),))
-    lo = _uop(Ops.INS, dtypes.float16, (a0, scale), AMDOps.MUL_TO_F16, (Register("lo", 264),))
-    hi = _uop(Ops.INS, dtypes.float16, (a1, scale), AMDOps.MUL_TO_F16, (Register("hi", 265),))
-    pack = _uop(Ops.INS, dtypes.float16, (lo, hi), AMDOps.PACK_F16, (Register("pack", 266),))
-    names = [getattr(i, "op_name", "") for i in _REN._insts_from_linear(UOp(Ops.LINEAR, src=(a0, a1, scale, lo, hi, pack)))]
-    self.assertEqual(names.count("V_FMA_MIXLO_F16"), 1)
-    self.assertEqual(names.count("V_FMA_MIXHI_F16"), 1)
-    self.assertNotIn("V_PACK_B32_F16", names)
+    bias = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32),), AMDOps.MOV, (Register("bias", 264),))
+    packed = _uop(Ops.INS, dtypes.uint32, (UOp.const(0x40003c00, dtypes.uint32),), AMDOps.MOV, (Register("packed", 265),))
+    fma = _uop(Ops.INS, dtypes.float16, (a, scale, bias), AMDOps.FMA_TO_F16, (Register("fma", 266),))
+    packed_mul = _uop(Ops.INS, dtypes.float16, (packed, scale, UOp.const(1, dtypes.uint32)),
+                      AMDOps.PACKED_F16_MUL_TO_F16, (Register("packed_mul", 267),))
+    insts = list(_REN._insts_from_linear(UOp(Ops.LINEAR, src=(a, scale, bias, packed, fma, packed_mul))))
+    mix = [i for i in insts if getattr(i, "op_name", "") == "V_FMA_MIXLO_F16"]
+    self.assertEqual(len(mix), 2)
+    self.assertEqual((mix[0].opsel, mix[0].opsel_hi, mix[0].opsel_hi2), (0, 0, 0))
+    self.assertEqual((mix[1].opsel, mix[1].opsel_hi, mix[1].opsel_hi2), (1, 1, 0))
 
   def test_store_uses_destination_dtype(self):
     prg = _implicit_float_to_half_store_program()
