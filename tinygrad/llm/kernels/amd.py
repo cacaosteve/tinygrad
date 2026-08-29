@@ -370,15 +370,16 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
   def dequant(base:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
     d, scale = _iq4_scales(raw, base, subgroup)
     scale = scale * d
+    qwords = _amd_load(raw[base+2+subgroup*4], 4, packed_u32=direct_isa)
     if out_features <= 6144:
-      pairs = tuple(lut[((raw[base + 2 + subgroup*4 + word] >> (byte*8)) & 255).cast(dtypes.weakint)]
+      pairs = tuple(lut[((qwords[word] >> (byte*8)) & 255).cast(dtypes.weakint)]
                     for word in range(4) for byte in range(4))
       if direct_isa: return tuple(_amd_packed_f16_mul_to_f16(pair, scale, half) for pair in pairs)
       values = tuple(_half((pair >> (half*16)) & 0xffff) for pair in pairs)
       return tuple((value*scale).cast(dtypes.float16) for value in values)
     # a subgroup-half gathers the lo (half=0) or hi (half=1) nibbles of byte pairs of each packed word
-    lut_pairs = (lut[(((raw[base+2+subgroup*4+i] >> (8*j+4*half)) & 15) |
-                      (((raw[base+2+subgroup*4+i] >> (8*j+8+4*half)) & 15) << 4)).cast(dtypes.weakint)]
+    lut_pairs = (lut[(((qwords[i] >> (8*j+4*half)) & 15) |
+                      (((qwords[i] >> (8*j+8+4*half)) & 15) << 4)).cast(dtypes.weakint)]
                  for i in range(4) for j in (0, 2))
     if direct_isa: return tuple(_amd_packed_f16_mul_to_f16(pair, scale, i) for pair in lut_pairs for i in range(2))
     return tuple((_half((pair >> (i*16)) & 0xffff)*scale).cast(dtypes.float16) for pair in lut_pairs for i in range(2))

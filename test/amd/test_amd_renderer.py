@@ -933,6 +933,22 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(names.count("GLOBAL_LOAD_B32"), 2)
     self.assertNotIn("SCRATCH_STORE_B32", names)
 
+  def test_iq4_wmma_uses_wide_quant_load(self):
+    from tinygrad.llm.kernels.amd import _iq4_linear_f16_wmma_kernel
+    rows, cols, tokens = 8192, 2048, 16
+    out = UOp.placeholder((tokens, rows), dtypes.float32, 0)
+    raw = UOp.placeholder((rows*cols//256*34,), dtypes.uint32, 1)
+    x = UOp.placeholder((tokens, cols), dtypes.float16, 2)
+    lut = UOp.placeholder((256,), dtypes.uint32, 3)
+    prg = _to_prg(_iq4_linear_f16_wmma_kernel(out, raw, x, lut, rows, cols, direct_isa=True))
+    names = _amd_inst_names(prg)
+    # One packed quant load plus four activation loads; the LUT and two-word header remain scalar.
+    self.assertEqual(names.count("GLOBAL_LOAD_B128"), 5)
+    self.assertEqual(names.count("GLOBAL_LOAD_B32"), 6)
+    wide = [i for i,name in enumerate(names) if name == "GLOBAL_LOAD_B128"]
+    self.assertLessEqual(wide[-1] - wide[0], 8)  # activations issue while the packed quant load is in flight
+    self.assertNotIn("SCRATCH_STORE_B32", names)
+
   def test_large_q6_gemv_upcasts_two_rows_and_reduces_each(self):
     rows, cols = 16384, 2048
     qdata = Tensor.empty(rows * cols // 256 * 210, dtype=dtypes.uint8, device="AMD")

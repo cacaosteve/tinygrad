@@ -2273,6 +2273,36 @@ def _prefetch_next_a_b128_before_pack(ops:list[UOp]) -> list[UOp]:
     i = i + len(chunk) + len(mid)
   return out
 
+def _prefetch_a_after_packed_quant(ops:list[UOp]) -> list[UOp]:
+  """Issue activation B128s immediately after a packed quant load while it is in flight.
+
+  IQ4 performs LDS table lookups between its packed weight read and activation reads.  Moving
+  independent activations ahead of those lookups lets the soft VMEM scoreboard wait only for
+  the quant data and leaves the activation burst outstanding until WMMA consumes it.
+  """
+  if sum(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops) != 2: return ops
+  out = list(ops)
+  for i,u in enumerate(out):
+    if u.op is not Ops.INS or _iop(u) is not AMDOps.LOAD or u.dtype is not dtypes.uint32 or _reg_slots(u) != 4: continue
+    wide:list[UOp] = []
+    saw_lload, j = False, i + 1
+    while j < len(out):
+      v = out[j]
+      if v.op is Ops.INS and _iop(v) is AMDOps.WMMA: break
+      if v.op is Ops.INS and _iop(v) in (AMDOps.BARRIER, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ,
+                                        AMDOps.STORE, AMDOps.LSTORE, AMDOps.SSTORE):
+        wide = []
+        break
+      if v.op is Ops.INS and _iop(v) is AMDOps.LLOAD: saw_lload = True
+      if v.op is Ops.INS and _iop(v) is AMDOps.LOAD and v.dtype is dtypes.half and _elem_count(v) >= 8: wide.append(v)
+      j += 1
+    if not saw_lload or not wide: continue
+    mid = out[i + 1:j]
+    if any(s in mid for load in wide for s in load.src): continue
+    out[i + 1:j] = wide + [x for x in mid if x not in wide]
+    break
+  return out
+
 def _prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
   """Issue next strided B U16 tile while current B U16 loads are still in flight.
 
@@ -3356,6 +3386,7 @@ class AMDRenderer(ISARenderer):
     7. Put a boundless-loop compare before any REG_STORE that mutates its old-value operand.
     """
     lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
+    lst = _prefetch_a_after_packed_quant(lst) if getenv("AMD_PREFETCH_IQ4_A", 1) else lst
     lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
     uses: dict[UOp, list[UOp]] = {}
     for u in lst:
