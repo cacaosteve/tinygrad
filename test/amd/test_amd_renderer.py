@@ -416,6 +416,12 @@ def _fused_packed_byte_program():
   packed = quant.cast(dtypes.uint32) + (quant.cast(dtypes.uint32) << UOp.const(8, dtypes.uint32))
   return _to_prg(out.index(idx).store(packed).sink(idx, arg=KernelInfo(name="amd_asm_fused_packed_byte")))
 
+def _uint32_bitfield_program():
+  out, inp = UOp.placeholder((16,), dtypes.uint32, 0), UOp.placeholder((16,), dtypes.uint32, 1)
+  idx = UOp.special(16, "gidx0")
+  value = (inp.index(idx).load() >> UOp.const(5, dtypes.uint32)) & UOp.const(15, dtypes.uint32)
+  return _to_prg(out.index(idx).store(value).sink(idx, arg=KernelInfo(name="amd_asm_uint32_bitfield")))
+
 def _cmod_pow2_program():
   out = UOp.placeholder((16,), dtypes.uint32, 0)
   inp = UOp.placeholder((16,), dtypes.uint32, 1)
@@ -2691,6 +2697,11 @@ class TestAMDRenderer(unittest.TestCase):
     _check_asm(self, _fused_packed_byte_program(), AMDOps.BFE, AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
                insts=("V_BFE_U32", "V_LSHL_OR_B32", "V_LSHL_ADD_U32"))
 
+  def test_uint32_shift_mask_uses_bfe(self):
+    prg = _uint32_bitfield_program()
+    self.assertEqual(_lin_ops(prg).count(AMDOps.BFE), 1)
+    self.assertEqual(_amd_inst_names(prg).count("V_BFE_U32"), 1)
+
   def test_cmod_pow2_legalizes_to_and(self):
     prg = _cmod_pow2_program()
     _check_elf(self, prg)
@@ -2711,7 +2722,7 @@ class TestAMDRenderer(unittest.TestCase):
     _check_elf(self, prg)
     self.assertFalse(any(u.op in (Ops.CDIV, Ops.CMOD) for u in _prg_lin(prg).src))
     linear_ops = _lin_ops(prg)
-    for op in (AMDOps.SHL, AMDOps.SHR, AMDOps.CMPLT, AMDOps.WHERE):
+    for op in (AMDOps.SHL, AMDOps.BFE, AMDOps.CMPLT, AMDOps.WHERE):
       self.assertIn(op, linear_ops)
 
   def test_bounded_negative_divmod_uses_range_proof(self):

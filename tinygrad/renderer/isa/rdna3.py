@@ -1339,7 +1339,7 @@ pre_isel_matcher = PatternMatcher([
   (UPat(Ops.CAST, dtype=dtypes.float32,
    src=(UPat(Ops.AND, dtype=dtypes.uint32, src=(UPat.var("value"), UPat.cvar().cast(name="mask"))),),
    name="x"), _cvt_ubyte_f32),
-  (UPat(Ops.AND, dtype=dtypes.uint8,
+  (UPat(Ops.AND, dtype=(dtypes.uint8, dtypes.uint32),
    src=(UPat(Ops.SHR, src=(UPat.var("value"), UPat.var("shift"))), UPat.cvar().cast(name="mask")),
    name="x"), _bitfield_extract),
   (UPat(Ops.OR, dtype=(dtypes.uint8, dtypes.uint32), src=(UPat(Ops.SHL, src=(UPat.var("value"), UPat.var("shift"))), UPat.var("other")),
