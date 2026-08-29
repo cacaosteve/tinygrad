@@ -213,6 +213,13 @@ def _signed_byte_load_cast_program():
     ast = Tensor.empty(16, device="AMD", dtype=dtypes.uint8).bitcast(dtypes.int8).float().schedule_linear().src[0].src[0]
   return _to_prg(ast)
 
+def _packed_ubyte_to_float_program():
+  out = UOp.placeholder((4,), dtypes.float32, 0)
+  inp = UOp.placeholder((1,), dtypes.uint32, 1)
+  word = inp.index(0).load()
+  stores = tuple(out.index(byte).store(((word >> (byte*8)) & 0xff).cast(dtypes.float32)) for byte in range(4))
+  return _to_prg(UOp.sink(*stores, arg=KernelInfo(name="amd_asm_packed_ubyte_to_float")))
+
 def _implicit_float_to_half_store_program():
   out = UOp.placeholder((16,), dtypes.float16, 0)
   inp = UOp.placeholder((16,), dtypes.float32, 1)
@@ -1134,6 +1141,13 @@ class TestAMDRenderer(unittest.TestCase):
     _check_asm(self, prg, AMDOps.LOAD, AMDOps.CAST, insts=("GLOBAL_LOAD_B32", "V_BFE_I32", "V_CVT_F32_I32_E32"))
     names = _amd_inst_names(prg)
     self.assertNotIn("V_ASHRREV_I32_E64", names)
+
+  def test_packed_ubyte_to_float_uses_native_conversions(self):
+    prg = _packed_ubyte_to_float_program()
+    self.assertEqual(_lin_ops(prg).count(AMDOps.CVT_UBYTE_F32), 4)
+    names = _amd_inst_names(prg)
+    for byte in range(4): self.assertEqual(names.count(f"V_CVT_F32_UBYTE{byte}_E32"), 1)
+    self.assertNotIn("V_CVT_F32_U32_E32", names)
 
   def test_store_uses_destination_dtype(self):
     prg = _implicit_float_to_half_store_program()

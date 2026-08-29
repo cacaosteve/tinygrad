@@ -112,6 +112,7 @@ class AMDOps(FastEnum):
   DOT4 = auto()
   BYTE_PERM = auto()
   BFE = auto()
+  CVT_UBYTE_F32 = auto()
   LSHL_OR = auto()
   LSHL_ADD = auto()
 
@@ -1081,6 +1082,14 @@ def _bitfield_extract(x:UOp, value:UOp, shift:UOp, mask:UOp) -> UOp|None:
   if m <= 0 or (m & (m + 1)) != 0 or (width:=m.bit_length()) >= 32: return None
   return x.ins(AMDOps.BFE, src=(value, shift, _tconst(width, dtypes.uint32).rtag()))
 
+def _cvt_ubyte_f32(x:UOp, value:UOp, mask:UOp, shift:UOp|None=None) -> UOp|None:
+  """Fold u32 byte extraction followed by float conversion into V_CVT_F32_UBYTEN."""
+  if _const_value(mask) != 0xff: return None
+  bit = 0 if shift is None else _const_value(shift)
+  if bit not in (0, 8, 16, 24): return None
+  return x.ins(AMDOps.CVT_UBYTE_F32,
+               src=(value, _tconst(int(bit) // 8, dtypes.uint32).rtag()))
+
 def _lshl_or(x:UOp, value:UOp, shift:UOp, other:UOp) -> UOp:
   return x.ins(AMDOps.LSHL_OR, src=(value, shift, other))
 
@@ -1317,6 +1326,13 @@ def _fuse_signed_byte_load_cast(x:UOp, y:UOp) -> UOp|None:
   return ld.bitcast(dtypes.int8).cast(x.dtype)
 
 pre_isel_matcher = PatternMatcher([
+  (UPat(Ops.CAST, dtype=dtypes.float32,
+   src=(UPat(Ops.AND, dtype=dtypes.uint32,
+     src=(UPat(Ops.SHR, src=(UPat.var("value"), UPat.var("shift"))), UPat.cvar().cast(name="mask"))),),
+   name="x"), _cvt_ubyte_f32),
+  (UPat(Ops.CAST, dtype=dtypes.float32,
+   src=(UPat(Ops.AND, dtype=dtypes.uint32, src=(UPat.var("value"), UPat.cvar().cast(name="mask"))),),
+   name="x"), _cvt_ubyte_f32),
   (UPat(Ops.AND, dtype=dtypes.uint8,
    src=(UPat(Ops.SHR, src=(UPat.var("value"), UPat.var("shift"))), UPat.cvar().cast(name="mask")),
    name="x"), _bitfield_extract),
@@ -1718,6 +1734,10 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
         return [scalar_bfe(_dst(u), _src(u.src[0]), shift | (width << 16))]
       pre, value = _vgpr_data(TMP_VDATA, u.src[0])
       return pre + [r3.v_bfe_u32(_dst(u), value, _src(u.src[1]), _src(u.src[2]))]
+    case AMDOps.CVT_UBYTE_F32:
+      if (byte:=_const_int(u.src[1])) is None or not 0 <= byte < 4: raise CompileError("bad ubyte lane")
+      return [(r3.v_cvt_f32_ubyte0_e32, r3.v_cvt_f32_ubyte1_e32,
+               r3.v_cvt_f32_ubyte2_e32, r3.v_cvt_f32_ubyte3_e32)[byte](_dst(u), _src(u.src[0]))]
     case AMDOps.LSHL_OR:
       if greg(u).index < 256:
         return [r3.s_lshl_b32(_dst(u), _src(u.src[0]), _src(u.src[1])),
@@ -2067,7 +2087,7 @@ def _hoist_lloads_before_extracts(ops:list[UOp]) -> list[UOp]:
 _SINKABLE_PAST_WMMA = frozenset({
   AMDOps.LOAD, AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV,
   # ADD excluded: sinking past loop S_ADD reorders the trip counter vs the last WMMA.
-  AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE,
+  AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE, AMDOps.CVT_UBYTE_F32,
   AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
 })
 
@@ -2366,7 +2386,7 @@ def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
 
 _VMEM_SCHEDULABLE = {AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.COLLECT, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.MULACC, AMDOps.FMAC,
                      AMDOps.CAST, AMDOps.RECIPROCAL, AMDOps.EXP2, AMDOps.LOG2, AMDOps.SQRT, AMDOps.TRUNC, AMDOps.SIN,
-                     AMDOps.MAX, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE,
+                     AMDOps.MAX, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE, AMDOps.CVT_UBYTE_F32,
                      AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
                      AMDOps.LOAD, AMDOps.PACK_F16}
 
