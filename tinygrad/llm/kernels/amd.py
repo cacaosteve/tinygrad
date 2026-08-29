@@ -16,6 +16,7 @@ Q4_K, Q5_K, Q6_K, IQ4_XS, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q4_WORDS, Q5_WORDS, Q6
 Q6_PADDED, Q6_WORDS = 212, 53  # the 210-byte Q6 blocks are padded to 212 bytes so they are word-addressable
 QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4}  # bytes per 256-weight block
 AMD_PACKED_U32X4_LOAD = "__builtin_nontemporal_load((const unsigned_int4*){0})"
+AMD_MUL_TO_F16 = "__builtin_amdgcn_fma_mixlo_f16({}, {}, 0.0)"
 
 def kernel_var(x:UOp) -> UOp:
   # a Variable is a 0-d ALU BUFFER in the tensor graph; inside kernels it takes the ALU PARAM form (same name keeps the value binding)
@@ -117,6 +118,9 @@ def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
 
 def _amd_byte_perm(a:UOp, b:UOp, selectors:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, src=tuple(x.cast(dtypes.uint32) for x in (a, b, selectors)), arg=("__builtin_amdgcn_perm({}, {}, {})", dtypes.uint32))
+
+def _amd_mul_to_f16(a:UOp, b:UOp) -> UOp:
+  return UOp(Ops.CUSTOMI, src=(a, b), arg=(AMD_MUL_TO_F16, dtypes.float16))
 
 def _amd_load(ptr:UOp, lanes:int|None=None, packed_u32:bool=False) -> UOp:
   assert ptr.op is Ops.INDEX
@@ -320,7 +324,7 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
                             f"linear_q{4 if ggml_type == Q4_K else 5}_k_f16_wmma")
 
 @functools.cache
-def _q6_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int) -> UOp:
+def _q6_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, direct_isa:bool=False) -> UOp:
   token_tile = 32 if out.shape[0] % 32 == 0 else 16
   def dequant(base:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
     scale_idx = subgroup*2 + half
@@ -332,8 +336,8 @@ def _q6_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
       low = raw[base+(subgroup//4)*16+(subgroup%2)*8+(word_idx//4)*4+word_idx%4] >> ((within//64)*4).cast(dtypes.uint32)
       high = raw[base+32+(subgroup//4)*8+(word_idx//4)*4+word_idx%4] >> ((within//32)*2).cast(dtypes.uint32)
       packed = (low & 0x0f0f0f0f) | ((high & 0x03030303) << 4)
-      values.extend((((packed >> (byte*8)) & 255).float() - 32) * scale * d for byte in range(4))
-    return tuple(value.cast(dtypes.float16) for value in values)
+      values.extend(((((packed >> (byte*8)) & 255).float() - 32) * scale for byte in range(4)))
+    return tuple(_amd_mul_to_f16(value, d) if direct_isa else (value*d).cast(dtypes.float16) for value in values)
   return _quant_linear_wmma(out, x, out_features, in_features, Q6_WORDS,
                             _wmma_layout(out, out_features, token_tile, 1), dequant, "linear_q6_k_f16_wmma")
 
@@ -378,7 +382,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   if tokens % 16 == 0 and out_features % 16 == 0:
     fxn:Callable[..., UOp]
     if layer.ggml_type == IQ4_XS: fxn = _iq4_linear_f16_wmma_kernel
-    elif layer.ggml_type == Q6_K: fxn = _q6_linear_f16_wmma_kernel
+    elif layer.ggml_type == Q6_K: fxn = functools.partial(_q6_linear_f16_wmma_kernel, direct_isa=amd_direct_isa(x.device))
     else: fxn = functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type, direct_isa=amd_direct_isa(x.device))
     extra = (iq4_half_lut(str(x.device)).uop,) if layer.ggml_type == IQ4_XS else ()
     return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop, *extra)

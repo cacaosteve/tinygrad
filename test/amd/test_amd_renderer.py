@@ -1149,6 +1149,18 @@ class TestAMDRenderer(unittest.TestCase):
     for byte in range(4): self.assertEqual(names.count(f"V_CVT_F32_UBYTE{byte}_E32"), 1)
     self.assertNotIn("V_CVT_F32_U32_E32", names)
 
+  def test_packed_mul_to_f16_uses_mixlo_mixhi(self):
+    a0 = _uop(Ops.INS, dtypes.float32, (UOp.const(2.0, dtypes.float32),), AMDOps.MOV, (Register("a0", 261),))
+    a1 = _uop(Ops.INS, dtypes.float32, (UOp.const(3.0, dtypes.float32),), AMDOps.MOV, (Register("a1", 262),))
+    scale = _uop(Ops.INS, dtypes.float32, (UOp.const(4.0, dtypes.float32),), AMDOps.MOV, (Register("scale", 263),))
+    lo = _uop(Ops.INS, dtypes.float16, (a0, scale), AMDOps.MUL_TO_F16, (Register("lo", 264),))
+    hi = _uop(Ops.INS, dtypes.float16, (a1, scale), AMDOps.MUL_TO_F16, (Register("hi", 265),))
+    pack = _uop(Ops.INS, dtypes.float16, (lo, hi), AMDOps.PACK_F16, (Register("pack", 266),))
+    names = [getattr(i, "op_name", "") for i in _REN._insts_from_linear(UOp(Ops.LINEAR, src=(a0, a1, scale, lo, hi, pack)))]
+    self.assertEqual(names.count("V_FMA_MIXLO_F16"), 1)
+    self.assertEqual(names.count("V_FMA_MIXHI_F16"), 1)
+    self.assertNotIn("V_PACK_B32_F16", names)
+
   def test_store_uses_destination_dtype(self):
     prg = _implicit_float_to_half_store_program()
     _check_asm(self, prg, AMDOps.CAST, AMDOps.STORE, insts=("V_CVT_F16_F32_E32", "GLOBAL_STORE_B16"))
