@@ -953,6 +953,7 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(names.count("GLOBAL_LOAD_B32"), 6)
     wide = [i for i,name in enumerate(names) if name == "GLOBAL_LOAD_B128"]
     self.assertLessEqual(wide[-1] - wide[0], 8)  # activations issue while the packed quant load is in flight
+    self.assertLessEqual(names.count("V_MOV_B32_E32"), 8)  # accumulator fragments remain resident across the K loop
     self.assertNotIn("SCRATCH_STORE_B32", names)
 
   def test_large_q6_gemv_upcasts_two_rows_and_reduces_each(self):
@@ -2022,6 +2023,33 @@ class TestAMDRenderer(unittest.TestCase):
       init_ids = {id(idx_map[p * 8 + lane][0]) for lane in range(8)}
       self.assertEqual(len(init_ids), 1)
       self.assertEqual([idx_map[p * 8 + lane][1] for lane in range(8)], list(range(8)))
+
+  def test_packed_wmma_acc_idx_map_distinguishes_small_buffers(self):
+    # IQ4 token tiles use separate small REG buffers with the same scalar indices. Key the
+    # epilogue map by buffer as well as index so both tiles retain their own accumulator.
+    from tinygrad.renderer.isa.rdna3 import _wmma_acc_zero_inits
+    zero = UOp.const(0.0, dtypes.float32)
+    ab = _uop(Ops.INS, dtypes.float, tuple(
+      _uop(Ops.INS, dtypes.float, (zero,), AMDOps.MOV, (Register(f"ab{i}", i),)) for i in range(8)),
+      AMDOps.PACK, (Register("ab", 10),))
+    marker = _uop(Ops.INS, dtypes.half,
+      (UOp.const(0, dtypes.uint32), UOp.const(1.0, dtypes.float32), UOp.const(0, dtypes.uint32)),
+      AMDOps.PACKED_F16_MUL_TO_F16, (Register("packed_mul", 20),))
+    bufs = [UOp.placeholder((16,), dtypes.float32, slot=i, addrspace=AddrSpace.REG) for i in range(2)]
+    uops: list[UOp] = [marker]
+    for bidx, buf in enumerate(bufs):
+      loads = [_uop(Ops.INS, dtypes.float, (buf, UOp.const(lane, dtypes.int32)), AMDOps.SLOAD,
+                     (Register(f"l{bidx}_{lane}", 100 + bidx * 8 + lane),)) for lane in range(8)]
+      tag = (Register(f"acc{bidx}", 200 + bidx * 8),)
+      pack = _uop(Ops.INS, dtypes.float, tuple(loads), AMDOps.PACK, tag)
+      uops += [*loads, pack, _uop(Ops.INS, dtypes.float, (pack, ab, ab), AMDOps.WMMA, tag)]
+    inits, _, idx_map = _wmma_acc_zero_inits(uops)
+    self.assertEqual(len(inits), 2)
+    self.assertEqual(len(idx_map), 16)
+    self.assertNotEqual(id(idx_map[(bufs[0], 0)][0]), id(idx_map[(bufs[1], 0)][0]))
+    for bidx, buf in enumerate(bufs):
+      self.assertEqual({id(idx_map[(buf, lane)][0]) for lane in range(8)}, {id(inits[bidx])})
+      self.assertEqual([idx_map[(buf, lane)][1] for lane in range(8)], list(range(8)))
 
   def test_after_pre_regalloc_schedules_cast_before_store(self):
     # Product-16 epilogue: f32→f16 CAST must sit immediately before its STORE so half temps

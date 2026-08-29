@@ -38,6 +38,9 @@ VGPR = tuple(Register(f"v{i}", 256+i, size=4) for i in range(5, 254))
 # per-k page idx + in-place <<1 once + GLOBAL offset rem — keeps s_clause, cuts addr ALU.
 # AMD_B_COMPACT=0 → AMD_B_LSHL_ADD dest-as-addr. AMD_D16_HI stays env-gated (mock NaNs).
 WMMA_ACC_VGPR = VGPR[121:]
+# Packed-quant fragments can overlap their short-lived B-pack band safely; starting at v110
+# keeps the 16/32/64-token IQ4 kernels below the 128-VGPR occupancy boundary.
+WMMA_ACC_PACKED_VGPR = VGPR[105:]
 # Disjoint pools: LDS half2 loads stay low; PACK_F16 early-clobber dests stay high (product-8 fix).
 # Under ALLOW_UPCAST16 ACC grows to v126..v253 and overlaps the high PACK band — use mid PACK then.
 LLOAD_VGPR = VGPR[:118]        # v5..v122
@@ -621,9 +624,11 @@ def _is_wmma_acc_reload_pack(cin:UOp, ctx:PreRegAllocContext|None=None) -> bool:
   return False
 
 def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
-  """REG acc buffers too large for scalar promotion (>64) that feed WMMA ACC VGPRs."""
+  """REG buffers whose scalar traffic can stay resident in WMMA accumulator fragments."""
   if (cached:=ctx.scratch.get("wmma_acc_buffers")) is not None: return cached
   bufs: set[UOp] = set()
+  packed_quant = bool(getenv("AMD_PACKED_WMMA_ACC", 1)) and any(
+    u.op is Ops.INS and _iop(u) is AMDOps.PACKED_F16_MUL_TO_F16 for u in (ctx.uops or []))
   for u in ctx.uops or []:
     if u.op is not Ops.INS or _iop(u) is not AMDOps.WMMA: continue
     pack = u.src[0]
@@ -631,14 +636,14 @@ def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
     for slot in pack.src:
       if slot.op is Ops.INS and _iop(slot) is AMDOps.SLOAD:
         if (base:=_reg_buffer_base(slot.src[0])) is None: continue
-        if 64 < base.max_numel() <= 128: bufs.add(base)
+        if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant): bufs.add(base)
   # LDS zero-cin path: packs are MOV zeros, so discover oversized REG via SLOAD/SSTORE traffic.
   if not bufs and any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA and _is_wmma_acc_reload_pack(u.src[0])
                       for u in (ctx.uops or []) if u.src):
     for u in ctx.uops or []:
       if u.op is not Ops.INS or _iop(u) not in (AMDOps.SLOAD, AMDOps.SSTORE): continue
       if (base:=_reg_buffer_base(u.src[0])) is None: continue
-      if 64 < base.max_numel() <= 128: bufs.add(base)
+      if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant): bufs.add(base)
   ctx.scratch["wmma_acc_buffers"] = bufs
   return bufs
 
@@ -646,10 +651,10 @@ def _wmma_slot_tile_lane(idx:int) -> tuple[int, int]:
   # 4×4 UPCAST packs floats as tile=(idx//32)*4+(idx%4), lane=(idx%32)//4
   return (idx // 32) * 4 + (idx % 4), (idx % 32) // 4
 
-def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dict[int, tuple[UOp, int]]]:
+def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dict[int|tuple[UOp, int], tuple[UOp, int]]]:
   """Zero-init WMMA ACC packs before the K-loop.
 
-  Returns (inits, tile->init, reg_idx->(init, lane)).
+  Returns (inits, tile->init, reg_idx-or-(buffer,reg_idx)->(init,lane)).
   tile->init uses the 4×4 interleaved formula. Consecutive product-16 SLOAD packs collide
   on first-idx tile keys (4 keys for 16 packs), so epilogue SLOADs use reg_idx->init.
   """
@@ -659,7 +664,7 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
   seen: set[int] = set()
   inits: list[UOp] = []
   tiles: dict[int, UOp] = {}
-  idx_map: dict[int, tuple[UOp, int]] = {}
+  idx_map: dict[int|tuple[UOp, int], tuple[UOp, int]] = {}
   next_tile = 0
   for u in uops:
     if u.op is not Ops.INS or _iop(u) is not AMDOps.WMMA: continue
@@ -681,8 +686,9 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
     init = UOp(Ops.INS, src=tuple(_tconst(0.0, dtypes.float32) for _ in range(8)), arg=(AMDOps.PACK, dtypes.float), tag=pack.tag)
     inits.append(init)
     tiles[tile] = init
-    for lane, idx in enumerate(sload_idxs):
-      if idx is not None: idx_map[idx] = (init, lane)
+    for lane, (sload, idx) in enumerate(zip(pack.src, sload_idxs)):
+      if idx is not None and (base:=_reg_buffer_base(sload.src[0])) is not None:
+        idx_map[idx if len(bufs) == 1 else (base, idx)] = (init, lane)
   return inits, tiles, idx_map
 
 def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
@@ -936,7 +942,9 @@ def _isel_wmma(ctx:IselContext, x:UOp) -> UOp:
     # tile (from UPCAST) needs its OWN accumulator register. the zero-init STACK is identical across
     # tiles and dedups to one UOp -> one reg, which the two-address coalesce can only satisfy for one
     # tile. pre-assign a unique vreg so each tile's accumulator stays distinct.
-    c = _wmma_stack_operand(cin, 2).replace(tag=(ctx.vreg(WMMA_ACC_VGPR),))
+    packed_quant = bool(getenv("AMD_PACKED_WMMA_ACC", 1)) and any(
+      u.op in (Ops.CUSTOM, Ops.CUSTOMI) and _custom_name(u) == AMD_PACKED_F16_MUL_TO_F16 for u in ctx.uses)
+    c = _wmma_stack_operand(cin, 2).replace(tag=(ctx.vreg(WMMA_ACC_PACKED_VGPR if packed_quant else WMMA_ACC_VGPR),))
   return UOp(Ops.INS, src=(c, a, b), arg=(AMDOps.WMMA, dtypes.float if x.dtype is dtypes.float else x.dtype), tag=x.tag)
 
 def _wmma_inst(u:UOp):
@@ -1560,7 +1568,7 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
       if (idx:=_const_int(x.src[1])) is None: return None
       # Prefer exact REG-index map (product-16: interleaved tile keys collide at 0..7).
       idx_map = ctx.scratch.get("wmma_acc_idx_map") or {}
-      if (got:=idx_map.get(idx)) is not None: init, lane = got
+      if (got:=idx_map.get((buf, idx), idx_map.get(idx))) is not None: init, lane = got
       else:
         tile, lane = _wmma_slot_tile_lane(idx)
         tiles = ctx.scratch.get("wmma_acc_tiles") or {}
