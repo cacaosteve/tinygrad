@@ -1028,6 +1028,19 @@ class TestAMDRenderer(unittest.TestCase):
     scheduled = amd_lib._schedule_scalar_vmem([load0, lane0, idx1, load1, lane1], {})
     self.assertEqual(scheduled, [load0, idx1, load1, lane0, lane1])
 
+  def test_scalar_vmem_scheduler_hoists_packed_word_loads_before_wmma(self):
+    base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
+    idx0 = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))
+    idx1 = _uop(Ops.INS, dtypes.uint32, (idx0, UOp.const(4, dtypes.uint32)), AMDOps.ADD, (Register("idx1", 261),))
+    count = UOp.const(4, dtypes.int32)
+    load0 = _uop(Ops.INS, dtypes.uint32, (base, idx0, count), AMDOps.LOAD, (Register("load0", 270),))
+    lane0 = _uop(Ops.INS, dtypes.uint32, (load0, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane0", 274),))
+    load1 = _uop(Ops.INS, dtypes.uint32, (base, idx1, count), AMDOps.LOAD, (Register("load1", 275),))
+    lane1 = _uop(Ops.INS, dtypes.uint32, (load1, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane1", 279),))
+    wmma = _uop(Ops.INS, dtypes.float32, (lane0, lane1, lane0), AMDOps.WMMA, (Register("wmma", 280),))
+    original = [load0, lane0, idx1, load1, lane1, wmma]
+    self.assertEqual(amd_lib._schedule_scalar_vmem(original, {}), [load0, idx1, load1, lane0, lane1, wmma])
+
   def test_scalar_vmem_scheduler_hoists_wide_f32_load(self):
     base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
     idx0 = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))

@@ -2419,7 +2419,14 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
   Explicit SSA dependencies preserve value order; REG_STORE and all other implicit
   architectural state or memory side effects are hard boundaries.
   """
-  if any(u.op is Ops.INS and (_iop(u) is AMDOps.WMMA or (_iop(u) is AMDOps.LOAD and not _vmem_schedulable_load(u))) for u in ops): return ops
+  # Custom quantized WMMA kernels use independent packed u32x4 reads, but also contain
+  # wide activation reads that must remain hard scheduling boundaries.  Schedule only
+  # the compatible straight-line subsegments; AMD_SCHEDULE_QUANT_WMMA=0 opts out.
+  schedule_wmma_segments = bool(getenv("AMD_SCHEDULE_QUANT_WMMA", 1)) and \
+    any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops) and \
+    any(u.op is Ops.INS and _iop(u) is AMDOps.LOAD and u.dtype is dtypes.uint32 and _reg_slots(u) == 4 for u in ops)
+  if not schedule_wmma_segments and \
+     any(u.op is Ops.INS and (_iop(u) is AMDOps.WMMA or (_iop(u) is AMDOps.LOAD and not _vmem_schedulable_load(u))) for u in ops): return ops
   fused_d16 = set(d16_hi_lo) | set(d16_hi_lo.values())
 
   def schedulable(u:UOp) -> bool:
@@ -2428,7 +2435,8 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
     if u in fused_d16 or u.op is not Ops.INS or _iop(u) not in _VMEM_SCHEDULABLE: return False
     # Wide f32 and packed-byte loads have independent addresses and dedicated destination
     # VGPRs, so they can participate. Other wide/d16 loads retain emitter temp constraints.
-    return _iop(u) is not AMDOps.LOAD or _vmem_schedulable_load(u)
+    return _iop(u) is not AMDOps.LOAD or _vmem_schedulable_load(u) or \
+      (schedule_wmma_segments and u.dtype is dtypes.uint32 and _reg_slots(u) == 4)
 
   def schedule(segment:list[UOp]) -> list[UOp]:
     loads = [i for i,u in enumerate(segment) if _iop(u) is AMDOps.LOAD]
