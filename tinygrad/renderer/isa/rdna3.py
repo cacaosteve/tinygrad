@@ -1675,7 +1675,7 @@ pre_regalloc_matcher = PatternMatcher([
 
 
 _ALU2: dict[AMDOps, tuple] = {
-  AMDOps.ADD: (r3.v_add_f16_e32, r3.v_add_f32_e32, r3.s_add_u32, r3.v_add_nc_u32_e64),
+  AMDOps.ADD: (r3.v_add_f16_e32, r3.v_add_f32_e32, r3.s_add_u32, r3.v_add_nc_u32_e32),
   AMDOps.SUB: (r3.v_sub_f16_e32, r3.v_sub_f32_e32, r3.s_sub_u32, r3.v_sub_nc_u32_e64),
   AMDOps.MUL: (r3.v_mul_f16_e32, r3.v_mul_f32_e32, r3.s_mul_i32, r3.v_mul_lo_u32),
 }
@@ -1690,6 +1690,12 @@ def _alu2(u:UOp):
     pre, b = _vgpr_data(TMP_VDATA, u.src[1])
     return pre + [inst(d, a, b)]
   if greg(u).index < 256: return [sgpr(d, _src(u.src[0]), _src(u.src[1]))]
+  if _iop(u) is AMDOps.ADD:
+    a, b = _src(u.src[0]), _src(u.src[1])
+    if isinstance(b, Reg) and b.offset >= 256: return [vint(d, a, b)]
+    if isinstance(a, Reg) and a.offset >= 256: return [vint(d, b, a)]
+    pre, b = _vgpr_data(TMP_VDATA, u.src[1])
+    return pre + [vint(d, a, b)]
   # VOP: one src must be VGPR; materialize src0 if it's an imm/SGPR.
   pre, a = _vgpr_data(TMP_VDATA, u.src[0])
   return pre + [vint(d, a, _src(u.src[1]))]
@@ -1934,14 +1940,14 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
     case AMDOps.SHL:
       if greg(u).index < 256: return [r3.s_lshl_b32(_dst(u), _src(u.src[0]), _src(u.src[1]))]
       pre, a = _vgpr_data(TMP_VDATA, u.src[0])
-      return pre + [r3.v_lshlrev_b32_e64(_dst(u), _src(u.src[1]), a)]
+      return pre + [r3.v_lshlrev_b32_e32(_dst(u), _src(u.src[1]), a)]
     case AMDOps.SHR:
       if greg(u).index < 256:
         scalar_shift = r3.s_ashr_i32 if u.dtype in dtypes.sints else r3.s_lshr_b32
         return [scalar_shift(_dst(u), _src(u.src[0]), _src(u.src[1]))]
       pre, a = _vgpr_data(TMP_VDATA, u.src[0])
-      if u.dtype in dtypes.sints: return pre + [r3.v_ashrrev_i32_e64(_dst(u), _src(u.src[1]), a)]
-      return pre + [r3.v_lshrrev_b32_e64(_dst(u), _src(u.src[1]), a)]
+      if u.dtype in dtypes.sints: return pre + [r3.v_ashrrev_i32_e32(_dst(u), _src(u.src[1]), a)]
+      return pre + [r3.v_lshrrev_b32_e32(_dst(u), _src(u.src[1]), a)]
     case AMDOps.AND:
       if greg(u).index < 256: return [r3.s_and_b32(_dst(u), _src(u.src[0]), _src(u.src[1]))]
       return _commutative_vop2(u, r3.v_and_b32_e32)
@@ -2341,7 +2347,7 @@ def _prefetch_a_after_packed_quant(ops:list[UOp]) -> list[UOp]:
   independent activations ahead of those lookups lets the soft VMEM scoreboard wait only for
   the quant data and leaves the activation burst outstanding until WMMA consumes it.
   """
-  if sum(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops) != 2: return ops
+  if not any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops): return ops
   out = list(ops)
   for i,u in enumerate(out):
     if u.op is not Ops.INS or _iop(u) is not AMDOps.LOAD or u.dtype is not dtypes.uint32 or _reg_slots(u) != 4: continue
@@ -2363,6 +2369,27 @@ def _prefetch_a_after_packed_quant(ops:list[UOp]) -> list[UOp]:
     out[i + 1:j] = wide + [x for x in mid if x not in wide]
     break
   return out
+
+def _prefetch_late_iq4_a_before_mix(ops:list[UOp]) -> list[UOp]:
+  """Issue the second 32-token A fragment after IQ4 LUT reads but before dequant FMAs.
+
+  Hoisting both token fragments directly after the packed-weight read keeps too many
+  VGPRs live across unpacking. This shorter overlap lets the later A loads run during
+  mixlo/mixhi and the first WMMA pair instead.
+  """
+  wmmas = [i for i,u in enumerate(ops) if u.op is Ops.INS and _iop(u) is AMDOps.WMMA]
+  if len(wmmas) != 4: return ops
+  target = next((i for i,u in enumerate(ops) if u.op is Ops.INS and _iop(u) is AMDOps.PACKED_F16_MUL_TO_F16), -1)
+  if target < 0 or target >= wmmas[0]: return ops
+  late = [i for i,u in enumerate(ops) if wmmas[0] < i < wmmas[-1] and u.op is Ops.INS and
+          _iop(u) is AMDOps.LOAD and u.dtype is dtypes.half and _elem_count(u) >= 8]
+  pos = {u:i for i,u in enumerate(ops)}
+  if len(late) != 2 or any(any(pos[s] >= target for s in ops[i].src if s in pos) for i in late): return ops
+  loads = [ops[i] for i in late]
+  late_set = set(late)
+  out = [u for i,u in enumerate(ops) if i not in late_set]
+  target = next(i for i,u in enumerate(out) if u.op is Ops.INS and _iop(u) is AMDOps.PACKED_F16_MUL_TO_F16)
+  return out[:target] + loads + out[target:]
 
 def _prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
   """Issue next strided B U16 tile while current B U16 loads are still in flight.
@@ -3563,6 +3590,7 @@ class AMDRenderer(ISARenderer):
     lst = _schedule_fma_mixhi_pairs(lst)
     lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
     lst = _prefetch_a_after_packed_quant(lst) if getenv("AMD_PREFETCH_IQ4_A", 1) else lst
+    lst = _prefetch_late_iq4_a_before_mix(lst) if getenv("AMD_PREFETCH_IQ4_A2", 1) else lst
     lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
     uses: dict[UOp, list[UOp]] = {}
     for u in lst:

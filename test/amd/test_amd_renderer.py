@@ -1023,6 +1023,22 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertLessEqual(names.count("V_MOV_B32_E32"), 8)  # accumulator fragments remain resident across the K loop
     self.assertNotIn("SCRATCH_STORE_B32", names)
 
+  def test_iq4_wmma_prefetches_both_32_token_fragments(self):
+    from tinygrad.llm.kernels.amd import _iq4_linear_f16_wmma_kernel
+    rows, cols, tokens = 8192, 2048, 32
+    out = UOp.placeholder((tokens, rows), dtypes.float32, 0)
+    raw = UOp.placeholder((rows*cols//256*34,), dtypes.uint32, 1)
+    x = UOp.placeholder((tokens, cols), dtypes.float16, 2)
+    lut = UOp.placeholder((256,), dtypes.uint32, 3)
+    prg = _to_prg(_iq4_linear_f16_wmma_kernel(out, raw, x, lut, rows, cols, direct_isa=True))
+    names = _amd_inst_names(prg)
+    wide = [i for i,name in enumerate(names) if name == "GLOBAL_LOAD_B128"]
+    self.assertEqual(len(wide), 9)  # one packed weight plus eight activation reads
+    self.assertLess(wide[-1], names.index("V_FMA_MIXLO_F16"))
+    self.assertIn("V_LSHLREV_B32_E32", names)
+    self.assertIn("V_ADD_NC_U32_E32", names)
+    self.assertNotIn("SCRATCH_STORE_B32", names)
+
   def test_large_q6_gemv_upcasts_two_rows_and_reduces_each(self):
     rows, cols = 16384, 2048
     qdata = Tensor.empty(rows * cols // 256 * 210, dtype=dtypes.uint8, device="AMD")
