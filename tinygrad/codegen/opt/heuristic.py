@@ -219,7 +219,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           if unroll == 0 and k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
             k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
       else:
-        for splits in [4]:
+        split_choices = [4]
+        if (large_unroll:=getattr(k.ren, "get_large_reduce_unroll", None)) is not None and \
+           (extra_split:=large_unroll(s, k.ast)) is not None and extra_split not in split_choices:
+          split_choices.append(extra_split)
+        for splits in split_choices:
           if k.full_shape[axis:=k.unrollable_dims[-1]]%splits == 0:
             k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, splits))
             break

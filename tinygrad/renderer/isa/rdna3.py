@@ -249,6 +249,7 @@ def _global_load_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
     raise CompileError(f"no vec global load {u.dtype}")
   if not isinstance(greg(u), Register): raise CompileError(f"expected reg dst {u}")
   if slots == 2: return [r3.global_load_b64(_dst(u), addr, saddr=saddr)]
+  if slots == 3: return [r3.global_load_b96(_dst(u), addr, saddr=saddr)]
   if slots == 4: return [r3.global_load_b128(_dst(u), addr, saddr=saddr)]
   if slots == 8:
     # offset+16 keeps addr live (no TMP bump). Emit clusters consecutive B128s into one
@@ -314,6 +315,7 @@ def _global_store_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
   if sc not in (dtypes.float16, dtypes.float32): raise CompileError(f"no vec global store {val.dtype}")
   if not isinstance(greg(val), Register): raise CompileError(f"expected reg src {val}")
   if slots == 2: return [r3.global_store_b64(addr=addr, data=_full_src(val), saddr=saddr, **off_kw)]
+  if slots == 3: return [r3.global_store_b96(addr=addr, data=_full_src(val), saddr=saddr, **off_kw)]
   if slots == 4: return [r3.global_store_b128(addr=addr, data=_full_src(val), saddr=saddr, **off_kw)]
   if slots == 8:
     lo, hi = _reg_chunk(greg(val), 0, 4), _reg_chunk(greg(val), 4, 4)
@@ -394,8 +396,10 @@ _SCALAR_STORE = {
   dtypes.int32: (r3.global_store_b32, r3.scratch_store_b32, r3.ds_store_b32),
   dtypes.float32: (r3.global_store_b32, r3.scratch_store_b32, r3.ds_store_b32),
 }
-_WIDE_LOAD = {8: (r3.global_load_b64, r3.ds_load_b64), 16: (r3.global_load_b128, r3.ds_load_b128)}
-_WIDE_STORE = {8: (r3.global_store_b64, r3.ds_store_b64), 16: (r3.global_store_b128, r3.ds_store_b128)}
+_WIDE_LOAD = {8: (r3.global_load_b64, r3.ds_load_b64), 12: (r3.global_load_b96, r3.ds_load_b96),
+              16: (r3.global_load_b128, r3.ds_load_b128)}
+_WIDE_STORE = {8: (r3.global_store_b64, r3.ds_store_b64), 12: (r3.global_store_b96, r3.ds_store_b96),
+               16: (r3.global_store_b128, r3.ds_store_b128)}
 
 def _mem_load(kind:int, dt:DType, n:int=1):
   if n > 1:
@@ -3286,14 +3290,23 @@ class AMDRenderer(ISARenderer):
     if size <= 3 or len(ast_uops) <= 32: return 0
     return None
 
+  def get_large_reduce_unroll(self, size:int, ast:UOp) -> int|None:
+    # The generic four-way split cannot expose adjacent loads for odd trip counts such as
+    # Llama's 128256-token vocabulary (501 inner iterations). RDNA3 has native B96 loads.
+    is_max = any(u.op is Ops.REDUCE and u.arg[0] is Ops.MAX for u in ast.toposort())
+    return 3 if is_max and size % 4 != 0 and size % 3 == 0 else None
+
   def get_grouped_reduce_unroll(self, k) -> int|None:
     # GROUPTOP returns before the generic reduce-unroll heuristic. LLVM subsequently vectorizes simple inner
     # reduction loops, but direct ISA needs those adjacent iterations exposed while coalescing is still possible.
-    unroll = getenv("AMD_GROUPED_REDUCE_UNROLL", 8)
-    if not unroll or k.reduceop is None or k.reduceop.arg[0] is not Ops.ADD or len(k.ast.toposort()) > 32 or \
-       any(u.op is Ops.PARAM and u.dtype is dtypes.uint8 for u in k.ast.toposort()) or not k.unrollable_dims: return None
+    unroll, ast_uops = getenv("AMD_GROUPED_REDUCE_UNROLL", 8), k.ast.toposort()
+    if not unroll or k.reduceop is None or k.reduceop.arg[0] not in (Ops.ADD, Ops.MAX) or \
+       (k.reduceop.arg[0] is Ops.ADD and len(ast_uops) > 32) or \
+       any(u.op is Ops.PARAM and u.dtype is dtypes.uint8 for u in ast_uops) or not k.unrollable_dims: return None
     size = k.full_shape[k.unrollable_dims[-1]]
-    return unroll if isinstance(size, int) and size >= unroll and size % unroll == 0 else None
+    if not isinstance(size, int): return None
+    if size >= unroll and size % unroll == 0: return unroll
+    return self.get_large_reduce_unroll(size, k.ast)
 
   def get_complex_matvec_rows(self, k) -> int:
     # Large packed-quant projections amortize the activation reads across two rows.
@@ -3338,6 +3351,7 @@ class AMDRenderer(ISARenderer):
     # 16 halves = one WMMA A frag (2×B128); PACK identity-aliases the load.
     if buf.dtype == dtypes.half: return [16, 8, 4, 2]
     if buf.dtype == dtypes.uint8 and getenv("AMD_COALESCE_U8", 1): return [16, 8, 4]
+    if buf.dtype == dtypes.float: return [4, 3, 2]
     return None
 
   def prepare_pre_regalloc(self, lst:list[UOp]) -> tuple[list[UOp], dict]:

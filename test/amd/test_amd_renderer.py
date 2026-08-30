@@ -137,6 +137,12 @@ def _float4_add_program():
     ast = (Tensor.empty(2, 8, device="AMD") + Tensor.empty(2, 8, device="AMD")).schedule_linear().src[0].src[0]
   return _to_prg(ast)
 
+def _float3_add_program():
+  with Context(BEAM=0):
+    ast = (Tensor.empty(3, device="AMD") + Tensor.empty(3, device="AMD")).schedule_linear().src[0].src[0]
+  from test.backend.test_linearizer import replace_opts
+  return _to_prg(replace_opts(ast, [Opt(OptOps.UPCAST, 0, 3)]))
+
 def _float4_lds_program():
   with Context(BEAM=0):
     ast = (Tensor.empty(1, 64, device="AMD").contiguous() @ Tensor.empty(64, 64, device="AMD").contiguous()).schedule_linear().src[0].src[0]
@@ -932,6 +938,12 @@ class TestAMDRenderer(unittest.TestCase):
     # Direct ISA has no late loop vectorizer: eight-way scheduler unrolling exposes two B128s per loop trip.
     self.assertEqual(names.count("GLOBAL_LOAD_B128"), 2)
     self.assertNotIn("GLOBAL_LOAD_B32", names)
+
+  def test_large_odd_max_uses_b96_load(self):
+    with Context(BEAM=0): ast = Tensor.empty(1503, device="AMD").max().schedule_linear().src[-1].src[0]
+    prg = to_program(ast, _REN)
+    self.assertIn(Opt(OptOps.UNROLL, 0, 3), prg.src[0].arg.applied_opts)
+    self.assertEqual(_amd_inst_names(prg).count("GLOBAL_LOAD_B96"), 1)
 
   def test_q6_wmma_uses_wide_quant_loads(self):
     from tinygrad.llm.kernels.amd import _q6_linear_f16_wmma_kernel
@@ -2264,6 +2276,13 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(inst_names.count("GLOBAL_LOAD_B128"), 2)
     self.assertEqual(inst_names.count("GLOBAL_STORE_B128"), 1)
 
+  def test_float3_global_memory_uses_b96(self):
+    prg = _float3_add_program()
+    _check_elf(self, prg)
+    inst_names = _amd_inst_names(prg)
+    self.assertEqual(inst_names.count("GLOBAL_LOAD_B96"), 2)
+    self.assertEqual(inst_names.count("GLOBAL_STORE_B96"), 1)
+
   def test_uniform_packed_u8_uses_scalar_extracts(self):
     rows, cols = 16384, 2048
     qdata = Tensor.empty(rows * cols // 256 * 144, dtype=dtypes.uint8, device="AMD")
@@ -2681,12 +2700,13 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertIn("DS_STORE_B128", inst_names)
     self.assertIn("DS_LOAD_B128", inst_names)
 
-  def test_padded_load_does_not_use_wide_global_load(self):
+  def test_padded_load_uses_exact_width_global_load(self):
     prg = _padded_load_program()
     _check_elf(self, prg)
     inst_names = _amd_inst_names(prg)
+    # Three valid floats can use an exact 12-byte access, but must not over-read with B128.
     self.assertNotIn("GLOBAL_LOAD_B128", inst_names)
-    self.assertIn("GLOBAL_LOAD_B32", inst_names)
+    self.assertIn("GLOBAL_LOAD_B96", inst_names)
 
   def test_int_signed_widen_cast_sign_extends(self):
     prg = _int_signed_widen_cast_program()
