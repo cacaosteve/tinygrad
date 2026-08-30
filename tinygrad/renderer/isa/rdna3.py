@@ -2547,6 +2547,46 @@ _VMEM_SCHEDULABLE = {AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.COLLECT, AM
                      AMDOps.LSHL_OR, AMDOps.LSHL_ADD,
                      AMDOps.LOAD, AMDOps.PACK_F16}
 
+def _hoist_gated_fmac_loads(ops:list[UOp]) -> list[UOp]:
+  """Issue adjacent independently-gated scalar loads before consuming any of them.
+
+  VCC makes comparisons and WHERE inseparable scheduling pairs.  Handle the narrow
+  CMP/WHERE-address/LOAD/CMP/WHERE-value/FMAC form as six-UOp groups, preserving each
+  pair while moving only the independent address/load halves ahead of the consumers.
+  """
+  if not getenv("AMD_GATED_VMEM", 1): return ops
+  cmps = (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ)
+  def group_at(i:int) -> tuple[UOp, ...]|None:
+    if i + 5 >= len(ops): return None
+    cmpa, addr, load, cmpv, val, fmac = ops[i:i+6]
+    if not (cmpa.op is addr.op is load.op is cmpv.op is val.op is fmac.op is Ops.INS): return None
+    if _iop(cmpa) not in cmps or _iop(addr) is not AMDOps.WHERE or _iop(load) is not AMDOps.LOAD or \
+       _iop(cmpv) not in cmps or _iop(val) is not AMDOps.WHERE or _iop(fmac) is not AMDOps.FMAC: return None
+    if not (addr.src and addr.src[0] is cmpa and len(load.src) >= 2 and load.src[1] is addr and
+            val.src and val.src[0] is cmpv and len(val.src) >= 2 and val.src[1] is load and val in fmac.src): return None
+    if not _vmem_schedulable_load(load) or _reg_slots(load) != 1: return None
+    return cmpa, addr, load, cmpv, val, fmac
+
+  out:list[UOp] = []
+  i = 0
+  while i < len(ops):
+    groups:list[tuple[UOp, ...]] = []
+    late:set[UOp] = set()
+    while (group:=group_at(i + len(groups) * 6)) is not None:
+      # A later address may legally depend on an earlier result in unusual kernels.
+      # Such a group is not independent and must remain in its original position.
+      if any(src in late for u in group[:3] for src in u.src): break
+      groups.append(group)
+      late.update(group[3:])
+    if len(groups) >= 2:
+      out.extend(u for group in groups for u in group[:3])
+      out.extend(u for group in groups for u in group[3:])
+      i += len(groups) * 6
+    else:
+      out.append(ops[i])
+      i += 1
+  return out
+
 def _vmem_schedulable_load(u:UOp) -> bool:
   slots = _reg_slots(u)
   return slots == 1 or (u.dtype in (dtypes.uint8, dtypes.float32) and slots <= 4) or \
@@ -3730,6 +3770,7 @@ class AMDRenderer(ISARenderer):
       lst = out
     d16_hi_lo = _d16_hi_lo_map(lst)
     lst = _order_d16_lo_before_hi(lst, d16_hi_lo)
+    lst = _hoist_gated_fmac_loads(lst)
     if getenv("AMD_SCHEDULE_VMEM", 1): lst = _schedule_scalar_vmem(lst, d16_hi_lo)
     return _schedule_loop_cmps(lst)
   def _pure_addr(self, x:UOp) -> bool:

@@ -1128,6 +1128,33 @@ class TestAMDRenderer(unittest.TestCase):
     scheduled = amd_lib._schedule_scalar_vmem([load0, use0, idx1, load1, use1], {})
     self.assertEqual(scheduled, [load0, idx1, load1, use0, use1])
 
+  def test_gated_fmac_load_scheduler_preserves_vcc_pairs(self):
+    base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
+    limit = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("limit", 7),))
+    factor = _uop(Ops.INS, dtypes.float32, arg=AMDOps.DEFINE, tag=(Register("factor", 260),))
+    groups = []
+    for i in range(2):
+      idx = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register(f"idx{i}", 261+i),))
+      cmpa = _uop(Ops.INS, dtypes.bool, (idx, limit), AMDOps.CMPLT)
+      addr = _uop(Ops.INS, dtypes.uint32, (cmpa, idx, UOp.const(0, dtypes.uint32)), AMDOps.WHERE, (Register(f"addr{i}", 263+i),))
+      load = _uop(Ops.INS, dtypes.float32, (base, addr), AMDOps.LOAD, (Register(f"load{i}", 265+i),))
+      cmpv = _uop(Ops.INS, dtypes.bool, (idx, limit), AMDOps.CMPLT)
+      val = _uop(Ops.INS, dtypes.float32, (cmpv, load, UOp.const(0.0, dtypes.float32)), AMDOps.WHERE, (Register(f"val{i}", 267+i),))
+      acc = _uop(Ops.INS, dtypes.float32, arg=AMDOps.DEFINE, tag=(Register(f"acc{i}", 269+i),))
+      fmac = _uop(Ops.INS, dtypes.float32, (acc, val, factor), AMDOps.FMAC, (Register(f"out{i}", 271+i),))
+      groups.append((cmpa, addr, load, cmpv, val, fmac))
+    original = [u for group in groups for u in group]
+    self.assertEqual(amd_lib._hoist_gated_fmac_loads(original),
+                     [*groups[0][:3], *groups[1][:3], *groups[0][3:], *groups[1][3:]])
+
+    cmp_dep = groups[1][0].replace(src=(groups[0][-1], factor))
+    addr_dep = groups[1][1].replace(src=(cmp_dep, *groups[1][1].src[1:]))
+    load_dep = groups[1][2].replace(src=(base, addr_dep))
+    val_dep = groups[1][4].replace(src=(groups[1][3], load_dep, groups[1][4].src[2]))
+    fmac_dep = groups[1][5].replace(src=(groups[1][5].src[0], val_dep, factor))
+    dependent = [*groups[0], cmp_dep, addr_dep, load_dep, groups[1][3], val_dep, fmac_dep]
+    self.assertEqual(amd_lib._hoist_gated_fmac_loads(dependent), dependent)
+
   def test_scalar_vmem_scheduler_crosses_pure_noop(self):
     base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
     idx0 = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))
