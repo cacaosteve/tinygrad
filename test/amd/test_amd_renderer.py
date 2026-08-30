@@ -908,6 +908,13 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(prg.src[0].arg.applied_opts, (Opt(OptOps.GROUP, 0, 16),))
     self.assertEqual(prg.arg.local_size, (16, 1, 1))
 
+  def test_group16_final_reduce_uses_wide_lds_loads(self):
+    with Context(DEV="MOCKKFD+AMD:AMD"):
+      ast = Tensor.empty(10_000_000).sum().schedule_linear().src[0].src[0]
+    names = _amd_inst_names(to_program(ast, _REN))
+    self.assertEqual(names.count("DS_LOAD_B128"), 4)
+    self.assertNotIn("DS_LOAD_B32", names)
+
   def test_scheduler_skips_complex_reduce_unroll(self):
     with Context(BEAM=0):
       x = Tensor.empty(4096, 32, device="AMD")
@@ -3676,6 +3683,11 @@ class TestAMDRenderer(unittest.TestCase):
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _bitcast_spill_program()
     _amd_rt(prg)(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [1.0] * 16 + [-2.0] * 16 + [0.5] * 16 + [3.0] * 16)
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_group16_final_reduce(self):
+    inp = Tensor.ones(1_000_000, device="AMD").contiguous().realize()
+    self.assertEqual(inp.sum().item(), 1_000_000.0)
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_lds_smoke(self):

@@ -2790,6 +2790,33 @@ def _fused_lds_pack_store(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|N
   deps = _reg_idxs(pack) | _reg_idxs(idx)
   return 8, pre + [r3.ds_store_b128(addr=addr, data0=data, **_ds_off(off0))], deps
 
+def _fused_lds_reduce_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
+  """Vector-load an exact 16-value f32 LDS reduction while preserving its left-to-right sum order."""
+  if i == 0 or i + 10 >= len(uops) or uops[i-1].op is not Ops.INS or _iop(uops[i-1]) is not AMDOps.BARRIER: return None
+  barrier = uops[i-1]
+  init, ctr, loop, cmp, exit_branch, load, add, copy, inc, back, out = uops[i:i+11]
+  if not (all(u.op is Ops.INS for u in (init, ctr, loop, cmp, exit_branch, load, add, copy, inc, back, out)) and
+          _iop(init) is AMDOps.MOV and init.dtype is dtypes.float32 and init.src and _is_zero_val(init.src[0]) and
+          _iop(ctr) is AMDOps.MOV and _const_int(ctr) == 0 and
+          _iop(loop) is AMDOps.LABEL and _iop(cmp) is AMDOps.CMP_GE and cmp.src[0] is ctr and _const_int(cmp.src[1]) == 16 and
+          _iop(exit_branch) is AMDOps.CBRANCH_SCC1 and exit_branch.src == (cmp,) and exit_branch.tag == out.tag and
+          _iop(load) is AMDOps.LLOAD and load.dtype is dtypes.float32 and _elem_count(load) == 1 and load.src[1] is ctr and
+          load.src[0].op is Ops.AFTER and barrier in load.src[0].src and
+          _iop(add) is AMDOps.ADD and add.dtype is dtypes.float32 and add.src == (init, load) and
+          _iop(copy) is AMDOps.MOV and copy.src == (add,) and greg(copy) == greg(init) and
+          _iop(inc) is AMDOps.ADD and inc.src[0] is ctr and _const_int(inc.src[1]) == 1 and greg(inc) == greg(ctr) and
+          _iop(back) is AMDOps.BRANCH and back.tag == loop.tag and _iop(out) is AMDOps.LABEL): return None
+  used_vgprs = {r-256 for u in uops for r in _reg_idxs(u) if 256 <= r < 512}
+  free = next((r for r in range(5, 253) if not used_vgprs.intersection(range(r, r+4))), None)
+  if free is None: return None
+  acc, base_off = _dst(init), _lds_base_offset(load.src[0]) + _lds_byte_off(load)
+  emitted = list(insts_for_uop(init)) + [r3.v_mov_b32_e32(TMP_VADDR, 0)]
+  for block in range(4):
+    emitted += [r3.ds_load_b128(vdst=v[free:free+3], addr=TMP_VADDR, **_ds_off(base_off + block*16)),
+                r3.s_waitcnt_lgkmcnt(sdst=NULL, simm16=0)]
+    emitted += [r3.v_add_f32_e32(acc, acc, v[free+lane]) for lane in range(4)]
+  return 11, emitted
+
 def insts_from_linear(lin:UOp):
   ops = list(lin.src)
   skip = _compute_amd_skip(ops)  # fused d16 hi LOADs still emit (d16_hi into lo)
@@ -2845,6 +2872,13 @@ def insts_from_linear(lin:UOp):
   oi = 0
   while oi < len(scheduled):
     u = scheduled[oi]
+    if mask_depth == 0 and (fused_reduce:=_fused_lds_reduce_loop(scheduled, oi)) is not None:
+      count, emitted = fused_reduce
+      flush("lgkm")
+      store_addr_cache.clear()
+      for inst in emitted: emit(inst)
+      oi += count
+      continue
     if u.op is Ops.INS and _iop(u) is AMDOps.LABEL:
       flush("vm", "lgkm", "vs")
       store_addr_cache.clear()
