@@ -1302,6 +1302,36 @@ def _materialize_bool_where(m:UOp, a:UOp, b:UOp) -> UOp|None:
   if m.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): return None
   return UOp(Ops.WHERE, src=(UOp(Ops.CMPNE, src=(m, _tconst(False, dtypes.bool))), a, b))
 
+def _merge_zero_cmp_and(a:UOp, b:UOp) -> UOp|None:
+  def nonzero_src(x:UOp) -> UOp|None:
+    if x.op is Ops.WHERE and len(x.src) == 3 and x.src[1].op is Ops.CONST and x.src[1].val is True and \
+       x.src[2].op is Ops.CONST and x.src[2].val is False: x = x.src[0]
+    # A merged equality can be materialized and negated while its parent boolean tree is still being rewritten:
+    # CMPNE(WHERE(CMPNE(v, 0), true, false), true) is v == 0.
+    if x.op is Ops.CMPNE:
+      inner = x.src[0] if _const_value(x.src[1]) is True else x.src[1] if _const_value(x.src[0]) is True else None
+      if inner is not None and inner.op is Ops.WHERE and _const_value(inner.src[1]) is True and _const_value(inner.src[2]) is False:
+        inner = inner.src[0]
+      if inner is not None and inner.op is Ops.CMPNE:
+        if _const_value(inner.src[0]) == 0: return inner.src[1]
+        if _const_value(inner.src[1]) == 0: return inner.src[0]
+    if x.op is not Ops.CMPEQ: return None
+    if _const_value(x.src[0]) == 0: return x.src[1]
+    if _const_value(x.src[1]) == 0: return x.src[0]
+    return None
+  def zero_srcs(x:UOp) -> list[UOp]|None:
+    if (v:=nonzero_src(x)) is not None: return [v]
+    if x.op is not Ops.AND: return None
+    left, right = zero_srcs(x.src[0]), zero_srcs(x.src[1])
+    return None if left is None or right is None else left + right
+  vals_a, vals_b = zero_srcs(a), zero_srcs(b)
+  if vals_a is None or vals_b is None: return None
+  vals = vals_a + vals_b
+  if any(v.dtype not in dtypes.ints or v.dtype.itemsize != 4 for v in vals): return None
+  merged = vals[0].cast(dtypes.uint32)
+  for val in vals[1:]: merged = merged | val.cast(dtypes.uint32)
+  return merged.eq(merged.const_like(0))
+
 def _is_foldable(ctx:IselContext, x:UOp, s:UOp) -> bool: return len(ctx.uses[s]) == x.src.count(s) == 1
 
 def _fused_mulacc(ctx:IselContext, a:UOp, b:UOp, c:UOp) -> UOp|None:
@@ -1375,6 +1405,7 @@ pre_isel_matcher = PatternMatcher([
   (UPat((Ops.CMPNE, Ops.CMPEQ),
    src=(UPat((Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ), name="m"), UPat.cvar("c").cast(dtypes.bool, name="c")), name="x"),
    _cmp_bool_const),
+  (UPat(Ops.AND, dtype=dtypes.bool, src=(UPat.var("a"), UPat.var("b"))), _merge_zero_cmp_and),
   (UPat((Ops.AND, Ops.OR, Ops.XOR, Ops.CMPNE, Ops.CMPEQ), dtype=dtypes.bool, name="x"), _materialize_compare_flags),
   (UPat(Ops.STORE, name="x"), _materialize_store_compare_flag),
   (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), name="a"), UPat.var("val")), allow_any_len=True, name="x"), _cast_store_value),
@@ -1510,7 +1541,10 @@ def _vcc_rematerialize(ctx, x:UOp):
              x.src[0] if _iop(x) in (AMDOps.WHERE, AMDOps.IF_MASK) and x.src[0].op is Ops.INS and _iop(x.src[0]) in _flags else None
   if flag_def is None: return None
   # VCC is implicit; rematerialize compares before WHERE/IF_MASK consumers
-  if flag_def is not x: return x, [flag_def, x]
+  if flag_def is not x:
+    # A directly adjacent compare still owns VCC; emitting it twice only extends the dependency chain.
+    if ctx.uops is not None and ctx.regalloc_i > 0 and ctx.uops[ctx.regalloc_i-1] is flag_def: return x, [x]
+    return x, [flag_def, x]
   if ctx.lock is not None and ctx.lock is not flag_def: ctx.clobbered.add(ctx.lock)
   ctx.lock = flag_def
   if flag_def not in ctx.clobbered: return None

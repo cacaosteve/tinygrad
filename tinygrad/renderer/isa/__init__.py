@@ -39,6 +39,7 @@ def greg(u:UOp):
 @dataclass
 class PreRegAllocContext:
   uops: list[UOp]|None = None
+  regalloc_i: int = 0
   lock: UOp|None = None
   clobbered: set[UOp] = field(default_factory=set)
   scratch: dict = field(default_factory=dict)

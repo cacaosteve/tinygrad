@@ -9,6 +9,7 @@ from tinygrad.device import Device
 from tinygrad.dtype import AddrSpace, Invalid, dtypes
 from tinygrad.helpers import Context, Target, getenv
 from tinygrad.llm.gguf import ggml_data_to_tensor
+from tinygrad.llm.kernels.amd import Q6_K, Q6_WORDS, _quant_decode_kernel
 from tinygrad.renderer.isa import IselContext, PreRegAllocContext, Register, greg
 from tinygrad.runtime.autogen import amdgpu_kd
 from tinygrad.runtime.support.elf import elf_loader
@@ -931,6 +932,18 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(names.count("DS_SWIZZLE_B32"), 5)
     self.assertNotIn("DS_STORE_B32", names)
     self.assertNotIn("S_BARRIER", names)
+
+  def test_q6_decode_folds_all_zero_store_predicate(self):
+    out_features, in_features, chunks = 64, 2048, 2
+    out = UOp.placeholder((1, out_features, chunks), dtypes.float32, 0)
+    raw = UOp.placeholder((out_features * in_features // 256 * Q6_WORDS,), dtypes.uint32, 1)
+    xq = UOp.placeholder((1, in_features // 32, 8), dtypes.uint32, 2)
+    xd = UOp.placeholder((1, in_features // 32), dtypes.float32, 3)
+    xs = UOp.placeholder((1, in_features // 32, 2), dtypes.float32, 4)
+    prg = _to_prg(_quant_decode_kernel(out, raw, xq, xd, xs, out_features, in_features, Q6_K))
+    names = _amd_inst_names(prg)
+    self.assertEqual(names.count("V_OR_B32_E32"), 3)
+    self.assertEqual(names.count("V_CMP_NE_U32_E32"), 2)
 
   def test_simple_grouped_reduce_exposes_wide_loads(self):
     ast = Tensor.empty(2048, device="AMD").square().mean().schedule_linear().src[-1].src[0]
