@@ -973,6 +973,17 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertNotIn("V_PACK_B32_F16", names)
     self.assertNotIn("SCRATCH_STORE_B32", names)
 
+  def test_q5_wmma_stays_below_128_vgprs(self):
+    from tinygrad.llm.kernels.amd import _q5_linear_f16_wmma_kernel
+    rows, cols, tokens = 8192, 2048, 32
+    out = UOp.placeholder((tokens, rows), dtypes.float32, 0)
+    raw = UOp.placeholder((rows*cols//256*44,), dtypes.uint32, 1)
+    x = UOp.placeholder((tokens, cols), dtypes.float16, 2)
+    prg = _to_prg(_q5_linear_f16_wmma_kernel(out, raw, x, rows, cols, 13, direct_isa=True))
+    regs = [(u, greg(u)) for u in _prg_lin(prg).src if isinstance(greg(u), Register) and greg(u).index >= 256]
+    self.assertLessEqual(max(r.index-256 + _REN.register_slots(u, r) for u,r in regs), 128)
+    self.assertNotIn(AMDOps.SPILL, _lin_ops(prg))
+
   def test_iq4_wmma_uses_wide_quant_load(self):
     from tinygrad.llm.kernels.amd import _iq4_linear_f16_wmma_kernel
     rows, cols, tokens = 8192, 2048, 16
@@ -987,6 +998,9 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(names.count("GLOBAL_LOAD_B32"), 6)
     self.assertEqual(names.count("V_FMA_MIXHI_F16"), 16)
     self.assertNotIn("V_PACK_B32_F16", names)
+    # The four scalar LUT stores stay scalar; packed accumulator exchange uses two B128 stores.
+    self.assertEqual(names.count("DS_STORE_B32"), 4)
+    self.assertEqual(names.count("DS_STORE_B128"), 2)
     wide = [i for i,name in enumerate(names) if name == "GLOBAL_LOAD_B128"]
     self.assertLessEqual(wide[-1] - wide[0], 8)  # activations issue while the packed quant load is in flight
     self.assertLessEqual(names.count("V_MOV_B32_E32"), 8)  # accumulator fragments remain resident across the K loop

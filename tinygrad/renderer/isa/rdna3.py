@@ -38,9 +38,9 @@ VGPR = tuple(Register(f"v{i}", 256+i, size=4) for i in range(5, 254))
 # per-k page idx + in-place <<1 once + GLOBAL offset rem — keeps s_clause, cuts addr ALU.
 # AMD_B_COMPACT=0 → AMD_B_LSHL_ADD dest-as-addr. AMD_D16_HI stays env-gated (mock NaNs).
 WMMA_ACC_VGPR = VGPR[121:]
-# Packed-quant fragments can overlap their short-lived B-pack band safely; starting at v110
-# keeps the 16/32/64-token IQ4 kernels below the 128-VGPR occupancy boundary.
-WMMA_ACC_PACKED_VGPR = VGPR[105:]
+# Quantized mixed-f16 fragments can overlap their short-lived dequant/pack band safely.
+# Starting at v94 keeps the 16/32/64-token custom kernels below the 128-VGPR boundary.
+WMMA_ACC_QUANT_VGPR = VGPR[89:]
 # Disjoint pools: LDS half2 loads stay low; PACK_F16 early-clobber dests stay high (product-8 fix).
 # Under ALLOW_UPCAST16 ACC grows to v126..v253 and overlaps the high PACK band — use mid PACK then.
 LLOAD_VGPR = VGPR[:118]        # v5..v122
@@ -946,9 +946,9 @@ def _isel_wmma(ctx:IselContext, x:UOp) -> UOp:
     # tile (from UPCAST) needs its OWN accumulator register. the zero-init STACK is identical across
     # tiles and dedups to one UOp -> one reg, which the two-address coalesce can only satisfy for one
     # tile. pre-assign a unique vreg so each tile's accumulator stays distinct.
-    packed_quant = bool(getenv("AMD_PACKED_WMMA_ACC", 1)) and any(
-      u.op in (Ops.CUSTOM, Ops.CUSTOMI) and _custom_name(u) == AMD_PACKED_F16_MUL_TO_F16 for u in ctx.uses)
-    c = _wmma_stack_operand(cin, 2).replace(tag=(ctx.vreg(WMMA_ACC_PACKED_VGPR if packed_quant else WMMA_ACC_VGPR),))
+    quantized = bool(getenv("AMD_PACKED_WMMA_ACC", 1)) and any(
+      u.op in (Ops.CUSTOM, Ops.CUSTOMI) and _custom_name(u) in (AMD_FMA_TO_F16, AMD_PACKED_F16_MUL_TO_F16) for u in ctx.uses)
+    c = _wmma_stack_operand(cin, 2).replace(tag=(ctx.vreg(WMMA_ACC_QUANT_VGPR if quantized else WMMA_ACC_VGPR),))
   return UOp(Ops.INS, src=(c, a, b), arg=(AMDOps.WMMA, dtypes.float if x.dtype is dtypes.float else x.dtype), tag=x.tag)
 
 def _wmma_inst(u:UOp):
@@ -2721,6 +2721,26 @@ def _schedule_fma_mixhi_pairs(uops:list[UOp]) -> list[UOp]:
     i = j
   return out
 
+def _fused_lds_pack_store(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
+  """Fold four aliasing f32 EXTRACT+LSTORE pairs into one DS_STORE_B128."""
+  if i + 7 >= len(uops): return None
+  extracts, stores = uops[i:i+8:2], uops[i+1:i+8:2]
+  if not all(x.op is Ops.INS and _iop(x) is AMDOps.EXTRACT for x in extracts): return None
+  if not all(x.op is Ops.INS and _iop(x) is AMDOps.LSTORE and x.src[2] is extracts[n] for n,x in enumerate(stores)): return None
+  pack, lane0 = extracts[0].src[0], _const_int(extracts[0].src[1])
+  off0 = _lds_byte_off(stores[0])
+  if (_iop(pack) is not AMDOps.PACK or pack.dtype is not dtypes.float32 or lane0 is None or lane0 % 4 or off0 % 16 or
+      _reg_slots(pack) < lane0 + 4 or not isinstance(greg(pack), Register)): return None
+  if not all(x.src[0] is pack and _const_int(x.src[1]) == lane0+n and isinstance(greg(x), Register) and
+             greg(x).index == greg(pack).index+lane0+n for n,x in enumerate(extracts)): return None
+  base, idx = stores[0].src[:2]
+  if not all(x.src[0] is base and x.src[1] is idx and _lds_byte_off(x) == off0+4*n and
+             x.src[2].dtype is dtypes.float32 for n,x in enumerate(stores)): return None
+  pre, addr = _local_addr(base, idx, dtypes.float32.itemsize)
+  data = _reg_chunk(greg(pack), lane0, 4)
+  deps = _reg_idxs(pack) | _reg_idxs(idx)
+  return 8, pre + [r3.ds_store_b128(addr=addr, data0=data, **_ds_off(off0))], deps
+
 def insts_from_linear(lin:UOp):
   ops = list(lin.src)
   skip = _compute_amd_skip(ops)  # fused d16 hi LOADs still emit (d16_hi into lo)
@@ -2816,6 +2836,16 @@ def insts_from_linear(lin:UOp):
     if u in skip:
       if u.op is Ops.INS and _iop(u) is AMDOps.END_MASK: mask_depth -= 1
       oi += 1
+      continue
+    # Quantized WMMA epilogues can scalarize a contiguous packed accumulator store into
+    # aliasing EXTRACT+LSTORE pairs. Rejoin only exact four-f32 groups after regalloc.
+    if mask_depth == 0 and (fused_store:=_fused_lds_pack_store(scheduled, oi)) is not None:
+      count, emitted, deps = fused_store
+      if deps and _pending_src(deps): flush_regs(deps)
+      store_addr_cache.clear()
+      for inst in emitted: emit(inst)
+      pending["lgkm"].add(-1)
+      oi += count
       continue
     # Cluster contiguous A B128 (half×8+): one s_clause over the burst (LLVM B128×8).
     # Per-tile s_clause stripped from _global_load_insts. Skip addr ALU between wide A tiles.
