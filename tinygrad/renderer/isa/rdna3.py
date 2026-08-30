@@ -71,6 +71,7 @@ class AMDOps(FastEnum):
   ADD = auto()
   SUB = auto()
   MUL = auto()
+  MULHI = auto()
   MULACC = auto()
   FMAC = auto()
   CAST = auto()
@@ -1252,13 +1253,29 @@ def _u32_divmod(n:UOp, d:UOp, bits:int|None=None) -> tuple[UOp, UOp]:
     r = ge.where(r - d, r)
   return q, r
 
+def _u32_fast_divmod(n:UOp, d:UOp) -> tuple[UOp, UOp]:
+  # Reciprocal-based unsigned division, following AMDGPU's 32-bit lowering.
+  # Two correction rounds make the estimate exact while avoiding one restoring
+  # division round per reachable numerator bit for symbolic launch dimensions.
+  def mulhi(a:UOp, b:UOp) -> UOp:
+    return UOp(Ops.INS, src=(a, b), arg=(AMDOps.MULHI, dtypes.uint32))
+  zero, one = _tconst(0, dtypes.uint32), _tconst(1, dtypes.uint32)
+  z = (d.cast(dtypes.float32).reciprocal() * _tconst(2**32 - 256, dtypes.float32)).cast(dtypes.uint32)
+  z = z + mulhi(z, zero - d * z)
+  q = mulhi(n, z)
+  r = n - q * d
+  for _ in range(2):
+    lt = r < d
+    q, r = lt.where(q, q + one), lt.where(r, r - d)
+  return q, r
+
 def _var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
   if x.dtype != d.dtype or x.dtype not in (dtypes.int32, dtypes.uint32): return None
   if x.dtype is dtypes.uint32:
-    q, r = _u32_divmod(x, d)
+    q, r = _u32_fast_divmod(x, d) if d.vmin > 0 else _u32_divmod(x, d)
     return q if op.op is Ops.CDIV else r
   if x.vmin >= 0 and d.vmin > 0:
-    q, r = _u32_divmod(x.cast(dtypes.uint32), d.cast(dtypes.uint32), int(x.vmax).bit_length())
+    q, r = _u32_fast_divmod(x.cast(dtypes.uint32), d.cast(dtypes.uint32))
     return (q if op.op is Ops.CDIV else r).cast(dtypes.int32)
   if x.vmin >= 0 and d.vmax < 0:
     signed_zero = _tconst(0, dtypes.int32)
@@ -1864,6 +1881,11 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       raise CompileError(f"unsupported extract dtype {src.dtype}")
     case AMDOps.ADD | AMDOps.SUB | AMDOps.MUL:
       return _alu2(u)
+    case AMDOps.MULHI:
+      a, b = _src(u.src[0]), _src(u.src[1])
+      if greg(u).index < 256: return [r3.s_mul_hi_u32(_dst(u), a, b)]
+      pre, b = _vgpr_data(TMP_VDATA, u.src[1])
+      return pre + [r3.v_mul_hi_u32(_dst(u), a, b)]
     case AMDOps.MULACC:
       if u.dtype is dtypes.float16: return [r3.v_fma_f16(_dst(u), _src(u.src[0]), _src(u.src[1]), _src(u.src[2]))]
       if u.dtype is dtypes.float32: return [r3.v_fma_f32(_dst(u), _src(u.src[0]), _src(u.src[1]), _src(u.src[2]))]
