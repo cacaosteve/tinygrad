@@ -980,9 +980,26 @@ class TestAMDRenderer(unittest.TestCase):
     raw = UOp.placeholder((rows*cols//256*44,), dtypes.uint32, 1)
     x = UOp.placeholder((tokens, cols), dtypes.float16, 2)
     prg = _to_prg(_q5_linear_f16_wmma_kernel(out, raw, x, rows, cols, 13, direct_isa=True))
-    regs = [(u, greg(u)) for u in _prg_lin(prg).src if isinstance(greg(u), Register) and greg(u).index >= 256]
+    linear = list(_prg_lin(prg).src)
+    regs = [(u, greg(u)) for u in linear if isinstance(greg(u), Register) and greg(u).index >= 256]
     self.assertLessEqual(max(r.index-256 + _REN.register_slots(u, r) for u,r in regs), 128)
+    pos = {u:i for i,u in enumerate(linear)}
+    loop_start = next(i for i,u in enumerate(linear) if u.op is Ops.INS and _iop(u) is AMDOps.LABEL)
+    root_accs = [u.src[0] for u in linear if u.op is Ops.INS and _iop(u) is AMDOps.WMMA and _iop(u.src[0]) is AMDOps.PACK]
+    self.assertTrue(root_accs)
+    self.assertTrue(all(pos[acc] < loop_start for acc in root_accs))
     self.assertNotIn(AMDOps.SPILL, _lin_ops(prg))
+
+  def test_wmma_acc_reload_matches_rebuilt_vreg_tag(self):
+    vreg = Register("acc", 0, _cons=amd_lib.WMMA_ACC_QUANT_VGPR)
+    init_tag, reload_tag = (vreg,), tuple([vreg])
+    self.assertIsNot(init_tag, reload_tag)
+    init = _uop(Ops.INS, dtypes.float32, tuple(UOp.const(0.0, dtypes.float32) for _ in range(8)), AMDOps.PACK, init_tag)
+    slot = _uop(Ops.INS, dtypes.float32, (UOp.const(0), UOp.const(0), UOp.const(1)), AMDOps.SLOAD,
+                (Register("slot", 1, _cons=amd_lib.VGPR),))
+    reload = _uop(Ops.INS, dtypes.float32, (slot,)*8, AMDOps.PACK, reload_tag)
+    ctx = PreRegAllocContext(scratch={"wmma_acc_inits": {init_tag: init}})
+    self.assertEqual(amd_lib._promote_wmma_acc_pack(ctx, reload), (init, []))
 
   def test_iq4_wmma_uses_wide_quant_load(self):
     from tinygrad.llm.kernels.amd import _iq4_linear_f16_wmma_kernel

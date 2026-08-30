@@ -632,7 +632,7 @@ def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
   if (cached:=ctx.scratch.get("wmma_acc_buffers")) is not None: return cached
   bufs: set[UOp] = set()
   packed_quant = bool(getenv("AMD_PACKED_WMMA_ACC", 1)) and any(
-    u.op is Ops.INS and _iop(u) is AMDOps.PACKED_F16_MUL_TO_F16 for u in (ctx.uops or []))
+    u.op is Ops.INS and _iop(u) in (AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16) for u in (ctx.uops or []))
   for u in ctx.uops or []:
     if u.op is not Ops.INS or _iop(u) is not AMDOps.WMMA: continue
     pack = u.src[0]
@@ -665,7 +665,7 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
   ctx = PreRegAllocContext(uops)
   bufs = _wmma_acc_buffers(ctx)
   if not bufs: return [], {}, {}
-  seen: set[int] = set()
+  seen: set[tuple] = set()
   inits: list[UOp] = []
   tiles: dict[int, UOp] = {}
   idx_map: dict[int|tuple[UOp, int], tuple[UOp, int]] = {}
@@ -675,7 +675,7 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
     pack = u.src[0]
     if not _is_wmma_acc_reload_pack(pack): continue
     if not isinstance(pack.tag, tuple) or not pack.tag: continue
-    if (tid:=id(pack.tag)) in seen: continue
+    if pack.tag in seen: continue
     # SLOAD-cin: tile from REG indices. Zero-MOV cin: enumerate in expand order.
     sload_idxs: list[int|None] = []
     if all(s.op is Ops.INS and _iop(s) is AMDOps.SLOAD for s in pack.src):
@@ -686,7 +686,7 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
     else:
       tile = next_tile
       next_tile += 1
-    seen.add(tid)
+    seen.add(pack.tag)
     init = UOp(Ops.INS, src=tuple(_tconst(0.0, dtypes.float32) for _ in range(8)), arg=(AMDOps.PACK, dtypes.float), tag=pack.tag)
     inits.append(init)
     tiles[tile] = init
@@ -1576,7 +1576,7 @@ def _promote_wmma_acc_pack(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp
   if not _is_wmma_acc_reload_pack(x, ctx): return None
   if not isinstance(x.tag, tuple) or not x.tag: return None
   inits = ctx.scratch.get("wmma_acc_inits") or {}
-  if (init:=inits.get(id(x.tag))) is None: return None
+  if (init:=inits.get(x.tag)) is None: return None
   left = ctx.scratch.get("wmma_packs_left")
   if left is None: ctx.scratch["wmma_packs_left"] = left = len(inits)
   ctx.scratch["wmma_packs_left"] = left - 1
@@ -3521,7 +3521,7 @@ class AMDRenderer(ISARenderer):
     if not inits: return lst, {}
     loop_i = next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), 0)
     return lst[:loop_i] + inits + lst[loop_i:], {
-      "wmma_acc_inits": {id(u.tag): u for u in inits},
+      "wmma_acc_inits": {u.tag: u for u in inits},
       "wmma_acc_tiles": tiles,
       "wmma_acc_idx_map": idx_map,
     }
