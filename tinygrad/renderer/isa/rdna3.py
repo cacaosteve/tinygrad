@@ -995,7 +995,7 @@ def _pack_f16_identity_load(u:UOp) -> UOp|None:
   if base is None or _reg_slots(base) < len(u.src) // 2: return None
   return base
 
-def _pack_f16_insts(u:UOp) -> list:
+def _pack_f16_insts(u:UOp, fma_hi_lo:dict[UOp, UOp]|None=None, fma_pair_dst:dict[UOp, Reg]|None=None) -> list:
   # Vec-load form: PACK_F16(LOAD/LLOAD[, ...]) — bitcast half2 words into WMMA src VGPRs.
   if _pack_f16_is_vec_load(u) or (len(u.src) == 1 and u.src[0].op is Ops.INS and
       _iop(u.src[0]) in (AMDOps.LOAD, AMDOps.LLOAD) and _reg_slots(u.src[0]) == _reg_slots(u)):
@@ -1017,6 +1017,12 @@ def _pack_f16_insts(u:UOp) -> list:
   ret = []
   for i in range(len(u.src) // 2):
     lo, hi = u.src[2*i], u.src[2*i+1]
+    # A paired mixhi has already written the high half into lo's VGPR. Move that
+    # packed word into the WMMA fragment instead of executing a separate v_pack.
+    if (fma_hi_lo or {}).get(hi) is lo:
+      src_slot, dst_slot = (fma_pair_dst or {}).get(lo, _dst(lo)), _reg_lane(greg(u), i)
+      if src_slot != dst_slot: ret.append(r3.v_mov_b32_e32(dst_slot, src_slot))
+      continue
     if (got := _pack_f16_half2_load(lo, hi)) is not None:
       base, slot = got
       src_slot, dst_slot = _reg_lane(greg(base), slot), _reg_lane(greg(u), i)
@@ -1731,7 +1737,8 @@ def _commutative_vop2(u:UOp, inst) -> list:
 _MASKED_MEM = (AMDOps.LOAD, AMDOps.STORE, AMDOps.LLOAD, AMDOps.LSTORE, AMDOps.SLOAD, AMDOps.SSTORE)
 
 def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_cache:_StoreAddrCache|None=None,
-                  d16_hi_lo:dict[UOp, UOp]|None=None, byte_scaled:set[int]|None=None):
+                  d16_hi_lo:dict[UOp, UOp]|None=None, byte_scaled:set[int]|None=None,
+                  fma_hi_lo:dict[UOp, UOp]|None=None, fma_pair_dst:dict[UOp, Reg]|None=None):
   if u.op is not Ops.INS or (skip and u in skip): return []
   if isinstance(_iop(u), Inst): return [_iop(u)]
   match _iop(u):
@@ -1759,7 +1766,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if u.dtype is not dtypes.float32: raise CompileError(f"f32 pack only, got {u.dtype}")
       return _parallel_vmov([(_reg_lane(greg(u), i), _src(s)) for i,s in enumerate(u.src)])
     case AMDOps.PACK_F16:
-      return _pack_f16_insts(u)
+      return _pack_f16_insts(u, fma_hi_lo, fma_pair_dst)
     case AMDOps.WMMA:
       acc, src0, src1 = u.src[0], u.src[1], u.src[2]
       vdst = _reg_to_amd(greg(acc), 8)
@@ -1792,11 +1799,19 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
                r3.v_cvt_f32_ubyte2_e32, r3.v_cvt_f32_ubyte3_e32)[byte](_dst(u), _src(u.src[0]))]
     case AMDOps.FMA_TO_F16:
       pre, a = _vgpr_data(TMP_VDATA, u.src[0])
-      return pre + [r3.v_fma_mixlo_f16(_dst(u), a, _src(u.src[1]), _src(u.src[2]), opsel=0, opsel_hi=0, opsel_hi2=0)]
+      if (lo := (fma_hi_lo or {}).get(u)) is not None:
+        return pre + [r3.v_fma_mixhi_f16((fma_pair_dst or {}).get(u, _dst(lo)), a, _src(u.src[1]), _src(u.src[2]),
+                                         opsel=0, opsel_hi=0, opsel_hi2=0)]
+      return pre + [r3.v_fma_mixlo_f16((fma_pair_dst or {}).get(u, _dst(u)), a, _src(u.src[1]), _src(u.src[2]),
+                                       opsel=0, opsel_hi=0, opsel_hi2=0)]
     case AMDOps.PACKED_F16_MUL_TO_F16:
       if (high:=_const_int(u.src[2])) not in (0, 1): raise CompileError("bad packed f16 lane")
       pre, a = _vgpr_data(TMP_VDATA, u.src[0])
-      return pre + [r3.v_fma_mixlo_f16(_dst(u), a, _src(u.src[1]), 0.0, opsel=high, opsel_hi=1, opsel_hi2=0)]
+      if (lo := (fma_hi_lo or {}).get(u)) is not None:
+        return pre + [r3.v_fma_mixhi_f16((fma_pair_dst or {}).get(u, _dst(lo)), a, _src(u.src[1]), 0.0,
+                                         opsel=high, opsel_hi=1, opsel_hi2=0)]
+      return pre + [r3.v_fma_mixlo_f16((fma_pair_dst or {}).get(u, _dst(u)), a, _src(u.src[1]), 0.0,
+                                       opsel=high, opsel_hi=1, opsel_hi2=0)]
     case AMDOps.LSHL_OR:
       if greg(u).index < 256:
         return [r3.s_lshl_b32(_dst(u), _src(u.src[0]), _src(u.src[1])),
@@ -2645,10 +2660,73 @@ def _order_d16_lo_before_hi(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp
       i += 1
   return batched
 
+def _fma_mixhi_lo_map(uops:list[UOp]) -> dict[UOp, UOp]:
+  """Pair single-use half FMAs consumed by the same WMMA fragment pack.
+
+  The low result remains live through PACK_F16, so mixhi can safely update its high
+  half in place without changing instruction order or extending any input lifetime.
+  """
+  if not getenv("AMD_FMA_MIXHI", 1): return {}
+  uses: dict[UOp, list[UOp]] = {}
+  for u in uops:
+    for src in u.src: uses.setdefault(src, []).append(u)
+  ret: dict[UOp, UOp] = {}
+  fma_ops = (AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16)
+  for pack in uops:
+    if pack.op is not Ops.INS or _iop(pack) is not AMDOps.PACK_F16 or _pack_f16_is_vec_load(pack): continue
+    for lo, hi in zip(pack.src[::2], pack.src[1::2]):
+      if lo.op is not Ops.INS or hi.op is not Ops.INS or _iop(lo) not in fma_ops or _iop(hi) is not _iop(lo): continue
+      if uses.get(lo) == [pack] and uses.get(hi) == [pack]: ret[hi] = lo
+  return ret
+
+def _fma_pair_pack_dsts(uops:list[UOp], fma_hi_lo:dict[UOp, UOp]) -> dict[UOp, Reg]:
+  """Use the final PACK_F16 lane directly when it is idle throughout a paired FMA's live interval."""
+  pos = {u:i for i,u in enumerate(uops)}
+  ret: dict[UOp, Reg] = {}
+  for pack in uops:
+    if pack.op is not Ops.INS or _iop(pack) is not AMDOps.PACK_F16 or not isinstance(greg(pack), Register): continue
+    for lane,(lo,hi) in enumerate(zip(pack.src[::2], pack.src[1::2])):
+      if fma_hi_lo.get(hi) is not lo or lo not in pos or hi not in pos or not (pos[lo] < pos[hi] < pos[pack]): continue
+      target_idx = greg(pack).index + lane
+      # Inputs still needed by either FMA and all intervening values must remain untouched.
+      blocked = set().union(*(_reg_idxs(s) for s in lo.src+hi.src))
+      for x in uops[pos[lo]+1:pos[pack]]:
+        if x is not hi: blocked |= _reg_idxs(x)
+      if target_idx in blocked: continue
+      dst = _reg_lane(greg(pack), lane)
+      ret[lo] = ret[hi] = dst
+  return ret
+
+def _schedule_fma_mixhi_pairs(uops:list[UOp]) -> list[UOp]:
+  """Separate paired mixlo/mixhi instructions enough to cover the destination dependency."""
+  pairs = _fma_mixhi_lo_map(uops)
+  lows, highs = set(pairs.values()), set(pairs)
+  paired = lows | highs
+  out, i = [], 0
+  while i < len(uops):
+    if uops[i] not in paired:
+      out.append(uops[i])
+      i += 1
+      continue
+    j = i
+    while j < len(uops) and uops[j] in paired: j += 1
+    run = uops[i:j]
+    if any(src in paired for u in run for src in u.src):
+      out.extend(run)
+    else:
+      for k in range(0, len(run), 8):
+        chunk = run[k:k+8]
+        out.extend([u for u in chunk if u in lows])
+        out.extend([u for u in chunk if u in highs])
+    i = j
+  return out
+
 def insts_from_linear(lin:UOp):
   ops = list(lin.src)
   skip = _compute_amd_skip(ops)  # fused d16 hi LOADs still emit (d16_hi into lo)
   d16_hi_lo = _d16_hi_lo_map(ops)
+  fma_hi_lo = _fma_mixhi_lo_map(ops)
+  fma_pair_dst: dict[UOp, Reg] = {}
   mask_depth = 0
   # vm: (dest_regs, n_vmem_ops) in issue order — soft vmcnt must count ops, not UOps
   # (PACK_F16 can emit 16 loads; treating that as 1 desyncs vmcnt → MMU faults).
@@ -2690,9 +2768,11 @@ def insts_from_linear(lin:UOp):
   def _pending_src(regs:set[int]) -> bool:
     return any(pr & regs for pr, _ in pending_vm) or bool(pending["lgkm"] & regs)
   def _emit_uop(u, masked=False, with_store_cache=False):
-    return list(insts_for_uop(u, skip, masked, store_addr_cache if with_store_cache else None, d16_hi_lo, byte_scaled))
+    return list(insts_for_uop(u, skip, masked, store_addr_cache if with_store_cache else None,
+                              d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst))
   scheduled = _order_d16_lo_before_hi(
     _hoist_loads_before_wmma(_sink_wmma_past_loads(_hoist_lloads_before_extracts(ops))), d16_hi_lo)
+  fma_pair_dst = _fma_pair_pack_dsts(scheduled, fma_hi_lo)
   oi = 0
   while oi < len(scheduled):
     u = scheduled[oi]
@@ -3450,6 +3530,7 @@ class AMDRenderer(ISARenderer):
     6. Hoist independent scalar VMEM reads in kernels without WMMA or wide global loads.
     7. Put a boundless-loop compare before any REG_STORE that mutates its old-value operand.
     """
+    lst = _schedule_fma_mixhi_pairs(lst)
     lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
     lst = _prefetch_a_after_packed_quant(lst) if getenv("AMD_PREFETCH_IQ4_A", 1) else lst
     lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))

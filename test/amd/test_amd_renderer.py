@@ -969,6 +969,8 @@ class TestAMDRenderer(unittest.TestCase):
     # Four packed quant loads plus four activation loads; only scale and d remain scalar.
     self.assertEqual(names.count("GLOBAL_LOAD_B128"), 8)
     self.assertEqual(names.count("GLOBAL_LOAD_B32"), 2)
+    self.assertEqual(names.count("V_FMA_MIXHI_F16"), 16)
+    self.assertNotIn("V_PACK_B32_F16", names)
     self.assertNotIn("SCRATCH_STORE_B32", names)
 
   def test_iq4_wmma_uses_wide_quant_load(self):
@@ -983,6 +985,8 @@ class TestAMDRenderer(unittest.TestCase):
     # One packed quant load plus four activation loads; the LUT and two-word header remain scalar.
     self.assertEqual(names.count("GLOBAL_LOAD_B128"), 5)
     self.assertEqual(names.count("GLOBAL_LOAD_B32"), 6)
+    self.assertEqual(names.count("V_FMA_MIXHI_F16"), 16)
+    self.assertNotIn("V_PACK_B32_F16", names)
     wide = [i for i,name in enumerate(names) if name == "GLOBAL_LOAD_B128"]
     self.assertLessEqual(wide[-1] - wide[0], 8)  # activations issue while the packed quant load is in flight
     self.assertLessEqual(names.count("V_MOV_B32_E32"), 8)  # accumulator fragments remain resident across the K loop
@@ -1243,6 +1247,19 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(len(mix), 2)
     self.assertEqual((mix[0].opsel, mix[0].opsel_hi, mix[0].opsel_hi2), (0, 0, 0))
     self.assertEqual((mix[1].opsel, mix[1].opsel_hi, mix[1].opsel_hi2), (1, 1, 0))
+
+  def test_mixed_f16_pack_writes_high_half_in_place(self):
+    a = _uop(Ops.INS, dtypes.float32, (UOp.const(2.0, dtypes.float32),), AMDOps.MOV, (Register("a", 261),))
+    scale = _uop(Ops.INS, dtypes.float32, (UOp.const(4.0, dtypes.float32),), AMDOps.MOV, (Register("scale", 263),))
+    bias = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32),), AMDOps.MOV, (Register("bias", 264),))
+    lo = _uop(Ops.INS, dtypes.float16, (a, scale, bias), AMDOps.FMA_TO_F16, (Register("lo", 266),))
+    hi = _uop(Ops.INS, dtypes.float16, (a, scale, bias), AMDOps.FMA_TO_F16, (Register("hi", 267),))
+    pack = _uop(Ops.INS, dtypes.float16, (lo, hi), AMDOps.PACK_F16, (Register("pack", 268),))
+    insts = list(_REN._insts_from_linear(UOp(Ops.LINEAR, src=(a, scale, bias, lo, hi, pack))))
+    mixlo = next(i for i in insts if getattr(i, "op_name", "") == "V_FMA_MIXLO_F16")
+    mixhi = next(i for i in insts if getattr(i, "op_name", "") == "V_FMA_MIXHI_F16")
+    self.assertEqual(mixlo.vdst, mixhi.vdst)
+    self.assertNotIn("V_PACK_B32_F16", [getattr(i, "op_name", "") for i in insts])
 
   def test_store_uses_destination_dtype(self):
     prg = _implicit_float_to_half_store_program()
