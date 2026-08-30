@@ -3286,6 +3286,15 @@ class AMDRenderer(ISARenderer):
     if size <= 3 or len(ast_uops) <= 32: return 0
     return None
 
+  def get_grouped_reduce_unroll(self, k) -> int|None:
+    # GROUPTOP returns before the generic reduce-unroll heuristic. LLVM subsequently vectorizes simple inner
+    # reduction loops, but direct ISA needs those adjacent iterations exposed while coalescing is still possible.
+    unroll = getenv("AMD_GROUPED_REDUCE_UNROLL", 8)
+    if not unroll or k.reduceop is None or k.reduceop.arg[0] is not Ops.ADD or len(k.ast.toposort()) > 32 or \
+       any(u.op is Ops.PARAM and u.dtype is dtypes.uint8 for u in k.ast.toposort()) or not k.unrollable_dims: return None
+    size = k.full_shape[k.unrollable_dims[-1]]
+    return unroll if isinstance(size, int) and size >= unroll and size % unroll == 0 else None
+
   def get_complex_matvec_rows(self, k) -> int:
     # Large packed-quant projections amortize the activation reads across two rows.
     # Below this threshold the extra code/register pressure only increases cold latency.

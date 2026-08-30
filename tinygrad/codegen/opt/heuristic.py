@@ -150,7 +150,14 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       except KernelOptError: pass
 
   # no more opt if we are grouping
-  if k.group_for_reduces: return k
+  if k.group_for_reduces:
+    # Native ISA renderers can expose a short vectorizable inner loop before lowering. Outsourced compilers
+    # normally recover this themselves with a loop-vectorization pass after the shared scheduler has run.
+    if (grouped_unroll:=getattr(k.ren, "get_grouped_reduce_unroll", None)) is not None and \
+       (unroll:=grouped_unroll(k)) is not None and k.unrollable_dims:
+      try: k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, unroll))
+      except KernelOptError: pass
+    return k
 
   # **** below this line need to be optional and benchmarked ****
 

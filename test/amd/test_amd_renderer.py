@@ -926,6 +926,13 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertNotIn("DS_STORE_B32", names)
     self.assertNotIn("S_BARRIER", names)
 
+  def test_simple_grouped_reduce_exposes_wide_loads(self):
+    ast = Tensor.empty(2048, device="AMD").square().mean().schedule_linear().src[-1].src[0]
+    names = _amd_inst_names(to_program(ast, _REN))
+    # Direct ISA has no late loop vectorizer: eight-way scheduler unrolling exposes two B128s per loop trip.
+    self.assertEqual(names.count("GLOBAL_LOAD_B128"), 2)
+    self.assertNotIn("GLOBAL_LOAD_B32", names)
+
   def test_q6_wmma_uses_wide_quant_loads(self):
     from tinygrad.llm.kernels.amd import _q6_linear_f16_wmma_kernel
     rows, cols, tokens = 8192, 2048, 16
