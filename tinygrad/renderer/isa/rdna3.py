@@ -2790,6 +2790,61 @@ def _fused_lds_pack_store(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|N
   deps = _reg_idxs(pack) | _reg_idxs(idx)
   return 8, pre + [r3.ds_store_b128(addr=addr, data0=data, **_ds_off(off0))], deps
 
+def _fused_mixed_dot4_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
+  """Wide-load an exact four-element f16*f32 dot while retaining its sequential FMA order."""
+  if i + 14 >= len(uops): return None
+  init, ctr, loop, cmp, exit_branch = uops[i:i+5]
+  if not (all(u.op is Ops.INS for u in (init, ctr, loop, cmp, exit_branch)) and
+          _iop(init) is AMDOps.MOV and init.dtype is dtypes.float32 and init.src and _is_zero_val(init.src[0]) and
+          _iop(ctr) is AMDOps.MOV and _const_int(ctr) == 0 and _iop(loop) is AMDOps.LABEL and
+          _iop(cmp) is AMDOps.CMP_GE and cmp.src[0] is ctr and _const_int(cmp.src[1]) == 4 and
+          _iop(exit_branch) is AMDOps.CBRANCH_SCC1 and exit_branch.src == (cmp,)): return None
+  cast_i = next((j for j in range(i+5, min(i+18, len(uops)))
+                 if uops[j].op is Ops.INS and _iop(uops[j]) is AMDOps.CAST and uops[j].dtype is dtypes.float32), None)
+  if cast_i is None or cast_i + 5 >= len(uops): return None
+  cast, fmac, copy, inc, back, out = uops[cast_i:cast_i+6]
+  if not (all(u.op is Ops.INS for u in (cast, fmac, copy, inc, back, out)) and
+          _iop(fmac) is AMDOps.FMAC and fmac.dtype is dtypes.float32 and fmac.src[0] is init and
+          _iop(copy) is AMDOps.MOV and copy.src == (fmac,) and greg(copy) == greg(init) and
+          _iop(inc) is AMDOps.ADD and inc.src[0] is ctr and _const_int(inc.src[1]) == 1 and greg(inc) == greg(ctr) and
+          _iop(back) is AMDOps.BRANCH and back.tag == loop.tag and _iop(out) is AMDOps.LABEL and exit_branch.tag == out.tag): return None
+  body = uops[i+5:cast_i]
+  if any(u.op is not Ops.INS or _iop(u) not in (AMDOps.ADD, AMDOps.LOAD) for u in body): return None
+  loads = [u for u in body if _iop(u) is AMDOps.LOAD]
+  if len(loads) != 2: return None
+  hload = next((u for u in loads if u.dtype is dtypes.float16), None)
+  fload = next((u for u in loads if u.dtype is dtypes.float32), None)
+  if hload is None or fload is None or cast.src != (hload,) or set(fmac.src[1:]) != {cast, fload}: return None
+  if any(_elem_count(u) != 1 or _mem_byte_off(u) != 0 for u in loads): return None
+  addr_deps = set(hload.src[1].toposort()) | set(fload.src[1].toposort())
+  if any(_iop(u) is AMDOps.ADD and (u not in addr_deps or u.dtype not in (dtypes.int32, dtypes.uint32)) for u in body): return None
+  def ctr_coeff(x:UOp) -> int|None:
+    if x is ctr: return 1
+    if ctr not in x.toposort(): return 0
+    if x.op is not Ops.INS or _iop(x) is not AMDOps.ADD: return None
+    a, b = ctr_coeff(x.src[0]), ctr_coeff(x.src[1])
+    return None if a is None or b is None else a+b
+  if ctr_coeff(hload.src[1]) != 1 or ctr_coeff(fload.src[1]) != 1: return None
+  used_vgprs = {r-256 for u in uops for r in _reg_idxs(u) if 256 <= r < 512}
+  free = next((r for r in range(5, 249) if not used_vgprs.intersection(range(r, r+6))), None)
+  if free is None: return None
+  emitted = list(insts_for_uop(init)) + list(insts_for_uop(ctr))
+  for u in body:
+    if u is hload:
+      pre, addr = _scaled_addr(TMP_VADDR, u.src[1], 2)
+      emitted += pre + [r3.global_load_b64(v[free:free+1], addr, saddr=_src(u.src[0]))]
+    elif u is fload:
+      pre, addr = _scaled_addr(TMP_VADDR, u.src[1], 4)
+      emitted += pre + [r3.global_load_b128(v[free+2:free+5], addr, saddr=_src(u.src[0]))]
+    else: emitted += insts_for_uop(u)
+  emitted.append(r3.s_waitcnt_vmcnt(sdst=NULL, simm16=0))
+  acc, half_first = _dst(init), fmac.src[1] is cast
+  for lane in range(4):
+    hreg, freg, hi = v[free+lane//2], v[free+2+lane], lane & 1
+    emitted.append(r3.v_fma_mix_f32(acc, hreg if half_first else freg, freg if half_first else hreg, acc,
+                                    opsel=hi * (1 if half_first else 2), opsel_hi=1 if half_first else 2, opsel_hi2=0))
+  return cast_i + 6 - i, emitted
+
 def _fused_lds_reduce_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
   """Vector-load an exact 16-value f32 LDS reduction while preserving its left-to-right sum order."""
   if i == 0 or i + 10 >= len(uops) or uops[i-1].op is not Ops.INS or _iop(uops[i-1]) is not AMDOps.BARRIER: return None
@@ -2872,6 +2927,13 @@ def insts_from_linear(lin:UOp):
   oi = 0
   while oi < len(scheduled):
     u = scheduled[oi]
+    if mask_depth == 0 and (fused_dot:=_fused_mixed_dot4_loop(scheduled, oi)) is not None:
+      count, emitted = fused_dot
+      flush("vm", "lgkm")
+      store_addr_cache.clear()
+      for inst in emitted: emit(inst)
+      oi += count
+      continue
     if mask_depth == 0 and (fused_reduce:=_fused_lds_reduce_loop(scheduled, oi)) is not None:
       count, emitted = fused_reduce
       flush("lgkm")

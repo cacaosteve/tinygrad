@@ -915,6 +915,17 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(names.count("DS_LOAD_B128"), 4)
     self.assertNotIn("DS_LOAD_B32", names)
 
+  def test_group16_mixed_dot4_uses_wide_global_loads(self):
+    with Context(BEAM=0, DEV="MOCKKFD+AMD:AMD"):
+      a = Tensor.empty(32, 64, device="AMD", dtype=dtypes.half)
+      b = Tensor.empty(32, 64, device="AMD", dtype=dtypes.float)
+      ast = (a*b).sum(axis=-1).schedule_linear().src[-1].src[0]
+    names = _amd_inst_names(to_program(ast, _REN))
+    self.assertEqual(names.count("GLOBAL_LOAD_B64"), 1)
+    self.assertEqual(names.count("GLOBAL_LOAD_B128"), 1)
+    self.assertEqual(names.count("V_FMA_MIX_F32"), 4)
+    self.assertNotIn("GLOBAL_LOAD_U16", names)
+
   def test_scheduler_skips_complex_reduce_unroll(self):
     with Context(BEAM=0):
       x = Tensor.empty(4096, 32, device="AMD")
@@ -3688,6 +3699,12 @@ class TestAMDRenderer(unittest.TestCase):
   def test_hardware_group16_final_reduce(self):
     inp = Tensor.ones(1_000_000, device="AMD").contiguous().realize()
     self.assertEqual(inp.sum().item(), 1_000_000.0)
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_group16_mixed_dot4(self):
+    a = Tensor.ones(32, 64, device="AMD", dtype=dtypes.half).contiguous().realize()
+    b = Tensor.full((32, 64), 2.0, device="AMD").contiguous().realize()
+    self.assertEqual((a*b).sum(axis=-1).tolist(), [128.0] * 32)
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_lds_smoke(self):
