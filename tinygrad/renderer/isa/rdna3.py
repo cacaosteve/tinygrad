@@ -1235,6 +1235,16 @@ def _scalarize_uniform_int_cast(y:UOp, x:UOp) -> UOp|None:
   return UOp(Ops.INS, src=(converted, _tconst(0, dtypes.int32).rtag()), arg=(AMDOps.COLLECT, x.dtype))
 
 def _scalarize_uniform_where(m:UOp, a:UOp, b:UOp, x:UOp) -> UOp|None:
+  # Normalize a boolean comparison of another comparison before SWHERE preserves the
+  # outer operands. Comparison results live in flags, so they cannot themselves be an
+  # SGPR operand to the scalar compare emitted for SWHERE.
+  if m.op in (Ops.CMPNE, Ops.CMPEQ):
+    for inner, c in ((m.src[0], m.src[1]), (m.src[1], m.src[0])):
+      if inner.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) and _const_value(c) in (False, True, 0, 1):
+        m = _cmp_bool_const(m, inner, c)
+        break
+  if m.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) and any(s.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) for s in m.src):
+    m = m.replace(src=tuple(_bool_flag(s) if s.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) else s for s in m.src))
   if not getenv("AMD_UNIFORM_INT", 1) or x.dtype not in dtypes.ints+(dtypes.bool,) or \
      not all(_is_uniform_expr(v) for v in (m, a, b)): return None
   # Comparisons carry their result in an implicit flag, so also keep their operands as
@@ -1248,7 +1258,7 @@ def _narrow_var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
   return UOp(op.op, src=(x.cast(wide), d.cast(wide))).cast(x.dtype)
 
 def _cmp_bool_const(x:UOp, m:UOp, c:UOp) -> UOp:
-  keep = (x.op is Ops.CMPNE and c.val is False) or (x.op is Ops.CMPEQ and c.val is True)
+  keep = (x.op is Ops.CMPNE and not bool(c.val)) or (x.op is Ops.CMPEQ and bool(c.val))
   return m if keep else m.where(_tconst(False, dtypes.bool), _tconst(True, dtypes.bool))
 
 def _bool_flag(x:UOp) -> UOp:
@@ -3372,6 +3382,11 @@ class AMDRenderer(ISARenderer):
     if buf.dtype == dtypes.uint8 and getenv("AMD_COALESCE_U8", 1): return [16, 8, 4]
     if buf.dtype == dtypes.float: return [4, 3, 2]
     return None
+
+  def coalesce_vec_alignment(self, buf):
+    # gfx11 wide global memory operations accept any dword-aligned address; they do not require
+    # natural vector alignment (for example, a B128 byte load may begin at byte offset four).
+    return max(4 // buf.dtype.itemsize, 1) if buf.addrspace is AddrSpace.GLOBAL else None
 
   def prepare_pre_regalloc(self, lst:list[UOp]) -> tuple[list[UOp], dict]:
     lst = _protect_loop_invariant_fmac(lst)

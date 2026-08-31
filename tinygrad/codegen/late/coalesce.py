@@ -117,6 +117,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       for su in u.src: uses[su].append(u)
   mem_ok = getattr(ctx, "coalesce_mem_ok", None)
   vec_lengths = getattr(ctx, "coalesce_vec_lengths", None)
+  vec_alignment = getattr(ctx, "coalesce_vec_alignment", None)
 
   # collect
   memory: defaultdict[tuple[Ops, UOp, UOp|str, UOp, object], dict[int, list[UOp]]] = defaultdict(dict)
@@ -143,7 +144,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
   replacements = {}
   for (op,buf,base,valid,ld_arg),offsets in memory.items():
     # allowed lengths (copied in)
-    lengths = []
+    lengths, alignment = [], 1
     must_divide = True
     if ctx is not None and ctx.target.device == "DSP":
       lengths, must_divide = [128,64,32,16,8,4], False
@@ -151,6 +152,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
     # Native ISAs use this when narrow vectors remain packed in registers.
     elif vec_lengths is not None and (L:=vec_lengths(buf, f4)) is not None:
       lengths = L
+      if vec_alignment is not None and (a:=vec_alignment(buf)) is not None: alignment, must_divide = a, False
     elif buf.dtype not in (dtypes.float, dtypes.half, dtypes.int, dtypes.uint, *dtypes.fp8s) and not is_image_shape(buf._shape):
       pass
     elif buf.addrspace == AddrSpace.REG:
@@ -164,7 +166,8 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
     for full_grp in grouped_offsets:
       while len(full_grp):
         offset = (base+full_grp[0]) if isinstance(base, UOp) else UOp.const(full_grp[0])
-        length = [l for l in lengths if l <= len(full_grp) and (not must_divide or offset.divides(l) is not None)][0]
+        length = [l for l in lengths if l <= len(full_grp) and (not must_divide or offset.divides(l) is not None) and
+                  (alignment == 1 or l*buf.dtype.itemsize < 4 or offset.divides(alignment) is not None)][0]
         grp = full_grp[:length]
         offset = offset.valid(valid) if valid is not None else offset
         idx = UOp(Ops.SHRINK, src=(buf, offset, UOp.const(len(grp)))) if len(grp) > 1 else buf.index(offset)

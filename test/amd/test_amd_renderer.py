@@ -198,6 +198,13 @@ def _copy_program(dtype):
   sink = out.index(idx).store(inp.index(idx).load()).sink(idx, arg=KernelInfo(name=f"amd_asm_copy_{dtype.name}"))
   return _to_prg(sink)
 
+def _offset_u8_vector_load_program(offset:int):
+  out = UOp.placeholder((16,), dtypes.uint8, 0)
+  inp = UOp.placeholder((64,), dtypes.uint8, 1)
+  idx = UOp.range(16, 0, AxisType.UPCAST)
+  sink = out.index(idx).store(inp.index(idx + offset).load()).sink(idx, arg=KernelInfo(name=f"amd_u8_offset_{offset}"))
+  return _to_prg(sink)
+
 def _where_program(dtype):
   out = UOp.placeholder((16,), dtype, 0)
   inp = UOp.placeholder((16,), dtype, 1)
@@ -499,6 +506,17 @@ def _uniform_max_program(dtype):
   idx = UOp.special(16, "lidx0")
   sink = out.index(idx).store(_uop(Ops.MAX, dtype, (a, b))).sink(idx, a, b,
     arg=KernelInfo(name=f"amd_asm_uniform_max_{dtype.name}"))
+  return _to_prg(sink)
+
+def _uniform_nested_compare_where_program():
+  out = UOp.placeholder((16,), dtypes.int32, 0)
+  value = UOp.param(1, dtypes.int32, (), vmin_vmax=(-2048, 2048), name="value", addrspace=AddrSpace.ALU)
+  idx = UOp.special(16, "lidx0")
+  inner0 = _uop(Ops.CMPLT, dtypes.bool, (value, UOp.const(0, dtypes.int32)))
+  inner1 = _uop(Ops.CMPLT, dtypes.bool, (value, UOp.const(1, dtypes.int32)))
+  gate = _uop(Ops.CMPNE, dtypes.bool, (inner0, inner1))
+  sink = out.index(idx).store(gate.where(value, UOp.const(0, dtypes.int32))).sink(
+    idx, value, arg=KernelInfo(name="amd_asm_uniform_nested_compare_where"))
   return _to_prg(sink)
 
 def _mulacc_program():
@@ -2435,6 +2453,15 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(inst_names.count("GLOBAL_LOAD_B96"), 2)
     self.assertEqual(inst_names.count("GLOBAL_STORE_B96"), 1)
 
+  def test_dword_aligned_u8_offset_uses_b128(self):
+    inst_names = _amd_inst_names(_offset_u8_vector_load_program(4))
+    self.assertEqual(inst_names.count("GLOBAL_LOAD_B128"), 1)
+
+  def test_sub_dword_u8_offset_stays_narrow_until_aligned(self):
+    inst_names = _amd_inst_names(_offset_u8_vector_load_program(1))
+    self.assertEqual(inst_names.count("GLOBAL_LOAD_U8"), 4)
+    self.assertNotIn("GLOBAL_LOAD_B128", inst_names)
+
   def test_uniform_packed_u8_uses_scalar_extracts(self):
     rows, cols = 16384, 2048
     qdata = Tensor.empty(rows * cols // 256 * 144, dtype=dtypes.uint8, device="AMD")
@@ -2966,6 +2993,12 @@ class TestAMDRenderer(unittest.TestCase):
         names = _amd_inst_names(_uniform_max_program(dtype))
         self.assertIn(inst, names)
         self.assertFalse(any(name.startswith("V_MAX_") for name in names))
+
+  def test_uniform_nested_compare_where_uses_salu(self):
+    prg = _uniform_nested_compare_where_program()
+    _check_elf(self, prg)
+    self.assertGreaterEqual(_lin_ops(prg).count(AMDOps.SWHERE), 3)
+    self.assertIn("S_CSELECT_B32", _amd_inst_names(prg))
 
   def test_mulacc_assembles(self):
     raw, fused = _mulacc_program(), _fused_mulacc_program()
@@ -3505,6 +3538,14 @@ class TestAMDRenderer(unittest.TestCase):
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_tensor_smoke(self):
     self.assertEqual((Tensor([1, 2, 3], device="AMD") * 2).tolist(), [2, 4, 6])
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_dword_aligned_u8_b128_load(self):
+    inp = Tensor(list(range(64)), dtype=dtypes.uint8, device="AMD").contiguous().realize()
+    out = Tensor.empty(16, dtype=dtypes.uint8, device="AMD").contiguous().realize()
+    bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _offset_u8_vector_load_program(4)
+    _amd_rt(prg)(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    self.assertEqual(out.tolist(), list(range(4, 20)))
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_large_elementwise_uses_launch_dims_smoke(self):
