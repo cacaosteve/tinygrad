@@ -43,6 +43,11 @@ z3_renderer = PatternMatcher([
   (UPat((Ops.LOAD, Ops.INDEX), dtypes.ints+(dtypes.weakint,), name="x"), lambda x,ctx:
     create_bounded(f"load{len(ctx[1])}", x.dtype.min, x.dtype.max, ctx[0])),
   (UPat((Ops.LOAD, Ops.INDEX), dtypes.bool), lambda ctx: (z3.Bool(f"load{len(ctx[1])}", ctx=ctx[0]), None)),
+  # Custom intrinsics are opaque to z3, but their result is still bounded by its dtype.
+  # Model them as independent values so masks and gates can establish safe addressing.
+  (UPat((Ops.CUSTOM, Ops.CUSTOMI), dtypes.ints+(dtypes.weakint,), name="x"), lambda x,ctx:
+    create_bounded(f"custom{len(ctx[1])}", x.dtype.min, x.dtype.max, ctx[0])),
+  (UPat((Ops.CUSTOM, Ops.CUSTOMI), dtypes.bool), lambda ctx: (z3.Bool(f"custom{len(ctx[1])}", ctx=ctx[0]), None)),
   # constants
   (UPat(Ops.CONST, arg=Invalid), lambda ctx: (z3.Int("Invalid", ctx=ctx[0]), None)),
   (UPat(Ops.CONST, dtypes.weakint, name="x"), lambda x,ctx: (z3.IntVal(x.val, ctx=ctx[0]), None)),

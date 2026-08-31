@@ -148,6 +148,12 @@ class TestValidateOOB(unittest.TestCase):
       ld0 = shrink.load().index(0)
       to_uops_list([buf1.index(ld0.valid((ld0 >= 0) & (ld0 < 64))).load()])
 
+  def test_custom_as_masked_index(self):
+    with Context(CHECK_OOB=1, SPEC=2):
+      buf = UOp.param(0, dtypes.int, 256)
+      opaque = UOp(Ops.CUSTOM, src=(UOp.const(0, dtypes.uint32),), arg=("opaque({})", dtypes.uint32))
+      to_uops_list([buf.index(opaque & 255).load()])
+
   def test_load_bool_as_mask(self):
     with Context(CHECK_OOB=1, SPEC=2):
       buf_bool = UOp.param(0, dtypes.bool, 16)
