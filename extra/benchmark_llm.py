@@ -1,4 +1,4 @@
-import argparse, time
+import argparse, json, time
 from tinygrad.helpers import profile_marker
 from tinygrad.llm.model import Transformer
 
@@ -10,6 +10,8 @@ if __name__ == "__main__":
   parser.add_argument("--decode-tokens", type=int, default=16, help="number of tokens to decode (default: %(default)s)")
   parser.add_argument("--chunk-size", type=int, default=32, help="chunk size for prefill (default: %(default)s)")
   parser.add_argument("--disable-custom-quant", action="store_true", help="use the generic quantized linear lowering")
+  parser.add_argument("--program-metrics", help="print captured prefill program metrics whose name contains this string")
+  parser.add_argument("--dump-machine", action="store_true", help="include decoded instructions with --program-metrics")
   args = parser.parse_args()
 
   if args.disable_custom_quant:
@@ -41,3 +43,8 @@ if __name__ == "__main__":
   et = time.perf_counter()
   print(f"decode {args.decode_tokens/(et-pt):.3f} tok/s output {output}", flush=True)
   profile_marker("decode end")
+
+  if args.program_metrics:
+    from bench_q6k_gemv import program_metrics
+    for metrics in program_metrics(model.prefill_jit, dump_machine=args.dump_machine):
+      if args.program_metrics in str(metrics["name"]): print(json.dumps(metrics, sort_keys=True, default=str))

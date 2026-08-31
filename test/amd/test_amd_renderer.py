@@ -465,6 +465,16 @@ def _positive_var_divmod_program(dtype=dtypes.int32):
                                          arg=KernelInfo(name=f"amd_asm_positive_var_divmod_{dtype.name}"))
   return _to_prg(sink)
 
+def _uniform_positive_var_divmod_program():
+  out_q, out_r = UOp.placeholder((256,), dtypes.uint32, 0), UOp.placeholder((256,), dtypes.uint32, 1)
+  value = UOp.param(2, dtypes.uint32, (), vmin_vmax=(0, dtypes.uint32.max), name="value", addrspace=AddrSpace.ALU)
+  div = UOp.param(3, dtypes.uint32, (), vmin_vmax=(1, dtypes.uint32.max), name="div", addrspace=AddrSpace.ALU)
+  idx = UOp.special(256, "lidx0")
+  q, r = _uop(Ops.CDIV, dtypes.uint32, (value, div)), _uop(Ops.CMOD, dtypes.uint32, (value, div))
+  sink = out_q.index(idx).store(q).sink(out_r.index(idx).store(r), idx, value, div,
+                                         arg=KernelInfo(name="amd_asm_uniform_positive_var_divmod"))
+  return _to_prg(sink)
+
 def _bounded_negative_divmod_program():
   out = UOp.placeholder((2,), dtypes.int32, 0)
   n = UOp.param(1, dtypes.int32, (), vmin_vmax=(1, 4127), name="n", addrspace=AddrSpace.ALU)
@@ -480,6 +490,15 @@ def _max_program(dtype):
   idx = UOp.special(16, "lidx0")
   sink = out.index(idx).store(_uop(Ops.MAX, dtype, (inp.index(idx).load(), UOp.const(7, dtype)))) \
             .sink(idx, arg=KernelInfo(name=f"amd_asm_max_{dtype.name}"))
+  return _to_prg(sink)
+
+def _uniform_max_program(dtype):
+  out = UOp.placeholder((16,), dtype, 0)
+  a = UOp.param(1, dtype, (), vmin_vmax=(dtype.min, dtype.max), name="a", addrspace=AddrSpace.ALU)
+  b = UOp.param(2, dtype, (), vmin_vmax=(dtype.min, dtype.max), name="b", addrspace=AddrSpace.ALU)
+  idx = UOp.special(16, "lidx0")
+  sink = out.index(idx).store(_uop(Ops.MAX, dtype, (a, b))).sink(idx, a, b,
+    arg=KernelInfo(name=f"amd_asm_uniform_max_{dtype.name}"))
   return _to_prg(sink)
 
 def _mulacc_program():
@@ -2921,6 +2940,15 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertIn(AMDOps.RECIPROCAL, linear_ops)
     self.assertIn(AMDOps.MULHI, linear_ops)
 
+  def test_uniform_positive_var_divmod_returns_to_salu(self):
+    prg = _uniform_positive_var_divmod_program()
+    _check_elf(self, prg)
+    self.assertIn(AMDOps.COLLECT, _lin_ops(prg))
+    self.assertIn(AMDOps.SWHERE, _lin_ops(prg))
+    names = _amd_inst_names(prg)
+    for name in ("V_READFIRSTLANE_B32_E32", "S_MUL_HI_U32", "S_CSELECT_B32", "S_SUB_U32"): self.assertIn(name, names)
+    self.assertNotIn("V_MUL_HI_U32", names)
+
   def test_bounded_negative_divmod_uses_range_proof(self):
     prg = _bounded_negative_divmod_program()
     _check_elf(self, prg)
@@ -2931,6 +2959,13 @@ class TestAMDRenderer(unittest.TestCase):
     for dtype in (dtypes.uint32, dtypes.int32, dtypes.float32):
       with self.subTest(dtype=dtype):
         _check_asm(self, _max_program(dtype), AMDOps.MAX)
+
+  def test_uniform_integer_max_uses_salu(self):
+    for dtype, inst in ((dtypes.uint32, "S_MAX_U32"), (dtypes.int32, "S_MAX_I32")):
+      with self.subTest(dtype=dtype):
+        names = _amd_inst_names(_uniform_max_program(dtype))
+        self.assertIn(inst, names)
+        self.assertFalse(any(name.startswith("V_MAX_") for name in names))
 
   def test_mulacc_assembles(self):
     raw, fused = _mulacc_program(), _fused_mulacc_program()
@@ -3351,6 +3386,8 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertFalse(any(u.op in (Ops.INDEX, Ops.IF, Ops.ENDIF, Ops.STORE) for u in lin.src))
     masked = [_iop(u) for u in lin.src if u.op is Ops.INS and _iop(u) in (AMDOps.IF_MASK, AMDOps.STORE, AMDOps.END_MASK)]
     self.assertEqual(masked, [AMDOps.IF_MASK, AMDOps.STORE, AMDOps.END_MASK])
+    exec_mask = next(u for u in lin.src if u.op is Ops.INS and _iop(u) is AMDOps.IF_MASK)
+    self.assertLess(greg(exec_mask).index, 102)
     inst_names = [getattr(i, "op_name", "") for i in _REN._insts_from_linear(lin)]
     self.assertLess(inst_names.index("S_AND_SAVEEXEC_B64"), inst_names.index("V_CNDMASK_B32_E32"))
     self.assertLess(inst_names.index("V_CNDMASK_B32_E32"), inst_names.index("GLOBAL_STORE_B32"))
@@ -3626,6 +3663,18 @@ class TestAMDRenderer(unittest.TestCase):
       values = range(base, base+256)
       self.assertEqual(out_q.tolist(), [x // div for x in values])
       self.assertEqual(out_r.tolist(), [x % div for x in values])
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_uniform_positive_var_divmod(self):
+    out_q = Tensor.empty(256, dtype=dtypes.uint32, device="AMD").contiguous().realize()
+    out_r = Tensor.empty(256, dtype=dtypes.uint32, device="AMD").contiguous().realize()
+    bufs, prg = [x._buffer().ensure_allocated() for x in (out_q, out_r)], _uniform_positive_var_divmod_program()
+    rt = _amd_rt(prg)
+    for value, div in ((0, 3), (65521, 257), (2**31, 65537), (2**32-1, 2**32-1)):
+      rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size,
+         vals=(value, div), wait=True)
+      self.assertEqual(out_q.tolist(), [value // div] * 256)
+      self.assertEqual(out_r.tolist(), [value % div] * 256)
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_bounded_negative_divmod_smoke(self):

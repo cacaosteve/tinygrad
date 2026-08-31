@@ -47,10 +47,9 @@ LLOAD_VGPR = VGPR[:118]        # v5..v122
 PACK_F16_VGPR = VGPR[185:244]  # v190..v248 (default)
 PACK_F16_VGPR_UP16 = VGPR[59:121]  # v64..v125 — below ACC when WMMA=16
 LLOAD_VGPR_UP16 = VGPR[:59]        # v5..v63
-# v3/v4: per-instruction VGPR scratch; s102:103: long branch; s104:105: EXEC save/restore or SALU compare scratch.
+# v3/v4: per-instruction VGPR scratch; s102:103: long branch; s104:105: SALU compare scratch.
 TMP_VDATA, TMP_VADDR = v[3], v[4]
 TMP_BRANCH = s[102:103]
-TMP_EXEC = s[104:105]
 TMP_SDATA0, TMP_SDATA1 = s[104], s[105]
 
 def _allow_upcast16() -> bool:
@@ -91,6 +90,7 @@ class AMDOps(FastEnum):
   CMPNE = auto()
   CMPEQ = auto()
   WHERE = auto()
+  SWHERE = auto()
   LOAD = auto()
   STORE = auto()
   ATOMIC_ADD = auto()
@@ -577,6 +577,16 @@ def _compute_amd_skip(uops:list[UOp]) -> set[UOp]:
     for src in u.src:
       if src in identity_loads and u not in skip: identity_loads.discard(src)
   skip |= identity_loads
+  # SWHERE rematerializes a wave-uniform comparison with SCC. If that is the
+  # comparison's only purpose, suppress its earlier VCC form (and the SGPR→VGPR
+  # materialization it would otherwise emit).
+  users: dict[UOp, list[UOp]] = {}
+  for u in uops:
+    for src in u.src: users.setdefault(src, []).append(u)
+  for u in uops:
+    if u.op is Ops.INS and _iop(u) in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ) and \
+       (us:=users.get(u)) and all(x.op is Ops.INS and _iop(x) is AMDOps.SWHERE and x.src[0] is u for x in us):
+      skip.add(u)
   return skip
 
 def _d16_hi_lo_map(uops:list[UOp]) -> dict[UOp, UOp]:
@@ -1175,11 +1185,12 @@ def _uniform_byte_extract(ctx:IselContext, x:UOp) -> UOp|None:
 
 def _wants_uniform_sgpr(x:UOp) -> bool:
   if _iop(x) is AMDOps.COLLECT: return True
+  if _iop(x) is AMDOps.SWHERE: return True
   if _iop(x) is AMDOps.EXTRACT and x.src and x.src[0].op is Ops.INS and _iop(x.src[0]) is AMDOps.LOAD and \
      x.src[0].dtype is dtypes.uint8 and all(_is_scalar_source(s) for s in x.src[0].src):
     return True
   if _iop(x) is AMDOps.CAST and (not x.src or x.src[0].dtype not in dtypes.ints): return False
-  return x.dtype in dtypes.ints and _iop(x) in (AMDOps.MOV, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.CAST,
+  return x.dtype in dtypes.ints and _iop(x) in (AMDOps.MOV, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.MULHI, AMDOps.MAX, AMDOps.CAST,
     AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.BFE, AMDOps.LSHL_OR, AMDOps.LSHL_ADD) and \
     all(_is_scalar_source(s) for s in x.src)
 
@@ -1211,7 +1222,13 @@ def _alloc_vregs(ctx:IselContext, x:UOp, sgpr_pool:tuple[Register, ...], vgpr_po
       return x.replace(tag=(ctx.vreg(vgpr_pool),))
     if (base := _pack_f16_identity_load(x)) is not None and isinstance(base.tag, tuple):
       return x.replace(tag=base.tag)
-    return x.replace(tag=(ctx.vreg(PACK_F16_VGPR_UP16 if _allow_upcast16() else PACK_F16_VGPR),))
+    # The disjoint high band protects live LDS/WMMA fragments. Generic kernels have
+    # no such fixed-register overlap, and forcing a late output pack to v64+ can cut
+    # occupancy even when only a few low VGPRs remain live.
+    has_wmma = ctx.scratch.setdefault("has_wmma", any(u.op is Ops.WMMA or
+      (u.op is Ops.INS and _iop(u) is AMDOps.WMMA) for u in ctx.uses))
+    pack_pool = (PACK_F16_VGPR_UP16 if _allow_upcast16() else PACK_F16_VGPR) if has_wmma else vgpr_pool
+    return x.replace(tag=(ctx.vreg(pack_pool),))
   if iop is AMDOps.LLOAD:
     return x.replace(tag=(ctx.vreg(LLOAD_VGPR_UP16 if _allow_upcast16() else LLOAD_VGPR),))
   if getenv("AMD_UNIFORM_INT", 1) and _wants_uniform_sgpr(x): return x.replace(tag=(ctx.vreg(scalar_pool),))
@@ -1290,6 +1307,36 @@ def _var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
   q, r = _u32_divmod(ax, ad, max(abs(int(x.vmin)), abs(int(x.vmax))).bit_length())
   q, r = q.cast(dtypes.int32), r.cast(dtypes.int32)
   return xneg.where(zero - r, r) if op.op is Ops.CMOD else (xneg ^ dneg).where(zero - q, q)
+
+_UNIFORM_GRAPH_OPS = (Ops.CAST, Ops.BITCAST, Ops.NOOP, Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.CDIV, Ops.CMOD,
+                      Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.AND, Ops.OR, Ops.XOR, Ops.CMPLT, Ops.CMPNE,
+                      Ops.CMPEQ, Ops.WHERE)
+_UNIFORM_INS_OPS = (AMDOps.MOV, AMDOps.COLLECT, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.MULHI, AMDOps.MAX,
+                    AMDOps.CAST, AMDOps.RECIPROCAL, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR,
+                    AMDOps.XOR, AMDOps.SWHERE)
+
+def _is_uniform_expr(x:UOp) -> bool:
+  """True for values that are identical in every lane of a wave."""
+  if _unwrap_const(x) is not None: return True
+  if x.op is Ops.PARAM: return x.arg.addrspace is AddrSpace.ALU
+  if x.op is Ops.SPECIAL: return x.arg.startswith("gidx")
+  if x.op is Ops.INS: return _iop(x) in _UNIFORM_INS_OPS and all(_is_uniform_expr(s) for s in x.src)
+  return x.op in _UNIFORM_GRAPH_OPS and all(_is_uniform_expr(s) for s in x.src)
+
+def _scalarize_uniform_int_cast(y:UOp, x:UOp) -> UOp|None:
+  # Float reciprocal/conversion instructions are vector-only on RDNA3. If their input is
+  # wave-uniform, collect the converted result once so the integer correction stays SALU.
+  if not getenv("AMD_UNIFORM_INT", 1) or not _is_uniform_expr(y): return None
+  converted = UOp(Ops.INS, src=(y,), arg=(AMDOps.CAST, x.dtype))
+  return UOp(Ops.INS, src=(converted, _tconst(0, dtypes.int32).rtag()), arg=(AMDOps.COLLECT, x.dtype))
+
+def _scalarize_uniform_where(m:UOp, a:UOp, b:UOp, x:UOp) -> UOp|None:
+  if not getenv("AMD_UNIFORM_INT", 1) or x.dtype not in dtypes.ints+(dtypes.bool,) or \
+     not all(_is_uniform_expr(v) for v in (m, a, b)): return None
+  # Comparisons carry their result in an implicit flag, so also keep their operands as
+  # direct dependencies. Otherwise regalloc may reuse an operand before SWHERE rematerializes it.
+  return UOp(Ops.INS, src=(m, a, b, *m.src) if m.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) else (m, a, b),
+             arg=(AMDOps.SWHERE, x.dtype))
 
 def _narrow_var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
   if x.dtype != d.dtype or x.dtype not in dtypes.ints or x.dtype.itemsize >= 4: return None
@@ -1396,7 +1443,11 @@ def _fuse_signed_byte_load_cast(x:UOp, y:UOp) -> UOp|None:
   if len(y.src) != 1 or (ld := y.src[0]).op is not Ops.LOAD or ld.dtype is not dtypes.uint8: return None
   return ld.bitcast(dtypes.int8).cast(x.dtype)
 
+def _fuse_negated_add(a:UOp, b:UOp, x:UOp) -> UOp:
+  return x.ins(AMDOps.SUB, src=(a, b))
+
 pre_isel_matcher = PatternMatcher([
+  ((UPat.var("a", dtypes.ints) + UPat.var("b", dtypes.ints) * -1).named("x"), _fuse_negated_add),
   (UPat(Ops.CAST, dtype=dtypes.float32,
    src=(UPat(Ops.AND, dtype=dtypes.uint32,
      src=(UPat(Ops.SHR, src=(UPat.var("value"), UPat.var("shift"))), UPat.cvar().cast(name="mask"))),),
@@ -1425,6 +1476,8 @@ pre_isel_matcher = PatternMatcher([
   (UPat((Ops.CDIV, Ops.CMOD), src=(UPat.var("x", dtypes.ints), UPat.var("d", dtypes.ints)), name="op"), _narrow_var_divmod),
   (UPat((Ops.CDIV, Ops.CMOD), src=(UPat.var("x", (dtypes.int32, dtypes.uint32)), UPat.var("d", (dtypes.int32, dtypes.uint32))), name="op"),
    _var_divmod),
+  (UPat.var("y", dtypes.float32).cast(dtypes.ints, name="x"), _scalarize_uniform_int_cast),
+  (UPat.var("m", dtypes.bool).where(UPat.var("a"), UPat.var("b")).named("x"), _scalarize_uniform_where),
   (UPat((Ops.CMPNE, Ops.CMPEQ),
    src=(UPat((Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ), name="m"), UPat.cvar("c").cast(dtypes.bool, name="c")), name="x"),
    _cmp_bool_const),
@@ -1582,7 +1635,10 @@ def _lower_late_store(ctx, x:UOp, a:UOp, val:UOp, gate:UOp|None=None) -> tuple[U
   if x in _amd_skip(ctx): return x, []
   st = _store_ins(x, _store_addr(a), val)
   if gate is None: return st, [st]
-  mif = UOp(Ops.INS, src=(gate,), arg=(AMDOps.IF_MASK, dtypes.void))
+  n = ctx.scratch.get("exec_mask_n", 0)
+  ctx.scratch["exec_mask_n"] = n + 1
+  mif = UOp(Ops.INS, src=(gate,), arg=(AMDOps.IF_MASK, dtypes.uint64),
+            tag=(Register(f"exec_mask{n}", 0, _cons=SGPR),))
   remat = _vcc_rematerialize(ctx, mif)
   pre = remat[1] if remat is not None else [mif]
   mend = UOp(Ops.INS, src=(mif,), arg=(AMDOps.END_MASK, dtypes.void))
@@ -1646,7 +1702,10 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
   return None
 
 def _lower_late_if(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
-  mif = UOp(Ops.INS, src=(x.src[0],), arg=(AMDOps.IF_MASK, dtypes.void))
+  n = ctx.scratch.get("exec_mask_n", 0)
+  ctx.scratch["exec_mask_n"] = n + 1
+  mif = UOp(Ops.INS, src=(x.src[0],), arg=(AMDOps.IF_MASK, dtypes.uint64),
+            tag=(Register(f"exec_mask{n}", 0, _cons=SGPR),))
   remat = _vcc_rematerialize(ctx, mif)
   return remat if remat is not None else (mif, [mif])
 
@@ -1719,6 +1778,9 @@ def _alu2(u:UOp):
 def _max(u:UOp):
   d = _dst(u)
   sc = u.dtype
+  if greg(u).index < 256:
+    scalar_max = r3.s_max_i32 if sc in dtypes.sints else r3.s_max_u32
+    return [scalar_max(d, _src(u.src[0]), _src(u.src[1]))]
   pre, a = _vgpr_data(TMP_VDATA, u.src[0])
   b = _src(u.src[1])
   if sc is dtypes.float16: return pre + [r3.v_max_f16_e32(d, a, b)]
@@ -1749,6 +1811,17 @@ def _cmp_eq(u:UOp):
   if isinstance(a, Reg) and a.offset >= 256: return [cmp(b, a)]
   pre, b = _vgpr_data(TMP_VDATA, u.src[1])
   return pre + [cmp(a, b)]
+
+def _scalar_condition(m:UOp, operands:tuple[UOp, ...]=()) -> list:
+  if m.op is Ops.INS and _iop(m) in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ) and all(_is_scalar_source(s) for s in m.src):
+    cmp_src = operands if len(operands) == 2 else m.src
+    a, b, sc = _src(cmp_src[0]), _src(cmp_src[1]), cmp_src[0].dtype
+    if _iop(m) is AMDOps.CMPLT: cmp = r3.s_cmp_lt_i32 if sc in dtypes.sints else r3.s_cmp_lt_u32
+    elif _iop(m) is AMDOps.CMPNE: cmp = r3.s_cmp_lg_i32 if sc in dtypes.sints else r3.s_cmp_lg_u32
+    else: cmp = r3.s_cmp_eq_i32 if sc in dtypes.sints else r3.s_cmp_eq_u32
+    return [cmp(a, b)]
+  pre, gate = _sgpr_data(TMP_SDATA0, m)
+  return pre + [r3.s_cmp_lg_u32(gate, 0)]
 
 def _commutative_vop2(u:UOp, inst) -> list:
   a, b = _src(u.src[0]), _src(u.src[1])
@@ -1853,7 +1926,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
     case AMDOps.COLLECT:
       if (lane:=_const_int(u.src[1])) is None: raise CompileError("non-constant collect lane")
       if not isinstance(greg(u.src[0]), Register): raise CompileError(f"expected vec reg src {u}")
-      return [r3.v_readfirstlane_b32_e32(_dst(u), _reg_lane(greg(u.src[0]), lane))]
+      return [r3.v_readfirstlane_b32_e32(_dst(u), _reg_lane(greg(u.src[0]), lane)), r3.s_delay_alu(1)]
     case AMDOps.EXTRACT:
       if (lane:=_const_int(u.src[1])) is None: raise CompileError("non-constant extract lane")
       src = u.src[0]
@@ -1988,6 +2061,9 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
     case AMDOps.WHERE:
       pre, true_val = _vgpr_data(TMP_VDATA, u.src[1])
       return pre + [r3.v_cndmask_b32_e32(_dst(u), _src(u.src[2]), true_val)]
+    case AMDOps.SWHERE:
+      return _scalar_condition(u.src[0], u.src[3:5]) + \
+        [r3.s_delay_alu(9), r3.s_cselect_b32(_dst(u), _src(u.src[1]), _src(u.src[2]))]
     case AMDOps.LOAD:
       if (lo := (d16_hi_lo or {}).get(u)) is not None:
         # Fused hi: merge into lo VGPR. data=vdst required (unset DATA → v0).
@@ -2152,11 +2228,11 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       return pre0 + pre1 + [r3.s_cmp_ge_u32(a, b)]
     case AMDOps.IF_MASK:
       if u.src[0].op is Ops.INS and _iop(u.src[0]) in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ):
-        return [r3.s_and_saveexec_b64(TMP_EXEC, VCC)]
+        return [r3.s_and_saveexec_b64(_dst(u), VCC)]
       pre, gate = _vgpr_data(TMP_VDATA, u.src[0])
-      return pre + [r3.v_cmp_ne_u32_e32(0, gate), r3.s_and_saveexec_b64(TMP_EXEC, VCC)]
+      return pre + [r3.v_cmp_ne_u32_e32(0, gate), r3.s_and_saveexec_b64(_dst(u), VCC)]
     case AMDOps.END_MASK:
-      return [r3.s_mov_b64(EXEC, TMP_EXEC)]
+      return [r3.s_mov_b64(EXEC, _src(u.src[0]))]
   raise CompileError(f"cannot encode {_iop(u)}")
 
 def _hoist_lloads_before_extracts(ops:list[UOp]) -> list[UOp]:
