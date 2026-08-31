@@ -535,7 +535,8 @@ pm_to_program = PatternMatcher([
   (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR), UPat(Ops.SOURCE, name="source")), name="prg"), do_compile),
 ])
 
-@rewrite_group(name=lambda ast,renderer,ret,**_: TracingKey((k:=ret.src[0].arg).name,(k.function_name, ast, ret.key),ret=renderer), replay=True)
+@rewrite_group(name=lambda ast,renderer,ret,**_: TracingKey(
+  (k:=ret.src[0].arg).name, (k.function_name, ast, ret.key, ret.program_key), ret=renderer), replay=True)
 @Context(ALLOW_DEVICE_USAGE=0)
 def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   """
@@ -617,7 +618,8 @@ def _program_cache_env_names() -> tuple[str, ...]:
   return tuple(sorted(names - {"COMPILE_TIMING"}))
 
 def to_program_disk_key(ast:UOp, renderer:Renderer) -> str|None:
-  if not CCACHE or not getattr(renderer, "disk_program_cache", False): return None
+  # VIZ must execute the compilation pipeline so every program and rewrite is recorded.
+  if not CCACHE or VIZ or not getattr(renderer, "disk_program_cache", False): return None
   env = tuple((name, os.environ[name]) for name in _program_cache_env_names() if name in os.environ)
   key = (to_program_key(ast, renderer), _program_source_fingerprint(), env, sys.version_info[:2])
   return hashlib.sha256(pickle.dumps(key, protocol=pickle.HIGHEST_PROTOCOL)).hexdigest()
