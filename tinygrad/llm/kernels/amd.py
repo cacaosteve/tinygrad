@@ -213,6 +213,10 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
 @functools.cache
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
   group_count = in_features // Q8_GROUP_SIZE
+  def load_xwords(token:UOp, group:UOp) -> tuple[UOp, ...]:
+    # two u32×4 loads → B128 under direct ISA (u32×8 still scalarizes)
+    halves = (_amd_load(xq[token, group, 0], 4), _amd_load(xq[token, group, 4], 4))
+    return tuple(halves[i // 4][i % 4] for i in range(8))
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
     block, subgroup = group // 8, group % 8
     if ggml_type in (Q4_K, Q5_K):
@@ -221,7 +225,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
       # vectorize the 8 packed-weight words and (for Q5_K) the 32-byte high-bit bitmap
       qs_pair = (_amd_load(raw[qs_base], 4), _amd_load(raw[qs_base+4], 4))
       if ggml_type == Q5_K: qh_pair = (_amd_load(raw[base+4], 4), _amd_load(raw[base+8], 4))
-      xwords = _amd_load(xq[token, group, 0], 8)
+      xwords = load_xwords(token, group)
       for word_idx in range(8):
         word = (qs_pair[word_idx//4][word_idx%4] >> ((subgroup&1)*4).cast(dtypes.uint32)) & 0x0f0f0f0f
         if ggml_type == Q5_K: word |= ((qh_pair[word_idx//4][word_idx%4] >> subgroup.cast(dtypes.uint32)) & 0x01010101) << 4
@@ -232,7 +236,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
     if ggml_type == IQ4_XS:
       base = (output * in_features//GGML_BLOCK_SIZE + block) * IQ4_WORDS
       dot = UOp.const(0, dtypes.int32)
-      xwords = _amd_load(xq[token, group, 0], 8)
+      xwords = load_xwords(token, group)
       for word_idx in range(8):
         packed = _amd_load(raw[base + 2 + subgroup*4 + word_idx%4])
         dot = _amd_dp4a(_iq4_bytes(packed, 4*(word_idx//4)), xwords[word_idx], dot)
@@ -243,7 +247,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
     # Issue packed-weight VMEM first so the decode scheduler can burst raw reads before activations/scales.
     lows = tuple(_amd_load(raw[base + (subgroup//4)*16 + (subgroup%2)*8 + half*4], 4) for half in range(2))
     highs = tuple(_amd_load(raw[base + 32 + (subgroup//4)*8 + half*4], 4) for half in range(2))
-    xwords = _amd_load(xq[token, group, 0], 8)
+    xwords = load_xwords(token, group)
     dots = [UOp.const(0, dtypes.int32)] * 2
     for word_idx in range(8):
       within = (subgroup*32 + word_idx*4)%128

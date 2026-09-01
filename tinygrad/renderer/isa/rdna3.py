@@ -307,6 +307,9 @@ def _mem_load(kind:int, dt:DType, n:int=1):
       if nbytes == 4: return (r3.global_load_b32, r3.scratch_load_b32, r3.ds_load_b32)[kind]
       if kind != 1 and nbytes in _WIDE_LOAD: return _WIDE_LOAD[nbytes][0 if kind == 0 else 1]
       return None
+    if dt in (dtypes.int32, dtypes.uint32):
+      wide_ops = _WIDE_LOAD.get(nbytes)
+      return None if wide_ops is None else wide_ops[0 if kind == 0 else 1]
     if dt is not dtypes.float32: return None
     wide_ops = _WIDE_LOAD.get(nbytes)
     return None if wide_ops is None else wide_ops[0 if kind == 0 else 1]
@@ -2579,10 +2582,10 @@ def _hoist_gated_fmac_loads(ops:list[UOp]) -> list[UOp]:
 
 def _vmem_schedulable_load(u:UOp) -> bool:
   slots = _reg_slots(u)
-  # half×4 B64 (_amd_load SHRINK×4): independent addr+dest like scalar; must not bail whole-kernel schedule.
+  # half×4 B64 and packed u32×4 B128 (_amd_load SHRINK×4): independent addr+dest like scalar;
+  # must not bail whole-kernel schedule (Q6 decode / flash).
   return slots == 1 or (u.dtype is dtypes.half and slots == 2) or \
-    (u.dtype in (dtypes.uint8, dtypes.float32) and slots <= 4) or \
-    (u.dtype is dtypes.uint32 and slots == 4 and _is_byte_addr_load(u))
+    (u.dtype in (dtypes.uint8, dtypes.float32, dtypes.uint32, dtypes.int32) and slots <= 4)
 
 def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:bool|None=None) -> list[UOp]:
   """Hoist independent global reads inside conservative straight-line segments.
@@ -2613,7 +2616,7 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
     # VGPRs, so they can participate. Other wide/d16 loads retain emitter temp constraints.
     return _iop(u) is not AMDOps.LOAD or _vmem_schedulable_load(u) or \
       (schedule_wmma_segments and u.dtype is dtypes.uint32 and _reg_slots(u) == 4) or \
-      (schedule_decode_segments and u.dtype in (dtypes.uint, dtypes.uint32) and _reg_slots(u) == 1)
+      (schedule_decode_segments and u.dtype in (dtypes.uint, dtypes.uint32) and _reg_slots(u) <= 4)
 
   def schedule(segment:list[UOp]) -> list[UOp]:
     loads = [i for i,u in enumerate(segment) if _iop(u) is AMDOps.LOAD]

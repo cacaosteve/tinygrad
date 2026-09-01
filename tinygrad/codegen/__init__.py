@@ -135,6 +135,9 @@ def do_devectorize(b:UOp):
   if b.shape == (): return None
   # flash _amd_load half×4 must stay packed; devectorizing first leaves scalar u16 paths isel widens poorly.
   if b.op is Ops.LOAD and b.dtype is dtypes.half and len(b.src) == 1 and b.src[0].op is Ops.SHRINK: return None
+  # quant _amd_load u32×4 must stay packed for B128 isel; u32×8 activations still devectorize.
+  if b.op is Ops.LOAD and b.dtype is dtypes.uint32 and len(b.src) == 1 and b.src[0].op is Ops.SHRINK and \
+      len(b.src[0].src) > 2 and b.src[0].src[2].op is Ops.CONST and b.src[0].src[2].val == 4: return None
   # broadcasting needs to be already unpacked, Invalid matches any dtype and shape
   if not all(x.shape == b.shape or x.base.is_invalid for x in b.src): return None
   src = []

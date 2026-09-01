@@ -1028,8 +1028,9 @@ class TestAMDRenderer(unittest.TestCase):
     xs = UOp.placeholder((1, in_features // 32, 2), dtypes.float32, 4)
     prg = _to_prg(_quant_decode_kernel(out, raw, xq, xd, xs, out_features, in_features, Q6_K))
     names = _amd_inst_names(prg)
-    self.assertGreaterEqual(names.count("S_CLAUSE"), 2)
-    self.assertLessEqual(names.count("S_WAITCNT_VMCNT"), 20)
+    self.assertGreaterEqual(names.count("GLOBAL_LOAD_B128"), 6)
+    self.assertLessEqual(names.count("GLOBAL_LOAD_B32"), 5)
+    self.assertLessEqual(names.count("S_WAITCNT_VMCNT"), 10)
 
   def test_q6_decode_hoists_and_fuses_kernargs(self):
     out_features, in_features, chunks = 8192, 2048, 4
