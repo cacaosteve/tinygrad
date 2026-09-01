@@ -2131,6 +2131,24 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       return [r3.s_mov_b64(EXEC, _src(u.src[0]))]
   raise CompileError(f"cannot encode {_iop(u)}")
 
+def _hoist_kernargs(ops:list[UOp]) -> list[UOp]:
+  """Issue all KERNARG SMEM reads early so one lgkmcnt covers them (HIP s_load_b256 pattern).
+
+  Late per-buffer s_load+wait serializes decode epilogues (xd/xs). Hoisting before SGPR
+  allocation also keeps pointer pairs contiguous for emit-time B128/B256 fusion.
+  """
+  if not getenv("AMD_HOIST_KERNARG", 1): return ops
+  idxs = [i for i,u in enumerate(ops) if u.op is Ops.INS and _iop(u) is AMDOps.KERNARG]
+  if len(idxs) < 2: return ops
+  kernarg_set = {ops[i] for i in idxs}
+  kernargs = sorted(kernarg_set, key=lambda u: _const_int(u.src[0]) or 0)
+  # Keep the SPECIAL/gidx setup prefix; splice sorted kernargs at the first original KERNARG.
+  insert_at = idxs[0]
+  rest = [u for i,u in enumerate(ops) if u not in kernarg_set]
+  # rest is shorter; map insert_at to the corresponding prefix length
+  prefix_len = sum(1 for i in range(insert_at) if ops[i] not in kernarg_set)
+  return rest[:prefix_len] + kernargs + rest[prefix_len:]
+
 def _hoist_lloads_before_extracts(ops:list[UOp]) -> list[UOp]:
   # Hand kernel: issue all ds_loads, one lgkmcnt, then use. Linearize emits LLOAD+EXTRACT pairs;
   # hoist LLOADs in each streak so the scoreboard waits once for the batch.
@@ -2692,6 +2710,36 @@ def _clauseable_scalar_vmem_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
 def _clauseable_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   return _clauseable_scalar_vmem_gload(u, skip, mask_depth) and u.dtype is dtypes.half
 
+def _fuse_kernarg_smem_loads(scheduled:list[UOp], oi:int, skip:set[UOp], mask_depth:int) -> tuple[int, list, list[UOp]]|None:
+  """Fuse contiguous ulong KERNARGs into s_load_b128/b256 when SGPR dests are contiguous."""
+  if mask_depth or not getenv("AMD_FUSE_KERNARG", 1) or oi >= len(scheduled): return None
+  u = scheduled[oi]
+  if u in skip or u.op is not Ops.INS or _iop(u) is not AMDOps.KERNARG or u.dtype.itemsize != 8: return None
+  if not isinstance(greg(u), Register) or (base_off:=_const_int(u.src[0])) is None: return None
+  group = [u]
+  j = oi + 1
+  while j < len(scheduled) and len(group) < 4:
+    v = scheduled[j]
+    if v in skip or v.op is not Ops.INS or _iop(v) is not AMDOps.KERNARG or v.dtype.itemsize != 8: break
+    prev, prev_off = group[-1], _const_int(group[-1].src[0])
+    off = _const_int(v.src[0])
+    if prev_off is None or off is None or off != prev_off + 8: break
+    if not isinstance(greg(prev), Register) or not isinstance(greg(v), Register): break
+    if greg(v).index != greg(prev).index + 2: break
+    group.append(v)
+    j += 1
+  if len(group) < 2: return None
+  base = greg(group[0]).index
+  # SMEM wide loads require destination SGPR alignment to the transfer width.
+  if len(group) >= 4 and base % 8 == 0: n = 4
+  elif base % 4 == 0: n = 2
+  else: return None
+  group = group[:n]
+  sdata = _reg_to_amd(greg(group[0]), n * 2)
+  load = r3.s_load_b256(sdata=sdata, sbase=KERNARG_REG, soffset=NULL, offset=base_off) if n == 4 else \
+         r3.s_load_b128(sdata=sdata, sbase=KERNARG_REG, soffset=NULL, offset=base_off)
+  return n, [load], group
+
 def _clauseable_wide_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   # Contiguous half×8+ global LOAD (A B128 pairs). Streak → one s_clause over all B128s.
   if u in skip or mask_depth or u.op is not Ops.INS or _iop(u) is not AMDOps.LOAD: return False
@@ -2963,6 +3011,13 @@ def insts_from_linear(lin:UOp):
       flush("lgkm")
       store_addr_cache.clear()
       for inst in emitted: emit(inst)
+      oi += count
+      continue
+    if mask_depth == 0 and (fused_ka:=_fuse_kernarg_smem_loads(scheduled, oi, skip, mask_depth)) is not None:
+      count, emitted, kas = fused_ka
+      store_addr_cache.clear()
+      for inst in emitted: emit(inst)
+      for ka in kas: pending["lgkm"] |= _reg_idxs(ka)
       oi += count
       continue
     if u.op is Ops.INS and _iop(u) is AMDOps.LABEL:
@@ -3423,7 +3478,7 @@ class AMDRenderer(ISARenderer):
   def merge_memory_loads(self, sink:UOp) -> UOp: return merge_adjacent_half_loads(sink)
 
   def prepare_pre_regalloc(self, lst:list[UOp]) -> tuple[list[UOp], dict]:
-    lst = _protect_loop_invariant_fmac(lst)
+    lst = _hoist_kernargs(_protect_loop_invariant_fmac(lst))
     # Unroll lowers WMMA cin to zero PACKs + ADD into phi. Those PACKs must run each K
     # iteration: if they stay pre-loop, two-address WMMA keeps ACC across iters and the
     # phi ADDs double-count (test_tensor_cores_unroll_phi).

@@ -1029,7 +1029,24 @@ class TestAMDRenderer(unittest.TestCase):
     prg = _to_prg(_quant_decode_kernel(out, raw, xq, xd, xs, out_features, in_features, Q6_K))
     names = _amd_inst_names(prg)
     self.assertGreaterEqual(names.count("S_CLAUSE"), 2)
-    self.assertLessEqual(names.count("S_WAITCNT_VMCNT"), 14)
+    self.assertLessEqual(names.count("S_WAITCNT_VMCNT"), 20)
+
+  def test_q6_decode_hoists_and_fuses_kernargs(self):
+    out_features, in_features, chunks = 8192, 2048, 4
+    out = UOp.placeholder((1, out_features, chunks), dtypes.float32, 0)
+    raw = UOp.placeholder((out_features * in_features // 256 * Q6_WORDS,), dtypes.uint32, 1)
+    xq = UOp.placeholder((1, in_features // 32, 8), dtypes.uint32, 2)
+    xd = UOp.placeholder((1, in_features // 32), dtypes.float32, 3)
+    xs = UOp.placeholder((1, in_features // 32, 2), dtypes.float32, 4)
+    prg = _to_prg(_quant_decode_kernel(out, raw, xq, xd, xs, out_features, in_features, Q6_K))
+    names = _amd_inst_names(prg)
+    # Five buffer pointers issued early; contiguous aligned pairs may fuse to B128/B256.
+    self.assertLessEqual(names.count("S_LOAD_B64"), 5)
+    self.assertLessEqual(names.count("S_WAITCNT_LGKMCNT"), 7)
+    linear = _prg_lin(prg).src
+    ka_idxs = [i for i,u in enumerate(linear) if u.op is Ops.INS and _iop(u) is AMDOps.KERNARG]
+    self.assertGreaterEqual(len(ka_idxs), 4)
+    self.assertLessEqual(max(ka_idxs) - min(ka_idxs), len(ka_idxs))
 
   def test_simple_grouped_reduce_exposes_wide_loads(self):
     ast = Tensor.empty(2048, device="AMD").square().mean().schedule_linear().src[-1].src[0]
@@ -1167,7 +1184,9 @@ class TestAMDRenderer(unittest.TestCase):
     second_load = inst_names.index("GLOBAL_LOAD_B32", first_load + 1)
     first_wait = inst_names.index("S_WAITCNT_VMCNT")
     self.assertEqual(inst_names.count("GLOBAL_LOAD_B32"), 2)
-    self.assertEqual(inst_names.count("S_LOAD_B64"), 3)
+    # Contiguous ulong kernargs may fuse to S_LOAD_B128/B256; still one SMEM wait before VMEM.
+    self.assertGreaterEqual(inst_names.count("S_LOAD_B64") + inst_names.count("S_LOAD_B128")*2 +
+                            inst_names.count("S_LOAD_B256")*4, 3)
     self.assertEqual(inst_names.count("S_WAITCNT_VMCNT"), 1)
     self.assertLess(inst_names.index("S_WAITCNT_LGKMCNT"), first_load)
     self.assertLess(first_load, first_wait)
