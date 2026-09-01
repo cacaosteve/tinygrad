@@ -124,6 +124,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
   for u in uops:
     # TODO: this should handle images too, it's just memory coalescing
     if u.op in {Ops.LOAD, Ops.STORE}:
+      if u.op is Ops.LOAD and u.dtype is dtypes.half and u.src[0].op is Ops.SHRINK: continue
       assert len(u.src) == (2 if u.op is Ops.STORE else 1), "memory coalescing does not support gated loads/stores"
       assert u.src[0].op is Ops.INDEX, f"memory coalescing should be on INDEX, not {u.src[0].op}"
       buf, idx_u = u.src[0].src

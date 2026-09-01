@@ -133,6 +133,8 @@ pm_expand_broadcast = pm_wmma_add+PatternMatcher([
 
 def do_devectorize(b:UOp):
   if b.shape == (): return None
+  # flash _amd_load half×4 must stay packed; devectorizing first leaves scalar u16 paths isel widens poorly.
+  if b.op is Ops.LOAD and b.dtype is dtypes.half and len(b.src) == 1 and b.src[0].op is Ops.SHRINK: return None
   # broadcasting needs to be already unpacked, Invalid matches any dtype and shape
   if not all(x.shape == b.shape or x.base.is_invalid for x in b.src): return None
   src = []
@@ -382,6 +384,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
 
   # do memory coalescing (late)
   sink = memory_coalescing(sink, ren)
+  if (merge:=getattr(ren, 'merge_memory_loads', None)) is not None: sink = merge(sink)
   sink = graph_rewrite(sink, symbolic_simple+ew_devectorizer+pm_simplify_add_image,
                        name="add images", ctx=({}, ren), bottom_up=True)
 
