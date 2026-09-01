@@ -1173,6 +1173,19 @@ class TestAMDRenderer(unittest.TestCase):
     scheduled = amd_lib._schedule_scalar_vmem([load0, use0, idx1, load1, use1], {})
     self.assertEqual(scheduled, [load0, idx1, load1, use0, use1])
 
+  def test_scalar_vmem_scheduler_hoists_half_b64_load(self):
+    base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
+    idx0 = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))
+    idx1 = _uop(Ops.INS, dtypes.uint32, (idx0, UOp.const(4, dtypes.uint32)), AMDOps.ADD, (Register("idx1", 261),))
+    count = UOp.const(4, dtypes.int32)
+    load0 = _uop(Ops.INS, dtypes.half, (base, idx0, count), AMDOps.LOAD, (Register("load0", 270),))
+    use0 = _uop(Ops.INS, dtypes.half, (load0, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("use0", 271),))
+    load1 = _uop(Ops.INS, dtypes.half, (base, idx1, count), AMDOps.LOAD, (Register("load1", 272),))
+    use1 = _uop(Ops.INS, dtypes.half, (load1, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("use1", 273),))
+    scheduled = amd_lib._schedule_scalar_vmem([load0, use0, idx1, load1, use1], {})
+    self.assertEqual(scheduled, [load0, idx1, load1, use0, use1])
+    self.assertTrue(amd_lib._vmem_schedulable_load(load0))
+
   def test_gated_fmac_load_scheduler_preserves_vcc_pairs(self):
     base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
     limit = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("limit", 7),))

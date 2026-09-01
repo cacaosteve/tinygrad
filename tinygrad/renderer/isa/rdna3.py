@@ -2561,7 +2561,9 @@ def _hoist_gated_fmac_loads(ops:list[UOp]) -> list[UOp]:
 
 def _vmem_schedulable_load(u:UOp) -> bool:
   slots = _reg_slots(u)
-  return slots == 1 or (u.dtype in (dtypes.uint8, dtypes.float32) and slots <= 4) or \
+  # half×4 B64 (_amd_load SHRINK×4): independent addr+dest like scalar; must not bail whole-kernel schedule.
+  return slots == 1 or (u.dtype is dtypes.half and slots == 2) or \
+    (u.dtype in (dtypes.uint8, dtypes.float32) and slots <= 4) or \
     (u.dtype is dtypes.uint32 and slots == 4 and _is_byte_addr_load(u))
 
 def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:bool|None=None) -> list[UOp]:
