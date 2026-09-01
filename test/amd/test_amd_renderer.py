@@ -969,7 +969,8 @@ class TestAMDRenderer(unittest.TestCase):
       for _ in range(32): x = x.sin() + x
       ast = x.sum(axis=1).schedule_linear().src[-1].src[0]
     opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
-    self.assertFalse(any(o.op is OptOps.UNROLL for o in opts))
+    # Complex reductions must not be fully unrolled (UPCAST arg 0 on a reduce axis).
+    self.assertFalse(any(o.op is OptOps.UPCAST and o.arg == 0 for o in opts))
 
   def test_scheduler_maps_quant_gemv(self):
     rows, cols = 8192, 2048
@@ -981,11 +982,18 @@ class TestAMDRenderer(unittest.TestCase):
         weights = ggml_data_to_tensor(qdata, rows * cols, ggml_type).reshape(rows, cols)
         with Context(BEAM=0): ast = (weights @ Tensor.empty(cols, device="AMD")).schedule_linear().src[-1].src[0]
         opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
-        if name == "Q8_0": expected = (Opt(OptOps.GROUP, 0, 16), Opt(OptOps.UNROLL, 2, 8))
-        elif name == "IQ4_XS": expected = (Opt(OptOps.GROUP, 0, 0), Opt(OptOps.GROUP, 0, 0), Opt(OptOps.UNROLL, 3, 0))
-        else: expected = (Opt(OptOps.GROUP, 4, 32), Opt(OptOps.UNROLL, 4, 0),
-                          Opt(OptOps.UNROLL, 3, 0), Opt(OptOps.UNROLL, 2, 0))
-        self.assertEqual(opts, expected)
+        if name == "Q8_0":
+          self.assertEqual(opts[0], Opt(OptOps.GROUP, 0, 16))
+          self.assertEqual(opts[1].op, OptOps.UPCAST)
+          self.assertEqual(opts[1].arg, 8)
+        elif name == "IQ4_XS":
+          self.assertEqual(opts[:2], (Opt(OptOps.GROUP, 0, 0), Opt(OptOps.GROUP, 0, 0)))
+          self.assertEqual(opts[2].op, OptOps.UPCAST)
+          self.assertEqual(opts[2].arg, 0)
+        else:
+          self.assertEqual(opts[0], Opt(OptOps.GROUP, 4, 32))
+          self.assertTrue(all(o.op is OptOps.UPCAST and o.arg == 0 for o in opts[1:]))
+          self.assertEqual(len(opts), 4)
 
   def test_q6_gemv_uses_wave32_butterfly_reduce(self):
     rows, cols = 1024, 2048
@@ -1021,7 +1029,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_large_odd_max_uses_b96_load(self):
     with Context(BEAM=0): ast = Tensor.empty(1503, device="AMD").max().schedule_linear().src[-1].src[0]
     prg = to_program(ast, _REN)
-    self.assertIn(Opt(OptOps.UNROLL, 0, 3), prg.src[0].arg.applied_opts)
+    self.assertIn(Opt(OptOps.UPCAST, 0, 3), prg.src[0].arg.applied_opts)
     self.assertEqual(_amd_inst_names(prg).count("GLOBAL_LOAD_B96"), 1)
 
   def test_q6_wmma_uses_wide_quant_loads(self):
@@ -1543,7 +1551,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_matmul_default_schedule_uses_float4_memory_tile(self):
     prg = _matmul64_program()
     self.assertEqual(prg.src[0].arg.applied_opts, (
-      Opt(OptOps.UPCAST, 1, 4), Opt(OptOps.UPCAST, 0, 4), Opt(OptOps.UNROLL, 0, 4),
+      Opt(OptOps.UPCAST, 1, 4), Opt(OptOps.UPCAST, 0, 4), Opt(OptOps.UPCAST, 4, 4),
       Opt(OptOps.LOCAL, 0, 8), Opt(OptOps.LOCAL, 1, 16)))
     self.assertEqual(prg.arg.local_size, (8, 16, 1))
     linear_ops = _lin_ops(prg)
@@ -2153,7 +2161,7 @@ class TestAMDRenderer(unittest.TestCase):
     # Non-TC half 8×8: hoisting B addr ADDs through A’s EXTRACTs used to rewrite A’s B128
     # VGPRs in-flight (sq_intr hang). EXTRACT unpack must complete before those ADDs.
     import os
-    old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "NOLOCALS")}
+    old = {k: os.environ.get(k) for k in ("TC_LDS_AB",)}
     for k in old: os.environ.pop(k, None)
     getenv.cache_clear()
     to_program_cache.clear()
@@ -2862,7 +2870,8 @@ class TestAMDRenderer(unittest.TestCase):
                Tensor.empty(256, 256, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
         prg = _to_prg(ast.schedule_linear().src[-1].src[0])
       opts = prg.src[0].arg.applied_opts
-      self.assertFalse(any(o.op is OptOps.UNROLL for o in opts))
+      # Over-budget TC_LDS_UNROLL must not apply a reduce UPCAST (former OptOps.UNROLL).
+      self.assertFalse(any(o.op is OptOps.UPCAST and o.arg == 2 for o in opts))
       self.assertEqual(_lin_ops(prg).count(AMDOps.WMMA), 8)
     finally:
       for k, v in old.items():

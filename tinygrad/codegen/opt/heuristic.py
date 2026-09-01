@@ -1,6 +1,6 @@
 import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
-from tinygrad.helpers import getenv, DEBUG, prod, NOLOCALS, TC_OPT, TC_SELECT, USE_TC, IMAGE
+from tinygrad.helpers import getenv, DEBUG, prod, TC_OPT, TC_SELECT, USE_TC, IMAGE
 from tinygrad.uop.ops import Ops, resolve, AxisType
 from tinygrad.codegen.late.coalesce import image_valid_dims
 from tinygrad.codegen.opt.postrange import Scheduler
@@ -10,7 +10,7 @@ def _unroll_small_inner_reduces(k:Scheduler, max_product:int=8) -> None:
   while k.unrollable_dims:
     inner_size = k.full_shape[k.unrollable_dims[-1]]
     if inner_size > 3 or unroll_product * inner_size > max_product: break
-    k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
+    k.apply_opt(Opt(OptOps.UPCAST, k.unrollable_dims[-1], 0))
     unroll_product *= inner_size
 
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
@@ -59,7 +59,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     force_unroll = getenv("MV_FORCE_UNROLL_INNER", 0)
     if force_unroll < 0: _unroll_small_inner_reduces(k)
     else:
-      for _ in range(force_unroll): k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
+      for _ in range(force_unroll): k.apply_opt(Opt(OptOps.UPCAST, k.unrollable_dims[-1], 0))
     return k
 
   # Direct-ISA renderers can provide a narrow, structurally matched quantized-matvec schedule.
@@ -75,10 +75,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         unit_stride_axes_mul_4 = [k.rngs.index(c) for c in idx.get_idx().split_uop(Ops.ADD) if
           c.op is Ops.RANGE and (c.vmax+1)%4 == 0 and c not in idx.get_valid().backward_slice]
         if len(unit_stride_axes_mul_4):
-          if (axis:=unit_stride_axes_mul_4[0]) in k.upcastable_dims:
-            k.apply_opt(Opt(OptOps.UPCAST, axis, 4))
-          elif axis in k.unrollable_dims:
-            k.apply_opt(Opt(OptOps.UNROLL, k.unrollable_dims.index(axis), 4))
+          if (axis:=unit_stride_axes_mul_4[0]) in k.upcastable_dims+k.unrollable_dims: k.apply_opt(Opt(OptOps.UPCAST, axis, 4))
 
   # Quantized weights leave the vector load as an INDEX but wrap the matrix load in dequantization ALU.
   # ISAs can opt into a one-wave-per-row mapping for these complex matvecs without broadening the generic rule below.
@@ -142,7 +139,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     else: return k
 
   # are we grouping? (requires local shape support)
-  if resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if NOLOCALS or k.ren.target.device == "QCOM" else 2048), False):
+  if resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if k.ren.target.device == "QCOM" else 2048), False):
     for axis, sz in itertools.product((0, 1, 2), (16,)):
       try:
         k.apply_opt(Opt(OptOps.GROUPTOP, axis, sz))
@@ -155,7 +152,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     # normally recover this themselves with a loop-vectorization pass after the shared scheduler has run.
     if (grouped_unroll:=getattr(k.ren, "get_grouped_reduce_unroll", None)) is not None and \
        (unroll:=grouped_unroll(k)) is not None and k.unrollable_dims:
-      try: k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, unroll))
+      try: k.apply_opt(Opt(OptOps.UPCAST, k.unrollable_dims[-1], unroll))
       except KernelOptError: pass
     return k
 
@@ -214,10 +211,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
         unroll = k.ren.get_reduce_unroll(s, k.ast)
         if unroll is not None:
-          k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, unroll))
+          k.apply_opt(Opt(OptOps.UPCAST, k.unrollable_dims[-1], unroll))
           # if it's small, upcast a second reduce dimension too
           if unroll == 0 and k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
-            k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
+            k.apply_opt(Opt(OptOps.UPCAST, k.unrollable_dims[-1], 0))
       else:
         split_choices = [4]
         if (large_unroll:=getattr(k.ren, "get_large_reduce_unroll", None)) is not None and \
@@ -225,7 +222,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           split_choices.append(extra_split)
         for splits in split_choices:
           if k.full_shape[axis:=k.unrollable_dims[-1]]%splits == 0:
-            k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, splits))
+            k.apply_opt(Opt(OptOps.UPCAST, axis, splits))
             break
   except KernelOptError: pass
 
@@ -237,9 +234,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # **** local groups ****
 
   if k.ren.has_local:
-    if NOLOCALS:
-      k.apply_opt(Opt(OptOps.NOLOCALS))
-    elif k.ren.target.device == "QCOM":
+    if k.ren.target.device == "QCOM":
       # for openpilot: use 32..128 threads per workgroup, at most 8 on the innermost axis
       # apply innermost global axes first so the leading hardware local dims hold the trailing global axes, like gidx
       workgroup = 1
@@ -267,18 +262,5 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         will_delete_shape = local_sz == k.full_shape[axis]
         k.apply_opt(Opt(OptOps.LOCAL, axis, local_sz))
         if will_delete_shape: deleted_shape += 1
-
-  # **** threading ****
-
-  if k.ren.has_threads and k.ren.global_max is not None:
-    for threads in [32,16,12,8,6,5,4,3,2]:
-      # Skip if too many threads. Heuristic: use about 128K ops per thread
-      if threads > k.ren.global_max[0] or resolve(prod(k.full_shape) // (128 << 10) < threads): continue
-      for axis in k.axes_of(AxisType.WEAK):
-        if k.full_shape[axis] % threads == 0:
-          try: k.apply_opt(Opt(OptOps.THREAD, axis, threads))
-          except KernelOptError: pass
-          break
-      if k.applied_opts and k.applied_opts[-1].op is OptOps.THREAD: break
 
   return k

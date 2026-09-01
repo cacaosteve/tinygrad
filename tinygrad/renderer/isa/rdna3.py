@@ -3222,7 +3222,7 @@ def apply_tc_hand_opts(tk, rngs):
     # UNROLL multiplies WMMA STACK tiles; past max_tiles expand soft-fails then unroll_axis
     # IndexErrors. Only apply when the upcast×unroll product still fits the LDS expand budget.
     if (ku := getenv("TC_LDS_UNROLL", 0)) and tk.unrollable_dims and tiles * ku <= max_tiles:
-      try: tk.apply_opt(Opt(OptOps.UNROLL, 0, ku))
+      try: tk.apply_opt(Opt(OptOps.UPCAST, tk.unrollable_dims[0], ku))
       except KernelOptError: pass
   else:
     do_upcast()
@@ -3356,7 +3356,7 @@ class AMDRenderer(ISARenderer):
     # Q8_0: use 16 lanes on the outer block loop and expose eight packed values per iteration.
     if len(reduce_sizes) == 2 and reduce_sizes[-1] == 32 and isinstance(reduce_sizes[0], int) and reduce_sizes[0] % 16 == 0:
       k.apply_opt(Opt(OptOps.GROUP, 0, 16))
-      k.apply_opt(Opt(OptOps.UNROLL, 2, 8))
+      k.apply_opt(Opt(OptOps.UPCAST, k.unrollable_dims[2], 8))
       return True
 
     # IQ4_XS: the dequantized reduction is [blocks, 4, 2, 2, 16]. Use a 2-D 32-128 lane group
@@ -3365,8 +3365,9 @@ class AMDRenderer(ISARenderer):
     # reductions retain the conservative generic schedule.
     if len(reduce_sizes) == 5 and reduce_sizes[1:] == (4, 2, 2, 16) and isinstance(reduce_sizes[0], int) and \
        2 <= reduce_sizes[0] <= 32 and output_size % 4 == 0:
-      for opt in (Opt(OptOps.GROUP, 0, 0), Opt(OptOps.GROUP, 0, 0), Opt(OptOps.UNROLL, 3, 0)):
+      for opt in (Opt(OptOps.GROUP, 0, 0), Opt(OptOps.GROUP, 0, 0)):
         k.apply_opt(opt)
+      k.apply_opt(Opt(OptOps.UPCAST, k.unrollable_dims[3], 0))
       return True
     return False
 
