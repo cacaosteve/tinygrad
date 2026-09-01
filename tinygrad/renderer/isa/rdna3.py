@@ -16,7 +16,7 @@ from tinygrad.uop.divandmod import affine_int_bounds
 from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
 from tinygrad.renderer.isa.rdna3_defs import (AMDOps, KERNARG_REG, WGID, LID, SGPR, SGPR32, VGPR, WMMA_ACC_VGPR, WMMA_ACC_QUANT_VGPR,
   LLOAD_VGPR, PACK_F16_VGPR, PACK_F16_VGPR_UP16, LLOAD_VGPR_UP16, TMP_VDATA, TMP_VADDR, TMP_BRANCH, TMP_SDATA0, TMP_SDATA1,
-  allow_upcast16 as _allow_upcast16)
+  allow_upcast16, unwrap_const as _unwrap_const, const_value as _const_value, tconst as _tconst)
 from tinygrad.renderer.isa.rdna3_tc import expand_wmma_lds_tiles, pm_stage_wmma_ab
 
 # RDNA3: kernarg in s[0:1], local ids packed in v0. Even SGPR bases for 64-bit kernarg loads.
@@ -30,17 +30,6 @@ _F32_UNARY = {AMDOps.RECIPROCAL: r3.v_rcp_f32_e32, AMDOps.EXP2: r3.v_exp_f32_e32
               AMDOps.SQRT: r3.v_sqrt_f32_e32, AMDOps.TRUNC: r3.v_trunc_f32_e32}
 _ISEL_UNARY = {Ops.RECIPROCAL: AMDOps.RECIPROCAL, Ops.EXP2: AMDOps.EXP2, Ops.LOG2: AMDOps.LOG2, Ops.SQRT: AMDOps.SQRT,
                Ops.TRUNC: AMDOps.TRUNC, Ops.SIN: AMDOps.SIN}
-
-def _unwrap_const(x:UOp) -> UOp|None:
-  while x.op in (Ops.CAST, Ops.BITCAST, Ops.NOOP) and len(x.src) == 1: x = x.src[0]
-  return x if x.op is Ops.CONST else None
-
-def _const_value(x:UOp):
-  return c.val if (c:=_unwrap_const(x)) is not None else None
-
-def _tconst(value, dtype:DType, tag=None) -> UOp:
-  """Typed bare constant for renderer-internal graphs, after the program spec boundary."""
-  return UOp.cconst(value, dtype).rtag(tag)
 
 def _iop(u:UOp):
   """Instruction selector carried by the dtype-less UOp INS argument."""
@@ -743,13 +732,8 @@ def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
   # (Hard-peel-only-≤4095 left ~120 addr VGPRs + LSHL/store for WMMA C.)
   return try_store(_global_store, AMDOps.STORE, peel=True, max_byte=0x7fffffff, deep=True)
 
-def _lane_const(x:UOp) -> int|None:
-  if (c:=_unwrap_const(x)) is not None: return int(c.val)
-  if x.op is Ops.INS and _iop(x) is AMDOps.MOV and len(x.src) == 1 and (c:=_unwrap_const(x.src[0])) is not None: return int(c.val)
-  return None
-
 def _extract_vec_lane(ctx:IselContext, x:UOp) -> UOp|None:
-  if len(x.src) != 2 or (lane:=_lane_const(x.src[1])) is None: return None
+  if len(x.src) != 2 or (lane:=_const_int(x.src[1])) is None: return None
   # INDEX into memory is an address. Only ALU values use INDEX as vector lane access.
   if x.src[0].addrspace not in (None, AddrSpace.ALU): return None
   if x.src[0].op is Ops.WMMA:
@@ -800,7 +784,7 @@ def _wmma_ab_vec_loads(elems:tuple[UOp, ...]) -> tuple[UOp, ...]|None:
   # recognize both forms so a WMMA fragment remains two B128s instead of sixteen U16 loads.
   def vec_lane(e:UOp) -> tuple[UOp, int]|None:
     while e.op in (Ops.RESHAPE, Ops.NOOP) and e.src and e.max_numel() == 1: e = e.src[0]
-    if e.op is Ops.INDEX and len(e.src) == 2 and (lane:=_lane_const(e.src[1])) is not None and e.src[0].op is Ops.LOAD:
+    if e.op is Ops.INDEX and len(e.src) == 2 and (lane:=_const_int(e.src[1])) is not None and e.src[0].op is Ops.LOAD:
       return e.src[0], lane
     if e.op is Ops.SHRINK and len(e.src) > 2 and _const_value(e.src[2]) == 1 and \
        (lane:=_const_int(e.src[1])) is not None and e.src[0].op is Ops.LOAD:
@@ -880,7 +864,7 @@ def _pack_f16_half2_load(lo:UOp, hi:UOp) -> tuple[UOp, int]|None:
   base = lo.src[0]
   if base.op is not Ops.INS or _iop(base) is not AMDOps.LLOAD: return None
   if not isinstance(greg(base), Register): return None
-  lo_lane, hi_lane = _lane_const(lo.src[1]), _lane_const(hi.src[1])
+  lo_lane, hi_lane = _const_int(lo.src[1]), _const_int(hi.src[1])
   if lo_lane is None or hi_lane != lo_lane + 1 or lo_lane % 2: return None
   return base, lo_lane // 2
 
@@ -1131,10 +1115,10 @@ def _alloc_vregs(ctx:IselContext, x:UOp, sgpr_pool:tuple[Register, ...], vgpr_po
     # occupancy even when only a few low VGPRs remain live.
     has_wmma = ctx.scratch.setdefault("has_wmma", any(u.op is Ops.WMMA or
       (u.op is Ops.INS and _iop(u) is AMDOps.WMMA) for u in ctx.uses))
-    pack_pool = (PACK_F16_VGPR_UP16 if _allow_upcast16() else PACK_F16_VGPR) if has_wmma else vgpr_pool
+    pack_pool = (PACK_F16_VGPR_UP16 if allow_upcast16() else PACK_F16_VGPR) if has_wmma else vgpr_pool
     return x.replace(tag=(ctx.vreg(pack_pool),))
   if iop is AMDOps.LLOAD:
-    return x.replace(tag=(ctx.vreg(LLOAD_VGPR_UP16 if _allow_upcast16() else LLOAD_VGPR),))
+    return x.replace(tag=(ctx.vreg(LLOAD_VGPR_UP16 if allow_upcast16() else LLOAD_VGPR),))
   if getenv("AMD_UNIFORM_INT", 1) and _wants_uniform_sgpr(x): return x.replace(tag=(ctx.vreg(scalar_pool),))
   return x.replace(tag=(ctx.vreg(vgpr_pool),))
 
@@ -1272,10 +1256,8 @@ def _materialize_flags(x:UOp, idx:tuple[int, ...]|None=None) -> UOp|None:
       changed = True
   return x.replace(src=tuple(src)) if changed else None
 
-def _materialize_compare_flags(x:UOp) -> UOp|None: return _materialize_flags(x)
 def _materialize_store_compare_flag(x:UOp) -> UOp|None:
   return _materialize_flags(x, (1,)) if len(x.src) >= 2 and x.src[1].op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) else None
-def _materialize_where_value_flags(x:UOp) -> UOp|None: return _materialize_flags(x, (1, 2))
 
 def _cast_store_value(x:UOp, a:UOp, val:UOp) -> UOp|None:
   # C-style renderers implicitly convert through the destination pointer type. ISA stores
@@ -1396,10 +1378,10 @@ pre_isel_matcher = PatternMatcher([
    src=(UPat((Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ), name="m"), UPat.cvar("c").cast(dtypes.bool, name="c")), name="x"),
    _cmp_bool_const),
   (UPat(Ops.AND, dtype=dtypes.bool, src=(UPat.var("a"), UPat.var("b"))), _merge_zero_cmp_and),
-  (UPat((Ops.AND, Ops.OR, Ops.XOR, Ops.CMPNE, Ops.CMPEQ), dtype=dtypes.bool, name="x"), _materialize_compare_flags),
+  (UPat((Ops.AND, Ops.OR, Ops.XOR, Ops.CMPNE, Ops.CMPEQ), dtype=dtypes.bool, name="x"), _materialize_flags),
   (UPat(Ops.STORE, name="x"), _materialize_store_compare_flag),
   (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), name="a"), UPat.var("val")), allow_any_len=True, name="x"), _cast_store_value),
-  (UPat(Ops.WHERE, name="x"), _materialize_where_value_flags),
+  (UPat(Ops.WHERE, name="x"), lambda x: _materialize_flags(x, (1, 2))),
   (UPat.var("m", dtypes.bool).cast(dtypes.ints+(dtypes.float16, dtypes.float32), name="x"),
    lambda m,x: m.where(_tconst(1, x.dtype), _tconst(0, x.dtype))),
   (UPat.var("m", dtypes.bool).where(UPat.var("a"), UPat.var("b")), _materialize_bool_where),
@@ -3182,7 +3164,7 @@ def apply_tc_hand_opts(tk, rngs):
   # Default on for all K; AMD_PREFETCH_A=0 opts out.
   _PREFETCH_NEXT_A = bool((not lds_ab) and getenv("AMD_PREFETCH_A", 1))
   loc_cap = getenv("TC_LOCAL", 2 if lds_ab else 4)
-  up16 = _allow_upcast16()
+  up16 = allow_upcast16()
   max_tiles = min(getenv("TC_UPCAST_TILES", 16 if up16 else 8), 8 if not up16 else 10**9)
   if lds_ab and getenv("ALLOW_LDS_PRODUCT8", 1) == 0:
     up_cap, max_tiles = min(up_cap, 2), min(max_tiles, 4)
@@ -3433,7 +3415,7 @@ class AMDRenderer(ISARenderer):
       _reg_slots(x.src[0]) == 4 and _is_byte_addr_load(x.src[0])
     if x.dtype is not dtypes.float32 and not packed_bytes: return None
     if not src_phys or src_phys[0] is None or not isinstance(x.tag, tuple): return None
-    if (lane := _lane_const(x.src[1])) is None: return None
+    if (lane := _const_int(x.src[1])) is None: return None
     want = src_phys[0].index + int(lane)
     return next((r for r in x.tag[0].cons if r.index == want), None)
 

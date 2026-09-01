@@ -1,27 +1,17 @@
 from __future__ import annotations
 
-from tinygrad.dtype import AddrSpace, DType, dtypes
+from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import getenv, prod
 from tinygrad.schedule.rangeify import BufferizeOpts
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
-from tinygrad.renderer.isa.rdna3_defs import allow_upcast16
-
-def _unwrap_const(x:UOp) -> UOp|None:
-  while x.op in (Ops.CAST, Ops.BITCAST, Ops.NOOP) and len(x.src) == 1: x = x.src[0]
-  return x if x.op is Ops.CONST else None
-
-def _const_value(x:UOp):
-  return c.val if (c:=_unwrap_const(x)) is not None else None
-
-def _tconst(value, dtype:DType, tag=None) -> UOp:
-  return UOp.cconst(value, dtype).rtag(tag)
+from tinygrad.renderer.isa.rdna3_defs import allow_upcast16, const_value, tconst
 
 # ***** TC_LDS_AB staging (codegen hooks via AMDRenderer.pm_stage_wmma_ab) *****
 _WMMA_LDS_AXES, _WMMA_LDS_LOOP_BASE, _WMMA_TC = (AxisType.LOCAL, AxisType.WARP), 200, 16
 
 def _range_size(r:UOp) -> int:
-  return int(n) if (n:=_const_value(r.src[0])) is not None else int(r.vmax) + 1
+  return int(n) if (n:=const_value(r.src[0])) is not None else int(r.vmax) + 1
 
 def _linearize_ranges(axes:list[UOp]) -> UOp:
   out = axes[0]
@@ -43,7 +33,7 @@ def _index_row_stride(idx:UOp) -> int|None:
   for side in e.src:
     if side.op is Ops.MUL:
       for t in side.src:
-        if (n:=_const_value(t)) is not None and int(n) > 1: return int(n)
+        if (n:=const_value(t)) is not None and int(n) > 1: return int(n)
   return None
 
 def _delinearize_ranges(linear:UOp, axes:list[UOp]) -> dict[UOp, UOp]:
@@ -291,7 +281,7 @@ def expand_wmma_lds_tiles(u, a, b, c, done_arg, unroll_axis, ctx):
   max_prod = 16 if allow_upcast16() else 8
   if ta * tb > max_prod: return None
   a_batch = getenv("TC_LDS_A_BATCH", 2)
-  c_stk = c if c.op is Ops.STACK else UOp.stack(*[c.index(_tconst(i, dtypes.weakint)) for i in range(c.max_numel())])
+  c_stk = c if c.op is Ops.STACK else UOp.stack(*[c.index(tconst(i, dtypes.weakint)) for i in range(c.max_numel())])
   wmmas: list[UOp] = []
   prev_batch: UOp|None = None
   for i0 in range(0, ta, a_batch):

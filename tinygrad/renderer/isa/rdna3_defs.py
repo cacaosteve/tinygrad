@@ -1,7 +1,9 @@
+from tinygrad.dtype import DType
 from tinygrad.helpers import getenv
 from tinygrad.renderer.isa import Register
 from tinygrad.renderer.amd.dsl import s, v
-from tinygrad.uop import FastEnum, auto
+from tinygrad.uop import FastEnum, Ops, auto
+from tinygrad.uop.ops import UOp
 
 # RDNA3 ABI and physical register constraints shared by selection, scheduling,
 # tensor-core staging, and emission. Keeping these in one leaf module lets the
@@ -31,6 +33,17 @@ TMP_SDATA0, TMP_SDATA1 = s[104], s[105]
 def allow_upcast16() -> bool:
   # Off under TC_LDS_AB — product 16 still spills there.
   return bool(getenv("ALLOW_UPCAST16", 0 if getenv("TC_LDS_AB", 0) else 1))
+
+def unwrap_const(x:UOp) -> UOp|None:
+  while x.op in (Ops.CAST, Ops.BITCAST, Ops.NOOP) and len(x.src) == 1: x = x.src[0]
+  return x if x.op is Ops.CONST else None
+
+def const_value(x:UOp):
+  return c.val if (c:=unwrap_const(x)) is not None else None
+
+def tconst(value, dtype:DType, tag=None) -> UOp:
+  """Typed bare constant for renderer-internal graphs, after the program spec boundary."""
+  return UOp.cconst(value, dtype).rtag(tag)
 
 class AMDOps(FastEnum):
   LABEL = auto()
