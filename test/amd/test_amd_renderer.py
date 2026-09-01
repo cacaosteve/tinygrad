@@ -2870,8 +2870,8 @@ class TestAMDRenderer(unittest.TestCase):
                Tensor.empty(256, 256, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
         prg = _to_prg(ast.schedule_linear().src[-1].src[0])
       opts = prg.src[0].arg.applied_opts
-      # Over-budget TC_LDS_UNROLL must not apply a reduce UPCAST (former OptOps.UNROLL).
-      self.assertFalse(any(o.op is OptOps.UPCAST and o.arg == 2 for o in opts))
+      # Over-budget TC_LDS_UNROLL must not UPCAST a remaining REDUCE axis (former OptOps.UNROLL).
+      self.assertTrue(all(o.axis in (0, 1) for o in opts if o.op is OptOps.UPCAST))
       self.assertEqual(_lin_ops(prg).count(AMDOps.WMMA), 8)
     finally:
       for k, v in old.items():
