@@ -2579,7 +2579,11 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
   schedule_wmma_segments = bool(getenv("AMD_SCHEDULE_QUANT_WMMA", 1)) and \
     any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops) and \
     any(u.op is Ops.INS and _iop(u) is AMDOps.LOAD and u.dtype is dtypes.uint32 and _reg_slots(u) == 4 for u in ops)
-  if not schedule_wmma_segments and \
+  # Q6/Q4 decode (linear_q6): many scalar packed-weight reads + dp4a/BFE chains between LLOADs.
+  schedule_decode_segments = bool(getenv("AMD_SCHEDULE_QUANT_DECODE", 1)) and not schedule_wmma_segments and \
+    any(u.op is Ops.INS and _iop(u) is AMDOps.DOT4 for u in ops) and \
+    sum(1 for u in ops if u.op is Ops.INS and _iop(u) is AMDOps.LOAD and u.dtype in (dtypes.uint, dtypes.uint32)) >= 8
+  if not schedule_wmma_segments and not schedule_decode_segments and \
      any(u.op is Ops.INS and (_iop(u) is AMDOps.WMMA or (_iop(u) is AMDOps.LOAD and not _vmem_schedulable_load(u))) for u in ops): return ops
   fused_d16 = set(d16_hi_lo) | set(d16_hi_lo.values())
 
@@ -2590,7 +2594,8 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
     # Wide f32 and packed-byte loads have independent addresses and dedicated destination
     # VGPRs, so they can participate. Other wide/d16 loads retain emitter temp constraints.
     return _iop(u) is not AMDOps.LOAD or _vmem_schedulable_load(u) or \
-      (schedule_wmma_segments and u.dtype is dtypes.uint32 and _reg_slots(u) == 4)
+      (schedule_wmma_segments and u.dtype is dtypes.uint32 and _reg_slots(u) == 4) or \
+      (schedule_decode_segments and u.dtype in (dtypes.uint, dtypes.uint32) and _reg_slots(u) == 1)
 
   def schedule(segment:list[UOp]) -> list[UOp]:
     loads = [i for i,u in enumerate(segment) if _iop(u) is AMDOps.LOAD]
@@ -2677,10 +2682,15 @@ def _tmp_vaddr_clause_safe(scales:list, loads:list) -> bool:
   if sum(1 for s in scales if getattr(s, "vdst", None) == TMP_VADDR) <= 1: return True
   return not any(getattr(ld, "addr", None) == TMP_VADDR for ld in loads)
 
-def _clauseable_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
-  # Scalar half global LOAD with dest-as-addr (no mask/TMP). Streak → hoist scales + s_clause.
+def _clauseable_scalar_vmem_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
+  # Scalar global LOAD with dest-as-addr (compact B). Streak → hoist scales + s_clause.
   if u in skip or mask_depth or u.op is not Ops.INS or _iop(u) is not AMDOps.LOAD: return False
-  return _reg_slots(u) == 1 and u.dtype is dtypes.half
+  if _is_lds_ref(u.src[0]) or _is_scratch_ref(u.src[0]): return False
+  if _reg_slots(u) != 1: return False
+  return u.dtype in (dtypes.half, dtypes.uint8, dtypes.int8, dtypes.uint, dtypes.int, dtypes.uint32, dtypes.int32, dtypes.float32)
+
+def _clauseable_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
+  return _clauseable_scalar_vmem_gload(u, skip, mask_depth) and u.dtype is dtypes.half
 
 def _clauseable_wide_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   # Contiguous half×8+ global LOAD (A B128 pairs). Streak → one s_clause over all B128s.
@@ -3036,12 +3046,13 @@ def insts_from_linear(lin:UOp):
           oi = j
           continue
     # Cluster scalar half loads: dest-as-addr scales, then s_clause + tight VMEM (LLVM-style B).
+    # Quant decode uses the same pattern for packed u32 weight reads (linear_q6).
     # Always on. With AMD_D16_HI lo+…hi+ batch: extend the clause through following d16_his
     # (u16+d16_hi in one s_clause); do not hard-flush on lo mid-clause.
-    if u not in d16_hi_lo and _clauseable_half_gload(u, skip, mask_depth):
+    if u not in d16_hi_lo and _clauseable_scalar_vmem_gload(u, skip, mask_depth):
       j = oi + 1
       while j < len(scheduled) and scheduled[j] not in d16_hi_lo and \
-            _clauseable_half_gload(scheduled[j], skip, mask_depth): j += 1
+            _clauseable_scalar_vmem_gload(scheduled[j], skip, mask_depth): j += 1
       j_hi = j
       if d16_hi_lo and j > oi:
         while j_hi < len(scheduled) and scheduled[j_hi] in d16_hi_lo: j_hi += 1

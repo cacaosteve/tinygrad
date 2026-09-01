@@ -1019,6 +1019,18 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(names.count("V_OR_B32_E32"), 3)
     self.assertEqual(names.count("V_CMP_NE_U32_E32"), 2)
 
+  def test_q6_decode_clusters_weight_loads(self):
+    out_features, in_features, chunks = 8192, 2048, 4
+    out = UOp.placeholder((1, out_features, chunks), dtypes.float32, 0)
+    raw = UOp.placeholder((out_features * in_features // 256 * Q6_WORDS,), dtypes.uint32, 1)
+    xq = UOp.placeholder((1, in_features // 32, 8), dtypes.uint32, 2)
+    xd = UOp.placeholder((1, in_features // 32), dtypes.float32, 3)
+    xs = UOp.placeholder((1, in_features // 32, 2), dtypes.float32, 4)
+    prg = _to_prg(_quant_decode_kernel(out, raw, xq, xd, xs, out_features, in_features, Q6_K))
+    names = _amd_inst_names(prg)
+    self.assertGreaterEqual(names.count("S_CLAUSE"), 2)
+    self.assertLessEqual(names.count("S_WAITCNT_VMCNT"), 14)
+
   def test_simple_grouped_reduce_exposes_wide_loads(self):
     ast = Tensor.empty(2048, device="AMD").square().mean().schedule_linear().src[-1].src[0]
     names = _amd_inst_names(to_program(ast, _REN))
