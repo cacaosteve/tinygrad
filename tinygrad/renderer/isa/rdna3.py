@@ -2691,6 +2691,14 @@ def _vm_load_count(insts:list) -> int:
              (n.startswith("GLOBAL_LOAD") or n.startswith("SCRATCH_LOAD") or
               n.startswith("BUFFER_LOAD") or n.startswith("FLAT_LOAD")))
 
+def _lgkm_load_count(insts:list) -> int:
+  return sum(1 for i in insts if (n:=getattr(i, "op_name", "")) and n.startswith("DS_LOAD"))
+
+def _split_lgkm_scale_and_loads(emitted:list) -> tuple[list, list]:
+  i = len(emitted)
+  while i > 0 and _lgkm_load_count([emitted[i - 1]]): i -= 1
+  return emitted[:i], emitted[i:]
+
 def _split_scale_and_loads(emitted:list) -> tuple[list, list]:
   """Split dest-as-addr scalar load emit into addr ALU vs trailing VMEM loads."""
   i = len(emitted)
@@ -3074,6 +3082,27 @@ def insts_from_linear(lin:UOp):
       pending["lgkm"].add(-1)
       oi += count
       continue
+    # Cluster consecutive LLOAD streaks (post _hoist_lloads_before_extracts): s_clause + ds_load burst.
+    if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.LLOAD:
+      j = oi + 1
+      while j < len(scheduled) and scheduled[j] not in skip and scheduled[j].op is Ops.INS and \
+            _iop(scheduled[j]) is AMDOps.LLOAD: j += 1
+      if j - oi >= 2:
+        parts = [_emit_uop(scheduled[k]) for k in range(oi, j)]
+        if all(_lgkm_load_count(p) >= 1 for p in parts):
+          store_addr_cache.clear()
+          scales, loads = [], []
+          for p in parts:
+            sc, ld = _split_lgkm_scale_and_loads(p)
+            scales.extend(sc)
+            loads.extend(ld)
+          if len(loads) >= 2:
+            for inst in scales: emit(inst)
+            emit(r3.s_clause(simm16=len(loads) - 1))
+            for inst in loads: emit(inst)
+            for k in range(oi, j): pending["lgkm"] |= _reg_idxs(scheduled[k])
+            oi = j
+            continue
     # Cluster contiguous A B128 (half×8+): one s_clause over the burst (LLVM B128×8).
     # Per-tile s_clause stripped from _global_load_insts. Skip addr ALU between wide A tiles.
     if _clauseable_wide_half_gload(u, skip, mask_depth):
