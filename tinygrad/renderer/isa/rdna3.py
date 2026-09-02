@@ -3221,7 +3221,19 @@ def insts_from_linear(lin:UOp):
     if (n:=_vm_load_count(insts)) and regs: pending_vm.append((regs, n))
   def _pending_src(regs:set[int]) -> bool:
     return any(pr & regs for pr, _ in pending_vm) or bool(pending["lgkm"] & regs)
+  last_vcc_key: tuple|None = None
   def _emit_uop(u, masked=False, with_store_cache=False):
+    nonlocal last_vcc_key
+    # CSE identical VCC compares: E_32 remats the same gate cmp before every cndmask.
+    if u.op is Ops.INS and _iop(u) in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ) and getenv("AMD_VCC_CSE", 1):
+      try:
+        key = (_iop(u), _src(u.src[0]), _src(u.src[1]) if len(u.src) > 1 else None)
+      except Exception:
+        key = None
+      if key is not None and key == last_vcc_key: return []
+      if key is not None: last_vcc_key = key
+    elif u.op is Ops.INS and _iop(u) in (AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.CBRANCH_VCCNZ):
+      last_vcc_key = None
     return list(insts_for_uop(u, skip, masked, store_addr_cache if with_store_cache else None,
                               d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst))
   scheduled = _order_d16_lo_before_hi(
