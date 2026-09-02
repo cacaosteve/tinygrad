@@ -304,8 +304,18 @@ def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int):
   tokens = tuple(tuple(token_block*token_tile + tile*16 + half*8 + i for i in range(8)) for tile in range(token_tile//16))
   return output_waves, token_block, output_block, lane, wave, half, outputs, inputs, tokens
 
-def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_waves):
-  # the accumulator fragment halves are exchanged between lane pairs (l, l^16) through LDS (a ds_swizzle without CUSTOM)
+def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_waves, swizzle_stores:bool=False):
+  # Accumulator fragment halves are exchanged between lane pairs (l, l^16).  HIP lowers the LDS
+  # spill/reload to in-register ds_swizzle; direct ISA was paying 32 ds_load_b32 per WMMA tile.
+  tt = len(tokens)
+  if swizzle_stores:
+    def values(acc:UOp) -> tuple[UOp, ...]:
+      own = tuple(acc.after(update)[i].load() for i in range(8))
+      peer = tuple(_swizzle_f32(own[i], 16) for i in range(8))
+      low = half.eq(0)
+      return tuple(low.where(own[i], peer[i+4]) if j == 0 else low.where(peer[i], own[i+4]) for i in range(4) for j in range(2))
+    return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
+            for tile,(tile_tokens,acc) in enumerate(zip(tokens, output_accs)) for token,value in zip(tile_tokens, values(acc))]
   flat_accs = [acc for output_accs in accs for acc in output_accs]
   lds = UOp.placeholder((output_waves, 32, len(flat_accs)*8), dtypes.float32, slot=33, addrspace=AddrSpace.LOCAL)
   stores = [lds[wave, lane, a*8+i].store(acc.after(update)[i].load()) for a,acc in enumerate(flat_accs) for i in range(8)]
@@ -315,11 +325,10 @@ def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_wa
     peer = tuple(lds[wave, lane ^ 16, ai*8+i].load() for i in range(8))
     low = half.eq(0)
     return tuple(low.where(own[i], peer[i+4]) if j == 0 else low.where(peer[i], own[i+4]) for i in range(4) for j in range(2))
-  tt = len(tokens)
   return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
           for tile,(tile_tokens,_acc) in enumerate(zip(tokens, output_accs)) for token,value in zip(tile_tokens, values(ot*tt+tile))]
 
-def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, dequant, name):
+def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, dequant, name, swizzle_stores:bool=False):
   x = x.reshape(out.shape[0], in_features)
   output_waves, token_block, output_block, lane, wave, physical_half, outputs, input_tokens, tokens = layout
   token_tile, output_tiles = len(tokens)*16, len(outputs)
@@ -340,7 +349,7 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
         wmma_accs[output_tile][tile] = UOp.wmma(afrag, bfrag, previous, *WMMA_ARG)
   update = UOp.group(*(acc.store(value) for output_accs,output_values in zip(accs, wmma_accs)
                        for acc,value in zip(output_accs, output_values))).end(group)
-  stores = _wmma_stores(out, outputs, tokens, accs, update, physical_half, lane, wave, output_waves)
+  stores = _wmma_stores(out, outputs, tokens, accs, update, physical_half, lane, wave, output_waves, swizzle_stores=swizzle_stores)
   return UOp.group(*stores).end(token_block, output_block, lane, wave).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
@@ -360,7 +369,7 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
     return tuple(((word >> (byte*8) & 255).float()*d*scale-dmin*minimum).cast(dtypes.float16) for word in words for byte in range(4))
   return _quant_linear_wmma(out, x, out_features, in_features, Q4_WORDS if ggml_type == Q4_K else Q5_WORDS,
                             _wmma_layout(out, out_features, token_tile, output_tiles), dequant,
-                            f"linear_q{4 if ggml_type == Q4_K else 5}_k_f16_wmma")
+                            f"linear_q{4 if ggml_type == Q4_K else 5}_k_f16_wmma", swizzle_stores=direct_isa)
 
 @functools.cache
 def _q6_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, direct_isa:bool=False) -> UOp:
@@ -385,7 +394,7 @@ def _q6_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
       return tuple(_amd_fma_to_f16(value, scaled, scaled*-32) for value in values)
     return tuple(((value-32)*scale*d).cast(dtypes.float16) for value in values)
   return _quant_linear_wmma(out, x, out_features, in_features, Q6_WORDS,
-                            _wmma_layout(out, out_features, token_tile, 1), dequant, "linear_q6_k_f16_wmma")
+                            _wmma_layout(out, out_features, token_tile, 1), dequant, "linear_q6_k_f16_wmma", swizzle_stores=direct_isa)
 
 @functools.cache
 def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int, direct_isa:bool=False) -> UOp:
@@ -414,7 +423,7 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
                  for i in range(4) for j in (0, 2))
     if direct_isa: return tuple(_amd_packed_f16_mul_to_f16(pair, scale, i) for pair in lut_pairs for i in range(2))
     return tuple((_half((pair >> (i*16)) & 0xffff)*scale).cast(dtypes.float16) for pair in lut_pairs for i in range(2))
-  return _quant_linear_wmma(out, x, out_features, in_features, IQ4_WORDS, layout, dequant, "linear_iq4_xs_f16_wmma")
+  return _quant_linear_wmma(out, x, out_features, in_features, IQ4_WORDS, layout, dequant, "linear_iq4_xs_f16_wmma", swizzle_stores=direct_isa)
 
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS)
