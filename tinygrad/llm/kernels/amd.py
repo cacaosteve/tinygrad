@@ -685,20 +685,14 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   K_store = KV_lds.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_k].store(kval).end(load_k)
   qk_load_barrier = UOp.barrier(UOp.group(Q_store, K_store))
   Q_lds, KV_lds_k = Q_lds.after(qk_load_barrier), KV_lds.after(qk_load_barrier)
-  # Unroll TM/TN/TD REG-index loops so direct-ISA REG promotion sees constant slots
-  # (dynamic indices force scratch and dominate flash prefill latency).
   S_reg = _reg((TM, TN), 6, 0, n_tile)
-  k_qk = UOp.range(D//WMMA_K, 101, AxisType.REDUCE)
-  S_view = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)
-  qk_stores = []
-  for tm1_i in range(TM // WMMA_ACC):
-    for tn1_i in range(TN):
-      S_frag = S_view[tm1_i, tn1_i]
-      q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1_i, lane_n, k_qk]
-      k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1_i, lane_n, k_qk]
-      qk_stores.append(S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)))
-  qk_done = UOp.group(*qk_stores).end(k_qk)
+  k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
+  S_frag = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[tm1, tn1]
+  q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1, lane_n, k_qk]
+  k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1, lane_n, k_qk]
+  qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk)
   S_reg = S_reg.after(qk_done, S_reg.store(S_reg * SCALE))
+  # Unroll softmask/softmax REG-index loops for const-slot promotion on direct ISA.
   mask_stores = []
   for rm_i in range(TM):
     for rn_i in range(TN):
@@ -739,16 +733,11 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   pv_barrier = UOp.barrier(UOp.group(P_store, V_store))
   P_lds, V_lds = P_lds.after(pv_barrier), V_lds.after(pv_barrier)
   pv_acc = _reg((TM, TD), 10, 0, n_tile).after(pv_barrier)
-  k_pv = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE)
-  pv_view = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)
-  pv_stores = []
-  for tm2_i in range(TM // WMMA_ACC):
-    for tn2_i in range(TD):
-      pv_frag = pv_view[tm2_i, tn2_i]
-      p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, tm2_i, lane_n, k_pv]
-      v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2_i, lane_n, k_pv]
-      pv_stores.append(pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)))
-  pv_done = UOp.group(*pv_stores).end(k_pv)
+  k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
+  pv_frag = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[tm2, tn2]
+  p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, tm2, lane_n, k_pv]
+  v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2, lane_n, k_pv]
+  pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
   pv_acc = pv_acc.after(pv_done)
   acc_updates = [acc[ri5_i, rj5_i].store(acc[ri5_i, rj5_i] + beta_i[ri5_i] * pv_acc[ri5_i, rj5_i])
                  for ri5_i in range(TM) for rj5_i in range(TD)]
