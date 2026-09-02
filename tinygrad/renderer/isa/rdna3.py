@@ -2734,7 +2734,7 @@ def _hoist_gated_fmac_loads(ops:list[UOp]) -> list[UOp]:
     if not (addr.src and addr.src[0] is cmpa and len(load.src) >= 2 and load.src[1] is addr and
             val.src and val.src[0] is cmpv and len(val.src) >= 2 and val.src[1] is load and
             val in consumer.src): return None
-    if not _vmem_schedulable_load(load) or _reg_slots(load) != 1: return None
+    if not _vmem_schedulable_load(load) or _reg_slots(load) > 4: return None
     return cmpa, addr, load, cmpv, val, consumer
 
   out:list[UOp] = []
