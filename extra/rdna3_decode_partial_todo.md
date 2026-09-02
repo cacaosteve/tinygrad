@@ -1,6 +1,6 @@
 # flash_decode_partial: HIP gap follow-up
 
-**Status @ 9737080a8 (7900 XTX):** decode e2e ~54.7 µs AMD:AMD vs ~52.7 µs HIP (~2 µs gap).
+**Status @ e39b40c22 (7900 XTX):** decode e2e ~54.4 µs AMD:AMD vs ~52.5 µs HIP (~2 µs gap).
 `flash_decode_partial` ~45 µs direct vs ~28 µs HIP isolated — main remaining bottleneck.
 `flash_decode_combine` already faster than HIP (~9 vs ~11.5 µs).
 
@@ -32,7 +32,10 @@ tighter wait counts — we have not fully diff'd HIP asm yet.
 Soft lgkm scoreboard (defer waits until dest read) was tried twice: correct with DS_SWIZZLE in
 scoreboard, but almost all waits stayed hard `lgkmcnt(0)` — no e2e win.
 
-Emit-time VMEM before swizzle (`AMD_SINK_VMEM_SWIZZLE`, fb031f1a2): neutral on HW.
+Emit-time VMEM before swizzle (`fb031f1a2`): neutral on HW.
+
+Emit-time VMEM **after** swizzle (`e39b40c22`): LLVM-style lgkm gap placement; partial still
+~45 µs (neutral), e2e slightly improved (~54.4 µs). ALU in gap (`08f7d875a`) reverted — e2e regression.
 
 ## TODO (when resuming)
 
