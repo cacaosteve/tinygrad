@@ -8,8 +8,8 @@ import statistics
 import numpy as np
 
 from tinygrad import Device, Tensor, TinyJit
-from tinygrad.engine.jit import _prepare_jit_inputs
-from tinygrad.engine.realize import time_call
+from tinygrad.engine.jit import _copy_input, _prepare_jit_inputs
+from tinygrad.engine.realize import get_graph_runtime, get_runtime
 from tinygrad.llm.kernels.amd import flash_attention
 from tinygrad.uop.ops import Ops
 
@@ -36,37 +36,38 @@ def main() -> None:
     runner(q)
     Device[Device.DEFAULT].synchronize()
 
-  _, var_vals, _, _ = _prepare_jit_inputs((q,), {})
-  linear = runner.captured.linear
+  input_buf_uops, var_vals, _, _ = _prepare_jit_inputs((q,), {})
+  concrete = tuple(_copy_input(u) if u in runner.captured._written_uops else u for u in input_buf_uops)
+  graph_call = runner.captured.linear.src[0]
+  if graph_call.src[0].op is not Ops.CUSTOM_FUNCTION or graph_call.src[0].arg != "graph":
+    raise SystemExit("expected graphed flash decode jit")
+  gr = get_graph_runtime(graph_call.src[0], concrete)
+
   kernels: list[dict[str, object]] = []
-  seen: set[str] = set()
-  for call in linear.src:
-    if call.op is not Ops.CALL or call.src[0].op is not Ops.PROGRAM: continue
-    name = call.src[0].arg.function_name
-    if name in seen: continue
-    seen.add(name)
+  for j, (_dev_idx, prg, bufs, device_vars) in enumerate(gr.calls):
+    if prg.op is not Ops.PROGRAM: continue
+    vv = {**var_vals, **device_vars}
+    rt = get_runtime(bufs[0].device, prg)
+    gs, ls = prg.arg.launch_dims(vv)
+    vals = prg.arg.vals(vv)
     tms: list[float] = []
-    timer = time_call(call, var_vals)
     for _ in range(args.samples):
-      try:
-        tms.append(next(timer) * 1e3)
-      except StopIteration:
-        break
+      et = rt(*[b.get_buf(b.device) for b in bufs], global_size=gs, local_size=ls, vals=vals, wait=True)
+      tms.append((et or 0) * 1e3)
     kernels.append({
-      "name": name,
-      "median_us": statistics.median(tms) if tms else None,
-      "best_us": min(tms) if tms else None,
+      "name": prg.arg.function_name,
+      "median_us": statistics.median(tms),
+      "best_us": min(tms),
       "samples_us": tms,
-      "global_size": call.src[0].arg.global_size,
-      "local_size": call.src[0].arg.local_size,
+      "global_size": gs,
+      "local_size": ls,
     })
 
-  total = sum(k["median_us"] or 0 for k in kernels)
   print(json.dumps({
     "device": Device.DEFAULT,
     "renderer": Device[Device.DEFAULT].renderer.__class__.__name__,
     "kernels": kernels,
-    "sum_median_us": total,
+    "sum_median_us": sum(k["median_us"] for k in kernels),
   }, indent=2))
 
 
