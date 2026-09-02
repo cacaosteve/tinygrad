@@ -1935,12 +1935,9 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       pre, b = _vgpr_data(TMP_VDATA, u.src[2])
       return pre + [inst(_dst(u), a, b)]
     case AMDOps.FMA_MIX_F32:
-      # srcs: (acc, half, f32) — half is always mix src0 (opsel_hi=1)
-      hbase, f32 = u.src[1], u.src[2]
-      pre_h, hreg = _vgpr_data(TMP_VDATA, hbase)
-      pre_f, freg = ([], _src(f32)) if isinstance(_src(f32), Reg) and _src(f32).offset >= 256 else _vgpr_data(TMP_VADDR, f32)
+      # srcs: (acc, half, f32) — half is always mix src0 (opsel_hi=1). VOP3 accepts VGPR/SGPR.
       acc = _dst(u)
-      return pre_h + pre_f + [r3.v_fma_mix_f32(acc, hreg, freg, acc, opsel=0, opsel_hi=1, opsel_hi2=0)]
+      return [r3.v_fma_mix_f32(acc, _src(u.src[1]), _src(u.src[2]), acc, opsel=0, opsel_hi=1, opsel_hi2=0)]
     case AMDOps.CAST:
       cast_src = _src(u.src[0])
       if greg(u).index < 256:
