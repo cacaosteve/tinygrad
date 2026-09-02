@@ -309,8 +309,8 @@ def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_wa
   # spill/reload to in-register ds_swizzle; direct ISA was paying 32 ds_load_b32 per WMMA tile.
   tt = len(tokens)
   if swizzle_stores:
-    global _reg_swizzle_slot
     def values(acc:UOp) -> tuple[UOp, ...]:
+      global _reg_swizzle_slot
       own = tuple(acc.after(update)[i].load() for i in range(8))
       # Park all 8 swizzles in REG so emit batches SWIZZLE×8 then one shared lgkm wait.
       raw = [_swizzle_f32(own[i], 16) for i in range(8)]
