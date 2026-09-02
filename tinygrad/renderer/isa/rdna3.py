@@ -2947,10 +2947,6 @@ def _fused_lds_reduce_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
     emitted += [r3.v_add_f32_e32(acc, acc, v[free+lane]) for lane in range(4)]
   return 11, emitted
 
-def _lgkm_load_count(insts:list) -> int:
-  return sum(1 for i in insts if (n:=getattr(i, "op_name", "")) and
-             (n.startswith("DS_LOAD") or n.startswith("S_LOAD")))
-
 def insts_from_linear(lin:UOp):
   ops = list(lin.src)
   skip = _compute_amd_skip(ops)  # fused d16 hi LOADs still emit (d16_hi into lo)
@@ -2961,7 +2957,6 @@ def insts_from_linear(lin:UOp):
   # vm: (dest_regs, n_vmem_ops) in issue order — soft vmcnt must count ops, not UOps
   # (PACK_F16 can emit 16 loads; treating that as 1 desyncs vmcnt → MMU faults).
   pending_vm: list[tuple[set[int], int]] = []
-  pending_lgkm: list[tuple[set[int], int]] = []
   pending: dict[str, set[int]] = {"lgkm": set(), "vs": set()}
   items, targets = [], {}
   store_addr_cache = _StoreAddrCache()
@@ -2984,41 +2979,20 @@ def insts_from_linear(lin:UOp):
       else:
         pending_vm[0] = (regs, n - done)
         done = 0
-  def wait_lgkm(allow:int=0):
-    total = sum(n for _, n in pending_lgkm)
-    if not total: return
-    allow = max(0, min(allow, total))
-    emit(_wait_for_domain("lgkm", allow))
-    done = total - allow
-    while done > 0 and pending_lgkm:
-      regs, n = pending_lgkm[0]
-      if n <= done:
-        pending_lgkm.pop(0)
-        done -= n
-      else:
-        pending_lgkm[0] = (regs, n - done)
-        done = 0
   def flush(*domains:str):
     for domain in domains:
       if domain == "vm": wait_vm(0)
-      elif domain == "lgkm":
-        wait_lgkm(0)
-        pending["lgkm"].clear()
       elif pending[domain]:
         emit(_wait_for_domain(domain))
         pending[domain].clear()
   def flush_regs(regs:set[int]):
     need_i = next((i for i in range(len(pending_vm) - 1, -1, -1) if pending_vm[i][0] & regs), -1)
     if need_i >= 0: wait_vm(sum(n for _, n in pending_vm[need_i + 1:]))
-    need_i = next((i for i in range(len(pending_lgkm) - 1, -1, -1) if pending_lgkm[i][0] & regs), -1)
-    if need_i >= 0: wait_lgkm(sum(n for _, n in pending_lgkm[need_i + 1:]))
     if pending["lgkm"] & regs: flush("lgkm")
   def note_vm(regs:set[int], insts:list):
     if (n:=_vm_load_count(insts)) and regs: pending_vm.append((regs, n))
-  def note_lgkm(regs:set[int], insts:list):
-    if (n:=_lgkm_load_count(insts)) and regs: pending_lgkm.append((regs, n))
   def _pending_src(regs:set[int]) -> bool:
-    return any(pr & regs for pr, _ in pending_vm) or any(pr & regs for pr, _ in pending_lgkm) or bool(pending["lgkm"] & regs)
+    return any(pr & regs for pr, _ in pending_vm) or bool(pending["lgkm"] & regs)
   def _emit_uop(u, masked=False, with_store_cache=False):
     return list(insts_for_uop(u, skip, masked, store_addr_cache if with_store_cache else None,
                               d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst))
@@ -3046,7 +3020,7 @@ def insts_from_linear(lin:UOp):
       count, emitted, kas = fused_ka
       store_addr_cache.clear()
       for inst in emitted: emit(inst)
-      if kas: note_lgkm(set().union(*(_reg_idxs(ka) for ka in kas)), emitted)
+      for ka in kas: pending["lgkm"] |= _reg_idxs(ka)
       oi += count
       continue
     if u.op is Ops.INS and _iop(u) is AMDOps.LABEL:
@@ -3077,7 +3051,6 @@ def insts_from_linear(lin:UOp):
       mask_depth += 1
       if (domain:=_wait_domain_for_load(u)) is not None:
         if domain == "vm": note_vm(_reg_idxs(u), emitted)
-        elif domain == "lgkm": note_lgkm(_reg_idxs(u), emitted)
         else: pending[domain] |= _reg_idxs(u)
       oi += 1
       continue
@@ -3200,7 +3173,6 @@ def insts_from_linear(lin:UOp):
     if (domain:=_wait_domain_for_load(u)) is not None:
       regs = _reg_idxs(d16_hi_lo[u]) if u in d16_hi_lo else _reg_idxs(u)
       if domain == "vm": note_vm(regs, vm_after_wait if saw_vm_wait0 else emitted)
-      elif domain == "lgkm": note_lgkm(regs, emitted)
       else: pending[domain] |= regs
     if (domain:=_wait_domain_for_store(u)) is not None:
       pending[domain] |= _store_src_regs(u)
