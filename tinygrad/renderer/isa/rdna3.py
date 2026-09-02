@@ -519,7 +519,7 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[
   slows SDPA despite fewer VGPRs. Set AMD_FMA_MIX=1 and optionally
   AMD_FMA_MIX_ALL=1 to fold every matching FMAC.
   """
-  if not getenv("AMD_FMA_MIX", 0): return {}, set()
+  if not (getenv("AMD_FMA_MIX", 0) or getenv("AMD_FMA_MIX_ALL", 0)): return {}, set()
   if not getenv("AMD_FMA_MIX_ALL", 0) and not any(u.op is Ops.INS and _iop(u) is AMDOps.EXP2 for u in uops):
     return {}, set()
   uses: dict[UOp, list[UOp]] = {}
@@ -2208,6 +2208,30 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       return [r3.s_mov_b64(EXEC, _src(u.src[0]))]
   raise CompileError(f"cannot encode {_iop(u)}")
 
+def _where_load_exec_fuses(ops:list[UOp]) -> tuple[dict[UOp, UOp], set[UOp]]:
+  """Map WHERE(cmp, LOAD, alt) → LOAD when the load's only use is that WHERE.
+
+  Emit path turns these into mov+saveexec+load+restore (HIP LLM glue style) instead of
+  per-lane cndmask on the loaded value.
+  """
+  if not getenv("AMD_LOAD_EXEC", 1): return {}, set()
+  uses: dict[UOp, list[UOp]] = {}
+  for u in ops:
+    for s in u.src: uses.setdefault(s, []).append(u)
+  fuse: dict[UOp, UOp] = {}
+  skip: set[UOp] = set()
+  for u in ops:
+    if not (u.op is Ops.INS and _iop(u) is AMDOps.WHERE and len(u.src) == 3): continue
+    cmp, load, _alt = u.src
+    if not (load.op is Ops.INS and _iop(load) is AMDOps.LOAD): continue
+    if uses.get(load) != [u]: continue
+    if _reg_slots(load) > 4: continue
+    # Need a compare that feeds VCC for saveexec.
+    if not (cmp.op is Ops.INS and _iop(cmp) in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ)): continue
+    fuse[u] = load
+    skip.add(load)
+  return fuse, skip
+
 def _hoist_kernargs(ops:list[UOp]) -> list[UOp]:
   """Issue all KERNARG SMEM reads early so one lgkmcnt covers them (HIP s_load_b256 pattern).
 
@@ -3140,6 +3164,8 @@ def _fused_lds_reduce_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
 def insts_from_linear(lin:UOp):
   ops = list(lin.src)
   skip = _compute_amd_skip(ops)  # fused d16 hi LOADs still emit (d16_hi into lo)
+  where_load_exec, where_load_skip = _where_load_exec_fuses(ops)
+  skip |= where_load_skip
   d16_hi_lo = _d16_hi_lo_map(ops)
   fma_hi_lo = _fma_mixhi_lo_map(ops)
   fma_pair_dst: dict[UOp, Reg] = {}
@@ -3263,6 +3289,32 @@ def insts_from_linear(lin:UOp):
     masked = mask_depth > 0 and u.op is Ops.INS and _iop(u) in _MASKED_MEM
     if u in skip:
       if u.op is Ops.INS and _iop(u) is AMDOps.END_MASK: mask_depth -= 1
+      oi += 1
+      continue
+    # WHERE(cmp, LOAD, alt) → mov alt; saveexec; load; copy; restore (HIP gated-load style).
+    if mask_depth == 0 and (load:=where_load_exec.get(u)) is not None:
+      store_addr_cache.clear()
+      cmp, alt = u.src[0], u.src[2]
+      # Rematerialize compare into VCC (may have been clobbered since the CMP UOp).
+      for inst in _emit_uop(cmp): emit(inst)
+      dst, slots = greg(u), _reg_slots(u)
+      alt_reg = greg(alt) if isinstance(greg(alt), Register) else None
+      for lane in range(slots):
+        d = _reg_lane(dst, lane) if slots > 1 else _dst(u)
+        if alt_reg is not None:
+          a = _reg_lane(alt_reg, lane) if _reg_slots(alt) > 1 else _src(alt)
+          emit(r3.v_mov_b32_e32(d, a))
+        else:
+          emit(r3.v_mov_b32_e32(d, _src(alt)))
+      emit(r3.s_and_saveexec_b64(s[104:105], VCC))
+      load_emitted = _emit_uop(load, masked=True)
+      for inst in load_emitted: emit(inst)
+      note_vm(_reg_idxs(load), load_emitted)
+      ldst = greg(load)
+      for lane in range(slots):
+        d = _reg_lane(dst, lane) if slots > 1 else _dst(u)
+        emit(r3.v_mov_b32_e32(d, _reg_lane(ldst, lane) if slots > 1 else _dst(load)))
+      emit(r3.s_mov_b64(EXEC, s[104:105]))
       oi += 1
       continue
     # REG-stack park of same-stage swizzles is scheduled pre-regalloc as SWIZZLE×N,MOV×N
