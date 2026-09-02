@@ -50,19 +50,19 @@ Tool: `extra/diff_flash_decode_partial_asm.py` — run on HW with `DEV=AMD:AMD` 
 | Swizzles with **0 ops before lgkm wait** | **158 / 160** | **59 / 160** |
 | Swizzles with VALU before wait | 1.2% | **27.5%** |
 | Median insts swizzle → wait | 1 | 2 |
+| **Swizzle streak before wait** | **always 1** | **1–17** (often batched) |
 
-**Conclusion:** HIP does **not** use a different reduce algorithm (same 160 swizzles). It wins by **scheduling**:
-LLVM places ~1+ independent VALU instructions between `ds_swizzle` and `s_waitcnt` on most butterfly
-stages, plus heavy **`s_delay_alu`** use. Direct ISA emits **`swizzle → lgkm wait → add`** back-to-back
-on 98% of stages — our post-swizzle VMEM sink only hits ~1% (loads rarely sit in the uop gap).
+**Conclusion:** HIP does **not** use a different reduce algorithm (same 160 swizzles). It wins by
+**software-pipelining independent butterflies**: many `ds_swizzle` then one `s_waitcnt`, plus
+`s_delay_alu`. Direct ISA emits **`swizzle → lgkm wait → add`** per stage (streak always 1).
 
-**Next experiment:** LLVM fills bubbles with independent **MUL** between swizzle and wait, not
-unrelated **ADD** (sinking ADD before the butterfly lgkm wait **hangs the GPU**). Pre-regalloc
-MUL reorder breaks regalloc. **`AMD_SWIZZLE_DELAY=1`** (opt-in `s_delay_alu` after each swizzle)
-is safe but **neutral** on HW (~54.9 vs ~54.7 µs e2e). Need a regalloc-safe way to place MUL
-in the uop gap, or emit-time sink without ADD/MUL that alias accumulator regs.
+**Tried (`9b4a96af5`, reverted):** `warp_reduce_many` + swizzle-breadth schedule + emit-time batching.
+Locally got some long streaks, but **VGPR spills** → HW partial **45 → 52 µs**. Need a
+spill-safe way to batch same-stage swizzles (smaller batches / better regalloc) without
+holding all lane-dots live.
 
-Branch tip: `c3c0f378a` — post-swizzle VMEM sink + opt-in delay (`AMD_SWIZZLE_DELAY=1`).
+**Also tried:** emit-time VALU/ADD gap sink (GPU hang); pre-regalloc MUL reorder (regalloc assert);
+`AMD_SWIZZLE_DELAY=1` (safe, neutral).
 
 ```bash
 DEV=AMD:AMD  PYTHONPATH=.:extra python extra/diff_flash_decode_partial_asm.py -o /tmp/direct.json
@@ -73,12 +73,10 @@ PYTHONPATH=.:extra python extra/diff_flash_decode_partial_asm.py --compare /tmp/
 ## TODO (when resuming)
 
 1. ~~**Side-by-side disasm**~~ — done; see above.
-2. **Fill swizzle lgkm bubble like LLVM:** sink independent VALU into swizzle→wait gap at emit time;
-   try `s_delay_alu` after `ds_swizzle`; validate WMMA/LLOAD tests.
-3. **Kernel option (larger):** fewer warp reduces in `_amd_flash_attention_decode_partial` (head/key
-   restructuring) if scheduling alone can't close ~17 µs isolated gap.
-4. **Do not repeat without new evidence:** DPP row_shl reduces (HW regression); pre-regalloc VMEM
-   sink (regalloc break); soft lgkm without WMMA-safe hard flush.
+2. **Spill-safe butterfly batching:** software-pipeline same-stage `ds_swizzle` in groups of ~4–8
+   without keeping all SEC×G lane-dots live; validate no SCRATCH ops; HW A/B partial.
+3. Kernel option: change score loop structure so LLVM-style batching falls out of linearization
+   with low register pressure.
 
 ## Bench commands (7900)
 
