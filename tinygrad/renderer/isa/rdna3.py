@@ -2715,8 +2715,10 @@ def _clauseable_scalar_vmem_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   # Scalar global LOAD with dest-as-addr (compact B). Streak → hoist scales + s_clause.
   if u in skip or mask_depth or u.op is not Ops.INS or _iop(u) is not AMDOps.LOAD: return False
   if _is_lds_ref(u.src[0]) or _is_scratch_ref(u.src[0]): return False
-  if _reg_slots(u) != 1: return False
-  return u.dtype in (dtypes.half, dtypes.uint8, dtypes.int8, dtypes.uint, dtypes.int, dtypes.uint32, dtypes.int32, dtypes.float32)
+  slots = _reg_slots(u)
+  if slots != 1:
+    return u.dtype in (dtypes.float32, dtypes.float) and slots <= 4
+  return u.dtype in (dtypes.half, dtypes.uint8, dtypes.int8, dtypes.uint, dtypes.int, dtypes.uint32, dtypes.int32, dtypes.float32, dtypes.float)
 
 def _clauseable_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   return _clauseable_scalar_vmem_gload(u, skip, mask_depth) and u.dtype is dtypes.half
