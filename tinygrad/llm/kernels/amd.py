@@ -692,39 +692,28 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1, lane_n, k_qk]
   qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk)
   S_reg = S_reg.after(qk_done, S_reg.store(S_reg * SCALE))
-  # Unroll softmask/softmax REG-index loops for const-slot promotion on direct ISA.
-  mask_stores = []
-  for rm_i in range(TM):
-    for rn_i in range(TN):
-      q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
-      k_idx = n_tile * BLOCK_N + rn_i * LANES_PER_WAVE_N + lane_n
-      mask_stores.append(S_reg[rm_i, rn_i].store((k_idx <= q_idx).where(S_reg[rm_i, rn_i], S_reg[rm_i, rn_i].const_like(-math.inf))))
-  S_reg = S_reg.after(UOp.group(*mask_stores))
-  m_ij = _reg((TM,), 7, -math.inf, n_tile)
-  for rn_i in range(TN):
-    m_ij = m_ij.after(m_ij.store(m_ij.maximum(S_reg[:, rn_i])))
-  for ri_w_i in range(TM):
-    m_ij = m_ij.after(m_ij[ri_w_i].store(warp_reduce(m_ij[ri_w_i], maximum=True)))
+  rm, rn = UOp.range(TM, 250), UOp.range(TN, 251)
+  q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm * LANES_PER_WAVE_M + lane_m
+  k_idx = n_tile * BLOCK_N + rn * LANES_PER_WAVE_N + lane_n
+  S_reg = S_reg.after(S_reg[rm, rn].store((k_idx <= q_idx).where(S_reg[rm, rn], S_reg[rm, rn].const_like(-math.inf))).end(rm, rn))
+  m_ij, rm2 = _reg((TM,), 7, -math.inf, n_tile), UOp.range(TN, 261, AxisType.REDUCE)
+  m_ij = m_ij.after(m_ij.store(m_ij.after(rm2).maximum(S_reg[:, rm2])).end(rm2))
+  ri_w = UOp.range(TM, 270)
+  m_ij = m_ij.after(m_ij[ri_w].store(warp_reduce(m_ij[ri_w], maximum=True)).end(ri_w))
   tile_max = m_ij.reshape(TM, 1).expand(TM, TN).maximum(-1e30)
   S_reg = S_reg.after(S_reg.store(((S_reg - tile_max) * LOG2E).exp2()))
-  p_local = _reg((TM,), 8, 0, n_tile)
-  p_sum = p_local.after(UOp.group(*[
-    p_local[ri_ws_i].store(sum((warp_reduce(S_reg[ri_ws_i, rn_i]) for rn_i in range(TN)), S_reg.const_like(0)))
-    for ri_ws_i in range(TM)]))
+  p_local, ri_ws = _reg((TM,), 8, 0, n_tile), UOp.range(TM, 295)
+  p_sum = p_local.after(p_local[ri_ws].store(sum((warp_reduce(S_reg[ri_ws, rn]) for rn in range(TN)), S_reg.const_like(0))).end(ri_ws))
   P_lds = QP_lds.flatten()[:WAVES_N * BLOCK_M * BLOCK_N].reshape(WAVES_N, BLOCK_M, BLOCK_N)
   P_write = P_lds.reshape(WAVES_N, WAVES_M, TM, LANES_PER_WAVE_M, 1, TN, LANES_PER_WAVE_N, 1).permute((1, 0, 3, 6, 2, 4, 5, 7)) \
     .reshape(THREADS_PER_BLOCK, TM, TN)
   P_store = P_write[tid].store(S_reg.cast(dtypes.half))
-  beta_i = UOp.placeholder((TM,), dtypes.float, slot=9, addrspace=AddrSpace.REG)
-  correction_stores = []
-  for ri4_i in range(TM):
-    m_new = m_i[ri4_i].maximum(m_ij[ri4_i])
-    alpha_val, beta_val = ((m_i[ri4_i] - m_new) * LOG2E).exp2(), ((m_ij[ri4_i] - m_new) * LOG2E).exp2()
-    for rj4_i in range(TD):
-      correction_stores.append(acc[ri4_i, rj4_i].store(alpha_val * acc[ri4_i, rj4_i]))
-    correction_stores += [l_i[ri4_i].store(alpha_val * l_i[ri4_i] + beta_val * p_sum[ri4_i]),
-                          m_i[ri4_i].store(m_new), beta_i[ri4_i].store(beta_val)]
-  correction = UOp.group(*correction_stores)
+  beta_i, ri4, rj4 = UOp.placeholder((TM,), dtypes.float, slot=9, addrspace=AddrSpace.REG), UOp.range(TM, 330), UOp.range(TD, 331)
+  m_new = m_i[ri4].maximum(m_ij[ri4])
+  alpha_val, beta_val = ((m_i[ri4] - m_new) * LOG2E).exp2(), ((m_ij[ri4] - m_new) * LOG2E).exp2()
+  correction = UOp.group(acc[ri4, rj4].store(alpha_val * acc[ri4, rj4]).end(rj4),
+                         l_i[ri4].store(alpha_val * l_i[ri4] + beta_val * p_sum[ri4]),
+                         m_i[ri4].store(m_new), beta_i[ri4].store(beta_val)).end(ri4)
   acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
   V_lds = UOp.placeholder((D, BLOCK_N + LDS_PAD), dtypes.half, slot=1, addrspace=AddrSpace.LOCAL)[:, :BLOCK_N]
   V_copy, load_v = V_lds.after(qk_done).permute(1, 0), UOp.range(KV_ELEMS_PER_THREAD, 390)
@@ -739,9 +728,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2, lane_n, k_pv]
   pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
   pv_acc = pv_acc.after(pv_done)
-  acc_updates = [acc[ri5_i, rj5_i].store(acc[ri5_i, rj5_i] + beta_i[ri5_i] * pv_acc[ri5_i, rj5_i])
-                 for ri5_i in range(TM) for rj5_i in range(TD)]
-  n_tile_end = UOp.group(*acc_updates).barrier().end(n_tile)
+  ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
+  n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
   acc, l_i, m_i = acc.after(n_tile_end), l_i.after(n_tile_end), m_i.after(n_tile_end)
   acc = acc.after(acc.store(acc * (1 / l_i).reshape(TM, 1).expand(TM, TD)))
   o = o.reshape(WAVES_M, TM, LANES_PER_WAVE_M, 1, WAVES_N, TD, LANES_PER_WAVE_N, 1) \
