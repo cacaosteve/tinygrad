@@ -3078,12 +3078,13 @@ def insts_from_linear(lin:UOp):
       if u.op is Ops.INS and _iop(u) is AMDOps.END_MASK: mask_depth -= 1
       oi += 1
       continue
-    # Overlap independent VMEM with in-flight ds_swizzle: emit swizzle, then gap loads, then add waits lgkm.
+    # Overlap independent VMEM with in-flight ds_swizzle (emit after swizzle, before add's lgkm wait).
     if mask_depth == 0 and getenv("AMD_SINK_VMEM_SWIZZLE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SWIZZLE and \
        oi + 1 < len(scheduled) and (add:=scheduled[oi + 1]).op is Ops.INS and _iop(add) in (AMDOps.ADD, AMDOps.MAX) and u in add.src:
       emitted = _emit_uop(u)
       for inst in emitted: emit(inst)
       pending["lgkm"] |= _reg_idxs(u)
+      if getenv("AMD_SWIZZLE_DELAY", 0): emit(r3.s_delay_alu(1))
       k, moved = oi + 2, 0
       while k < len(scheduled) and moved < 4:
         if k in early_emitted or scheduled[k] in skip:
@@ -3093,6 +3094,8 @@ def insts_from_linear(lin:UOp):
         if cand.op is Ops.INS and _iop(cand) is AMDOps.LOAD and _vmem_schedulable_load(cand) and \
            u not in cand.toposort() and add not in cand.toposort() and \
            not any(cand in scheduled[m].toposort() for m in range(oi + 2, k)):
+          src_regs = set().union(*(_reg_idxs(s) for s in cand.src))
+          if src_regs and _pending_src(src_regs): flush_regs(src_regs)
           gap_emitted = _emit_uop(cand)
           for inst in gap_emitted: emit(inst)
           note_vm(_reg_idxs(cand), gap_emitted)
