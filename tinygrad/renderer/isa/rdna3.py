@@ -3575,7 +3575,9 @@ def isa_float4_mem_ok(f4, float4_safe, buf, value_dtype, u, uses, valid) -> bool
     return u.op is Ops.LOAD and value_dtype is dtypes.uint8 and buf.addrspace is not AddrSpace.LOCAL and \
       bool(valid.op is Ops.CONST and valid.val is True)
   if not float4_safe or buf.dtype != value_dtype: return False
-  if u.op is Ops.LOAD and any(v.op in {Ops.CAST, Ops.BITCAST} for v in uses[u]): return False
+  # BITCAST may reinterpret packed lanes; keep those scalar. CAST (e.g. half→float after
+  # SDPA KV loads) is fine: wide VMEM + EXTRACT + cvt matches HIP's B64 half traffic.
+  if u.op is Ops.LOAD and any(v.op is Ops.BITCAST for v in uses[u]): return False
   if u.op is Ops.STORE and u.src[1].op is Ops.BITCAST: return False
   return bool(valid.op is Ops.CONST and valid.val is True)
 

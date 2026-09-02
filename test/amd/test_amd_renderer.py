@@ -2575,6 +2575,16 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertIs(loads[0].op, Ops.LOAD)
     self.assertEqual(loads[0].max_numel(), 16)
 
+  def test_half_load_cast_float_coalesces_b64(self):
+    # Contiguous half→float must coalesce despite CAST users (SDPA KV path).
+    with Context(BEAM=0):
+      ast = (Tensor.empty(1024, dtype=dtypes.half, device="AMD").float() + 1).schedule_linear().src[0].src[0]
+      prg = _to_prg(ast)
+    names = _amd_inst_names(prg)
+    self.assertGreater(names.count("GLOBAL_LOAD_B64"), 0, "expected half×4 B64 after CAST-to-float")
+    self.assertEqual(names.count("GLOBAL_LOAD_U16"), 0, "scalar u16 half loads should be coalesced")
+    self.assertEqual(names.count("V_CVT_F32_F16_E32"), 4)
+
   def test_half_matmul_uses_wide_global_load(self):
     # Register path: contiguous operand B128; strided WMMA operand stays U16.
     import os
