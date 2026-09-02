@@ -516,7 +516,10 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple], set[UOp]]:
   Mix from the CAST source VGPR as f16 lo (opsel=0). Do not skip EXTRACT/LSHR —
   reading packed halves via opsel still NaNs on SDPA; matvec-only was fine.
   """
-  if not getenv("AMD_FMA_MIX", 0): return {}, set()
+  if not getenv("AMD_FMA_MIX", 1): return {}, set()
+  # Fused softmax@V NaNs with mix; keep cvt+fmac when EXP is in the same kernel.
+  if any(u.op is Ops.INS and _iop(u) is AMDOps.EXP2 for u in uops) and not getenv("AMD_FMA_MIX_EXP", 0):
+    return {}, set()
   uses: dict[UOp, list[UOp]] = {}
   for u in uops:
     for s in u.src: uses.setdefault(s, []).append(u)
