@@ -1,6 +1,6 @@
 # flash_decode_partial: HIP gap follow-up
 
-**Status @ e39b40c22 (7900 XTX):** decode e2e ~54.4 µs AMD:AMD vs ~52.5 µs HIP (~2 µs gap).
+**Status @ 2185ab0c7 (7900 XTX):** decode e2e ~55 µs AMD:AMD vs ~52.5 µs HIP (~2.5 µs gap).
 `flash_decode_partial` ~45 µs direct vs ~28 µs HIP isolated — main remaining bottleneck.
 `flash_decode_combine` already faster than HIP (~9 vs ~11.5 µs).
 
