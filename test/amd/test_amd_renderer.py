@@ -2594,6 +2594,16 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertGreater(names.count("GLOBAL_LOAD_B128"), 0)
     self.assertLessEqual(names.count("GLOBAL_LOAD_B32"), 1)
 
+  def test_float_coalesce_survives_mixed_dtype_kernel(self):
+    # A sibling int load must not disable float B128 coalesce via float4_safe=False.
+    with Context(BEAM=0):
+      f = Tensor.empty(256, device="AMD")
+      i = Tensor.empty(256, dtype=dtypes.int32, device="AMD")
+      ast = (f.contiguous() + i.float()).schedule_linear().src[-1].src[0]
+      prg = _to_prg(ast)
+    names = _amd_inst_names(prg)
+    self.assertGreater(names.count("GLOBAL_LOAD_B128"), 0)
+
   def test_half_matmul_uses_wide_global_load(self):
     # Register path: contiguous operand B128; strided WMMA operand stays U16.
     import os
