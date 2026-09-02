@@ -2546,33 +2546,39 @@ def _hoist_gated_fmac_loads(ops:list[UOp]) -> list[UOp]:
   """Issue adjacent independently-gated scalar loads before consuming any of them.
 
   VCC makes comparisons and WHERE inseparable scheduling pairs.  Handle the narrow
-  CMP/WHERE-address/LOAD/CMP/WHERE-value/FMAC form as six-UOp groups, preserving each
+  CMP/WHERE-address/LOAD/CMP/WHERE-value/consumer form as six-UOp groups, preserving each
   pair while moving only the independent address/load halves ahead of the consumers.
+
+  Consumers include FMAC (flash) and AND/BFE/LSHL_OR/CAST (quant dequant). Gate CMPs are
+  excluded from the independence set — they are often shared across adjacent gated reads and
+  previously forced every streak to length 1 (vmcnt(0) per uchar load).
   """
   if not getenv("AMD_GATED_VMEM", 1): return ops
-  cmps = (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ)
+  cmps = (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ, AMDOps.CMP_GE)
+  bad_consumer = {AMDOps.LOAD, AMDOps.STORE, AMDOps.LLOAD, AMDOps.LSTORE, AMDOps.SLOAD, AMDOps.SSTORE,
+                  AMDOps.WHERE, AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER, AMDOps.BRANCH,
+                  AMDOps.CBRANCH_SCC1, AMDOps.LABEL, AMDOps.LOOP_CMP}
   def group_at(i:int) -> tuple[UOp, ...]|None:
     if i + 5 >= len(ops): return None
-    cmpa, addr, load, cmpv, val, fmac = ops[i:i+6]
-    if not (cmpa.op is addr.op is load.op is cmpv.op is val.op is fmac.op is Ops.INS): return None
+    cmpa, addr, load, cmpv, val, consumer = ops[i:i+6]
+    if not (cmpa.op is addr.op is load.op is cmpv.op is val.op is consumer.op is Ops.INS): return None
     if _iop(cmpa) not in cmps or _iop(addr) is not AMDOps.WHERE or _iop(load) is not AMDOps.LOAD or \
-       _iop(cmpv) not in cmps or _iop(val) is not AMDOps.WHERE or _iop(fmac) is not AMDOps.FMAC: return None
+       _iop(cmpv) not in cmps or _iop(val) is not AMDOps.WHERE or _iop(consumer) in bad_consumer: return None
     if not (addr.src and addr.src[0] is cmpa and len(load.src) >= 2 and load.src[1] is addr and
-            val.src and val.src[0] is cmpv and len(val.src) >= 2 and val.src[1] is load and val in fmac.src): return None
+            val.src and val.src[0] is cmpv and len(val.src) >= 2 and val.src[1] is load and
+            val in consumer.src): return None
     if not _vmem_schedulable_load(load) or _reg_slots(load) != 1: return None
-    return cmpa, addr, load, cmpv, val, fmac
+    return cmpa, addr, load, cmpv, val, consumer
 
   out:list[UOp] = []
   i = 0
   while i < len(ops):
     groups:list[tuple[UOp, ...]] = []
-    late:set[UOp] = set()
+    late_data:set[UOp] = set()
     while (group:=group_at(i + len(groups) * 6)) is not None:
-      # A later address may legally depend on an earlier result in unusual kernels.
-      # Such a group is not independent and must remain in its original position.
-      if any(src in late for u in group[:3] for src in u.src): break
+      if any(src in late_data for u in group[:3] for src in u.src): break
       groups.append(group)
-      late.update(group[3:])
+      late_data.update((group[2], group[4], group[5]))  # load, value, consumer — not cmpv
     if len(groups) >= 2:
       out.extend(u for group in groups for u in group[:3])
       out.extend(u for group in groups for u in group[3:])
