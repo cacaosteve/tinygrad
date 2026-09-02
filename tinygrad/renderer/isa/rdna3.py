@@ -138,8 +138,8 @@ def _global_load_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
   if slots == 1:
     if (load:=_global_load(u.dtype, _elem_count(u))) is None: raise CompileError(f"no global load {u.dtype}")
     return [load(_dst(u), addr, saddr=saddr, **off_kw)]
-  # multi-VGPR by byte width: float×2/×4, half×4/×8, u32×4/×8, or byte×8/×16 → B64/B128.
-  if sc not in (dtypes.uint8, dtypes.float16, dtypes.float32, dtypes.int32, dtypes.uint32, dtypes.uint, dtypes.int):
+  # multi-VGPR by byte width: float×2/×4, half×4/×8, or byte×8/×16 → B64/B128.
+  if sc not in (dtypes.uint8, dtypes.float16, dtypes.float32, dtypes.int32, dtypes.uint32):
     raise CompileError(f"no vec global load {u.dtype}")
   if not isinstance(greg(u), Register): raise CompileError(f"expected reg dst {u}")
   if slots == 2: return [r3.global_load_b64(_dst(u), addr, saddr=saddr)]
@@ -685,8 +685,7 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
   if _is_scratch_ref(a.src[0]):
     if _scratch_load(x.dtype, n) is None: raise CompileError(f"no scratch load {x.dtype} x{n}")
     return x.ins(AMDOps.SLOAD, dtype=x.dtype, src=(a.src[0], a.src[1], count))
-  if _global_load(x.dtype, n) is None and not (x.dtype is dtypes.half and n == 16) and \
-      not (x.dtype in (dtypes.uint32, dtypes.int32, dtypes.uint) and n == 8):
+  if _global_load(x.dtype, n) is None and not (x.dtype is dtypes.half and n == 16):
     raise CompileError(f"no global load {x.dtype} x{n}")
   # Compact B: peel to per-k page idx + rem≤4095 GLOBAL offset (LLVM @N≥2048). Else full-imm
   # v_lshl_add into dest (AMD_B_LSHL_ADD) — keeps dest-as-addr s_clause.
@@ -2583,10 +2582,10 @@ def _hoist_gated_fmac_loads(ops:list[UOp]) -> list[UOp]:
 
 def _vmem_schedulable_load(u:UOp) -> bool:
   slots = _reg_slots(u)
-  # half×4 B64 and packed u32×4/×8 B128 (_amd_load SHRINK): independent addr+dest like scalar;
+  # half×4 B64 and packed u32×4 B128 (_amd_load SHRINK×4): independent addr+dest like scalar;
   # must not bail whole-kernel schedule (Q6 decode / flash).
   return slots == 1 or (u.dtype is dtypes.half and slots == 2) or \
-    (u.dtype in (dtypes.uint8, dtypes.float32, dtypes.uint32, dtypes.int32) and slots <= 8)
+    (u.dtype in (dtypes.uint8, dtypes.float32, dtypes.uint32, dtypes.int32) and slots <= 4)
 
 def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:bool|None=None) -> list[UOp]:
   """Hoist independent global reads inside conservative straight-line segments.
@@ -2656,16 +2655,8 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
     ready = [i for i,n in enumerate(indegree) if n == 0]
     scheduled:list[UOp] = []
     while ready:
-      # Wide VMEM first, then addr ALU for remaining loads, then scalar VMEM. Scalar scale/d
-      # loads must not cut B128 bursts — emit s_clauses them only when consecutive.
-      def _prio(j:int) -> tuple:
-        op, slots = _iop(segment[j]), _reg_slots(segment[j]) if _iop(segment[j]) is AMDOps.LOAD else 0
-        if op is AMDOps.LOAD and slots >= 4: tier = 0
-        elif j in load_ancestors: tier = 1
-        elif op is AMDOps.LOAD: tier = 2
-        else: tier = 3
-        return (tier, -slots, alu_depth[j] if use_alu_breadth else 0, j)
-      i = min(ready, key=_prio)
+      i = min(ready, key=lambda j: (0 if _iop(segment[j]) is AMDOps.LOAD else 1 if j in load_ancestors else 2,
+                                    alu_depth[j] if use_alu_breadth else 0, j))
       ready.remove(i)
       scheduled.append(segment[i])
       for user in users[i]:
@@ -2752,89 +2743,11 @@ def _fuse_kernarg_smem_loads(scheduled:list[UOp], oi:int, skip:set[UOp], mask_de
          r3.s_load_b128(sdata=sdata, sbase=KERNARG_REG, soffset=NULL, offset=base_off)
   return n, [load], group
 
-def _sink_scalar_vm_consumers_for_decode(ops:list[UOp]) -> list[UOp]:
-  """After a wide+scalar VMEM burst, consume wide loads before scalar-only results.
-
-  Otherwise the first ALU (often `d & 0xffff`) hard-waits on the trailing scalar and
-  drains every in-flight B128 — killing dequant/VMEM overlap that HIP gets from soft waits.
-  Only scalar-only consumers are deferred; other ALU keeps relative order (shift imm defs etc).
-  """
-  if not getenv("AMD_SINK_SCALAR_VM", 1): return ops
-  if not any(u.op is Ops.INS and _iop(u) is AMDOps.DOT4 for u in ops): return ops
-  wide = {u for u in ops if u.op is Ops.INS and _iop(u) is AMDOps.LOAD and _reg_slots(u) >= 4}
-  scalar = {u for u in ops if u.op is Ops.INS and _iop(u) is AMDOps.LOAD and _reg_slots(u) == 1}
-  if not wide or not scalar: return ops
-
-  def is_load(u:UOp) -> bool: return u.op is Ops.INS and _iop(u) is AMDOps.LOAD
-  stop = {AMDOps.LOAD, AMDOps.STORE, AMDOps.LLOAD, AMDOps.LSTORE, AMDOps.SLOAD, AMDOps.SSTORE,
-          AMDOps.BARRIER, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ, AMDOps.LABEL,
-          AMDOps.WMMA, AMDOps.DOT4}
-
-  def depends_on(u:UOp, roots:set[UOp], local:set[UOp]) -> bool:
-    stack, seen = list(u.src), set()
-    while stack:
-      s = stack.pop()
-      if s in seen: continue
-      seen.add(s)
-      if s in roots: return True
-      if s in local: stack.extend(s.src)
-    return False
-
-  # Burst = from first wide LOAD to last scalar LOAD before the first DOT4, allowing
-  # intervening addr ALU / compare / early AND (schedule may interleave).
-  try:
-    first_wide = next(i for i,u in enumerate(ops) if u in wide)
-    first_dot = next(i for i,u in enumerate(ops) if u.op is Ops.INS and _iop(u) is AMDOps.DOT4)
-  except StopIteration:
-    return ops
-  scalar_in_burst = [i for i,u in enumerate(ops) if first_wide <= i < first_dot and u in scalar]
-  if not scalar_in_burst: return ops
-  last_scalar = scalar_in_burst[-1]
-  j = last_scalar + 1
-  k = j
-  while k < first_dot:
-    u = ops[k]
-    if u.op is Ops.INS and _iop(u) in stop: break
-    if is_load(u): break
-    k += 1
-  block, local = list(ops[j:k]), set(ops[first_wide:k])
-  if len(block) < 2: return ops
-  wide_only = {u for u in block if depends_on(u, wide, local) and not depends_on(u, scalar, local)}
-  scalar_only = {u for u in block if depends_on(u, scalar, local) and not depends_on(u, wide, local)}
-  if not wide_only or not scalar_only: return ops
-  # Move all scalar-only ALU after wide/mixed dequant (safe when nothing else in the block
-  # depends on those scalar-only results — verified for Q6 decode).
-  if any(depends_on(u, scalar_only, local | set(block)) for u in block if u not in scalar_only):
-    deferred, new_block, seen_wide = [], [], False
-    for u in block:
-      if u in scalar_only and not seen_wide:
-        deferred.append(u)
-        continue
-      if u in wide_only: seen_wide = True
-      new_block.append(u)
-      if seen_wide and deferred:
-        new_block.extend(deferred)
-        deferred = []
-    new_block.extend(deferred)
-  else:
-    new_block = [u for u in block if u not in scalar_only] + [u for u in block if u in scalar_only]
-  if new_block == block: return ops
-  return ops[:j] + new_block + ops[k:]
-
 def _clauseable_wide_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   # Contiguous half×8+ global LOAD (A B128 pairs). Streak → one s_clause over all B128s.
   if u in skip or mask_depth or u.op is not Ops.INS or _iop(u) is not AMDOps.LOAD: return False
   return u.dtype is dtypes.half and _elem_count(u) >= 8 and not _is_lds_ref(u.src[0]) and \
          not _is_scratch_ref(u.src[0])
-
-def _clauseable_wide_u32_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
-  # Packed u32×4/×8 B128 (Q6 decode weights/activations). Streak → s_clause like HIP.
-  if u in skip or mask_depth or u.op is not Ops.INS or _iop(u) is not AMDOps.LOAD: return False
-  return u.dtype in (dtypes.uint32, dtypes.int32, dtypes.uint) and _elem_count(u) in (4, 8) and \
-         not _is_lds_ref(u.src[0]) and not _is_scratch_ref(u.src[0])
-
-def _clauseable_wide_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
-  return _clauseable_wide_half_gload(u, skip, mask_depth) or _clauseable_wide_u32_gload(u, skip, mask_depth)
 
 def _order_d16_lo_before_hi(ops:list[UOp], d16_hi_lo:dict[UOp, UOp]) -> list[UOp]:
   # Fused hi must follow its lo in BOTH regalloc and emit order. Emit-only reorder lets lo's
@@ -3163,18 +3076,18 @@ def insts_from_linear(lin:UOp):
       continue
     # Cluster contiguous A B128 (half×8+): one s_clause over the burst (LLVM B128×8).
     # Per-tile s_clause stripped from _global_load_insts. Skip addr ALU between wide A tiles.
-    if _clauseable_wide_gload(u, skip, mask_depth):
+    if _clauseable_wide_half_gload(u, skip, mask_depth):
       j = oi + 1
       while j < len(scheduled):
         if _is_addr_alu(scheduled[j]):
           j += 1
           continue
-        if _clauseable_wide_gload(scheduled[j], skip, mask_depth):
+        if _clauseable_wide_half_gload(scheduled[j], skip, mask_depth):
           j += 1
           continue
         break
       while j > oi + 1 and _is_addr_alu(scheduled[j - 1]): j -= 1
-      idxs = [k for k in range(oi, j) if _clauseable_wide_gload(scheduled[k], skip, mask_depth)]
+      idxs = [k for k in range(oi, j) if _clauseable_wide_half_gload(scheduled[k], skip, mask_depth)]
       parts = [_emit_uop(scheduled[k]) for k in range(oi, j)]
       if idxs and sum(_vm_load_count(p) for p in parts) >= 2:
         store_addr_cache.clear()
@@ -3188,23 +3101,6 @@ def insts_from_linear(lin:UOp):
           emit(r3.s_clause(simm16=len(loads) - 1))
           for inst in loads: emit(inst)
           for k in idxs: note_vm(_reg_idxs(scheduled[k]), parts[k - oi])
-          oi = j
-          continue
-        # Multi-base u32×8 tiles each need their own TMP scale; clause per tile (1 scale + 2×B128).
-        if any(_vm_load_count(parts[k - oi]) >= 2 for k in idxs):
-          for k in range(oi, j):
-            p = parts[k - oi]
-            if _clauseable_wide_gload(scheduled[k], skip, mask_depth):
-              sc, ld = _split_scale_and_loads(p)
-              if len(ld) >= 2 and _tmp_vaddr_clause_safe(sc, ld):
-                for inst in sc: emit(inst)
-                emit(r3.s_clause(simm16=len(ld) - 1))
-                for inst in ld: emit(inst)
-              else:
-                for inst in p: emit(inst)
-              note_vm(_reg_idxs(scheduled[k]), p)
-            else:
-              for inst in p: emit(inst)
           oi = j
           continue
     # Cluster scalar half loads: dest-as-addr scales, then s_clause + tight VMEM (LLVM-style B).
@@ -3673,7 +3569,6 @@ class AMDRenderer(ISARenderer):
     lst = _order_d16_lo_before_hi(lst, d16_hi_lo)
     lst = _hoist_gated_fmac_loads(lst)
     if getenv("AMD_SCHEDULE_VMEM", 1): lst = _schedule_scalar_vmem(lst, d16_hi_lo)
-    lst = _sink_scalar_vm_consumers_for_decode(lst)
     return _schedule_loop_cmps(lst)
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True

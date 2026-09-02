@@ -214,21 +214,21 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
   group_count = in_features // Q8_GROUP_SIZE
   def load_xwords(token:UOp, group:UOp) -> tuple[UOp, ...]:
-    # one u32×8 → two B128 under one addr scale (direct ISA s_clause)
-    vec = _amd_load(xq[token, group, 0], 8)
-    return tuple(vec[i] for i in range(8))
+    # two u32×4 loads → B128 under direct ISA (u32×8 still scalarizes)
+    halves = (_amd_load(xq[token, group, 0], 4), _amd_load(xq[token, group, 4], 4))
+    return tuple(halves[i // 4][i % 4] for i in range(8))
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
     block, subgroup = group // 8, group % 8
     if ggml_type in (Q4_K, Q5_K):
       base = (output * in_features//GGML_BLOCK_SIZE + block) * (Q4_WORDS if ggml_type == Q4_K else Q5_WORDS)
       qs_base, dot = base + (4 if ggml_type == Q4_K else 12) + (subgroup//2)*8, UOp.const(0, dtypes.int32)
       # vectorize the 8 packed-weight words and (for Q5_K) the 32-byte high-bit bitmap
-      qs = _amd_load(raw[qs_base], 8)
-      if ggml_type == Q5_K: qh = _amd_load(raw[base+4], 8)
+      qs_pair = (_amd_load(raw[qs_base], 4), _amd_load(raw[qs_base+4], 4))
+      if ggml_type == Q5_K: qh_pair = (_amd_load(raw[base+4], 4), _amd_load(raw[base+8], 4))
       xwords = load_xwords(token, group)
       for word_idx in range(8):
-        word = (qs[word_idx] >> ((subgroup&1)*4).cast(dtypes.uint32)) & 0x0f0f0f0f
-        if ggml_type == Q5_K: word |= ((qh[word_idx] >> subgroup.cast(dtypes.uint32)) & 0x01010101) << 4
+        word = (qs_pair[word_idx//4][word_idx%4] >> ((subgroup&1)*4).cast(dtypes.uint32)) & 0x0f0f0f0f
+        if ggml_type == Q5_K: word |= ((qh_pair[word_idx//4][word_idx%4] >> subgroup.cast(dtypes.uint32)) & 0x01010101) << 4
         dot = _amd_dp4a(word, xwords[word_idx], dot)
       d, dmin, scale, minimum = _q5_scales(raw, base, subgroup)
       gsum = xs[token, group, 0].load() + xs[token, group, 1].load()
@@ -245,15 +245,14 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
     # the packed rows were padded to 212 bytes (53 words) per 256-block in set_quantized: everything is word-aligned
     base = (output*in_features//GGML_BLOCK_SIZE+block)*Q6_WORDS
     # Issue packed-weight VMEM first so the decode scheduler can burst raw reads before activations/scales.
-    # u32×8 → two B128 sharing one scaled addr (s_clause-safe), vs two independent ×4 TMP scales.
-    lows = _amd_load(raw[base + (subgroup//4)*16 + (subgroup%2)*8], 8)
-    highs = _amd_load(raw[base + 32 + (subgroup//4)*8], 8)
+    lows = tuple(_amd_load(raw[base + (subgroup//4)*16 + (subgroup%2)*8 + half*4], 4) for half in range(2))
+    highs = tuple(_amd_load(raw[base + 32 + (subgroup//4)*8 + half*4], 4) for half in range(2))
     xwords = load_xwords(token, group)
     dots = [UOp.const(0, dtypes.int32)] * 2
     for word_idx in range(8):
       within = (subgroup*32 + word_idx*4)%128
-      low = lows[word_idx] >> ((within//64)*4).cast(dtypes.uint32)
-      high = highs[word_idx] >> ((within//32)*2).cast(dtypes.uint32)
+      low = lows[word_idx//4][word_idx%4] >> ((within//64)*4).cast(dtypes.uint32)
+      high = highs[word_idx//4][word_idx%4] >> ((within//32)*2).cast(dtypes.uint32)
       # 4 values per word: (low nibble) | (2 high bits << 4). values stay positive, so the int8-bitcast/-32 of the
       # naive dequant is skipped and the -32 offset is applied later via the per-16 sums of the quantized inputs
       word = (low & 0x0f0f0f0f) | ((high & 0x03030303) << 4)
