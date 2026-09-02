@@ -2214,7 +2214,7 @@ def _where_load_exec_fuses(ops:list[UOp]) -> tuple[dict[UOp, UOp], set[UOp]]:
   Emit path turns these into mov+saveexec+load+restore (HIP LLM glue style) instead of
   per-lane cndmask on the loaded value.
   """
-  if not getenv("AMD_LOAD_EXEC", 1): return {}, set()
+  if not getenv("AMD_LOAD_EXEC", 0): return {}, set()
   uses: dict[UOp, list[UOp]] = {}
   for u in ops:
     for src in u.src: uses.setdefault(src, []).append(u)
