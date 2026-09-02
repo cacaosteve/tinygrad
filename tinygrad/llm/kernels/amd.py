@@ -380,21 +380,27 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
 def _q6_scale_raw(raw:UOp, base:UOp, idx:UOp) -> UOp:
   return ((raw[base+48+idx//4] >> ((idx%4)*8).cast(dtypes.uint32)) & 255).cast(dtypes.uint8).bitcast(dtypes.int8).float()
 
+def _q6_packed_word(low:UOp, high:UOp, lo_shift:UOp, hi_shift:UOp) -> UOp:
+  # Match pre-isel LSHL_OR: OR(AND(low, mask), SHL(AND(high, mask2), 4))
+  lo = (low >> lo_shift) & 0x0f0f0f0f
+  hi = ((high >> hi_shift) & 0x03030303) << 4
+  return lo | hi
+
+def _q6_byte_f32(word:UOp, byte:int) -> UOp:
+  # Pre-isel folds CAST(AND(SHR(word, shift), 255)) → V_CVT_F32_UBYTEn
+  return ((word >> UOp.const(byte*8, dtypes.uint32)) & 255).cast(dtypes.float32)
+
 def _q6_wmma_words(ql4:tuple[UOp, ...], qh4:tuple[UOp, ...], subgroup:UOp, half:int) -> tuple[UOp, ...]:
-  words:list[UOp] = []
-  for i in range(4):
-    word_idx = half*4 + i
-    within = (subgroup*32 + word_idx*4) % 128
-    lo_shift, hi_shift = (within//64)*4, (within//32)*2
-    low = ql4[i] >> lo_shift.cast(dtypes.uint32)
-    high = qh4[i] >> hi_shift.cast(dtypes.uint32)
-    words.append((low & 0x0f0f0f0f) | ((high & 0x03030303) << 4))
-  return tuple(words)
+  # All four words in a half share lo/hi shifts (within steps by 4 do not cross 64/32 boundaries).
+  within0 = (subgroup*32 + half*16) % 128
+  lo_shift, hi_shift = (within0//64)*4, (within0//32)*2
+  lo_s, hi_s = lo_shift.cast(dtypes.uint32), hi_shift.cast(dtypes.uint32)
+  return tuple(_q6_packed_word(ql4[i], qh4[i], lo_s, hi_s) for i in range(4))
 
 def _q6_wmma_frags(words:tuple[UOp, ...], scale:UOp, d:UOp, direct_isa:bool) -> tuple[UOp, ...]:
   if direct_isa:
     scaled, bias = scale*d, scale*d*-32
-    return tuple(_amd_fma_to_f16((word >> (byte*8) & 255).float(), scaled, bias) for word in words for byte in range(4))
+    return tuple(_amd_fma_to_f16(_q6_byte_f32(word, byte), scaled, bias) for word in words for byte in range(4))
   return tuple((((word >> (byte*8) & 255).float()-32)*scale*d).cast(dtypes.float16) for word in words for byte in range(4))
 
 @functools.cache
