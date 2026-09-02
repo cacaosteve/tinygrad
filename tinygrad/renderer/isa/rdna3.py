@@ -3063,12 +3063,16 @@ def insts_from_linear(lin:UOp):
   scheduled = _schedule_swizzle_mov_batches(scheduled)
   fma_pair_dst = _fma_pair_pack_dsts(scheduled, fma_hi_lo)
   early_emitted: set[int] = set()
+  perm_selects_ready = False
   oi = 0
   while oi < len(scheduled):
     if oi in early_emitted:
       oi += 1
       continue
     u = scheduled[oi]
+    # Anything that may clobber TMP_SDATA0/1 invalidates cached permlanex selects.
+    if u.op is Ops.INS and _iop(u) not in (AMDOps.PERMLANEX16, AMDOps.EXTRACT, AMDOps.MOV):
+      perm_selects_ready = False
     if mask_depth == 0 and (fused_dot:=_fused_mixed_dot4_loop(scheduled, oi)) is not None:
       count, emitted = fused_dot
       flush("vm", "lgkm")
@@ -3172,21 +3176,18 @@ def insts_from_linear(lin:UOp):
       pending["lgkm"].add(-1)
       oi += count
       continue
-    # Cluster consecutive PERMLANEX16: one pair of lane-select s_movs then VALU burst.
+    # PERMLANEX16: install lane-select SGPRs once across EXTRACT-separated peers.
     if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.PERMLANEX16:
-      j = oi + 1
-      while j < len(scheduled) and scheduled[j] not in skip and scheduled[j].op is Ops.INS and \
-            _iop(scheduled[j]) is AMDOps.PERMLANEX16: j += 1
-      if j - oi >= 1:
-        store_addr_cache.clear()
+      store_addr_cache.clear()
+      if not perm_selects_ready:
         emit(r3.s_mov_b32(TMP_SDATA0, 0x76543210))
         emit(r3.s_mov_b32(TMP_SDATA1, 0xfedcba98))
-        for k in range(oi, j):
-          pre, val = _vgpr_data(TMP_VDATA, scheduled[k].src[0])
-          for inst in pre: emit(inst)
-          emit(r3.v_permlanex16_b32(_dst(scheduled[k]), val, TMP_SDATA0, TMP_SDATA1, opsel=1))
-        oi = j
-        continue
+        perm_selects_ready = True
+      pre, val = _vgpr_data(TMP_VDATA, u.src[0])
+      for inst in pre: emit(inst)
+      emit(r3.v_permlanex16_b32(_dst(u), val, TMP_SDATA0, TMP_SDATA1, opsel=1))
+      oi += 1
+      continue
     # Cluster consecutive LLOAD streaks (post _hoist_lloads_before_extracts): s_clause + ds_load burst.
     if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.LLOAD:
       j = oi + 1
