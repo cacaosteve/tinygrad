@@ -3874,7 +3874,7 @@ class AMDRenderer(ISARenderer):
     return super().loop_end(x)
   def prefer_phys(self, x:UOp, src_phys:list) -> Register|None:
     # WHERE/cndmask: prefer aliasing onto the true-value VGPR (HIP-style; kills E_32 mov chains).
-    if x.op is Ops.INS and _iop(x) is AMDOps.WHERE and getenv("AMD_WHERE_ALIAS", 1):
+    if x.op is Ops.INS and _iop(x) is AMDOps.WHERE and getenv("AMD_WHERE_ALIAS", 0):
       if len(src_phys) > 1 and src_phys[1] is not None and isinstance(x.tag, tuple):
         if src_phys[1] in x.tag[0].cons: return src_phys[1]
     # EXTRACT from a multi-VGPR value → alias onto its source lane. Besides WMMA
