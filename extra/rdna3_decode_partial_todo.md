@@ -1,68 +1,38 @@
 # flash_decode_partial: HIP gap follow-up
 
-**Status @ 2185ab0c7 (7900 XTX):** decode e2e ~55 µs AMD:AMD vs ~52.5 µs HIP (~2.5 µs gap).
-`flash_decode_partial` ~45 µs direct vs ~28 µs HIP isolated — main remaining bottleneck.
+**Status (7900 XTX):** decode e2e ~**53.9 µs** AMD:AMD vs ~**52.5 µs** HIP (~1.4 µs gap).
+`flash_decode_partial` ~**37.3 µs** direct (was ~45) vs ~28 µs HIP isolated — still the main gap.
 `flash_decode_combine` already faster than HIP (~9 vs ~11.5 µs).
+
+## Landed: spill-safe same-stage swizzle batching
+
+`warp_reduce_many` parks each stage’s GQA-head `ds_swizzle` results in unique REG temps
+(per-element stores), and `_schedule_swizzle_mov_batches` rewrites `SW,MOV,SW,MOV,…` →
+`SW×N,MOV×N` **before regalloc**. Soft lgkm then shares one wait per stage (streak 4).
+
+**Do not** emit-reorder that pattern after regalloc — swizzle live ranges get aliased and
+results diverge from tip (same checksum/first8 required).
+
+HW (prod shape waves=8, block_n=64): partial **45 → 37.3 µs**, e2e **~55 → ~53.9 µs**,
+err/checksum match tip, 0 scratch. Toggle: `AMD_BATCH_SWIZZLE_MOV=0`.
 
 ## Does HIP do DPP / different reduce?
 
-**Same kernel source.** Both paths use `warp_reduce()` in `tinygrad/llm/kernels/amd.py`, which emits
-`__builtin_amdgcn_ds_swizzle` CUSTOM ops (butterfly offsets 16,8,4,2,1). HIP compiles those via
-LLVM/comgr; direct ISA lowers them in `tinygrad/renderer/isa/rdna3.py`.
+**Same kernel source.** Both paths use `warp_reduce` / `warp_reduce_many` in
+`tinygrad/llm/kernels/amd.py` (`ds_swizzle` CUSTOM). DPP `row_shl` was tried on direct ISA —
+codegen looked better but **HW regressed ~+3.5 µs**; reverted.
 
-We tried replacing row-local swizzle stages with **V_ADD DPP row_shl** on direct ISA only — codegen
-had far fewer lgkm waits, but **HW regressed ~+3.5 µs on partial**. So HIP is **not** winning
-because it uses DPP for these reduces (likely still ds_swizzle in LLVM output).
+## Why is direct ISA still slower on partial?
 
-## Why is direct ISA slower on partial?
+HIP still wins some on scheduling (`s_delay_alu`, longer streaks up to ~17, more VALU in the
+lgkm gap). Direct now batches G=4 per stage; HIP often batches more aggressively across work.
 
-Machine code (partial kernel, ~1558 insts each):
+## Failed approaches (do not repeat blindly)
 
-| | AMD:AMD direct | AMD:HIP |
-|--|----------------|---------|
-| `DS_SWIZZLE_B32` | ~160 | ~160 (same algorithm) |
-| Global loads | ~20 | ~20 |
-| **`S_WAITCNT_LGKMCNT`** | **~202** | **~150** |
-
-Same swizzles, **~52 extra lgkm hard-waits** on direct. Our emitter calls `flush_regs` before
-most ALU that consumes a swizzle dest → `lgkmcnt(0)` every butterfly stage. LLVM tends to
-**schedule independent VMEM/ALU in the swizzle latency gap** and may use **`s_delay_alu`** /
-tighter wait counts — we have not fully diff'd HIP asm yet.
-
-Soft lgkm scoreboard (defer waits until dest read) was tried twice: correct with DS_SWIZZLE in
-scoreboard, but almost all waits stayed hard `lgkmcnt(0)` — no e2e win.
-
-Emit-time VMEM before swizzle (`fb031f1a2`): neutral on HW.
-
-Emit-time VMEM **after** swizzle (`e39b40c22`): LLVM-style lgkm gap placement; partial still
-~45 µs (neutral), e2e slightly improved (~54.4 µs). ALU in gap (`08f7d875a`) reverted — e2e regression.
-
-## Disasm findings (7900 XTX, `2d3957def`)
-
-Tool: `extra/diff_flash_decode_partial_asm.py` — run on HW with `DEV=AMD:AMD` and `DEV=AMD:HIP`.
-
-| Metric | Direct ISA | HIP |
-|--------|------------|-----|
-| `ds_swizzle_b32` | 160 | 160 |
-| Total waitcnt | 202 | 150 |
-| **`s_delay_alu`** | **0** | **108** |
-| Global loads | 20 | 20 |
-| Swizzles with **0 ops before lgkm wait** | **158 / 160** | **59 / 160** |
-| Swizzles with VALU before wait | 1.2% | **27.5%** |
-| Median insts swizzle → wait | 1 | 2 |
-| **Swizzle streak before wait** | **always 1** | **1–17** (often batched) |
-
-**Conclusion:** HIP does **not** use a different reduce algorithm (same 160 swizzles). It wins by
-**software-pipelining independent butterflies**: many `ds_swizzle` then one `s_waitcnt`, plus
-`s_delay_alu`. Direct ISA emits **`swizzle → lgkm wait → add`** per stage (streak always 1).
-
-**Tried (`9b4a96af5`, reverted):** `warp_reduce_many` + swizzle-breadth schedule + emit-time batching.
-Locally got some long streaks, but **VGPR spills** → HW partial **45 → 52 µs**. Need a
-spill-safe way to batch same-stage swizzles (smaller batches / better regalloc) without
-holding all lane-dots live.
-
-**Also tried:** emit-time VALU/ADD gap sink (GPU hang); pre-regalloc MUL reorder (regalloc assert);
-`AMD_SWIZZLE_DELAY=1` (safe, neutral).
+- Global swizzle-breadth ready-list (FMAC hoist / uncapped) → spills or VMEM overlap loss
+- Emit-time SWIZZLE/MOV reorder after regalloc → **wrong numerics** (VGPR alias)
+- Soft lgkm alone without park → streak always 1
+- VALU/ADD gap sink → GPU hang; `AMD_SWIZZLE_DELAY=1` → neutral
 
 ```bash
 DEV=AMD:AMD  PYTHONPATH=.:extra python extra/diff_flash_decode_partial_asm.py -o /tmp/direct.json
@@ -72,11 +42,9 @@ PYTHONPATH=.:extra python extra/diff_flash_decode_partial_asm.py --compare /tmp/
 
 ## TODO (when resuming)
 
-1. ~~**Side-by-side disasm**~~ — done; see above.
-2. **Spill-safe butterfly batching:** software-pipeline same-stage `ds_swizzle` in groups of ~4–8
-   without keeping all SEC×G lane-dots live; validate no SCRATCH ops; HW A/B partial.
-3. Kernel option: change score loop structure so LLVM-style batching falls out of linearization
-   with low register pressure.
+1. Close remaining ~9 µs isolated partial gap vs HIP (`s_delay_alu` placement, longer batches
+   without spills, more VALU/VMEM in swizzle latency gaps).
+2. Re-check e2e vs HIP after any further partial work (~1.4 µs left).
 
 ## Bench commands (7900)
 

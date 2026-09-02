@@ -44,13 +44,41 @@ def amd_direct_isa(device:str|tuple[str, ...]|None) -> bool:
   if device is None or device.split(":")[0] != "AMD": return False
   with Context(ALLOW_DEVICE_USAGE=1): return Device[device].renderer.__class__.__name__ == "AMDRenderer"
 
+def _swizzle_f32(val:UOp, offset:int) -> UOp:
+  return UOp(Ops.CUSTOM, src=(val,), arg=
+    (f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))", dtypes.float))
+
 def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
-    other = UOp(Ops.CUSTOM, src=(val,), arg=
-      (f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))", dtypes.float))
+    other = _swizzle_f32(val, offset)
     val = val.maximum(other) if maximum else val + other
   return val
+
+_reg_swizzle_slot = 64
+
+def warp_reduce_many(vals:list[UOp], maximum:bool=False, full_wave:bool=False) -> list[UOp]:
+  """Butterfly-reduce independent f32s; park same-stage swizzles in REG temps.
+
+  Per-element REG stores keep all stage-N ds_swizzle ops ahead of butterfly adds so
+  emit can issue SWIZZLE×N then one lgkm wait (HIP pattern). Unique slots per stage
+  avoid clobbering live parks across keys.
+  """
+  if not vals: return []
+  if len(vals) == 1: return [warp_reduce(vals[0], maximum=maximum, full_wave=full_wave)]
+  global _reg_swizzle_slot
+  offsets = (16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)
+  chunk = list(vals)
+  for i, v in enumerate(chunk):
+    if v.op is Ops.INDEX and v.addrspace == AddrSpace.REG: chunk[i] = v.load()
+  for offset in offsets:
+    raw = [_swizzle_f32(v, offset) for v in chunk]
+    tmp = UOp.placeholder((len(chunk),), dtypes.float, slot=_reg_swizzle_slot, addrspace=AddrSpace.REG)
+    _reg_swizzle_slot += 1
+    tmp = tmp.after(UOp.group(*[tmp[i].store(sw) for i, sw in enumerate(raw)]))
+    others = [tmp[i].load() for i in range(len(chunk))]
+    chunk = [v.maximum(o) if maximum else v + o for v, o in zip(chunk, others)]
+  return chunk
 
 def _reg(shape:tuple[int, ...], slot:int, value:float, dep:UOp|None=None) -> UOp:
   ret = UOp.placeholder(shape, dtypes.float, slot=slot, addrspace=AddrSpace.REG)
@@ -485,9 +513,10 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
     kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
     # V is prefetched in the score pass so both streams are in flight together
     vfrags[j] = _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL)
-    for h in range(G):
-      s = warp_reduce(sum((qf[h][i]*kfrag[i] for i in range(DPL)), UOp.const(0, dtypes.float)), full_wave=True) * (1/math.sqrt(D))
-      scores[j][h] = valid.where(s, UOp.const(-math.inf, dtypes.float))
+    # Same-stage swizzles for all GQA heads share one lgkm wait (see warp_reduce_many).
+    dots = [sum((qf[h][i]*kfrag[i] for i in range(DPL)), zerof) for h in range(G)]
+    for h, s in enumerate(warp_reduce_many(dots, full_wave=True)):
+      scores[j][h] = valid.where(s * (1/math.sqrt(D)), UOp.const(-math.inf, dtypes.float))
   ninf = UOp.const(-math.inf, dtypes.float)
   row_max = [functools.reduce(UOp.maximum, (scores[j][h] for j in range(SEC)), ninf) for h in range(G)]
   accs:list[list[UOp]] = [[UOp.const(0, dtypes.float)] * DPL for _ in range(G)]

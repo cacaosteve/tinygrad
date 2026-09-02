@@ -2686,6 +2686,32 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
   out.extend(schedule(segment))
   return out
 
+def _schedule_swizzle_mov_batches(ops:list[UOp]) -> list[UOp]:
+  """Rewrite SWIZZLE,MOV,SWIZZLE,MOV,… into SWIZZLE×N,MOV×N before regalloc.
+
+  Emit-time reordering of the same pattern extends swizzle live ranges past what
+  regalloc assumed (aliased VGPRs → wrong results). Scheduling here keeps liveness honest.
+  """
+  if not getenv("AMD_BATCH_SWIZZLE_MOV", 1): return ops
+  out: list[UOp] = []
+  i = 0
+  while i < len(ops):
+    u = ops[i]
+    if u.op is Ops.INS and _iop(u) is AMDOps.SWIZZLE and i + 1 < len(ops) and \
+       ops[i + 1].op is Ops.INS and _iop(ops[i + 1]) is AMDOps.MOV and u in ops[i + 1].src:
+      sws, movs = [u], [ops[i + 1]]
+      j = i + 2
+      while j + 1 < len(ops) and len(sws) < 8 and \
+            ops[j].op is Ops.INS and _iop(ops[j]) is AMDOps.SWIZZLE and \
+            ops[j + 1].op is Ops.INS and _iop(ops[j + 1]) is AMDOps.MOV and \
+            ops[j] in ops[j + 1].src:
+        sws.append(ops[j]); movs.append(ops[j + 1]); j += 2
+      if len(sws) >= 2:
+        out.extend(sws); out.extend(movs); i = j
+        continue
+    out.append(u); i += 1
+  return out
+
 def _vm_load_count(insts:list) -> int:
   return sum(1 for i in insts if (n:=getattr(i, "op_name", "")) and
              (n.startswith("GLOBAL_LOAD") or n.startswith("SCRATCH_LOAD") or
@@ -3078,6 +3104,9 @@ def insts_from_linear(lin:UOp):
       if u.op is Ops.INS and _iop(u) is AMDOps.END_MASK: mask_depth -= 1
       oi += 1
       continue
+    # REG-stack park of same-stage swizzles is scheduled pre-regalloc as SWIZZLE×N,MOV×N
+    # (_schedule_swizzle_mov_batches). Soft lgkm then shares one wait on the first MOV.
+    # Do not emit-reorder here — that extends live ranges past regalloc and corrupts results.
     # Overlap independent VMEM with in-flight ds_swizzle (emit after swizzle, before add's lgkm wait).
     if mask_depth == 0 and getenv("AMD_SINK_VMEM_SWIZZLE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SWIZZLE and \
        oi + 1 < len(scheduled) and (add:=scheduled[oi + 1]).op is Ops.INS and _iop(add) in (AMDOps.ADD, AMDOps.MAX) and u in add.src:
@@ -3632,6 +3661,7 @@ class AMDRenderer(ISARenderer):
     lst = _order_d16_lo_before_hi(lst, d16_hi_lo)
     lst = _hoist_gated_fmac_loads(lst)
     if getenv("AMD_SCHEDULE_VMEM", 1): lst = _schedule_scalar_vmem(lst, d16_hi_lo)
+    lst = _schedule_swizzle_mov_batches(lst)
     return _schedule_loop_cmps(lst)
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True
