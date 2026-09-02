@@ -517,9 +517,6 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple], set[UOp]]:
   reading packed halves via opsel still NaNs on SDPA; matvec-only was fine.
   """
   if not getenv("AMD_FMA_MIX", 1): return {}, set()
-  # Fused softmax@V NaNs with mix; keep cvt+fmac when EXP is in the same kernel.
-  if any(u.op is Ops.INS and _iop(u) is AMDOps.EXP2 for u in uops) and not getenv("AMD_FMA_MIX_EXP", 0):
-    return {}, set()
   uses: dict[UOp, list[UOp]] = {}
   for u in uops:
     for s in u.src: uses.setdefault(s, []).append(u)
@@ -542,6 +539,21 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple], set[UOp]]:
     else:
       for u in consumers: folds.pop(u, None)
   return folds, skip
+
+def _pin_fma_mix_half_lives(lst:list[UOp]) -> list[UOp]:
+  """Keep half VGPRs live until FMAC when CAST is skipped for fma_mix.
+
+  Regalloc only sees FMAC←CAST; after skipping CAST emit, the half source can be
+  reused before mix reads it (NaNs under register pressure / fused softmax@V).
+  """
+  folds, _ = _fma_mix_f32_folds(lst)
+  if not folds: return lst
+  out: list[UOp] = []
+  for u in lst:
+    if (mix:=folds.get(u)) is not None and mix[2] not in u.src:
+      u = u.replace(src=u.src + (mix[2],))
+    out.append(u)
+  return out
 
 def _amd_skip(ctx:PreRegAllocContext) -> set[UOp]:
   if "skip" not in ctx.scratch and ctx.uops: ctx.scratch["skip"] = _compute_amd_skip(ctx.uops)
@@ -3824,6 +3836,7 @@ class AMDRenderer(ISARenderer):
     6. Hoist independent scalar VMEM reads in kernels without WMMA or wide global loads.
     7. Put a boundless-loop compare before any REG_STORE that mutates its old-value operand.
     """
+    lst = _pin_fma_mix_half_lives(lst)
     lst = _schedule_fma_mixhi_pairs(lst)
     lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
     lst = _prefetch_a_after_packed_quant(lst) if getenv("AMD_PREFETCH_IQ4_A", 1) else lst
