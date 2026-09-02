@@ -515,7 +515,7 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[
   Returns (fmac → (hbase, f32_src), skip CAST).
   Mul is commutative so half is always the mix src0 (opsel_hi=1, opsel=0).
   """
-  if not getenv("AMD_FMA_MIX", 1): return {}, set()
+  if not getenv("AMD_FMA_MIX", 0): return {}, set()
   uses: dict[UOp, list[UOp]] = {}
   for u in uops:
     for s in u.src: uses.setdefault(s, []).append(u)
@@ -3646,7 +3646,7 @@ class AMDRenderer(ISARenderer):
   float4_dtypes = (dtypes.float32, dtypes.half)
   wide_regalloc = True
   disk_program_cache = True
-  preferred_reduce_group = 16
+  preferred_reduce_group = 64
   preferred_complex_matvec_group = 32
   global_max = (0x8fffffff, 0x8fffffff, 0x8fffffff)
   # 2D locals (WARP=lidx0 → e.g. (32,4,1)); needs gfx1100 USER_SGPR=15 (elf.py).
