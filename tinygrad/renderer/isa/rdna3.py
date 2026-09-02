@@ -22,7 +22,7 @@ from tinygrad.renderer.isa.rdna3_tc import expand_wmma_lds_tiles, pm_stage_wmma_
 # RDNA3: kernarg in s[0:1], local ids packed in v0. Even SGPR bases for 64-bit kernarg loads.
 # WGID follows USER_SGPR_COUNT: s2 when count=2 (1D locals); s15 when gfx1100 pads to 15 (2D locals).
 # AMD_PREFETCH_A (default 1): within-K next-A B128 before PACK so A tiles overlap WMMA; 0 opts out.
-# AMD_COALESCE_U8 (default 1): combine adjacent byte loads into packed B32/B64/B128 VMEM operations.
+# AMD_COALESCE_U8 (default 1): combine adjacent byte loads into packed U16/B32/B64/B128 VMEM operations.
 # AMD_UNIFORM_INT (default 1): move wave-uniform packed-byte extraction and integer address chains to SGPRs.
 _PREFETCH_NEXT_A = False
 
@@ -299,6 +299,8 @@ def _mem_load(kind:int, dt:DType, n:int=1):
   if n > 1:
     nbytes = dt.itemsize * n
     if dt is dtypes.uint8 and kind == 0:
+      # uchar×2 → u16 (scale halfwords); ×4 → b32; ×8/16 → b64/b128.
+      if nbytes == 2: return r3.global_load_u16
       if nbytes == 4: return r3.global_load_b32
       return _WIDE_LOAD.get(nbytes, (None, None))[0]
     # half×2 → B32; half×4/×8 → B64/B128 for global+LDS (PACK_F16 clobber fixed; gated stays scalar).
@@ -3561,7 +3563,7 @@ class AMDRenderer(ISARenderer):
   def coalesce_vec_lengths(self, buf, f4):
     # 16 halves = one WMMA A frag (2×B128); PACK identity-aliases the load.
     if buf.dtype == dtypes.half: return [16, 8, 4, 2]
-    if buf.dtype == dtypes.uint8 and getenv("AMD_COALESCE_U8", 1): return [16, 8, 4]
+    if buf.dtype == dtypes.uint8 and getenv("AMD_COALESCE_U8", 1): return [16, 8, 4, 2]
     if buf.dtype == dtypes.float: return [4, 3, 2]
     return None
 
