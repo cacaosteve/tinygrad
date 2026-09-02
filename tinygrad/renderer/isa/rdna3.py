@@ -3873,6 +3873,10 @@ class AMDRenderer(ISARenderer):
     if x.op is Ops.INS and _iop(x) is AMDOps.LOOP_CMP: return x.src[2] if len(x.src) == 3 else x.src[3]
     return super().loop_end(x)
   def prefer_phys(self, x:UOp, src_phys:list) -> Register|None:
+    # WHERE/cndmask: prefer aliasing onto the true-value VGPR (HIP-style; kills E_32 mov chains).
+    if x.op is Ops.INS and _iop(x) is AMDOps.WHERE and getenv("AMD_WHERE_ALIAS", 1):
+      if len(src_phys) > 1 and src_phys[1] is not None and isinstance(x.tag, tuple):
+        if src_phys[1] in x.tag[0].cons: return src_phys[1]
     # EXTRACT from a multi-VGPR value → alias onto its source lane. Besides WMMA
     # float stores, packed quantized byte loads use uint32 lanes exactly once.
     if x.op is not Ops.INS or _iop(x) is not AMDOps.EXTRACT: return None
