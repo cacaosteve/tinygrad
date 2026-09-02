@@ -37,12 +37,39 @@ Emit-time VMEM before swizzle (`fb031f1a2`): neutral on HW.
 Emit-time VMEM **after** swizzle (`e39b40c22`): LLVM-style lgkm gap placement; partial still
 ~45 µs (neutral), e2e slightly improved (~54.4 µs). ALU in gap (`08f7d875a`) reverted — e2e regression.
 
+## Disasm findings (7900 XTX, `2d3957def`)
+
+Tool: `extra/diff_flash_decode_partial_asm.py` — run on HW with `DEV=AMD:AMD` and `DEV=AMD:HIP`.
+
+| Metric | Direct ISA | HIP |
+|--------|------------|-----|
+| `ds_swizzle_b32` | 160 | 160 |
+| Total waitcnt | 202 | 150 |
+| **`s_delay_alu`** | **0** | **108** |
+| Global loads | 20 | 20 |
+| Swizzles with **0 ops before lgkm wait** | **158 / 160** | **59 / 160** |
+| Swizzles with VALU before wait | 1.2% | **27.5%** |
+| Median insts swizzle → wait | 1 | 2 |
+
+**Conclusion:** HIP does **not** use a different reduce algorithm (same 160 swizzles). It wins by **scheduling**:
+LLVM places ~1+ independent VALU instructions between `ds_swizzle` and `s_waitcnt` on most butterfly
+stages, plus heavy **`s_delay_alu`** use. Direct ISA emits **`swizzle → lgkm wait → add`** back-to-back
+on 98% of stages — our post-swizzle VMEM sink only hits ~1% (loads rarely sit in the uop gap).
+
+**Next experiment:** emit-time sink of independent **VALU** (MUL/FMAC) between swizzle and add; and/or
+`s_delay_alu` after swizzle (HIP uses 108). Not DPP.
+
+```bash
+DEV=AMD:AMD  PYTHONPATH=.:extra python extra/diff_flash_decode_partial_asm.py -o /tmp/direct.json
+DEV=AMD:HIP  PYTHONPATH=.:extra python extra/diff_flash_decode_partial_asm.py -o /tmp/hip.json
+PYTHONPATH=.:extra python extra/diff_flash_decode_partial_asm.py --compare /tmp/direct.json /tmp/hip.json
+```
+
 ## TODO (when resuming)
 
-1. **Side-by-side disasm:** `flash_decode_partial` @ `DEV=AMD:AMD` vs `DEV=AMD:HIP` on 7900 —
-   diff wait placement around score `warp_reduce` loops (not DPP-first; focus lgkmcnt + inst order).
-2. **Mimic LLVM schedule in `insts_from_linear`:** defer lgkm flush on swizzle consumers when
-   intervening ops don't read swizzle dest; validate WMMA/LLOAD tests.
+1. ~~**Side-by-side disasm**~~ — done; see above.
+2. **Fill swizzle lgkm bubble like LLVM:** sink independent VALU into swizzle→wait gap at emit time;
+   try `s_delay_alu` after `ds_swizzle`; validate WMMA/LLOAD tests.
 3. **Kernel option (larger):** fewer warp reduces in `_amd_flash_attention_decode_partial` (head/key
    restructuring) if scheduling alone can't close ~17 µs isolated gap.
 4. **Do not repeat without new evidence:** DPP row_shl reduces (HW regression); pre-regalloc VMEM
