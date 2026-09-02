@@ -512,8 +512,9 @@ def _fused_d16_hi_loads(uops:list[UOp]) -> set[UOp]:
 def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple], set[UOp]]:
   """Fold FMAC(acc, CAST(f16), f32) into v_fma_mix_f32 (HIP SDPA style).
 
-  Returns (fmac → (half_first, opsel_h, hbase, word, f32_src), skip CAST/EXTRACT).
-  One CAST may feed several FMACs; fold every user then drop the cvt.
+  Returns (fmac → (half_first, opsel_h, hbase, word, f32_src), skip CAST).
+  Mix from the CAST source VGPR as f16 lo (opsel=0). Do not skip EXTRACT/LSHR —
+  reading packed halves via opsel still NaNs on SDPA; matvec-only was fine.
   """
   if not getenv("AMD_FMA_MIX", 0): return {}, set()
   uses: dict[UOp, list[UOp]] = {}
@@ -526,21 +527,14 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple], set[UOp]]:
             cast.src and cast.src[0].dtype is dtypes.float16): continue
     if not consumers or any(c.op is not Ops.INS or _iop(c) is not AMDOps.FMAC or c.dtype is not dtypes.float32
                             for c in consumers): continue
-    h, opsel_h, word, hbase = cast.src[0], 0, 0, cast.src[0]
-    if h.op is Ops.INS and _iop(h) is AMDOps.EXTRACT and h.dtype is dtypes.float16:
-      if (lane:=_const_int(h.src[1])) is None: continue
-      if uses.get(h) == [cast]:
-        opsel_h, word, hbase = lane & 1, lane // 2, h.src[0]
-        skip.add(h)
-      else:
-        opsel_h, word, hbase = 0, 0, h
+    hbase = cast.src[0]
     ok = True
     for u in consumers:
       half_i = next((i for i in (1, 2) if u.src[i] is cast), None)
       if half_i is None:
         ok = False; break
       f32_i, half_first = (2, True) if half_i == 1 else (1, False)
-      folds[u] = (half_first, opsel_h, hbase, word, u.src[f32_i])
+      folds[u] = (half_first, 0, hbase, 0, u.src[f32_i])
     if ok: skip.add(cast)
     else:
       for u in consumers: folds.pop(u, None)
@@ -3243,8 +3237,11 @@ def insts_from_linear(lin:UOp):
         flush_regs(set().union(*(_reg_idxs(s) for s in u.src)))
       else:
         regs = set().union(*(_reg_idxs(s) for s in u.src), _reg_idxs(u))
-        # fma_mix reads packed half VGPRs directly; CAST/EXTRACT may be skipped.
-        if (mix:=fma_mix_folds.get(u)) is not None: regs |= _reg_idxs(mix[2])
+        # fma_mix reads half VGPRs; CAST may be skipped — wait the underlying VMEM.
+        if (mix:=fma_mix_folds.get(u)) is not None:
+          hb = mix[2]
+          while hb.op is Ops.INS and _iop(hb) is AMDOps.EXTRACT and hb.src: hb = hb.src[0]
+          regs |= _reg_idxs(hb)
         flush_regs(regs)
     if u.op is Ops.INS and _iop(u) is AMDOps.IF_MASK:
       store_addr_cache.clear()
