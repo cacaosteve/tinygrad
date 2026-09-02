@@ -3322,6 +3322,8 @@ def insts_from_linear(lin:UOp):
       load_emitted = _emit_uop(load, masked=True)
       for inst in load_emitted: emit(inst)
       note_vm(_reg_idxs(load), load_emitted)
+      # Load data must be visible before copying into the WHERE dest under exec.
+      flush_regs(_reg_idxs(load))
       ldst = greg(load)
       for lane in range(slots):
         d = _reg_lane(dst, lane) if slots > 1 else _dst(u)
