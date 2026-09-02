@@ -139,7 +139,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     else: return k
 
   # are we grouping? (requires local shape support)
-  if resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if k.ren.target.device == "QCOM" else 2048), False):
+  kernel_name = getattr(getattr(k.ast, "arg", None), "name", None)
+  if kernel_name != "flash_decode_combine" and resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if k.ren.target.device == "QCOM" else 2048), False):
     for axis, sz in itertools.product((0, 1, 2), (16,)):
       try:
         k.apply_opt(Opt(OptOps.GROUPTOP, axis, sz))
@@ -212,6 +213,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         unroll = k.ren.get_reduce_unroll(s, k.ast)
         if unroll is not None:
           k.apply_opt(Opt(OptOps.UPCAST, k.unrollable_dims[-1], unroll))
+          # flash decode combine: unroll both chunk passes (max + weighted sum).
+          if kernel_name == "flash_decode_combine" and unroll == 0:
+            for dim in k.unrollable_dims[:-1]:
+              if k.full_shape[dim] == s: k.apply_opt(Opt(OptOps.UPCAST, dim, 0))
           # if it's small, upcast a second reduce dimension too
           if unroll == 0 and k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
             k.apply_opt(Opt(OptOps.UPCAST, k.unrollable_dims[-1], 0))
