@@ -515,13 +515,16 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[
   Returns (fmac → (hbase, f32_src), skip CAST).
   Mul is commutative so half is always the mix src0 (opsel_hi=1, opsel=0).
 
-  Default off (AMD_FMA_MIX=0). Even EXP-only (softmax@V) mix currently
-  slows SDPA despite fewer VGPRs. Set AMD_FMA_MIX=1 and optionally
-  AMD_FMA_MIX_ALL=1 to fold every matching FMAC.
+  Default AMD_FMA_MIX=1 for small EXP kernels only (softmax@V, ≤24 half casts).
+  QK-sized mix storms and non-EXP kernels stay on cvt+fmac unless AMD_FMA_MIX_ALL=1.
   """
-  if not (getenv("AMD_FMA_MIX", 0) or getenv("AMD_FMA_MIX_ALL", 0)): return {}, set()
-  if not getenv("AMD_FMA_MIX_ALL", 0) and not any(u.op is Ops.INS and _iop(u) is AMDOps.EXP2 for u in uops):
-    return {}, set()
+  if not (getenv("AMD_FMA_MIX", 1) or getenv("AMD_FMA_MIX_ALL", 0)): return {}, set()
+  if not getenv("AMD_FMA_MIX_ALL", 0):
+    if not any(u.op is Ops.INS and _iop(u) is AMDOps.EXP2 for u in uops): return {}, set()
+    # QK-sized mix storms (64+) add MOVs; only fold small EXP kernels (softmax@V).
+    ncast = sum(1 for u in uops if u.op is Ops.INS and _iop(u) is AMDOps.CAST and u.dtype is dtypes.float32 and
+                u.src and u.src[0].dtype is dtypes.float16)
+    if ncast > 24: return {}, set()
   uses: dict[UOp, list[UOp]] = {}
   for u in uops:
     for s in u.src: uses.setdefault(s, []).append(u)
