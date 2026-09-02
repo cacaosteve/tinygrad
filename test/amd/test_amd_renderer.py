@@ -2585,6 +2585,15 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(names.count("GLOBAL_LOAD_U16"), 0, "scalar u16 half loads should be coalesced")
     self.assertEqual(names.count("V_CVT_F32_F16_E32"), 4)
 
+  def test_gated_float_loads_coalesce_b128(self):
+    # Pad bounds share one valid; coalesce to B128 like HIP saveexec vector loads.
+    with Context(BEAM=0):
+      ast = Tensor.empty(256, device="AMD").pad((0, 16)).contiguous().schedule_linear().src[0].src[0]
+      prg = _to_prg(ast)
+    names = _amd_inst_names(prg)
+    self.assertGreater(names.count("GLOBAL_LOAD_B128"), 0)
+    self.assertLessEqual(names.count("GLOBAL_LOAD_B32"), 1)
+
   def test_half_matmul_uses_wide_global_load(self):
     # Register path: contiguous operand B128; strided WMMA operand stays U16.
     import os

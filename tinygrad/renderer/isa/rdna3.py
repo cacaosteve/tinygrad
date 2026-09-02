@@ -3579,7 +3579,9 @@ def isa_float4_mem_ok(f4, float4_safe, buf, value_dtype, u, uses, valid) -> bool
   # SDPA KV loads) is fine: wide VMEM + EXTRACT + cvt matches HIP's B64 half traffic.
   if u.op is Ops.LOAD and any(v.op is Ops.BITCAST for v in uses[u]): return False
   if u.op is Ops.STORE and u.src[1].op is Ops.BITCAST: return False
-  return bool(valid.op is Ops.CONST and valid.val is True)
+  # Shared non-trivial valids still coalesce together (keyed by `valid` in memory_coalescing).
+  # LLM E_32 RoPE/KV glue is gated; HIP wraps B128 in saveexec — ungated-only left AMD on b32×N.
+  return True
 
 class AMDRenderer(ISARenderer):
   device = "AMD"
