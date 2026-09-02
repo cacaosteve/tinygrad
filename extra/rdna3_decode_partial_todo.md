@@ -56,8 +56,13 @@ LLVM places ~1+ independent VALU instructions between `ds_swizzle` and `s_waitcn
 stages, plus heavy **`s_delay_alu`** use. Direct ISA emits **`swizzle → lgkm wait → add`** back-to-back
 on 98% of stages — our post-swizzle VMEM sink only hits ~1% (loads rarely sit in the uop gap).
 
-**Next experiment:** emit-time sink of independent **VALU** (MUL/FMAC) between swizzle and add; and/or
-`s_delay_alu` after swizzle (HIP uses 108). Not DPP.
+**Next experiment:** LLVM fills bubbles with independent **MUL** between swizzle and wait, not
+unrelated **ADD** (sinking ADD before the butterfly lgkm wait **hangs the GPU**). Pre-regalloc
+MUL reorder breaks regalloc. **`AMD_SWIZZLE_DELAY=1`** (opt-in `s_delay_alu` after each swizzle)
+is safe but **neutral** on HW (~54.9 vs ~54.7 µs e2e). Need a regalloc-safe way to place MUL
+in the uop gap, or emit-time sink without ADD/MUL that alias accumulator regs.
+
+Branch tip: `c3c0f378a` — post-swizzle VMEM sink + opt-in delay (`AMD_SWIZZLE_DELAY=1`).
 
 ```bash
 DEV=AMD:AMD  PYTHONPATH=.:extra python extra/diff_flash_decode_partial_asm.py -o /tmp/direct.json
