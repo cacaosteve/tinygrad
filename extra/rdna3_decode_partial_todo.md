@@ -1,20 +1,20 @@
 # flash_decode_partial: HIP gap follow-up
 
-**Status (7900 XTX):** decode e2e ~**53.9 µs** AMD:AMD vs ~**52.5 µs** HIP (~1.4 µs gap).
-`flash_decode_partial` ~**37.3 µs** direct (was ~45) vs ~28 µs HIP isolated — still the main gap.
+**Status (7900 XTX):** decode e2e ~**54 µs** AMD:AMD vs ~**52.3 µs** HIP (~1.7 µs gap).
+`flash_decode_partial` ~**35.3 µs** direct (was ~45, then ~37.3 with G=4 batches) vs ~28 µs HIP.
 `flash_decode_combine` already faster than HIP (~9 vs ~11.5 µs).
 
 ## Landed: spill-safe same-stage swizzle batching
 
-`warp_reduce_many` parks each stage’s GQA-head `ds_swizzle` results in unique REG temps
-(per-element stores), and `_schedule_swizzle_mov_batches` rewrites `SW,MOV,SW,MOV,…` →
-`SW×N,MOV×N` **before regalloc**. Soft lgkm then shares one wait per stage (streak 4).
+`warp_reduce_many` parks each stage’s swizzles in unique REG temps (per-element stores),
+and `_schedule_swizzle_mov_batches` rewrites `SW,MOV,…` → `SW×N,MOV×N` **before regalloc**.
+Score loop reduces **two keys at once** (batch of 8 = 2×G) when `SEC` allows.
 
-**Do not** emit-reorder that pattern after regalloc — swizzle live ranges get aliased and
-results diverge from tip (same checksum/first8 required).
+HW: partial **45 → 35.3 µs**, checksum/first8 match tip, 0 scratch.
+Toggle: `AMD_BATCH_SWIZZLE_MOV=0`.
 
-HW (prod shape waves=8, block_n=64): partial **45 → 37.3 µs**, e2e **~55 → ~53.9 µs**,
-err/checksum match tip, 0 scratch. Toggle: `AMD_BATCH_SWIZZLE_MOV=0`.
+**Do not** emit-reorder SW/MOV after regalloc (VGPR alias → wrong numerics).
+**Do not** elide park MOVs by rewriting AFTER/store edges (broke decode checksum).
 
 ## Does HIP do DPP / different reduce?
 

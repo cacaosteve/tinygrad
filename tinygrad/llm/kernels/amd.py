@@ -506,17 +506,22 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   valids: list[UOp] = []
   scores: list[list[UOp]] = [[zerof]*G for _ in range(SEC)]
   vfrags: list[tuple[UOp, ...]] = [()]*SEC
-  for j in range(SEC):
-    key = block_chunk*CHUNK + wave*SEC + j
-    valid = key < valid_kv_len
-    valids.append(valid)
-    kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
-    # V is prefetched in the score pass so both streams are in flight together
-    vfrags[j] = _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL)
-    # Same-stage swizzles for all GQA heads share one lgkm wait (see warp_reduce_many).
-    dots = [sum((qf[h][i]*kfrag[i] for i in range(DPL)), zerof) for h in range(G)]
-    for h, s in enumerate(warp_reduce_many(dots, full_wave=True)):
-      scores[j][h] = valid.where(s * (1/math.sqrt(D)), UOp.const(-math.inf, dtypes.float))
+  for j0 in range(0, SEC, 2):
+    # Reduce two keys' GQA heads together (batch of 8) when possible — longer ds_swizzle
+    # streaks / fewer lgkm waits, still small enough to avoid VGPR spills.
+    js = range(j0, min(j0 + 2, SEC))
+    dots: list[UOp] = []
+    for j in js:
+      key = block_chunk*CHUNK + wave*SEC + j
+      valid = key < valid_kv_len
+      valids.append(valid)
+      kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
+      # V is prefetched in the score pass so both streams are in flight together
+      vfrags[j] = _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL)
+      dots.extend([sum((qf[h][i]*kfrag[i] for i in range(DPL)), zerof) for h in range(G)])
+    for t, s in enumerate(warp_reduce_many(dots, full_wave=True)):
+      j, h = j0 + t // G, t % G
+      scores[j][h] = valids[j].where(s * (1/math.sqrt(D)), UOp.const(-math.inf, dtypes.float))
   ninf = UOp.const(-math.inf, dtypes.float)
   row_max = [functools.reduce(UOp.maximum, (scores[j][h] for j in range(SEC)), ninf) for h in range(G)]
   accs:list[list[UOp]] = [[UOp.const(0, dtypes.float)] * DPL for _ in range(G)]
