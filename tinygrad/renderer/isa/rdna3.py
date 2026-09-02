@@ -515,10 +515,11 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[
   Returns (fmac → (hbase, f32_src), skip CAST).
   Mul is commutative so half is always the mix src0 (opsel_hi=1, opsel=0).
 
-  Default AMD_FMA_MIX=1 for small EXP kernels only (softmax@V, ≤24 half casts).
-  QK-sized mix storms and non-EXP kernels stay on cvt+fmac unless AMD_FMA_MIX_ALL=1.
+  Default off (AMD_FMA_MIX=0). Small EXP-only mix still slowed SDPA
+  (~375→425µs). Set AMD_FMA_MIX=1 for ≤24-cast EXP kernels, or
+  AMD_FMA_MIX_ALL=1 for every matching FMAC.
   """
-  if not (getenv("AMD_FMA_MIX", 1) or getenv("AMD_FMA_MIX_ALL", 0)): return {}, set()
+  if not (getenv("AMD_FMA_MIX", 0) or getenv("AMD_FMA_MIX_ALL", 0)): return {}, set()
   if not getenv("AMD_FMA_MIX_ALL", 0):
     if not any(u.op is Ops.INS and _iop(u) is AMDOps.EXP2 for u in uops): return {}, set()
     # QK-sized mix storms (64+) add MOVs; only fold small EXP kernels (softmax@V).
