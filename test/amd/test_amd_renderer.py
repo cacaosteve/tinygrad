@@ -1077,6 +1077,21 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertNotIn("V_PACK_B32_F16", names)
     self.assertNotIn("SCRATCH_STORE_B32", names)
 
+  def test_q6_wmma_prefetches_a_before_dequant_mix(self):
+    from tinygrad.llm.kernels.amd import _q6_linear_f16_wmma_kernel
+    rows, cols, tokens = 8192, 2048, 32
+    out = UOp.placeholder((tokens, rows), dtypes.float32, 0)
+    raw = UOp.placeholder((rows*cols//256*53,), dtypes.uint32, 1)
+    x = UOp.placeholder((tokens, cols), dtypes.float16, 2)
+    prg = _to_prg(_q6_linear_f16_wmma_kernel(out, raw, x, rows, cols, direct_isa=True))
+    names = _amd_inst_names(prg)
+    wide = [i for i,name in enumerate(names) if name == "GLOBAL_LOAD_B128"]
+    # Packed weights first, then all activation B128s before mixlo (HIP overlap shape).
+    self.assertGreaterEqual(len(wide), 12)
+    self.assertLess(wide[-1], names.index("V_FMA_MIXLO_F16"))
+    self.assertLess(wide[-1], names.index("V_WMMA_F32_16X16X16_F16"))
+    self.assertNotIn("SCRATCH_STORE_B32", names)
+
   def test_q5_wmma_stays_below_128_vgprs(self):
     from tinygrad.llm.kernels.amd import _q5_linear_f16_wmma_kernel
     rows, cols, tokens = 8192, 2048, 32

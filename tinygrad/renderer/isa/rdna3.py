@@ -2403,6 +2403,51 @@ def _prefetch_a_after_packed_quant(ops:list[UOp]) -> list[UOp]:
     break
   return out
 
+_DEQUANT_MIX_OPS = frozenset({AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16, AMDOps.CVT_UBYTE_F32})
+
+def _prefetch_a_before_dequant_mix(ops:list[UOp]) -> list[UOp]:
+  """Issue activation B128s before Q6-style dequant mix so they fly during CVT/FMA_MIX.
+
+  Without LDS lookups, linearize leaves A after the full unpack+mix and right before WMMA.
+  HIP issues A mid-unpack. Soft vmcnt on the first weight use then leaves A outstanding until
+  WMMA — same overlap IQ4 gets from `_prefetch_a_after_packed_quant`.
+  """
+  if not any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops): return ops
+  out = list(ops)
+  wmma0 = next(i for i,u in enumerate(out) if u.op is Ops.INS and _iop(u) is AMDOps.WMMA)
+  mix0 = next((i for i,u in enumerate(out) if i < wmma0 and u.op is Ops.INS and _iop(u) in _DEQUANT_MIX_OPS), -1)
+  if mix0 < 0: return ops
+  # Require a packed weight read before mix so A lands after weights in the VMEM scoreboard.
+  if not any(u.op is Ops.INS and _iop(u) is AMDOps.LOAD and u.dtype is dtypes.uint32 and _reg_slots(u) == 4
+             for u in out[:mix0]):
+    return ops
+  # Body ends at the first branch after WMMA0 (nested half/token A may sit between WMMA pairs).
+  end = next((i for i,u in enumerate(out) if i > wmma0 and u.op is Ops.INS and
+              _iop(u) in (AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ, AMDOps.BARRIER,
+                          AMDOps.STORE, AMDOps.LSTORE, AMDOps.SSTORE)), len(out))
+  late = [i for i,u in enumerate(out) if mix0 < i < end and u.op is Ops.INS and
+          _iop(u) is AMDOps.LOAD and u.dtype is dtypes.half and _elem_count(u) >= 8]
+  if not late: return ops
+  # Pull each load with its addr-ALU prefix; keep relative order.
+  move_idx: set[int] = set()
+  chunks: list[UOp] = []
+  for li in late:
+    start = li
+    while start > mix0 and _is_addr_alu(out[start - 1]) and (start - 1) not in move_idx: start -= 1
+    for k in range(start, li + 1):
+      if k in move_idx: continue
+      move_idx.add(k)
+      chunks.append(out[k])
+  # Only reject if a moved load still needs something that stays between mix0 and end
+  # (would create a backward dep). Mid may depend on chunks — that is satisfied by hoisting.
+  stay = [out[i] for i in range(mix0, end) if i not in move_idx]
+  stay_set = set(stay)
+  if any(s in stay_set for cu in chunks for s in cu.src): return ops
+  head = out[:mix0]
+  mid = stay
+  tail = out[end:]
+  return head + chunks + mid + tail
+
 def _prefetch_late_iq4_a_before_mix(ops:list[UOp]) -> list[UOp]:
   """Issue the second 32-token A fragment after IQ4 LUT reads but before dequant FMAs.
 
@@ -3706,6 +3751,8 @@ class AMDRenderer(ISARenderer):
     lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
     lst = _prefetch_a_after_packed_quant(lst) if getenv("AMD_PREFETCH_IQ4_A", 1) else lst
     lst = _prefetch_late_iq4_a_before_mix(lst) if getenv("AMD_PREFETCH_IQ4_A2", 1) else lst
+    # Q6 (no LDS LUT): hoist A before CVT/FMA_MIX. Default on; AMD_PREFETCH_Q6_A=0 opts out.
+    lst = _prefetch_a_before_dequant_mix(lst) if getenv("AMD_PREFETCH_Q6_A", 1) else lst
     lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
     uses: dict[UOp, list[UOp]] = {}
     for u in lst:
