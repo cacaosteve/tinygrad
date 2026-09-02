@@ -515,7 +515,7 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple], set[UOp]]:
   Returns (fmac → (half_first, opsel_h, hbase, word, f32_src), skip CAST/EXTRACT).
   One CAST may feed several FMACs; fold every user then drop the cvt.
   """
-  if not getenv("AMD_FMA_MIX", 1): return {}, set()
+  if not getenv("AMD_FMA_MIX", 0): return {}, set()
   uses: dict[UOp, list[UOp]] = {}
   for u in uops:
     for s in u.src: uses.setdefault(s, []).append(u)

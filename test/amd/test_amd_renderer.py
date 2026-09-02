@@ -2606,13 +2606,22 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_half_fmac_uses_fma_mix_f32(self):
     # Contiguous half×float FMAC should emit v_fma_mix_f32 (HIP SDPA), not only cvt+fmac.
-    with Context(BEAM=0):
-      ast = (Tensor.empty(64, 64, device="AMD") @
-             Tensor.empty(64, 64, dtype=dtypes.half, device="AMD").float()).schedule_linear().src[-1].src[0]
-      prg = _to_prg(ast)
-    names = _amd_inst_names(prg)
-    self.assertGreater(names.count("V_FMA_MIX_F32"), 0)
-    self.assertGreater(names.count("V_FMA_MIX_F32"), names.count("V_CVT_F32_F16_E32"))
+    import os
+    old = os.environ.get("AMD_FMA_MIX")
+    os.environ["AMD_FMA_MIX"] = "1"
+    getenv.cache_clear(); to_program_cache.clear()
+    try:
+      with Context(BEAM=0):
+        ast = (Tensor.empty(64, 64, device="AMD") @
+               Tensor.empty(64, 64, dtype=dtypes.half, device="AMD").float()).schedule_linear().src[-1].src[0]
+        prg = _to_prg(ast)
+      names = _amd_inst_names(prg)
+      self.assertGreater(names.count("V_FMA_MIX_F32"), 0)
+      self.assertGreater(names.count("V_FMA_MIX_F32"), names.count("V_CVT_F32_F16_E32"))
+    finally:
+      if old is None: os.environ.pop("AMD_FMA_MIX", None)
+      else: os.environ["AMD_FMA_MIX"] = old
+      getenv.cache_clear(); to_program_cache.clear()
 
   def test_half_matmul_uses_wide_global_load(self):
     # Register path: contiguous operand B128; strided WMMA operand stays U16.
