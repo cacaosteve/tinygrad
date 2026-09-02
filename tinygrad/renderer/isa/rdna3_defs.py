@@ -102,6 +102,7 @@ class AMDOps(FastEnum):
   PACK_F16 = auto()
   WMMA = auto()
   SWIZZLE = auto()
+  PERMLANEX16 = auto()
   DOT4 = auto()
   BYTE_PERM = auto()
   BFE = auto()

@@ -48,6 +48,12 @@ def _swizzle_f32(val:UOp, offset:int) -> UOp:
   return UOp(Ops.CUSTOM, src=(val,), arg=
     (f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))", dtypes.float))
 
+def _peer16_f32(val:UOp) -> UOp:
+  """Lane i ← lane i^16 via VALU permlanex16 (no ds_swizzle / lgkm wait)."""
+  return UOp(Ops.CUSTOM, src=(val,), arg=(
+    "__builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__builtin_bit_cast(int, {0}), "
+    "__builtin_bit_cast(int, {0}), 0x76543210, 0xfedcba98, true, false))", dtypes.float))
+
 def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
@@ -310,14 +316,9 @@ def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_wa
   tt = len(tokens)
   if swizzle_stores:
     def values(acc:UOp) -> tuple[UOp, ...]:
-      global _reg_swizzle_slot
       own = tuple(acc.after(update)[i].load() for i in range(8))
-      # Park all 8 swizzles in REG so emit batches SWIZZLE×8 then one shared lgkm wait.
-      raw = [_swizzle_f32(own[i], 16) for i in range(8)]
-      tmp = UOp.placeholder((8,), dtypes.float, slot=_reg_swizzle_slot, addrspace=AddrSpace.REG)
-      _reg_swizzle_slot += 1
-      tmp = tmp.after(UOp.group(*[tmp[i].store(sw) for i, sw in enumerate(raw)]))
-      peer = tuple(tmp[i].load() for i in range(8))
+      # VALU permlanex16 avoids ds_swizzle lgkm waits on the WMMA epilogue.
+      peer = tuple(_peer16_f32(own[i]) for i in range(8))
       low = half.eq(0)
       return tuple(low.where(own[i], peer[i+4]) if j == 0 else low.where(peer[i], own[i+4]) for i in range(4) for j in range(2))
     return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))

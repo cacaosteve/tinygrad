@@ -962,6 +962,8 @@ AMD_FMA_TO_F16 = "__builtin_amdgcn_fma_mixlo_f16({}, {}, {})"
 AMD_PACKED_F16_MUL_TO_F16 = "__builtin_amdgcn_fma_mixlo_f16_packed({}, {}, {})"
 AMD_MBCNT_LO = "__builtin_amdgcn_mbcnt_lo(-1, 0)"
 AMD_SWIZZLE_PREFIX = "__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {0}), "
+# Identity cross-16 gather: lane i reads lane i^16. Select nibbles 0..15 across src1|src2.
+AMD_PERMLANEX16 = "__builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__builtin_bit_cast(int, {0}), __builtin_bit_cast(int, {0}), 0x76543210, 0xfedcba98, true, false))"
 
 def _warp_group_reduce(x:UOp) -> UOp|None:
   """Use a wave32 butterfly for an isolated f32 ADD group reduction."""
@@ -1008,6 +1010,7 @@ def _amd_custom_intrinsic(x:UOp) -> UOp|None:
     except ValueError: return None
     if not 0 <= offset <= 0xffff: raise CompileError(f"bad ds_swizzle offset {offset}")
     return x.ins(AMDOps.SWIZZLE, src=(x.src[0], _tconst(offset, dtypes.uint32).rtag()))
+  if arg == AMD_PERMLANEX16: return x.ins(AMDOps.PERMLANEX16)
   return None
 
 def _nontemporal_load(x:UOp) -> UOp|None:
@@ -1781,6 +1784,12 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       pre, val = _vgpr_data(TMP_VDATA, u.src[0])
       if (offset:=_const_int(u.src[1])) is None: raise CompileError("non-constant swizzle offset")
       return pre + [r3.ds_swizzle_b32(vdst=_dst(u), addr=val, offset0=offset & 0xff, offset1=offset >> 8)]
+    case AMDOps.PERMLANEX16:
+      # VALU cross-16 (no lgkm). Two 32-bit lane selects need SGPRs (one literal/instr).
+      # opsel bit0=FI so inactive source lanes still contribute (ds_swizzle-equivalent).
+      pre, val = _vgpr_data(TMP_VDATA, u.src[0])
+      return pre + [r3.s_mov_b32(TMP_SDATA0, 0x76543210), r3.s_mov_b32(TMP_SDATA1, 0xfedcba98),
+                    r3.v_permlanex16_b32(_dst(u), val, TMP_SDATA0, TMP_SDATA1, opsel=1)]
     case AMDOps.DOT4:
       a, b = _src(u.src[0]), _src(u.src[1])
       pre0, a = ([], a) if not isinstance(a, Reg) else _vgpr_data(TMP_VDATA, u.src[0])
