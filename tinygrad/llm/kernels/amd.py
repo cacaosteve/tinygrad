@@ -329,12 +329,18 @@ def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_wa
     return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
             for tile,(tile_tokens,acc) in enumerate(zip(tokens, output_accs)) for token,value in zip(tile_tokens, values(acc))]
   flat_accs = [acc for output_accs in accs for acc in output_accs]
+  # HIP-style: contiguous float4 LDS chunks so emit can use ds_store/load_b128.
   lds = UOp.placeholder((output_waves, 32, len(flat_accs)*8), dtypes.float32, slot=33, addrspace=AddrSpace.LOCAL)
-  stores = [lds[wave, lane, a*8+i].store(acc.after(update)[i].load()) for a,acc in enumerate(flat_accs) for i in range(8)]
+  stores = []
+  for a, acc in enumerate(flat_accs):
+    cur = acc.after(update)
+    for chunk in range(2):
+      base = a*8 + chunk*4
+      stores.append(lds[wave, lane, base:base+4].store(UOp.stack(*(cur[chunk*4+i].load() for i in range(4)))))
   lds = lds.after(UOp.barrier(UOp.group(*stores)))
   def values(ai:int) -> tuple[UOp, ...]:
-    own = tuple(lds[wave, lane, ai*8+i].load() for i in range(8))
-    peer = tuple(lds[wave, lane ^ 16, ai*8+i].load() for i in range(8))
+    own = tuple(lds[wave, lane, ai*8+chunk*4:ai*8+chunk*4+4].load()[i] for chunk in range(2) for i in range(4))
+    peer = tuple(lds[wave, lane ^ 16, ai*8+chunk*4:ai*8+chunk*4+4].load()[i] for chunk in range(2) for i in range(4))
     low = half.eq(0)
     return tuple(low.where(own[i], peer[i+4]) if j == 0 else low.where(peer[i], own[i+4]) for i in range(4) for j in range(2))
   return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
@@ -434,7 +440,7 @@ def _q6_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
     return (_q6_wmma_frags(_q6_wmma_words(ql0, qh0, subgroup, 0), scale0, d, True),
             _q6_wmma_frags(_q6_wmma_words(ql1, qh1, subgroup, 1), scale1, d, True))
   return _quant_linear_wmma(out, x, out_features, in_features, Q6_WORDS, _wmma_layout(out, out_features, token_tile, 1),
-                            dequant, "linear_q6_k_f16_wmma", swizzle_stores=direct_isa,
+                            dequant, "linear_q6_k_f16_wmma", swizzle_stores=False,
                             dequant_halves=dequant_halves if direct_isa else None)
 
 @functools.cache
