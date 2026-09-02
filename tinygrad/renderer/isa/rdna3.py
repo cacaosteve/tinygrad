@@ -2927,6 +2927,22 @@ def _fused_lds_pack_store(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|N
   deps = _reg_idxs(pack) | _reg_idxs(idx)
   return 8, pre + [r3.ds_store_b128(addr=addr, data0=data, **_ds_off(off0))], deps
 
+def _fused_lds_pack_load(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
+  """Fold four contiguous f32 LLOAD (same base, offs +0..+12) into one DS_LOAD_B128."""
+  if i + 3 >= len(uops): return None
+  loads = uops[i:i+4]
+  if not all(x.op is Ops.INS and _iop(x) is AMDOps.LLOAD and x.dtype is dtypes.float32 and _elem_count(x) == 1
+             for x in loads): return None
+  if not all(isinstance(greg(x), Register) for x in loads): return None
+  base, idx, off0 = loads[0].src[0], loads[0].src[1], _lds_byte_off(loads[0])
+  if off0 % 16: return None
+  if not all(x.src[0] is base and x.src[1] is idx and _lds_byte_off(x) == off0 + 4 * n for n, x in enumerate(loads)):
+    return None
+  if not all(greg(x).index == greg(loads[0]).index + n for n, x in enumerate(loads)): return None
+  pre, addr = _local_addr(base, idx, dtypes.float32.itemsize)
+  deps = _reg_idxs(idx)
+  return 4, pre + [r3.ds_load_b128(vdst=_reg_chunk(greg(loads[0]), 0, 4), addr=addr, **_ds_off(off0))], deps
+
 def _fused_mixed_dot4_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
   """Wide-load an exact four-element f16*f32 dot while retaining its sequential FMA order."""
   if i + 14 >= len(uops): return None
@@ -3174,6 +3190,14 @@ def insts_from_linear(lin:UOp):
       store_addr_cache.clear()
       for inst in emitted: emit(inst)
       pending["lgkm"].add(-1)
+      oi += count
+      continue
+    if mask_depth == 0 and (fused_load:=_fused_lds_pack_load(scheduled, oi)) is not None:
+      count, emitted, deps = fused_load
+      if deps and _pending_src(deps): flush_regs(deps)
+      store_addr_cache.clear()
+      for inst in emitted: emit(inst)
+      for k in range(oi, oi + count): pending["lgkm"] |= _reg_idxs(scheduled[k])
       oi += count
       continue
     # PERMLANEX16: install lane-select SGPRs once across EXTRACT-separated peers.

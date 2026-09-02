@@ -127,9 +127,6 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       if u.op is Ops.LOAD and u.dtype is dtypes.half and u.src[0].op is Ops.SHRINK: continue
       if u.op is Ops.LOAD and u.dtype is dtypes.uint32 and u.src[0].op is Ops.SHRINK and \
           len(u.src[0].src) > 2 and u.src[0].src[2].op is Ops.CONST and u.src[0].src[2].val == 4: continue
-      # INDEX(view, *coords) with a trailing vector axis (WMMA float×4 LDS) is not (buf, idx).
-      if u.src[0].op is Ops.INDEX and len(u.src[0].src) != 2: continue
-      if u.src[0].op is Ops.SHRINK: continue
       assert len(u.src) == (2 if u.op is Ops.STORE else 1), "memory coalescing does not support gated loads/stores"
       assert u.src[0].op is Ops.INDEX, f"memory coalescing should be on INDEX, not {u.src[0].op}"
       buf, idx_u = u.src[0].src
