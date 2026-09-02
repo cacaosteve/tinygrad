@@ -138,6 +138,11 @@ def do_devectorize(b:UOp):
   # quant _amd_load u32×4 must stay packed for B128 isel; u32×8 activations still devectorize.
   if b.op is Ops.LOAD and b.dtype is dtypes.uint32 and len(b.src) == 1 and b.src[0].op is Ops.SHRINK and \
       len(b.src[0].src) > 2 and b.src[0].src[2].op is Ops.CONST and b.src[0].src[2].val == 4: return None
+  # WMMA epilogue float×4 LDS load/store must stay packed for ds_load/store_b128.
+  if b.dtype is dtypes.float32 and b.shape == (4,) and b.op in (Ops.LOAD, Ops.STORE):
+    a = b.src[0]
+    while a.op in (Ops.AFTER, Ops.SHRINK, Ops.RESHAPE, Ops.PERMUTE, Ops.INDEX, Ops.BITCAST, Ops.CAST): a = a.src[0]
+    if a.op is Ops.BUFFER and a.addrspace is AddrSpace.LOCAL: return None
   # broadcasting needs to be already unpacked, Invalid matches any dtype and shape
   if not all(x.shape == b.shape or x.base.is_invalid for x in b.src): return None
   src = []
