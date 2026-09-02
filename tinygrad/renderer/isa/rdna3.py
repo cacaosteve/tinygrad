@@ -3189,6 +3189,7 @@ def insts_from_linear(lin:UOp):
       oi += 1
       continue
     # Cluster consecutive LLOAD streaks (post _hoist_lloads_before_extracts): s_clause + ds_load burst.
+    # Must not hoist multiple TMP_VADDR scales before loads (same bug as VMEM clause).
     if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.LLOAD:
       j = oi + 1
       while j < len(scheduled) and scheduled[j] not in skip and scheduled[j].op is Ops.INS and \
@@ -3202,7 +3203,7 @@ def insts_from_linear(lin:UOp):
             sc, ld = _split_lgkm_scale_and_loads(p)
             scales.extend(sc)
             loads.extend(ld)
-          if len(loads) >= 2:
+          if len(loads) >= 2 and _tmp_vaddr_clause_safe(scales, loads):
             for inst in scales: emit(inst)
             emit(r3.s_clause(simm16=len(loads) - 1))
             for inst in loads: emit(inst)
