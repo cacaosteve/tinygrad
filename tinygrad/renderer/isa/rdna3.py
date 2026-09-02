@@ -2949,7 +2949,7 @@ def _fused_lds_reduce_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
 
 def _lgkm_load_count(insts:list) -> int:
   return sum(1 for i in insts if (n:=getattr(i, "op_name", "")) and
-             (n.startswith("DS_LOAD") or n.startswith("S_LOAD")))
+             (n.startswith("DS_LOAD") or n.startswith("S_LOAD") or n.startswith("DS_SWIZZLE")))
 
 def insts_from_linear(lin:UOp):
   ops = list(lin.src)
