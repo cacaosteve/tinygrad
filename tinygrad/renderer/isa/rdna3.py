@@ -610,6 +610,11 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
 
 def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
   if (promotable:=ctx.scratch.get("reg_promotable")) is not None: return promotable
+  if not getenv("AMD_REG_PROMOTE", 1):
+    ctx.scratch["reg_promotable"] = set()
+    ctx.scratch["reg_values"] = {}
+    ctx.scratch["reg_n"] = 0
+    return set()
   bases, bad, seen_store = set(), set(), set()
   wmma_bufs = _wmma_acc_buffers(ctx)
   for u in ctx.uops or []:
