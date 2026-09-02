@@ -2214,7 +2214,7 @@ def _where_load_exec_fuses(ops:list[UOp]) -> tuple[dict[UOp, UOp], set[UOp]]:
   Emit path turns these into mov+saveexec+load+restore (HIP LLM glue style) instead of
   per-lane cndmask on the loaded value.
   """
-  if not getenv("AMD_LOAD_EXEC", 0): return {}, set()
+  if not getenv("AMD_LOAD_EXEC", 1): return {}, set()
   uses: dict[UOp, list[UOp]] = {}
   for u in ops:
     for src in u.src: uses.setdefault(src, []).append(u)
@@ -3303,7 +3303,7 @@ def insts_from_linear(lin:UOp):
       if u.op is Ops.INS and _iop(u) is AMDOps.END_MASK: mask_depth -= 1
       oi += 1
       continue
-    # WHERE(cmp, LOAD, alt) → mov alt; saveexec; load; copy; restore (HIP gated-load style).
+    # WHERE(cmp, LOAD, alt) → mov alt; saveexec; load into WHERE dst; restore (HIP gated-load style).
     if mask_depth == 0 and (load:=where_load_exec.get(u)) is not None:
       store_addr_cache.clear()
       cmp, alt = u.src[0], u.src[2]
@@ -3319,15 +3319,12 @@ def insts_from_linear(lin:UOp):
         else:
           emit(r3.v_mov_b32_e32(d, _src(alt)))
       emit(r3.s_and_saveexec_b64(exec_save, VCC))
-      load_emitted = _emit_uop(load, masked=True)
+      # Load into the WHERE dest so dest-as-addr and VMEM write the same regs (inactive keep alt).
+      load_into = load.replace(tag=u.tag)
+      load_emitted = _emit_uop(load_into, masked=True)
       for inst in load_emitted: emit(inst)
-      note_vm(_reg_idxs(load), load_emitted)
-      # Load data must be visible before copying into the WHERE dest under exec.
-      flush_regs(_reg_idxs(load))
-      ldst = greg(load)
-      for lane in range(slots):
-        d = _reg_lane(dst, lane) if slots > 1 else _dst(u)
-        emit(r3.v_mov_b32_e32(d, _reg_lane(ldst, lane) if slots > 1 else _dst(load)))
+      note_vm(_reg_idxs(u), load_emitted)
+      flush_regs(_reg_idxs(u))
       emit(r3.s_mov_b64(EXEC, exec_save))
       oi += 1
       continue
