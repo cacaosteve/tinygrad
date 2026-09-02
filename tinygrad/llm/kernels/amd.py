@@ -305,32 +305,30 @@ def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int):
   return output_waves, token_block, output_block, lane, wave, half, outputs, inputs, tokens
 
 def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_waves, swizzle_stores:bool=False):
-  # Accumulator fragment halves are exchanged between lane pairs (l, l^16).
-  # Prefer vector LDS (B128) like HIP/LLVM; ds_swizzle is denser but more lgkm waits on gfx11.
+  # Accumulator fragment halves are exchanged between lane pairs (l, l^16).  HIP lowers the LDS
+  # spill/reload to in-register ds_swizzle; direct ISA was paying 32 ds_load_b32 per WMMA tile.
   tt = len(tokens)
   if swizzle_stores:
+    global _reg_swizzle_slot
     def values(acc:UOp) -> tuple[UOp, ...]:
       own = tuple(acc.after(update)[i].load() for i in range(8))
-      peer = tuple(_swizzle_f32(own[i], 16) for i in range(8))
+      # Park all 8 swizzles in REG so emit batches SWIZZLE×8 then one shared lgkm wait.
+      raw = [_swizzle_f32(own[i], 16) for i in range(8)]
+      tmp = UOp.placeholder((8,), dtypes.float, slot=_reg_swizzle_slot, addrspace=AddrSpace.REG)
+      _reg_swizzle_slot += 1
+      tmp = tmp.after(UOp.group(*[tmp[i].store(sw) for i, sw in enumerate(raw)]))
+      peer = tuple(tmp[i].load() for i in range(8))
       low = half.eq(0)
       return tuple(low.where(own[i], peer[i+4]) if j == 0 else low.where(peer[i], own[i+4]) for i in range(4) for j in range(2))
     return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
             for tile,(tile_tokens,acc) in enumerate(zip(tokens, output_accs)) for token,value in zip(tile_tokens, values(acc))]
   flat_accs = [acc for output_accs in accs for acc in output_accs]
-  # Layout: [wave][lane][acc][8 floats] so each 4-float chunk is a natural B128 LDS op.
-  lds = UOp.placeholder((output_waves, 32, len(flat_accs), 8), dtypes.float32, slot=33, addrspace=AddrSpace.LOCAL)
-  stores = []
-  for a, acc in enumerate(flat_accs):
-    cur = acc.after(update)
-    for chunk in range(2):
-      stores.append(lds[wave, lane, a, chunk*4:(chunk+1)*4].store(
-        UOp.stack(*(cur[chunk*4+i].load() for i in range(4)))))
+  lds = UOp.placeholder((output_waves, 32, len(flat_accs)*8), dtypes.float32, slot=33, addrspace=AddrSpace.LOCAL)
+  stores = [lds[wave, lane, a*8+i].store(acc.after(update)[i].load()) for a,acc in enumerate(flat_accs) for i in range(8)]
   lds = lds.after(UOp.barrier(UOp.group(*stores)))
   def values(ai:int) -> tuple[UOp, ...]:
-    own = tuple(lds[wave, lane, ai, chunk*4:(chunk+1)*4].load()[i]
-                for chunk in range(2) for i in range(4))
-    peer = tuple(lds[wave, lane ^ 16, ai, chunk*4:(chunk+1)*4].load()[i]
-                 for chunk in range(2) for i in range(4))
+    own = tuple(lds[wave, lane, ai*8+i].load() for i in range(8))
+    peer = tuple(lds[wave, lane ^ 16, ai*8+i].load() for i in range(8))
     low = half.eq(0)
     return tuple(low.where(own[i], peer[i+4]) if j == 0 else low.where(peer[i], own[i+4]) for i in range(4) for j in range(2))
   return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
@@ -430,7 +428,7 @@ def _q6_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
     return (_q6_wmma_frags(_q6_wmma_words(ql0, qh0, subgroup, 0), scale0, d, True),
             _q6_wmma_frags(_q6_wmma_words(ql1, qh1, subgroup, 1), scale1, d, True))
   return _quant_linear_wmma(out, x, out_features, in_features, Q6_WORDS, _wmma_layout(out, out_features, token_tile, 1),
-                            dequant, "linear_q6_k_f16_wmma", swizzle_stores=False,
+                            dequant, "linear_q6_k_f16_wmma", swizzle_stores=direct_isa,
                             dequant_halves=dequant_halves if direct_isa else None)
 
 @functools.cache
