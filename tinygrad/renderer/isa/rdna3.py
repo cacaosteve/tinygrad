@@ -1785,11 +1785,9 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if (offset:=_const_int(u.src[1])) is None: raise CompileError("non-constant swizzle offset")
       return pre + [r3.ds_swizzle_b32(vdst=_dst(u), addr=val, offset0=offset & 0xff, offset1=offset >> 8)]
     case AMDOps.PERMLANEX16:
-      # VALU cross-16 (no lgkm). Lane selects come from emit-time streak hoist when possible.
-      # Fallback keeps selects here for a lone PERMLANEX16.
+      # VALU cross-16 (no lgkm). Lane-select SGPRs are installed by the emit streak hoist.
       pre, val = _vgpr_data(TMP_VDATA, u.src[0])
-      return pre + [r3.s_mov_b32(TMP_SDATA0, 0x76543210), r3.s_mov_b32(TMP_SDATA1, 0xfedcba98),
-                    r3.v_permlanex16_b32(_dst(u), val, TMP_SDATA0, TMP_SDATA1, opsel=1)]
+      return pre + [r3.v_permlanex16_b32(_dst(u), val, TMP_SDATA0, TMP_SDATA1, opsel=1)]
     case AMDOps.DOT4:
       a, b = _src(u.src[0]), _src(u.src[1])
       pre0, a = ([], a) if not isinstance(a, Reg) else _vgpr_data(TMP_VDATA, u.src[0])
@@ -3062,6 +3060,7 @@ def insts_from_linear(lin:UOp):
                               d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst))
   scheduled = _order_d16_lo_before_hi(
     _hoist_loads_before_wmma(_sink_wmma_past_loads(_hoist_lloads_before_extracts(ops))), d16_hi_lo)
+  scheduled = _schedule_swizzle_mov_batches(scheduled)
   fma_pair_dst = _fma_pair_pack_dsts(scheduled, fma_hi_lo)
   early_emitted: set[int] = set()
   oi = 0
