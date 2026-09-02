@@ -515,11 +515,11 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[
   Returns (fmac → (hbase, f32_src), skip CAST).
   Mul is commutative so half is always the mix src0 (opsel_hi=1, opsel=0).
 
-  Default off (AMD_FMA_MIX=0). When enabled, only fold in kernels that already
-  contain EXP2 (softmax@V) — plain QK FMAC→mix adds MOVs and slows SDPA.
-  Set AMD_FMA_MIX_ALL=1 to fold every matching FMAC.
+  Default off (AMD_FMA_MIX=0). Even EXP-only (softmax@V) mix currently
+  slows SDPA despite fewer VGPRs. Set AMD_FMA_MIX=1 and optionally
+  AMD_FMA_MIX_ALL=1 to fold every matching FMAC.
   """
-  if not getenv("AMD_FMA_MIX", 1): return {}, set()
+  if not getenv("AMD_FMA_MIX", 0): return {}, set()
   if not getenv("AMD_FMA_MIX_ALL", 0) and not any(u.op is Ops.INS and _iop(u) is AMDOps.EXP2 for u in uops):
     return {}, set()
   uses: dict[UOp, list[UOp]] = {}
