@@ -3241,7 +3241,11 @@ def insts_from_linear(lin:UOp):
       # left WMMA reading in-flight LDS data (NaN/inf). Hand kernel waits lgkmcnt(0) first.
       if u.op is Ops.INS and _iop(u) is AMDOps.WMMA:
         flush_regs(set().union(*(_reg_idxs(s) for s in u.src)))
-      else: flush_regs(set().union(*(_reg_idxs(s) for s in u.src), _reg_idxs(u)))
+      else:
+        regs = set().union(*(_reg_idxs(s) for s in u.src), _reg_idxs(u))
+        # fma_mix reads packed half VGPRs directly; CAST/EXTRACT may be skipped.
+        if (mix:=fma_mix_folds.get(u)) is not None: regs |= _reg_idxs(mix[2])
+        flush_regs(regs)
     if u.op is Ops.INS and _iop(u) is AMDOps.IF_MASK:
       store_addr_cache.clear()
       emitted = _emit_uop(u)
