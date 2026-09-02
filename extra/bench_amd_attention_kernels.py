@@ -53,7 +53,7 @@ def main() -> None:
     tms: list[float] = []
     for _ in range(args.samples):
       et = rt(*[b.get_buf(b.device) for b in bufs], global_size=gs, local_size=ls, vals=vals, wait=True)
-      tms.append((et or 0) * 1000)  # HCQ returns ms → µs
+      tms.append((et or 0) * 1e6)  # HCQ returns seconds → µs
     kernels.append({
       "name": prg.arg.function_name,
       "median_us": statistics.median(tms),
