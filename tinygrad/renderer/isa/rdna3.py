@@ -509,6 +509,43 @@ def _fused_d16_hi_loads(uops:list[UOp]) -> set[UOp]:
   # Hi LOADs only (no VGPR). Not in _compute_amd_skip — promote drops those from the list.
   return set(_d16_hi_lo_map(uops))
 
+def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple], set[UOp]]:
+  """Fold FMAC(acc, CAST(f16), f32) into v_fma_mix_f32 (HIP SDPA style).
+
+  Returns (fmac → (half_first, opsel_h, hbase, word, f32_src), skip CAST/EXTRACT).
+  One CAST may feed several FMACs; fold every user then drop the cvt.
+  """
+  if not getenv("AMD_FMA_MIX", 1): return {}, set()
+  uses: dict[UOp, list[UOp]] = {}
+  for u in uops:
+    for s in u.src: uses.setdefault(s, []).append(u)
+  folds: dict[UOp, tuple] = {}
+  skip: set[UOp] = set()
+  for cast, consumers in uses.items():
+    if not (cast.op is Ops.INS and _iop(cast) is AMDOps.CAST and cast.dtype is dtypes.float32 and
+            cast.src and cast.src[0].dtype is dtypes.float16): continue
+    if not consumers or any(c.op is not Ops.INS or _iop(c) is not AMDOps.FMAC or c.dtype is not dtypes.float32
+                            for c in consumers): continue
+    h, opsel_h, word, hbase = cast.src[0], 0, 0, cast.src[0]
+    if h.op is Ops.INS and _iop(h) is AMDOps.EXTRACT and h.dtype is dtypes.float16:
+      if (lane:=_const_int(h.src[1])) is None: continue
+      if uses.get(h) == [cast]:
+        opsel_h, word, hbase = lane & 1, lane // 2, h.src[0]
+        skip.add(h)
+      else:
+        opsel_h, word, hbase = 0, 0, h
+    ok = True
+    for u in consumers:
+      half_i = next((i for i in (1, 2) if u.src[i] is cast), None)
+      if half_i is None:
+        ok = False; break
+      f32_i, half_first = (2, True) if half_i == 1 else (1, False)
+      folds[u] = (half_first, opsel_h, hbase, word, u.src[f32_i])
+    if ok: skip.add(cast)
+    else:
+      for u in consumers: folds.pop(u, None)
+  return folds, skip
+
 def _amd_skip(ctx:PreRegAllocContext) -> set[UOp]:
   if "skip" not in ctx.scratch and ctx.uops: ctx.scratch["skip"] = _compute_amd_skip(ctx.uops)
   return ctx.scratch.get("skip") or set()
@@ -1747,7 +1784,8 @@ _MASKED_MEM = (AMDOps.LOAD, AMDOps.STORE, AMDOps.LLOAD, AMDOps.LSTORE, AMDOps.SL
 
 def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_cache:_StoreAddrCache|None=None,
                   d16_hi_lo:dict[UOp, UOp]|None=None, byte_scaled:set[int]|None=None,
-                  fma_hi_lo:dict[UOp, UOp]|None=None, fma_pair_dst:dict[UOp, Reg]|None=None):
+                  fma_hi_lo:dict[UOp, UOp]|None=None, fma_pair_dst:dict[UOp, Reg]|None=None,
+                  fma_mix_folds:dict[UOp, tuple]|None=None):
   if u.op is not Ops.INS or (skip and u in skip): return []
   if isinstance(_iop(u), Inst): return [_iop(u)]
   match _iop(u):
@@ -1881,6 +1919,21 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if u.dtype is dtypes.float32: return [r3.v_fma_f32(_dst(u), _src(u.src[0]), _src(u.src[1]), _src(u.src[2]))]
       raise CompileError(f"f16/f32 mulacc only, got {u.dtype}")
     case AMDOps.FMAC:
+      if u.dtype is dtypes.float32 and fma_mix_folds is not None and (mix:=fma_mix_folds.get(u)) is not None:
+        half_first, opsel_h, hbase, word, f32 = mix
+        if isinstance(greg(hbase), Register) and _elem_count(hbase) > 1:
+          hreg = _reg_lane(greg(hbase), word)
+        else:
+          pre_h, hreg = _vgpr_data(TMP_VDATA, hbase)
+          if pre_h: return pre_h + [r3.v_fma_mix_f32(_dst(u), hreg if half_first else _src(f32),
+                                                      _src(f32) if half_first else hreg, _dst(u),
+                                                      opsel=opsel_h * (1 if half_first else 2),
+                                                      opsel_hi=1 if half_first else 2, opsel_hi2=0)]
+        pre_f, freg = ([], _src(f32)) if isinstance(_src(f32), Reg) and _src(f32).offset >= 256 else _vgpr_data(TMP_VADDR, f32)
+        acc = _dst(u)
+        return pre_f + [r3.v_fma_mix_f32(acc, hreg if half_first else freg, freg if half_first else hreg, acc,
+                                         opsel=opsel_h * (1 if half_first else 2),
+                                         opsel_hi=1 if half_first else 2, opsel_hi2=0)]
       a, b = _src(u.src[1]), _src(u.src[2])
       inst = r3.v_fmac_f16_e32 if u.dtype is dtypes.float16 else r3.v_fmac_f32_e32 if u.dtype is dtypes.float32 else None
       if inst is None: raise CompileError(f"f16/f32 fmac only, got {u.dtype}")
@@ -3084,6 +3137,8 @@ def _fused_lds_reduce_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
 def insts_from_linear(lin:UOp):
   ops = list(lin.src)
   skip = _compute_amd_skip(ops)  # fused d16 hi LOADs still emit (d16_hi into lo)
+  fma_mix_folds, fma_mix_skip = _fma_mix_f32_folds(ops)
+  skip |= fma_mix_skip
   d16_hi_lo = _d16_hi_lo_map(ops)
   fma_hi_lo = _fma_mixhi_lo_map(ops)
   fma_pair_dst: dict[UOp, Reg] = {}
@@ -3129,7 +3184,7 @@ def insts_from_linear(lin:UOp):
     return any(pr & regs for pr, _ in pending_vm) or bool(pending["lgkm"] & regs)
   def _emit_uop(u, masked=False, with_store_cache=False):
     return list(insts_for_uop(u, skip, masked, store_addr_cache if with_store_cache else None,
-                              d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst))
+                              d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst, fma_mix_folds))
   scheduled = _order_d16_lo_before_hi(
     _hoist_loads_before_wmma(_sink_wmma_past_loads(_hoist_lloads_before_extracts(ops))), d16_hi_lo)
   scheduled = _schedule_swizzle_mov_batches(scheduled)
