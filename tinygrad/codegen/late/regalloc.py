@@ -4,7 +4,7 @@ from tinygrad.device import CompileError
 from tinygrad.helpers import dedup
 from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat
 from tinygrad.renderer.isa import ISARenderer, Register, greg
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import dtypes, AddrSpace
 
 PSEUDO_OPS = {Ops.CONST, Ops.CAST, Ops.BITCAST, Ops.NOOP, Ops.AFTER, Ops.BARRIER, Ops.GROUP, Ops.STACK}
 
@@ -17,6 +17,11 @@ class LinearScanRegallocContext:
     self.wide = ren.wide_regalloc
     self.idx = itertools.count()
     self.regalloc_i = 0
+    self.reg_promotable: set[UOp] = set()
+    if ren.pre_regalloc_matcher is not None:
+      from tinygrad.renderer.isa import PreRegAllocContext
+      from tinygrad.renderer.isa.rdna3 import _reg_promotable_buffers
+      self.reg_promotable = _reg_promotable_buffers(PreRegAllocContext(uops))
     # the label associated with each loop NOTE: this is only used post regalloc and should be removed
     self.loop_label: dict[UOp, str] = {}
 
@@ -122,6 +127,7 @@ class LinearScanRegallocContext:
       for rv in [rv for rv in live if rv in self.remat and not ren.keep_remat(self.vdef(rv))]: live.pop(rv, None)
 
       if u.op is Ops.BUFFER:
+        if u.addrspace is AddrSpace.REG and u in self.reg_promotable: continue
         self.locals[u] = UOp.cconst(self.stack_size, dtypes.int32)
         self.stack_size += u.max_numel() * u.dtype.itemsize
 
@@ -213,7 +219,9 @@ def wide_regalloc_rewrite(ctx, x:UOp):
     elif isinstance(vr, Register) and vr in ctx.spills: nsrc.append(ctx.ren.fill(ctx.spills[vr], su, ctx.reals[i][vr]))
     else: nsrc.append(su)
   ndefs = tuple(ctx.reals[i][vr] for vr in x.tag) if isinstance(x.tag, tuple) else x.tag
-  if x.op is Ops.BUFFER: nx = ctx.ren.isel_matcher.rewrite(ctx.ren.stack_pointer().index(ctx.locals[x], tag=ndefs))
+  if x.op is Ops.BUFFER:
+    if x in ctx.reg_promotable and x not in ctx.locals: nx = ctx.ren.isel_matcher.rewrite(x.replace(tag=ndefs))
+    else: nx = ctx.ren.isel_matcher.rewrite(ctx.ren.stack_pointer().index(ctx.locals[x], tag=ndefs))
   else: nx = x.replace(src=tuple(nsrc), tag=ndefs)
   before = [wide_restore(ctx, vr, r, i) for vr,r in ctx.insert_before.get(i, [])]
   after = [ctx.ren.spill(ctx.spills[vr], nx) for vr in x.tag if vr in ctx.spills] if isinstance(x.tag, tuple) else []
@@ -235,7 +243,9 @@ def regalloc_rewrite(ctx:LinearScanRegallocContext, x:UOp):
     if i in ctx.reals and (v:=greg(ctx.uops[i].src[j])) in ctx.spills: nsrc.append(ctx.ren.fill(ctx.spills[v], ctx.vdef(v), ctx.reals[i][v]))
     else: nsrc.append(s)
   ndefs = tuple(ctx.reals[i][v] for v in x.tag) if isinstance(x.tag, tuple) else x.tag
-  if x.op is Ops.BUFFER: nx = ctx.ren.isel_matcher.rewrite(ctx.ren.stack_pointer().index(ctx.locals[x], tag=ndefs))
+  if x.op is Ops.BUFFER:
+    if x in ctx.reg_promotable and x not in ctx.locals: nx = ctx.ren.isel_matcher.rewrite(x.replace(tag=ndefs))
+    else: nx = ctx.ren.isel_matcher.rewrite(ctx.ren.stack_pointer().index(ctx.locals[x], tag=ndefs))
   else: nx = x.replace(src=tuple(nsrc), tag=ndefs)
 
   before = [ctx.ren.fill(ctx.spills[v], ctx.vdef(v), r) for v,r in ctx.insert_before.get(i, [])]

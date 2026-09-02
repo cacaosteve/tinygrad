@@ -518,8 +518,12 @@ def _amd_fused_d16(ctx:PreRegAllocContext) -> set[UOp]:
   return ctx.scratch.get("fused_d16") or set()
 
 def _const_int(x:UOp) -> int|None:
-  if (c:=_unwrap_const(x)) is not None: return int(c.val)
-  if x.op is Ops.INS and _iop(x) is AMDOps.MOV and x.src and (c:=_unwrap_const(x.src[0])) is not None: return int(c.val)
+  if (c:=_unwrap_const(x)) is not None:
+    try: return int(c.val)
+    except (OverflowError, ValueError): return None
+  if x.op is Ops.INS and _iop(x) is AMDOps.MOV and x.src and (c:=_unwrap_const(x.src[0])) is not None:
+    try: return int(c.val)
+    except (OverflowError, ValueError): return None
   return None
 
 def _is_wmma_acc_reload_pack(cin:UOp, ctx:PreRegAllocContext|None=None) -> bool:
