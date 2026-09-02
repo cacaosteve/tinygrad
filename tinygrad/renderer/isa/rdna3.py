@@ -19,6 +19,9 @@ from tinygrad.renderer.isa.rdna3_defs import (AMDOps, KERNARG_REG, WGID, LID, SG
   allow_upcast16, unwrap_const as _unwrap_const, const_value as _const_value, tconst as _tconst)
 from tinygrad.renderer.isa.rdna3_tc import expand_wmma_lds_tiles, pm_stage_wmma_ab
 
+# Scratch SGPR pair for emit-time saveexec around fused WHERE(LOAD) (s is often shadowed).
+_EXEC_SAVE = s[104:105]
+
 # RDNA3: kernarg in s[0:1], local ids packed in v0. Even SGPR bases for 64-bit kernarg loads.
 # WGID follows USER_SGPR_COUNT: s2 when count=2 (1D locals); s15 when gfx1100 pads to 15 (2D locals).
 # AMD_PREFETCH_A (default 1): within-K next-A B128 before PACK so A tiles overlap WMMA; 0 opts out.
@@ -3306,7 +3309,7 @@ def insts_from_linear(lin:UOp):
           emit(r3.v_mov_b32_e32(d, a))
         else:
           emit(r3.v_mov_b32_e32(d, _src(alt)))
-      emit(r3.s_and_saveexec_b64(s[104:105], VCC))
+      emit(r3.s_and_saveexec_b64(_EXEC_SAVE, VCC))
       load_emitted = _emit_uop(load, masked=True)
       for inst in load_emitted: emit(inst)
       note_vm(_reg_idxs(load), load_emitted)
@@ -3314,7 +3317,7 @@ def insts_from_linear(lin:UOp):
       for lane in range(slots):
         d = _reg_lane(dst, lane) if slots > 1 else _dst(u)
         emit(r3.v_mov_b32_e32(d, _reg_lane(ldst, lane) if slots > 1 else _dst(load)))
-      emit(r3.s_mov_b64(EXEC, s[104:105]))
+      emit(r3.s_mov_b64(EXEC, _EXEC_SAVE))
       oi += 1
       continue
     # REG-stack park of same-stage swizzles is scheduled pre-regalloc as SWIZZLE×N,MOV×N
