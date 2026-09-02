@@ -111,3 +111,4 @@ class AMDOps(FastEnum):
   PACKED_F16_MUL_TO_F16 = auto()
   LSHL_OR = auto()
   LSHL_ADD = auto()
+  FMA_MIX_F32 = auto()  # srcs: (acc_f32, half, f32)

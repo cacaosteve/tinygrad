@@ -509,21 +509,17 @@ def _fused_d16_hi_loads(uops:list[UOp]) -> set[UOp]:
   # Hi LOADs only (no VGPR). Not in _compute_amd_skip — promote drops those from the list.
   return set(_d16_hi_lo_map(uops))
 
-def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple], set[UOp]]:
+def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[UOp]]:
   """Fold FMAC(acc, CAST(f16), f32) into v_fma_mix_f32 (HIP SDPA style).
 
-  Returns (fmac → (half_first, opsel_h, hbase, word, f32_src), skip CAST).
-  Mix from the CAST source VGPR as f16 lo (opsel=0). Do not skip EXTRACT/LSHR —
-  reading packed halves via opsel still NaNs on SDPA; matvec-only was fine.
+  Returns (fmac → (hbase, f32_src), skip CAST).
+  Mul is commutative so half is always the mix src0 (opsel_hi=1, opsel=0).
   """
   if not getenv("AMD_FMA_MIX", 1): return {}, set()
-  # Fused softmax@V NaNs with mix; keep cvt+fmac when EXP is in the same kernel.
-  if any(u.op is Ops.INS and _iop(u) is AMDOps.EXP2 for u in uops) and not getenv("AMD_FMA_MIX_EXP", 0):
-    return {}, set()
   uses: dict[UOp, list[UOp]] = {}
   for u in uops:
     for s in u.src: uses.setdefault(s, []).append(u)
-  folds: dict[UOp, tuple] = {}
+  folds: dict[UOp, tuple[UOp, UOp]] = {}
   skip: set[UOp] = set()
   for cast, consumers in uses.items():
     if not (cast.op is Ops.INS and _iop(cast) is AMDOps.CAST and cast.dtype is dtypes.float32 and
@@ -536,12 +532,28 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple], set[UOp]]:
       half_i = next((i for i in (1, 2) if u.src[i] is cast), None)
       if half_i is None:
         ok = False; break
-      f32_i, half_first = (2, True) if half_i == 1 else (1, False)
-      folds[u] = (half_first, 0, hbase, 0, u.src[f32_i])
+      f32_i = 2 if half_i == 1 else 1
+      folds[u] = (hbase, u.src[f32_i])
     if ok: skip.add(cast)
     else:
       for u in consumers: folds.pop(u, None)
   return folds, skip
+
+def _lower_fma_mix_f32(lst:list[UOp]) -> list[UOp]:
+  """Rewrite FMAC(acc, CAST(f16), f32) into FMA_MIX_F32(acc, half, f32) before regalloc.
+
+  Half stays a real operand so liveness covers EXTRACT/LOAD through the mix.
+  """
+  folds, skip_casts = _fma_mix_f32_folds(lst)
+  if not folds: return lst
+  out: list[UOp] = []
+  for u in lst:
+    if u in skip_casts: continue
+    if (mix:=folds.get(u)) is not None:
+      hbase, f32 = mix
+      u = UOp(Ops.INS, src=(u.src[0], hbase, f32), arg=(AMDOps.FMA_MIX_F32, dtypes.float32), tag=u.tag)
+    out.append(u)
+  return out
 
 def _amd_skip(ctx:PreRegAllocContext) -> set[UOp]:
   if "skip" not in ctx.scratch and ctx.uops: ctx.scratch["skip"] = _compute_amd_skip(ctx.uops)
@@ -1781,8 +1793,7 @@ _MASKED_MEM = (AMDOps.LOAD, AMDOps.STORE, AMDOps.LLOAD, AMDOps.LSTORE, AMDOps.SL
 
 def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_cache:_StoreAddrCache|None=None,
                   d16_hi_lo:dict[UOp, UOp]|None=None, byte_scaled:set[int]|None=None,
-                  fma_hi_lo:dict[UOp, UOp]|None=None, fma_pair_dst:dict[UOp, Reg]|None=None,
-                  fma_mix_folds:dict[UOp, tuple]|None=None):
+                  fma_hi_lo:dict[UOp, UOp]|None=None, fma_pair_dst:dict[UOp, Reg]|None=None):
   if u.op is not Ops.INS or (skip and u in skip): return []
   if isinstance(_iop(u), Inst): return [_iop(u)]
   match _iop(u):
@@ -1916,21 +1927,6 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if u.dtype is dtypes.float32: return [r3.v_fma_f32(_dst(u), _src(u.src[0]), _src(u.src[1]), _src(u.src[2]))]
       raise CompileError(f"f16/f32 mulacc only, got {u.dtype}")
     case AMDOps.FMAC:
-      if u.dtype is dtypes.float32 and fma_mix_folds is not None and (mix:=fma_mix_folds.get(u)) is not None:
-        half_first, opsel_h, hbase, word, f32 = mix
-        if isinstance(greg(hbase), Register) and _elem_count(hbase) > 1:
-          hreg = _reg_lane(greg(hbase), word)
-        else:
-          pre_h, hreg = _vgpr_data(TMP_VDATA, hbase)
-          if pre_h: return pre_h + [r3.v_fma_mix_f32(_dst(u), hreg if half_first else _src(f32),
-                                                      _src(f32) if half_first else hreg, _dst(u),
-                                                      opsel=opsel_h * (1 if half_first else 2),
-                                                      opsel_hi=1 if half_first else 2, opsel_hi2=0)]
-        pre_f, freg = ([], _src(f32)) if isinstance(_src(f32), Reg) and _src(f32).offset >= 256 else _vgpr_data(TMP_VADDR, f32)
-        acc = _dst(u)
-        return pre_f + [r3.v_fma_mix_f32(acc, hreg if half_first else freg, freg if half_first else hreg, acc,
-                                         opsel=opsel_h * (1 if half_first else 2),
-                                         opsel_hi=1 if half_first else 2, opsel_hi2=0)]
       a, b = _src(u.src[1]), _src(u.src[2])
       inst = r3.v_fmac_f16_e32 if u.dtype is dtypes.float16 else r3.v_fmac_f32_e32 if u.dtype is dtypes.float32 else None
       if inst is None: raise CompileError(f"f16/f32 fmac only, got {u.dtype}")
@@ -1938,6 +1934,13 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if isinstance(a, Reg) and a.offset >= 256: return [inst(_dst(u), b, a)]
       pre, b = _vgpr_data(TMP_VDATA, u.src[2])
       return pre + [inst(_dst(u), a, b)]
+    case AMDOps.FMA_MIX_F32:
+      # srcs: (acc, half, f32) — half is always mix src0 (opsel_hi=1)
+      hbase, f32 = u.src[1], u.src[2]
+      pre_h, hreg = _vgpr_data(TMP_VDATA, hbase)
+      pre_f, freg = ([], _src(f32)) if isinstance(_src(f32), Reg) and _src(f32).offset >= 256 else _vgpr_data(TMP_VADDR, f32)
+      acc = _dst(u)
+      return pre_h + pre_f + [r3.v_fma_mix_f32(acc, hreg, freg, acc, opsel=0, opsel_hi=1, opsel_hi2=0)]
     case AMDOps.CAST:
       cast_src = _src(u.src[0])
       if greg(u).index < 256:
@@ -3134,8 +3137,6 @@ def _fused_lds_reduce_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
 def insts_from_linear(lin:UOp):
   ops = list(lin.src)
   skip = _compute_amd_skip(ops)  # fused d16 hi LOADs still emit (d16_hi into lo)
-  fma_mix_folds, fma_mix_skip = _fma_mix_f32_folds(ops)
-  skip |= fma_mix_skip
   d16_hi_lo = _d16_hi_lo_map(ops)
   fma_hi_lo = _fma_mixhi_lo_map(ops)
   fma_pair_dst: dict[UOp, Reg] = {}
@@ -3181,7 +3182,7 @@ def insts_from_linear(lin:UOp):
     return any(pr & regs for pr, _ in pending_vm) or bool(pending["lgkm"] & regs)
   def _emit_uop(u, masked=False, with_store_cache=False):
     return list(insts_for_uop(u, skip, masked, store_addr_cache if with_store_cache else None,
-                              d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst, fma_mix_folds))
+                              d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst))
   scheduled = _order_d16_lo_before_hi(
     _hoist_loads_before_wmma(_sink_wmma_past_loads(_hoist_lloads_before_extracts(ops))), d16_hi_lo)
   scheduled = _schedule_swizzle_mov_batches(scheduled)
@@ -3240,11 +3241,6 @@ def insts_from_linear(lin:UOp):
         flush_regs(set().union(*(_reg_idxs(s) for s in u.src)))
       else:
         regs = set().union(*(_reg_idxs(s) for s in u.src), _reg_idxs(u))
-        # fma_mix reads half VGPRs; CAST may be skipped — wait the underlying VMEM.
-        if (mix:=fma_mix_folds.get(u)) is not None:
-          hb = mix[2]
-          while hb.op is Ops.INS and _iop(hb) is AMDOps.EXTRACT and hb.src: hb = hb.src[0]
-          regs |= _reg_idxs(hb)
         flush_regs(regs)
     if u.op is Ops.INS and _iop(u) is AMDOps.IF_MASK:
       store_addr_cache.clear()
@@ -3792,7 +3788,7 @@ class AMDRenderer(ISARenderer):
 
   def is_two_address(self, x:UOp) -> bool:
     if x.op is not Ops.INS: return False
-    if _iop(x) in (AMDOps.WMMA, AMDOps.FMAC): return True
+    if _iop(x) in (AMDOps.WMMA, AMDOps.FMAC, AMDOps.FMA_MIX_F32): return True
     # PACK_F16(half×16 LOAD) — coalesce onto the load (hand FA/FB).
     return _iop(x) is AMDOps.PACK_F16 and _pack_f16_is_vec_load(x) and len(x.src) == 1
   def loop_end(self, x:UOp) -> UOp|None:
@@ -3824,6 +3820,7 @@ class AMDRenderer(ISARenderer):
     6. Hoist independent scalar VMEM reads in kernels without WMMA or wide global loads.
     7. Put a boundless-loop compare before any REG_STORE that mutates its old-value operand.
     """
+    lst = _lower_fma_mix_f32(lst)
     lst = _schedule_fma_mixhi_pairs(lst)
     lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
     lst = _prefetch_a_after_packed_quant(lst) if getenv("AMD_PREFETCH_IQ4_A", 1) else lst
