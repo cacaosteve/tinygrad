@@ -3078,11 +3078,14 @@ def insts_from_linear(lin:UOp):
       if u.op is Ops.INS and _iop(u) is AMDOps.END_MASK: mask_depth -= 1
       oi += 1
       continue
-    # Overlap independent VMEM with in-flight ds_swizzle (emit early; uop order unchanged).
+    # Overlap independent VMEM with in-flight ds_swizzle: emit swizzle, then gap loads, then add waits lgkm.
     if mask_depth == 0 and getenv("AMD_SINK_VMEM_SWIZZLE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SWIZZLE and \
        oi + 1 < len(scheduled) and (add:=scheduled[oi + 1]).op is Ops.INS and _iop(add) in (AMDOps.ADD, AMDOps.MAX) and u in add.src:
+      emitted = _emit_uop(u)
+      for inst in emitted: emit(inst)
+      pending["lgkm"] |= _reg_idxs(u)
       k, moved = oi + 2, 0
-      while k < len(scheduled) and moved < 2:
+      while k < len(scheduled) and moved < 4:
         if k in early_emitted or scheduled[k] in skip:
           k += 1
           continue
@@ -3090,14 +3093,16 @@ def insts_from_linear(lin:UOp):
         if cand.op is Ops.INS and _iop(cand) is AMDOps.LOAD and _vmem_schedulable_load(cand) and \
            u not in cand.toposort() and add not in cand.toposort() and \
            not any(cand in scheduled[m].toposort() for m in range(oi + 2, k)):
-          emitted = _emit_uop(cand)
-          for inst in emitted: emit(inst)
-          note_vm(_reg_idxs(cand), emitted)
+          gap_emitted = _emit_uop(cand)
+          for inst in gap_emitted: emit(inst)
+          note_vm(_reg_idxs(cand), gap_emitted)
           early_emitted.add(k)
           moved += 1
           k += 1
           continue
         break
+      oi += 1
+      continue
     # Quantized WMMA epilogues can scalarize a contiguous packed accumulator store into
     # aliasing EXTRACT+LSTORE pairs. Rejoin only exact four-f32 groups after regalloc.
     if mask_depth == 0 and (fused_store:=_fused_lds_pack_store(scheduled, oi)) is not None:
