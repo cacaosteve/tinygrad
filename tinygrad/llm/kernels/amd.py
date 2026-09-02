@@ -4,7 +4,7 @@ from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import prod
+from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
@@ -707,9 +707,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   tile_max = m_ij.reshape(TM, 1).expand(TM, TN).maximum(-1e30)
   S_reg = S_reg.after(S_reg.store(((S_reg - tile_max) * LOG2E).exp2()))
   p_local = _reg((TM,), 8, 0, n_tile)
-  for ri_ws_i in range(TM):
-    p_sum_val = sum((warp_reduce(S_reg[ri_ws_i, rn_i]) for rn_i in range(TN)), S_reg.const_like(0))
-    p_local = p_local.after(p_local[ri_ws_i].store(p_sum_val))
+  p_sum = p_local.after(UOp.group(*[p_local[ri_ws_i].store(sum((warp_reduce(S_reg[ri_ws_i, rn_i]) for rn_i in range(TN)), S_reg.const_like(0)))
+                                      for ri_ws_i in range(TM)]))
   P_lds = QP_lds.flatten()[:WAVES_N * BLOCK_M * BLOCK_N].reshape(WAVES_N, BLOCK_M, BLOCK_N)
   P_write = P_lds.reshape(WAVES_N, WAVES_M, TM, LANES_PER_WAVE_M, 1, TN, LANES_PER_WAVE_N, 1).permute((1, 0, 3, 6, 2, 4, 5, 7)) \
     .reshape(THREADS_PER_BLOCK, TM, TN)
@@ -721,7 +720,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     alpha_val, beta_val = ((m_i[ri4_i] - m_new) * LOG2E).exp2(), ((m_ij[ri4_i] - m_new) * LOG2E).exp2()
     for rj4_i in range(TD):
       correction_stores.append(acc[ri4_i, rj4_i].store(alpha_val * acc[ri4_i, rj4_i]))
-    correction_stores += [l_i[ri4_i].store(alpha_val * l_i[ri4_i] + beta_val * p_local[ri4_i]),
+    correction_stores += [l_i[ri4_i].store(alpha_val * l_i[ri4_i] + beta_val * p_sum[ri4_i]),
                           m_i[ri4_i].store(m_new), beta_i[ri4_i].store(beta_val)]
   correction = UOp.group(*correction_stores)
   acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
@@ -751,6 +750,12 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
   T_real, q_start = q.shape[2], None
   if resolve(T_real == 1): return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, assigned_kv.shape[3]))
+  # Direct ISA can render the hand WMMA prefill correctly, but its per-tile REG scratch
+  # traffic is currently much slower than the generic fused attention lowering.
+  if amd_direct_isa(q.device) and not getenv("AMD_FLASH_DIRECT", 0):
+    k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
+    mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
+    return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]
