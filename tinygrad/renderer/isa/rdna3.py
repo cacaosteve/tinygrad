@@ -1785,8 +1785,8 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if (offset:=_const_int(u.src[1])) is None: raise CompileError("non-constant swizzle offset")
       return pre + [r3.ds_swizzle_b32(vdst=_dst(u), addr=val, offset0=offset & 0xff, offset1=offset >> 8)]
     case AMDOps.PERMLANEX16:
-      # VALU cross-16 (no lgkm). Two 32-bit lane selects need SGPRs (one literal/instr).
-      # opsel bit0=FI so inactive source lanes still contribute (ds_swizzle-equivalent).
+      # VALU cross-16 (no lgkm). Lane selects come from emit-time streak hoist when possible.
+      # Fallback keeps selects here for a lone PERMLANEX16.
       pre, val = _vgpr_data(TMP_VDATA, u.src[0])
       return pre + [r3.s_mov_b32(TMP_SDATA0, 0x76543210), r3.s_mov_b32(TMP_SDATA1, 0xfedcba98),
                     r3.v_permlanex16_b32(_dst(u), val, TMP_SDATA0, TMP_SDATA1, opsel=1)]
@@ -2713,22 +2713,24 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
   return out
 
 def _schedule_swizzle_mov_batches(ops:list[UOp]) -> list[UOp]:
-  """Rewrite SWIZZLE,MOV,SWIZZLE,MOV,… into SWIZZLE×N,MOV×N before regalloc.
+  """Rewrite (SWIZZLE|PERMLANEX16),MOV×… into op×N,MOV×N before regalloc.
 
-  Emit-time reordering of the same pattern extends swizzle live ranges past what
+  Emit-time reordering of the same pattern extends live ranges past what
   regalloc assumed (aliased VGPRs → wrong results). Scheduling here keeps liveness honest.
   """
   if not getenv("AMD_BATCH_SWIZZLE_MOV", 1): return ops
+  batchable = (AMDOps.SWIZZLE, AMDOps.PERMLANEX16)
   out: list[UOp] = []
   i = 0
   while i < len(ops):
     u = ops[i]
-    if u.op is Ops.INS and _iop(u) is AMDOps.SWIZZLE and i + 1 < len(ops) and \
+    if u.op is Ops.INS and _iop(u) in batchable and i + 1 < len(ops) and \
        ops[i + 1].op is Ops.INS and _iop(ops[i + 1]) is AMDOps.MOV and u in ops[i + 1].src:
+      kind = _iop(u)
       sws, movs = [u], [ops[i + 1]]
       j = i + 2
       while j + 1 < len(ops) and len(sws) < 8 and \
-            ops[j].op is Ops.INS and _iop(ops[j]) is AMDOps.SWIZZLE and \
+            ops[j].op is Ops.INS and _iop(ops[j]) is kind and \
             ops[j + 1].op is Ops.INS and _iop(ops[j + 1]) is AMDOps.MOV and \
             ops[j] in ops[j + 1].src:
         sws.append(ops[j]); movs.append(ops[j + 1]); j += 2
