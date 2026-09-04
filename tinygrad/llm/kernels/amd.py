@@ -445,7 +445,12 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
   token_tile = 32 if out_features <= 1024 and out.shape[0] % 32 == 0 else 64 if out.shape[0] % 64 == 0 and \
     (out_features <= 6144 or out_features == 5120 and in_features > 8192) else 128 if out.shape[0] % 128 == 0 else \
     32 if out.shape[0] % 32 == 0 else 16
-  output_tiles = 1 if out_features <= 1024 else 2 if out_features <= 6144 else 1
+  # Dual output tiles (old default for 1024<out<=6144) inflated LUT dequant VGPR live
+  # ranges (~1.47× HIP on 4096×2048). Single tile is default; AMD_IQ4_DUAL_OUT=1 restores.
+  if (t:=getenv("AMD_IQ4_OUTPUT_TILES", 0)): output_tiles = t
+  elif getenv("AMD_IQ4_DUAL_OUT", 0):
+    output_tiles = 1 if out_features <= 1024 else 2 if out_features <= 6144 else 1
+  else: output_tiles = 1
   layout = _wmma_layout(out, out_features, token_tile, output_tiles)
   output_waves, _, _, lane, wave, _, _, _, _ = layout
   local_lut = UOp.placeholder((256,), dtypes.uint32, slot=32, addrspace=AddrSpace.LOCAL)
