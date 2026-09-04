@@ -3024,16 +3024,23 @@ def _fma_mixhi_lo_map(uops:list[UOp]) -> dict[UOp, UOp]:
 def _fma_pair_pack_dsts(uops:list[UOp], fma_hi_lo:dict[UOp, UOp]) -> dict[UOp, Reg]:
   """Use the final PACK_F16 lane directly when it is idle throughout a paired FMA's live interval."""
   pos = {u:i for i,u in enumerate(uops)}
+  last_use: dict[UOp, int] = {}
+  for i,u in enumerate(uops):
+    for s in u.src: last_use[s] = i
   ret: dict[UOp, Reg] = {}
   for pack in uops:
     if pack.op is not Ops.INS or _iop(pack) is not AMDOps.PACK_F16 or not isinstance(greg(pack), Register): continue
     for lane,(lo,hi) in enumerate(zip(pack.src[::2], pack.src[1::2])):
       if fma_hi_lo.get(hi) is not lo or lo not in pos or hi not in pos or not (pos[lo] < pos[hi] < pos[pack]): continue
       target_idx = greg(pack).index + lane
-      # Inputs still needed by either FMA and all intervening values must remain untouched.
+      # Inputs of either FMA, intervening defs, and any value live across [lo, pack]
+      # (defined earlier, last use ≥ lo). Omitting live-ins let Q4/Q5/Q6 mixhi clobber
+      # sibling dequant temps → NaN WMMA fragments (IQ4 packed-mul often missed the hazard).
       blocked = set().union(*(_reg_idxs(s) for s in lo.src+hi.src))
       for x in uops[pos[lo]+1:pos[pack]]:
         if x is not hi: blocked |= _reg_idxs(x)
+      for x in uops[:pos[lo]]:
+        if last_use.get(x, -1) >= pos[lo]: blocked |= _reg_idxs(x)
       if target_idx in blocked: continue
       dst = _reg_lane(greg(pack), lane)
       ret[lo] = ret[hi] = dst
