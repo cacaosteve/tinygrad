@@ -57,7 +57,7 @@ def _peer16_f32(val:UOp) -> UOp:
 def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
-    other = _swizzle_f32(val, offset)
+    other = _peer16_f32(val) if offset == 16 else _swizzle_f32(val, offset)
     val = val.maximum(other) if maximum else val + other
   return val
 
@@ -69,6 +69,9 @@ def warp_reduce_many(vals:list[UOp], maximum:bool=False, full_wave:bool=False) -
   Per-element REG stores keep all stage-N ds_swizzle ops ahead of butterfly adds so
   emit can issue SWIZZLE×N then one lgkm wait (HIP pattern). Unique slots per stage
   avoid clobbering live parks across keys.
+
+  Offset 16 uses VALU permlanex16 (no lgkm) when full_wave — same cross-half exchange
+  as ds_swizzle 0x1f|16<<10, cheaper on the flash_decode score reduce.
   """
   if not vals: return []
   if len(vals) == 1: return [warp_reduce(vals[0], maximum=maximum, full_wave=full_wave)]
@@ -78,7 +81,7 @@ def warp_reduce_many(vals:list[UOp], maximum:bool=False, full_wave:bool=False) -
   for i, v in enumerate(chunk):
     if v.op is Ops.INDEX and v.addrspace == AddrSpace.REG: chunk[i] = v.load()
   for offset in offsets:
-    raw = [_swizzle_f32(v, offset) for v in chunk]
+    raw = [_peer16_f32(v) if offset == 16 else _swizzle_f32(v, offset) for v in chunk]
     tmp = UOp.placeholder((len(chunk),), dtypes.float, slot=_reg_swizzle_slot, addrspace=AddrSpace.REG)
     _reg_swizzle_slot += 1
     tmp = tmp.after(UOp.group(*[tmp[i].store(sw) for i, sw in enumerate(raw)]))
