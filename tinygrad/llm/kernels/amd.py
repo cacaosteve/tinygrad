@@ -707,20 +707,16 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   qk_load_barrier = UOp.barrier(UOp.group(Q_store, K_store))
   Q_lds, KV_lds_k = Q_lds.after(qk_load_barrier), KV_lds.after(qk_load_barrier)
   S_reg = _reg((TM, TN), 6, 0, n_tile)
-  if getenv("AMD_FLASH_UNROLL", 0):
-    # Python-unroll WMMA/soft indices so REG promote sees const slots (scratch→VGPR).
-    S_view = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)
-    qk_stores = []
-    for tm1_i in range(TM // WMMA_ACC):
-      for tn1_i in range(TN):
-        frag_idx = S_view[tm1_i, tn1_i]
-        cur = frag_idx
-        for k_i in range(D // WMMA_K):
-          q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1_i, lane_n, k_i]
-          k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1_i, lane_n, k_i]
-          st = frag_idx.store(UOp.wmma(q_frag, k_frag, cur, *WMMA_ARG))
-          cur, qk_stores = frag_idx.after(st), qk_stores + [st]
-    qk_done = UOp.group(*qk_stores)
+  # AMD_FLASH_UNROLL: 0=off; 1 or 6=soft+corr python-unroll (const REG slots). WMMA stays ranged —
+  # frag.after(store) cin was wrong; const_like(0) chains break direct-ISA emit (half2 LDS).
+  _fu = getenv("AMD_FLASH_UNROLL", 0)
+  if _fu == 1: _fu = 6
+  k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
+  S_frag = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[tm1, tn1]
+  q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1, lane_n, k_qk]
+  k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1, lane_n, k_qk]
+  qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk)
+  if _fu & 2:
     S_reg = S_reg.after(qk_done, S_reg.store(S_reg * SCALE))
     mask_stores = []
     for rm_i in range(TM):
@@ -739,11 +735,6 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     p_sum = p_local.after(UOp.group(*[p_local[ri].store(sum((warp_reduce(S_reg[ri, rn_i]) for rn_i in range(TN)), S_reg.const_like(0)))
                                       for ri in range(TM)]))
   else:
-    k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
-    S_frag = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[tm1, tn1]
-    q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1, lane_n, k_qk]
-    k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1, lane_n, k_qk]
-    qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk)
     S_reg = S_reg.after(qk_done, S_reg.store(S_reg * SCALE))
     rm, rn = UOp.range(TM, 250), UOp.range(TN, 251)
     q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm * LANES_PER_WAVE_M + lane_m
@@ -762,8 +753,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     .reshape(THREADS_PER_BLOCK, TM, TN)
   P_store = P_write[tid].store(S_reg.cast(dtypes.half))
   beta_i = UOp.placeholder((TM,), dtypes.float, slot=9, addrspace=AddrSpace.REG)
-  if getenv("AMD_FLASH_UNROLL", 0):
-    # Loop-carried REG state must be read through after(n_tile) (phi) when python-unrolled.
+  if _fu & 4:
     acc_c, l_c, m_c = acc.after(n_tile), l_i.after(n_tile), m_i.after(n_tile)
     corr = []
     for ri in range(TM):
@@ -789,31 +779,14 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   pv_barrier = UOp.barrier(UOp.group(P_store, V_store))
   P_lds, V_lds = P_lds.after(pv_barrier), V_lds.after(pv_barrier)
   pv_acc = _reg((TM, TD), 10, 0, n_tile).after(pv_barrier)
-  if getenv("AMD_FLASH_UNROLL", 0):
-    pv_view = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)
-    pv_stores = []
-    for tm2_i in range(TM // WMMA_ACC):
-      for tn2_i in range(TD):
-        frag_idx = pv_view[tm2_i, tn2_i]
-        cur = frag_idx
-        for k_i in range(BLOCK_N // WMMA_K):
-          p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, tm2_i, lane_n, k_i]
-          v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2_i, lane_n, k_i]
-          st = frag_idx.store(UOp.wmma(p_frag, v_frag, cur, *WMMA_ARG))
-          cur, pv_stores = frag_idx.after(st), pv_stores + [st]
-    pv_acc = pv_acc.after(UOp.group(*pv_stores))
-    acc_c, beta_c = acc.after(n_tile), beta_i.after(n_tile)
-    n_tile_end = UOp.group(*[acc_c[ri, rj].store(acc_c[ri, rj] + beta_c[ri] * pv_acc[ri, rj])
-                             for ri in range(TM) for rj in range(TD)]).barrier().end(n_tile)
-  else:
-    k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
-    pv_frag = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[tm2, tn2]
-    p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, tm2, lane_n, k_pv]
-    v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2, lane_n, k_pv]
-    pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
-    pv_acc = pv_acc.after(pv_done)
-    ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
-    n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
+  k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
+  pv_frag = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[tm2, tn2]
+  p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, tm2, lane_n, k_pv]
+  v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2, lane_n, k_pv]
+  pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
+  pv_acc = pv_acc.after(pv_done)
+  ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
+  n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
   acc, l_i, m_i = acc.after(n_tile_end), l_i.after(n_tile_end), m_i.after(n_tile_end)
   acc = acc.after(acc.store(acc * (1 / l_i).reshape(TM, 1).expand(TM, TD)))
   o = o.reshape(WAVES_M, TM, LANES_PER_WAVE_M, 1, WAVES_N, TD, LANES_PER_WAVE_N, 1) \
