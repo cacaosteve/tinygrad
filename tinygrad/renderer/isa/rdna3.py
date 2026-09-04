@@ -405,10 +405,14 @@ def _scratch_base_offset(x:UOp) -> int:
   if x.op is Ops.INS and _iop(x) is AMDOps.SCRATCH_ADDR: return _const_int(x.src[0]) or 0
   return 0
 
-def _local_addr(base:UOp, idx:UOp, itemsize:int) -> tuple[list, Reg]:
-  pre, addr = _scaled_addr(TMP_VADDR, idx, itemsize)
+def _local_addr(base:UOp, idx:UOp, itemsize:int, addr_dst:Reg|None=None) -> tuple[list, Reg]:
+  dst = addr_dst if addr_dst is not None else TMP_VADDR
+  pre, addr = _scaled_addr(dst, idx, itemsize)
+  # When a dedicated addr_dst is requested, materialize into it (itemsize==1 may return idx as-is).
+  if addr_dst is not None and addr != dst:
+    pre, addr = pre + [r3.v_mov_b32_e32(dst, addr)], dst
   if (off:=_lds_base_offset(base)) == 0: return pre, addr
-  return pre + [r3.v_add_nc_u32_e64(TMP_VADDR, off, addr)], TMP_VADDR
+  return pre + [r3.v_add_nc_u32_e64(dst, off, addr)], dst
 
 def _scratch_addr(base:UOp, idx:UOp, itemsize:int) -> tuple[list, Reg]:
   pre, addr = _scaled_addr(TMP_VADDR, idx, itemsize)
@@ -2110,7 +2114,9 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
                            r3.s_waitcnt_vmcnt(sdst=NULL, simm16=0)]
     case AMDOps.LLOAD:
       slots = _reg_slots(u)
-      pre, addr = _local_addr(u.src[0], u.src[1], _mem_itemsize(u.dtype))
+      # Dest-as-addr: scale into the load VGPR so LDS gathers aren't serialized on TMP_VADDR.
+      addr_dst = _dst(u) if getenv("AMD_LDS_DEST_ADDR", 1) and isinstance(greg(u), Register) and slots == 1 else None
+      pre, addr = _local_addr(u.src[0], u.src[1], _mem_itemsize(u.dtype), addr_dst)
       pre, addr = _masked_addr(pre, addr, masked)
       off = _lds_byte_off(u)
       if slots == 8 and u.dtype is dtypes.half:
@@ -3432,6 +3438,7 @@ def insts_from_linear(lin:UOp):
       continue
     # Cluster consecutive LLOAD streaks (post _hoist_lloads_before_extracts): s_clause + ds_load burst.
     # Must not hoist multiple TMP_VADDR scales before loads (same bug as VMEM clause).
+    # With AMD_LDS_DEST_ADDR, scales target distinct load VGPRs so the TMP check allows the burst.
     if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.LLOAD:
       j = oi + 1
       while j < len(scheduled) and scheduled[j] not in skip and scheduled[j].op is Ops.INS and \
