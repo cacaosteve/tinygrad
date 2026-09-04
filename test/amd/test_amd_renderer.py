@@ -942,7 +942,7 @@ class TestAMDRenderer(unittest.TestCase):
     with Context(DEV="MOCKKFD+AMD:AMD"):
       ast = Tensor.empty(10_000_000).sum().schedule_linear().src[0].src[0]
     prg = to_program(ast, _REN)
-    self.assertEqual(prg.src[0].arg.applied_opts, (Opt(OptOps.SPLIT, 0, (16, AxisType.GROUP_REDUCE)),))
+    self.assertEqual(prg.src[0].arg.applied_opts, (Opt(OptOps.SPLIT, 1, (16, AxisType.GROUP_REDUCE)),))
     self.assertEqual(prg.arg.local_size, (16, 1, 1))
 
   def test_group16_final_reduce_uses_wide_lds_loads(self):
@@ -983,13 +983,13 @@ class TestAMDRenderer(unittest.TestCase):
         with Context(BEAM=0): ast = (weights @ Tensor.empty(cols, device="AMD")).schedule_linear().src[-1].src[0]
         opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
         if name == "Q8_0":
-          self.assertEqual(opts[0], Opt(OptOps.SPLIT, 0, (16, AxisType.GROUP_REDUCE)))
+          self.assertEqual(opts[0], Opt(OptOps.SPLIT, 1, (16, AxisType.GROUP_REDUCE)))
           self.assertEqual(opts[1], Opt(OptOps.SPLIT, opts[1].axis, (8, AxisType.UNROLL)))
         elif name == "IQ4_XS":
-          self.assertEqual(opts[:2], (Opt(OptOps.SPLIT, 0, (0, AxisType.GROUP_REDUCE)), Opt(OptOps.SPLIT, 0, (0, AxisType.GROUP_REDUCE))))
+          self.assertEqual(opts[:2], (Opt(OptOps.SPLIT, 1, (0, AxisType.GROUP_REDUCE)), Opt(OptOps.SPLIT, 2, (0, AxisType.GROUP_REDUCE))))
           self.assertEqual(opts[2], Opt(OptOps.SPLIT, opts[2].axis, (0, AxisType.UNROLL)))
         else:
-          self.assertEqual(opts[0], Opt(OptOps.SPLIT, 4, (32, AxisType.GROUP_REDUCE)))
+          self.assertEqual(opts[0], Opt(OptOps.SPLIT, 5, (32, AxisType.GROUP_REDUCE)))
           self.assertTrue(all(o.op is OptOps.SPLIT and isinstance(o.arg, tuple) and o.arg[0] == 0 and o.arg[1] is AxisType.UNROLL for o in opts[1:]))
           self.assertEqual(len(opts), 4)
 
@@ -1057,7 +1057,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_large_odd_max_uses_b96_load(self):
     with Context(BEAM=0): ast = Tensor.empty(1503, device="AMD").max().schedule_linear().src[-1].src[0]
     prg = to_program(ast, _REN)
-    self.assertIn(Opt(OptOps.SPLIT, 0, (3, AxisType.UPCAST)), prg.src[0].arg.applied_opts)
+    self.assertIn(Opt(OptOps.SPLIT, 0, (3, AxisType.UNROLL)), prg.src[0].arg.applied_opts)
     self.assertEqual(_amd_inst_names(prg).count("GLOBAL_LOAD_B96"), 1)
 
   def test_q6_wmma_uses_wide_quant_loads(self):
@@ -1135,9 +1135,9 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(names.count("GLOBAL_LOAD_B32"), 6)
     self.assertEqual(names.count("V_FMA_MIXHI_F16"), 16)
     self.assertNotIn("V_PACK_B32_F16", names)
-    # The four scalar LUT stores stay scalar; packed accumulator exchange uses two B128 stores.
+    # LUT install stays scalar; peer16/permlanex accumulator exchange no longer needs DS B128.
     self.assertEqual(names.count("DS_STORE_B32"), 4)
-    self.assertEqual(names.count("DS_STORE_B128"), 2)
+    self.assertNotIn("DS_STORE_B128", names)
     wide = [i for i,name in enumerate(names) if name == "GLOBAL_LOAD_B128"]
     self.assertLessEqual(wide[-1] - wide[0], 8)  # activations issue while the packed quant load is in flight
     self.assertLessEqual(names.count("V_MOV_B32_E32"), 8)  # accumulator fragments remain resident across the K loop
@@ -1612,7 +1612,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_matmul_default_schedule_uses_float4_memory_tile(self):
     prg = _matmul64_program()
     self.assertEqual(prg.src[0].arg.applied_opts, (
-      Opt(OptOps.SPLIT, 1, (4, AxisType.UPCAST)), Opt(OptOps.SPLIT, 0, (4, AxisType.UPCAST)), Opt(OptOps.SPLIT, 4, (4, AxisType.UPCAST)),
+      Opt(OptOps.SPLIT, 1, (4, AxisType.UPCAST)), Opt(OptOps.SPLIT, 0, (4, AxisType.UPCAST)), Opt(OptOps.SPLIT, 4, (4, AxisType.UNROLL)),
       Opt(OptOps.SPLIT, 0, (8, AxisType.LOCAL)), Opt(OptOps.SPLIT, 1, (16, AxisType.LOCAL))))
     self.assertEqual(prg.arg.local_size, (8, 16, 1))
     linear_ops = _lin_ops(prg)
@@ -2528,8 +2528,10 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_sub_dword_u8_offset_stays_narrow_until_aligned(self):
     inst_names = _amd_inst_names(_offset_u8_vector_load_program(1))
-    self.assertEqual(inst_names.count("GLOBAL_LOAD_U8"), 4)
+    # Odd byte offset: keep sub-dword loads (u16 pairs), never promote to B128.
+    self.assertEqual(inst_names.count("GLOBAL_LOAD_U16"), 8)
     self.assertNotIn("GLOBAL_LOAD_B128", inst_names)
+    self.assertNotIn("GLOBAL_LOAD_B32", inst_names)
 
   def test_uniform_packed_u8_uses_scalar_extracts(self):
     rows, cols = 16384, 2048
