@@ -10,7 +10,7 @@ from tinygrad.renderer.amd.dsl import Reg, s, v, NULL, EXEC, VCC, Inst
 from tinygrad.runtime.autogen.amd.rdna3 import ins as r3
 from tinygrad.runtime.autogen.amd.rdna3.enum import VOPDOp
 from tinygrad.codegen.decomp.op import fast_idiv
-from tinygrad.codegen.opt import tc
+from tinygrad.renderer import tc
 from tinygrad.uop import Ops, GroupOp
 from tinygrad.uop.divandmod import affine_int_bounds
 from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
