@@ -509,6 +509,10 @@ def _fused_d16_hi_loads(uops:list[UOp]) -> set[UOp]:
   # Hi LOADs only (no VGPR). Not in _compute_amd_skip — promote drops those from the list.
   return set(_d16_hi_lo_map(uops))
 
+def _is_f16_to_f32_cast(u:UOp) -> bool:
+  return u.op is Ops.INS and _iop(u) is AMDOps.CAST and u.dtype is dtypes.float32 and \
+         bool(u.src) and u.src[0].dtype is dtypes.float16
+
 def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[UOp]]:
   """Fold FMAC(acc, CAST(f16), f32) into v_fma_mix_f32 (HIP SDPA style).
 
@@ -518,22 +522,25 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[
   Default off (AMD_FMA_MIX=0). Small EXP-only mix still slowed SDPA
   (~375→425µs). Set AMD_FMA_MIX=1 for ≤24-cast EXP kernels, or
   AMD_FMA_MIX_ALL=1 for every matching FMAC.
+
+  Half×half FMACs (QK dots: both srcs are f16→f32 casts) are skipped unless
+  AMD_FMA_MIX_HH=1 — folding those storms added MOVs and slowed flash_decode.
+  Softmax@V (beta*V) keeps one true f32 sibling and is the profitable case.
   """
   if not (getenv("AMD_FMA_MIX", 0) or getenv("AMD_FMA_MIX_ALL", 0)): return {}, set()
   if not getenv("AMD_FMA_MIX_ALL", 0):
     if not any(u.op is Ops.INS and _iop(u) is AMDOps.EXP2 for u in uops): return {}, set()
     # QK-sized mix storms (64+) add MOVs; only fold small EXP kernels (softmax@V).
-    ncast = sum(1 for u in uops if u.op is Ops.INS and _iop(u) is AMDOps.CAST and u.dtype is dtypes.float32 and
-                u.src and u.src[0].dtype is dtypes.float16)
+    ncast = sum(1 for u in uops if _is_f16_to_f32_cast(u))
     if ncast > 24: return {}, set()
+  allow_hh = getenv("AMD_FMA_MIX_HH", 0)
   uses: dict[UOp, list[UOp]] = {}
   for u in uops:
     for s in u.src: uses.setdefault(s, []).append(u)
   folds: dict[UOp, tuple[UOp, UOp]] = {}
   skip: set[UOp] = set()
   for cast, consumers in uses.items():
-    if not (cast.op is Ops.INS and _iop(cast) is AMDOps.CAST and cast.dtype is dtypes.float32 and
-            cast.src and cast.src[0].dtype is dtypes.float16): continue
+    if not _is_f16_to_f32_cast(cast): continue
     if not consumers or any(c.op is not Ops.INS or _iop(c) is not AMDOps.FMAC or c.dtype is not dtypes.float32
                             for c in consumers): continue
     hbase = cast.src[0]
@@ -543,7 +550,11 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[
       if half_i is None:
         ok = False; break
       f32_i = 2 if half_i == 1 else 1
-      folds[u] = (hbase, u.src[f32_i])
+      f32 = u.src[f32_i]
+      # Skip QK-style half×half; both casts would still need a cvt or a second mix.
+      if not allow_hh and _is_f16_to_f32_cast(f32):
+        ok = False; break
+      folds[u] = (hbase, f32)
     if ok: skip.add(cast)
     else:
       for u in consumers: folds.pop(u, None)
