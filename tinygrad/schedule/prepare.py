@@ -1,7 +1,7 @@
 import itertools
 from tinygrad.dtype import dtypes, to_dtype
 from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, resolve, GroupOp
-from tinygrad.uop.ops import graph_rewrite, rewrite_group, ParamArg, identity_element, resolve_returned_after
+from tinygrad.uop.ops import graph_rewrite, rewrite_group, identity_element, resolve_returned_after
 from tinygrad.uop.movement import mop_cleanup
 from tinygrad.helpers import prod, getenv, all_int, DEBUG, SPLIT_REDUCEOP, OPENPILOT_HACKS, FLOAT16, argsort
 from tinygrad.schedule.indexing import apply_movement_op
@@ -120,7 +120,7 @@ def resolve_function(c:UOp, allow_param_mismatch=True) -> UOp|None:
 # shape-changing bitcast
 def expand_bitcast(bc:UOp) -> UOp|None:
   x = bc.src[0]
-  if (ns:=bc.dtype.itemsize) == (os:=x.dtype.itemsize) or (isinstance(x.device, str) and x.device.startswith(("DISK", "TINYFS"))): return None
+  if (ns:=bc.dtype.itemsize) == (os:=x.dtype.itemsize) or (isinstance(x.device, str) and x.device.startswith("DISK")): return None
   new_uint, tmp = to_dtype(f"uint{8*ns}"), x.bitcast(to_dtype(f"uint{8*os}"))
   if ns > os:
     tmp = tmp.reshape(x.shape[:-1] + (x.shape[-1]//(rate := ns//os), rate))
@@ -131,7 +131,7 @@ def expand_bitcast(bc:UOp) -> UOp|None:
 
 earliest_rewrites = mop_cleanup+PatternMatcher([
   # resolve calls with RETURNED inputs (inline the body)
-  (UPat(Ops.CALL, name="c"), lambda c: resolve_function(c) if c.num_returned else None),
+  (UPat(Ops.CALL, name="c"), lambda c: resolve_function(c) if c.has_unbound_outputs else None),
 
   # resolve AFTER on RETURNED (call outputs)
   (UPat(Ops.AFTER, src=(UPat(name="r"), UPat(Ops.SINK, name="t")), allow_any_len=True), resolve_returned_after),
@@ -202,7 +202,7 @@ def convert_copy_to_store(ctx, copy:UOp, existing_buf:UOp|None=None):
     # if there's already a buffer, we just use it
     return existing_buf.flatten().store(input_src)
   # create the output buffer
-  buf = UOp(Ops.BUFFER, arg=ParamArg(next(ctx), copy.dtype, size=prod(input_src.max_shape), device=copy.device))
+  buf = UOp.new_buffer(copy.device, prod(input_src.max_shape), copy.dtype)
   # reshape back to input
   return buf.reshape(input_src.max_shape).after(buf.store(input_src)).reshape(copy.shape)
 

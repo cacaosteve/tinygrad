@@ -142,7 +142,7 @@ def _float3_add_program():
   with Context(BEAM=0):
     ast = (Tensor.empty(3, device="AMD") + Tensor.empty(3, device="AMD")).schedule_linear().src[0].src[0]
   from test.backend.test_linearizer import replace_opts
-  return _to_prg(replace_opts(ast, [Opt(OptOps.UPCAST, 0, 3)]))
+  return _to_prg(replace_opts(ast, [Opt(OptOps.SPLIT, 0, (3, AxisType.UPCAST))]))
 
 def _float4_lds_program():
   with Context(BEAM=0):
@@ -936,13 +936,13 @@ class TestAMDRenderer(unittest.TestCase):
   def test_scheduler_rejects_oversized_local_workgroup(self):
     ast = Tensor.empty(4000, device="AMD").sum().schedule_linear().src[0].src[0]
     with self.assertRaises(KernelOptError):
-      to_program(ast.replace(arg=replace(ast.arg, opts_to_apply=(Opt(OptOps.GROUP, 0, 0),))), _REN)
+      to_program(ast.replace(arg=replace(ast.arg, opts_to_apply=(Opt(OptOps.SPLIT, 0, (0, AxisType.GROUP_REDUCE)),))), _REN)
 
   def test_scheduler_prefers_group_for_simple_partial_sum(self):
     with Context(DEV="MOCKKFD+AMD:AMD"):
       ast = Tensor.empty(10_000_000).sum().schedule_linear().src[0].src[0]
     prg = to_program(ast, _REN)
-    self.assertEqual(prg.src[0].arg.applied_opts, (Opt(OptOps.GROUP, 0, 16),))
+    self.assertEqual(prg.src[0].arg.applied_opts, (Opt(OptOps.SPLIT, 0, (16, AxisType.GROUP_REDUCE)),))
     self.assertEqual(prg.arg.local_size, (16, 1, 1))
 
   def test_group16_final_reduce_uses_wide_lds_loads(self):
@@ -969,8 +969,8 @@ class TestAMDRenderer(unittest.TestCase):
       for _ in range(32): x = x.sin() + x
       ast = x.sum(axis=1).schedule_linear().src[-1].src[0]
     opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
-    # Complex reductions must not be fully unrolled (UPCAST arg 0 on a reduce axis).
-    self.assertFalse(any(o.op is OptOps.UPCAST and o.arg == 0 for o in opts))
+    # Complex reductions must not be fully unrolled (SPLIT amt 0 → UNROLL on a reduce axis).
+    self.assertFalse(any(o.op is OptOps.SPLIT and isinstance(o.arg, tuple) and o.arg[0] == 0 and o.arg[1] is AxisType.UNROLL for o in opts))
 
   def test_scheduler_maps_quant_gemv(self):
     rows, cols = 8192, 2048
@@ -983,16 +983,14 @@ class TestAMDRenderer(unittest.TestCase):
         with Context(BEAM=0): ast = (weights @ Tensor.empty(cols, device="AMD")).schedule_linear().src[-1].src[0]
         opts = full_rewrite_to_sink(ast, _REN, optimize=True).arg.applied_opts
         if name == "Q8_0":
-          self.assertEqual(opts[0], Opt(OptOps.GROUP, 0, 16))
-          self.assertEqual(opts[1].op, OptOps.UPCAST)
-          self.assertEqual(opts[1].arg, 8)
+          self.assertEqual(opts[0], Opt(OptOps.SPLIT, 0, (16, AxisType.GROUP_REDUCE)))
+          self.assertEqual(opts[1], Opt(OptOps.SPLIT, opts[1].axis, (8, AxisType.UNROLL)))
         elif name == "IQ4_XS":
-          self.assertEqual(opts[:2], (Opt(OptOps.GROUP, 0, 0), Opt(OptOps.GROUP, 0, 0)))
-          self.assertEqual(opts[2].op, OptOps.UPCAST)
-          self.assertEqual(opts[2].arg, 0)
+          self.assertEqual(opts[:2], (Opt(OptOps.SPLIT, 0, (0, AxisType.GROUP_REDUCE)), Opt(OptOps.SPLIT, 0, (0, AxisType.GROUP_REDUCE))))
+          self.assertEqual(opts[2], Opt(OptOps.SPLIT, opts[2].axis, (0, AxisType.UNROLL)))
         else:
-          self.assertEqual(opts[0], Opt(OptOps.GROUP, 4, 32))
-          self.assertTrue(all(o.op is OptOps.UPCAST and o.arg == 0 for o in opts[1:]))
+          self.assertEqual(opts[0], Opt(OptOps.SPLIT, 4, (32, AxisType.GROUP_REDUCE)))
+          self.assertTrue(all(o.op is OptOps.SPLIT and isinstance(o.arg, tuple) and o.arg[0] == 0 and o.arg[1] is AxisType.UNROLL for o in opts[1:]))
           self.assertEqual(len(opts), 4)
 
   def test_q6_gemv_uses_wave32_butterfly_reduce(self):
@@ -1059,7 +1057,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_large_odd_max_uses_b96_load(self):
     with Context(BEAM=0): ast = Tensor.empty(1503, device="AMD").max().schedule_linear().src[-1].src[0]
     prg = to_program(ast, _REN)
-    self.assertIn(Opt(OptOps.UPCAST, 0, 3), prg.src[0].arg.applied_opts)
+    self.assertIn(Opt(OptOps.SPLIT, 0, (3, AxisType.UPCAST)), prg.src[0].arg.applied_opts)
     self.assertEqual(_amd_inst_names(prg).count("GLOBAL_LOAD_B96"), 1)
 
   def test_q6_wmma_uses_wide_quant_loads(self):
@@ -1169,7 +1167,7 @@ class TestAMDRenderer(unittest.TestCase):
     prg = to_program(ast, _REN)
     _check_elf(self, prg)
     self.assertEqual(prg.arg.global_size, (rows // 2, 1, 1))
-    self.assertEqual(prg.src[0].arg.applied_opts[-1], Opt(OptOps.UPCAST, 0, 2))
+    self.assertEqual(prg.src[0].arg.applied_opts[-1], Opt(OptOps.SPLIT, 0, (2, AxisType.UPCAST)))
     names = _amd_inst_names(prg)
     self.assertEqual(names.count("DS_SWIZZLE_B32"), 10)
     self.assertNotIn("DS_STORE_B32", names)
@@ -1614,8 +1612,8 @@ class TestAMDRenderer(unittest.TestCase):
   def test_matmul_default_schedule_uses_float4_memory_tile(self):
     prg = _matmul64_program()
     self.assertEqual(prg.src[0].arg.applied_opts, (
-      Opt(OptOps.UPCAST, 1, 4), Opt(OptOps.UPCAST, 0, 4), Opt(OptOps.UPCAST, 4, 4),
-      Opt(OptOps.LOCAL, 0, 8), Opt(OptOps.LOCAL, 1, 16)))
+      Opt(OptOps.SPLIT, 1, (4, AxisType.UPCAST)), Opt(OptOps.SPLIT, 0, (4, AxisType.UPCAST)), Opt(OptOps.SPLIT, 4, (4, AxisType.UPCAST)),
+      Opt(OptOps.SPLIT, 0, (8, AxisType.LOCAL)), Opt(OptOps.SPLIT, 1, (16, AxisType.LOCAL))))
     self.assertEqual(prg.arg.local_size, (8, 16, 1))
     linear_ops = _lin_ops(prg)
     self.assertEqual(linear_ops.count(AMDOps.FMAC), 48)
@@ -1659,14 +1657,14 @@ class TestAMDRenderer(unittest.TestCase):
       opts = sink.arg.applied_opts
       # Default / TC_LOCAL=2 → LOCAL 2×2. TC_LOCAL≥4 → asymmetric Opt LOCAL 2×4.
       if tc_local is not None and tc_local >= 4:
-        self.assertIn(Opt(OptOps.LOCAL, 0, 2), opts)
-        self.assertIn(Opt(OptOps.LOCAL, 1, 4), opts)
+        self.assertIn(Opt(OptOps.SPLIT, 0, (2, AxisType.LOCAL)), opts)
+        self.assertIn(Opt(OptOps.SPLIT, 1, (4, AxisType.LOCAL)), opts)
       else:
         loc = 2 if tc_local is None else tc_local
-        self.assertIn(Opt(OptOps.LOCAL, 0, loc), opts)
-        self.assertIn(Opt(OptOps.LOCAL, 1, loc), opts)
+        self.assertIn(Opt(OptOps.SPLIT, 0, (loc, AxisType.LOCAL)), opts)
+        self.assertIn(Opt(OptOps.SPLIT, 1, (loc, AxisType.LOCAL)), opts)
       # tile product ≤8 under TC_LDS_AB (LLOAD/PACK_F16 disjoint VGPR pools)
-      up = [o.arg for o in opts if o.op is OptOps.UPCAST]
+      up = [o.arg[0] for o in opts if o.op is OptOps.SPLIT and isinstance(o.arg, tuple) and o.arg[1] is AxisType.UPCAST]
       self.assertGreaterEqual(math.prod(up) if up else 0, 4)
       self.assertLessEqual(math.prod(up) if up else 0, 8)
       sink = sink.replace(arg=replace(sink.arg, estimates=Estimates.from_uops(tuple(sink.toposort()), ignore_indexing=True)))
@@ -1843,8 +1841,8 @@ class TestAMDRenderer(unittest.TestCase):
                Tensor.empty(256, 256, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
         prg = _to_prg(ast.schedule_linear().src[-1].src[0])
       opts = prg.src[0].arg.applied_opts
-      self.assertIn(Opt(OptOps.UPCAST, 0, 4), opts)
-      self.assertIn(Opt(OptOps.UPCAST, 1, 4), opts)
+      self.assertIn(Opt(OptOps.SPLIT, 0, (4, AxisType.UPCAST)), opts)
+      self.assertIn(Opt(OptOps.SPLIT, 1, (4, AxisType.UPCAST)), opts)
       linear_ops = _lin_ops(prg)
       self.assertGreaterEqual(linear_ops.count(AMDOps.WMMA), 16)
       self.assertNotIn(AMDOps.SLOAD, linear_ops)
@@ -1901,7 +1899,7 @@ class TestAMDRenderer(unittest.TestCase):
         ast = (Tensor.empty(256, 256, dtype=dtypes.half, device="AMD") @
                Tensor.empty(256, 256, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
         prg = _to_prg(ast.schedule_linear().src[-1].src[0])
-      up = [o.arg for o in prg.src[0].arg.applied_opts if o.op is OptOps.UPCAST]
+      up = [o.arg[0] for o in prg.src[0].arg.applied_opts if o.op is OptOps.SPLIT and isinstance(o.arg, tuple) and o.arg[1] is AxisType.UPCAST]
       self.assertLessEqual(math.prod(up) if up else 0, 8)
       self.assertEqual(_lin_ops(prg).count(AMDOps.WMMA), 8)
     finally:
@@ -1930,9 +1928,9 @@ class TestAMDRenderer(unittest.TestCase):
                Tensor.empty(256, 256, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
         prg = _to_prg(ast.schedule_linear().src[-1].src[0])
       opts = prg.src[0].arg.applied_opts
-      self.assertIn(Opt(OptOps.LOCAL, 0, 2), opts)
-      self.assertIn(Opt(OptOps.LOCAL, 1, 2), opts)
-      up = [o.arg for o in opts if o.op is OptOps.UPCAST]
+      self.assertIn(Opt(OptOps.SPLIT, 0, (2, AxisType.LOCAL)), opts)
+      self.assertIn(Opt(OptOps.SPLIT, 1, (2, AxisType.LOCAL)), opts)
+      up = [o.arg[0] for o in opts if o.op is OptOps.SPLIT and isinstance(o.arg, tuple) and o.arg[1] is AxisType.UPCAST]
       self.assertLessEqual(math.prod(up) if up else 0, 8)
       linear_ops = _lin_ops(prg)
       self.assertEqual(linear_ops.count(AMDOps.WMMA), 8)
@@ -2109,7 +2107,7 @@ class TestAMDRenderer(unittest.TestCase):
       linear_ops = _lin_ops(prg)
       self.assertEqual(linear_ops.count(AMDOps.WMMA), 16)
       self.assertEqual(linear_ops.count(AMDOps.LLOAD), 0)
-      self.assertIn(Opt(OptOps.LOCAL, 1, 4), prg.src[0].arg.applied_opts)
+      self.assertIn(Opt(OptOps.SPLIT, 1, (4, AxisType.LOCAL)), prg.src[0].arg.applied_opts)
       self.assertNotIn(AMDOps.SPILL, linear_ops)
       self.assertNotIn(AMDOps.FILL, linear_ops)
       self.assertNotIn(AMDOps.SLOAD, linear_ops)
@@ -2137,7 +2135,7 @@ class TestAMDRenderer(unittest.TestCase):
           ast = (Tensor.empty(n, n, dtype=dtypes.half, device="AMD") @
                  Tensor.empty(n, n, dtype=dtypes.half, device="AMD"))
           prg = _to_prg(ast.schedule_linear().src[-1].src[0])
-        self.assertIn(Opt(OptOps.LOCAL, 1, 4), prg.src[0].arg.applied_opts, f"N={n}")
+        self.assertIn(Opt(OptOps.SPLIT, 1, (4, AxisType.LOCAL)), prg.src[0].arg.applied_opts, f"N={n}")
         self.assertEqual(prg.arg.local_size, (32, 4, 1), f"N={n}")
     finally:
       for k, v in old.items():
@@ -2672,7 +2670,7 @@ class TestAMDRenderer(unittest.TestCase):
       self.assertEqual(inst_names.count("V_PACK_B32_F16"), 0)
       self.assertGreaterEqual(inst_names.count("S_CLAUSE"), 2)
       self.assertEqual(inst_names.count("V_WMMA_F32_16X16X16_F16"), 4)
-      self.assertFalse(any(o.op is OptOps.LOCAL for o in prg.src[0].arg.applied_opts))
+      self.assertFalse(any(o.op is OptOps.SPLIT and isinstance(o.arg, tuple) and o.arg[1] is AxisType.LOCAL for o in prg.src[0].arg.applied_opts))
       self.assertEqual(prg.arg.local_size, (32, 1, 1))
     finally:
       for k, v in old.items():
@@ -2984,7 +2982,7 @@ class TestAMDRenderer(unittest.TestCase):
         prg = _to_prg(ast.schedule_linear().src[-1].src[0])
       opts = prg.src[0].arg.applied_opts
       # Over-budget TC_LDS_UNROLL must not UPCAST a remaining REDUCE axis (former OptOps.UNROLL).
-      self.assertTrue(all(o.axis in (0, 1) for o in opts if o.op is OptOps.UPCAST))
+      self.assertTrue(all(o.axis in (0, 1) for o in opts if o.op is OptOps.SPLIT and isinstance(o.arg, tuple) and o.arg[1] is AxisType.UPCAST))
       self.assertEqual(_lin_ops(prg).count(AMDOps.WMMA), 8)
     finally:
       for k, v in old.items():

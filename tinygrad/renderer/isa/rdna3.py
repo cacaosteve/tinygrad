@@ -3599,12 +3599,12 @@ def apply_tc_hand_opts(tk, rngs):
       for tc_dim, cap in ((0, loc_cap), (1, min(2, loc_cap) if loc_cap else 0)):
         if not cap: continue
         if (szs := [sz for sz in loc_szs if sz <= cap and rngs[tc_dim].src[0].divides(sz) is not None]):
-          try: rngs[tc_dim] = tk.apply_opt(Opt(OptOps.LOCAL, tk.rngs.index(rngs[tc_dim]), szs[0]))[0]
+          try: rngs[tc_dim] = tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[tc_dim]), (szs[0], AxisType.LOCAL)))[0]
           except KernelOptError: pass
       return
     for tc_dim in local_dims:
       if (szs := [sz for sz in loc_szs if sz <= loc_cap and rngs[tc_dim].src[0].divides(sz) is not None]):
-        try: rngs[tc_dim] = tk.apply_opt(Opt(OptOps.LOCAL, tk.rngs.index(rngs[tc_dim]), szs[0]))[0]
+        try: rngs[tc_dim] = tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[tc_dim]), (szs[0], AxisType.LOCAL)))[0]
         except KernelOptError: pass
   def do_upcast() -> int:
     tiles = 1
@@ -3619,7 +3619,7 @@ def apply_tc_hand_opts(tk, rngs):
         if i == 0 and rem == 1 and other.src[0].divides(2) is not None and sz > 2: continue
         szs.append(sz)
       if szs:
-        rngs[tc_dim] = tk.apply_opt(Opt(OptOps.UPCAST, tk.rngs.index(rngs[tc_dim]), szs[0]))[0]
+        rngs[tc_dim] = tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[tc_dim]), (szs[0], AxisType.UPCAST)))[0]
         tiles *= szs[0]
     return tiles
   if lds_ab:
@@ -3628,7 +3628,7 @@ def apply_tc_hand_opts(tk, rngs):
     # UNROLL multiplies WMMA STACK tiles; past max_tiles expand soft-fails then unroll_axis
     # IndexErrors. Only apply when the upcast×unroll product still fits the LDS expand budget.
     if (ku := getenv("TC_LDS_UNROLL", 0)) and tk.unrollable_dims and tiles * ku <= max_tiles:
-      try: tk.apply_opt(Opt(OptOps.UPCAST, tk.unrollable_dims[0], ku))
+      try: tk.apply_opt(Opt(OptOps.SPLIT, tk.unrollable_dims[0], (ku, AxisType.UNROLL)))
       except KernelOptError: pass
   else:
     do_upcast()
@@ -3641,9 +3641,9 @@ def llvm_tc_hand_opts(tk, rngs):
   from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
   for tc_dim in [1, 0]:
     if (szs := [sz for sz in [5, 4, 3, 2] if rngs[tc_dim].src[0].divides(sz) is not None]):
-      rngs[tc_dim] = tk.apply_opt(Opt(OptOps.UPCAST, tk.rngs.index(rngs[tc_dim]), szs[0]))[0]
+      rngs[tc_dim] = tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[tc_dim]), (szs[0], AxisType.UPCAST)))[0]
   if (szs := [sz for sz in [4, 2] if rngs[0].src[0].divides(sz) is not None]):
-    try: tk.apply_opt(Opt(OptOps.LOCAL, tk.rngs.index(rngs[0]), szs[0]))
+    try: tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[0]), (szs[0], AxisType.LOCAL)))
     except KernelOptError: pass
 
 def install_amdllvm_tc(cls):
@@ -3804,8 +3804,8 @@ class AMDRenderer(ISARenderer):
 
     # Q8_0: use 16 lanes on the outer block loop and expose eight packed values per iteration.
     if len(reduce_sizes) == 2 and reduce_sizes[-1] == 32 and isinstance(reduce_sizes[0], int) and reduce_sizes[0] % 16 == 0:
-      k.apply_opt(Opt(OptOps.GROUP, 0, 16))
-      k.apply_opt(Opt(OptOps.UPCAST, k.unrollable_dims[2], 8))
+      k.apply_opt(Opt(OptOps.SPLIT, k.axes_of(AxisType.REDUCE)[0], (16, AxisType.GROUP_REDUCE)))
+      k.apply_opt(Opt(OptOps.SPLIT, k.unrollable_dims[2], (8, AxisType.UNROLL)))
       return True
 
     # IQ4_XS: the dequantized reduction is [blocks, 4, 2, 2, 16]. Use a 2-D 32-128 lane group
@@ -3814,9 +3814,9 @@ class AMDRenderer(ISARenderer):
     # reductions retain the conservative generic schedule.
     if len(reduce_sizes) == 5 and reduce_sizes[1:] == (4, 2, 2, 16) and isinstance(reduce_sizes[0], int) and \
        2 <= reduce_sizes[0] <= 32 and output_size % 4 == 0:
-      for opt in (Opt(OptOps.GROUP, 0, 0), Opt(OptOps.GROUP, 0, 0)):
-        k.apply_opt(opt)
-      k.apply_opt(Opt(OptOps.UPCAST, k.unrollable_dims[3], 0))
+      for _ in range(2):
+        k.apply_opt(Opt(OptOps.SPLIT, k.axes_of(AxisType.REDUCE)[0], (0, AxisType.GROUP_REDUCE)))
+      k.apply_opt(Opt(OptOps.SPLIT, k.unrollable_dims[3], (0, AxisType.UNROLL)))
       return True
     return False
 

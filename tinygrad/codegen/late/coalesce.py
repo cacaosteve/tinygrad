@@ -131,6 +131,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       assert u.src[0].op is Ops.INDEX, f"memory coalescing should be on INDEX, not {u.src[0].op}"
       buf, idx_u = u.src[0].src
       if buf.addrspace == AddrSpace.REG: continue
+      if buf.op is Ops.PARAM and buf.arg.volatile: continue # volatile accesses never merge
       idx, valid = idx_u.get_idx(), idx_u.get_valid()
       value_dtype = u.src[1].dtype if u.op is Ops.STORE else u.dtype
       if mem_ok is not None and not mem_ok(f4, float4_safe, buf, value_dtype, u, uses, valid): continue
