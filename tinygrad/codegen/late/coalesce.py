@@ -129,7 +129,8 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
           len(u.src[0].src) > 2 and u.src[0].src[2].op is Ops.CONST and u.src[0].src[2].val == 4: continue
       assert len(u.src) == (2 if u.op is Ops.STORE else 1), "memory coalescing does not support gated loads/stores"
       assert u.src[0].op is Ops.INDEX, f"memory coalescing should be on INDEX, not {u.src[0].op}"
-      buf, idx_u = u.src[0].src
+      # INDEX may carry trailing metadata srcs; only buf+idx are required here.
+      buf, idx_u = u.src[0].src[0], u.src[0].src[1]
       if buf.addrspace == AddrSpace.REG: continue
       if buf.op is Ops.PARAM and buf.arg.volatile: continue # volatile accesses never merge
       idx, valid = idx_u.get_idx(), idx_u.get_valid()
