@@ -616,18 +616,8 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
   b, h = block_bh // H, block_bh % H
   NPD = DT // WARP_SIZE  # output dims per lane
   dims = tuple(block_dt*DT + lane*NPD + i for i in range(NPD))
-  if isinstance(live, int):
-    chunk_max = functools.reduce(lambda m, ci: UOp.maximum(m, stats[b, h, ci, 0].load()),
-                                 range(live), UOp.const(-math.inf, dtypes.float))
-    acc = [UOp.const(0, dtypes.float) for _ in range(NPD)]
-    weight_sum = UOp.const(0, dtypes.float)
-    for ci in range(live):
-      w = ((stats[b, h, ci, 0].load() - chunk_max) * LOG2E).exp2()
-      acc = [a + w * partial[b, h, ci, d].load() for a, d in zip(acc, dims)]
-      weight_sum = weight_sum + w * stats[b, h, ci, 1].load()
-    inv = 1 / weight_sum
-    return UOp.group(*[o[b, h, 0, d].store(a * inv) for a, d in zip(acc, dims)]) \
-      .end(lane, block_dt, block_bh).sink(arg=KernelInfo(name="flash_decode_combine", opts_to_apply=()))
+  # Always use the bound REDUCE loop. Unrolling a large const `live` (e.g. 32 chunks at
+  # kv_len=2048) blew combine to ~138 VGPRs vs HIP's looped ~92.
   chunk = UOp.range(live, 100, AxisType.REDUCE)
   def iloop(ph, val): return ph.store(ph.const_like(val))
   chunk_max = UOp.placeholder((1,), dtypes.float, slot=0, addrspace=AddrSpace.REG)

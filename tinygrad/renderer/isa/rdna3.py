@@ -3704,6 +3704,43 @@ def merge_adjacent_half_loads(sink:UOp) -> UOp:
         else: i += 1
   return sink.substitute(replacements, name="merge adjacent half loads") if replacements else sink
 
+def merge_adjacent_uint32_loads(sink:UOp) -> UOp:
+  """Re-widen scalar uint32 global loads into SHRINK×4 for B128 (IQ4/Q6 weight headers)."""
+  if not getenv("AMD_MERGE_U32", 1): return sink
+  import itertools
+  from collections import defaultdict
+  from tinygrad.dtype import Invalid
+  memory: defaultdict[tuple, dict[int, list[UOp]]] = defaultdict(dict)
+  for u in sink.toposort():
+    if u.op is not Ops.LOAD or u.dtype is not dtypes.uint32 or u.max_numel() != 1: continue
+    if len(u.src) != 1 or u.src[0].op is not Ops.INDEX: continue
+    buf, idx_u = u.src[0].src[0], u.src[0]
+    if buf.addrspace is not AddrSpace.GLOBAL: continue
+    idx, valid = idx_u.get_idx(), idx_u.get_valid()
+    if idx.op is Ops.ADD and idx.src[1].op is Ops.CONST and isinstance((c:=idx.src[1].val), int):
+      root_src, arg = idx.src[0], c
+    elif idx.op is Ops.ADD and idx.src[0].op is Ops.CONST and isinstance((c:=idx.src[0].val), int):
+      root_src, arg = idx.src[1], c
+    elif idx.op is Ops.CONST and idx.val is not Invalid and isinstance(idx.val, int):
+      root_src, arg = "CONST", idx.val
+    else: continue
+    memory[(buf, root_src, valid, u.arg)].setdefault(arg, []).append(u)
+  replacements: dict[UOp, UOp] = {}
+  for (buf, base, valid, ld_arg), offsets in memory.items():
+    for full_grp in ([x for _, x in g] for _, g in itertools.groupby(enumerate(sorted(offsets)), lambda x: x[1]-x[0])):
+      i = 0
+      while i < len(full_grp):
+        if i + 4 <= len(full_grp) and full_grp[i:i+4] == list(range(full_grp[i], full_grp[i]+4)):
+          grp = full_grp[i:i+4]
+          offset = (base + grp[0]) if isinstance(base, UOp) else UOp.const(grp[0], dtypes.int32)
+          if valid is not None: offset = offset.valid(valid)
+          ld = UOp(Ops.SHRINK, src=(buf.flatten(), offset, UOp.const(4, dtypes.int32))).load(arg=ld_arg)
+          for j, off in enumerate(grp):
+            for oo in offsets[off]: replacements[oo] = ld.index(j)
+          i += 4
+        else: i += 1
+  return sink.substitute(replacements, name="merge adjacent uint32 loads") if replacements else sink
+
 # Re-export INDEX mops (tests / callers); definition lives in codegen.late.index_mops.
 from tinygrad.codegen.late.index_mops import pm_index_mops, _index_through_reshape, _index_through_permute  # noqa: F401,E402
 
@@ -3856,7 +3893,7 @@ class AMDRenderer(ISARenderer):
     # natural vector alignment (for example, a B128 byte load may begin at byte offset four).
     return max(4 // buf.dtype.itemsize, 1) if buf.addrspace is AddrSpace.GLOBAL else None
 
-  def merge_memory_loads(self, sink:UOp) -> UOp: return merge_adjacent_half_loads(sink)
+  def merge_memory_loads(self, sink:UOp) -> UOp: return merge_adjacent_uint32_loads(merge_adjacent_half_loads(sink))
 
   def prepare_pre_regalloc(self, lst:list[UOp]) -> tuple[list[UOp], dict]:
     lst = _hoist_kernargs(_protect_loop_invariant_fmac(lst))
