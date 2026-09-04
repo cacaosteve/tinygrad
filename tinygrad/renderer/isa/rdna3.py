@@ -1577,7 +1577,11 @@ post_regalloc_matcher = PatternMatcher([
   (UPat(Ops.RANGE, name="x"), lambda ctx,x: _lower_range(ctx, x)),
   (UPat(Ops.END, name="x"), lambda ctx,x: _lower_end(ctx, x)),
   (UPat(Ops.INS, arg=(AMDOps.REG_STORE, dtypes.void), name="x"), lambda x: _lower_reg_store(x)),
-  (UPat((Ops.CONST, Ops.CAST, Ops.BITCAST, Ops.NOOP, Ops.AFTER, Ops.SPECIAL, Ops.SINK, Ops.GROUP), name="x"), lambda x: (x, [])),
+  # STRUCTURAL: INDEX/SHRINK/CAST/CONST etc. must not become LINEAR statements. Regalloc returns
+  # None for SHRINK/LOAD/STORE → line_rewrite's `or (nu,[nu])` would otherwise re-emit them and
+  # break do_assemble's all-INS match (flash_decode_partial ELF regression after master merge).
+  (UPat((Ops.CONST, Ops.CAST, Ops.BITCAST, Ops.NOOP, Ops.AFTER, Ops.SPECIAL, Ops.SINK, Ops.GROUP, Ops.SHRINK, Ops.INDEX, Ops.LOAD, Ops.STORE), name="x"),
+   lambda x: (x, [])),
 ])
 
 def _vcc_rematerialize(ctx, x:UOp):
@@ -1707,6 +1711,7 @@ def _schedule_loop_cmps(lst:list[UOp]) -> list[UOp]:
 
 pre_regalloc_matcher = PatternMatcher([
   (UPat(Ops.INDEX, name="x"), _lower_late_index),
+  (UPat(Ops.SHRINK, name="x"), lambda x: (x, [])),  # address mop; do not emit as a statement
   (UPat(Ops.STORE, src=(UPat.var("a"), UPat.var("val"), UPat.var("gate", dtype=dtypes.bool)), name="x"), _lower_late_store),
   (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), name="a"), UPat.var("val")), name="x"), _lower_late_store),
   (UPat(Ops.STORE, src=(UPat.var("a"), UPat.var("val")), name="x"), _lower_late_store),
