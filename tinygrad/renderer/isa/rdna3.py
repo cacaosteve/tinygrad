@@ -2242,13 +2242,15 @@ def _where_load_exec_fuses(ops:list[UOp]) -> tuple[dict[UOp, UOp], set[UOp]]:
   return fuse, skip
 
 def _exec_save_pair(ops:list[UOp]) -> Reg:
-  """SGPR pair just above allocated SGPRs so saveexec does not force s104 (occupancy)."""
+  """SGPR pair just above allocated SGPRs so saveexec does not force high scratch (occupancy)."""
   mx = 5
   for u in ops:
     g = greg(u)
     if isinstance(g, Register) and g.index < 256:
       mx = max(mx, g.index + _reg_slots(u) - 1)
   base = (mx + 2) & ~1  # next even pair
+  # Skip WGID holes and low scratch (s20/s21 temps, s22:23 long branch).
+  while base in (14, 16, 20, 22): base += 2
   if base >= 102: return TMP_BRANCH
   return s[base:base+1]
 

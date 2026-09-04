@@ -14,8 +14,11 @@ LID = tuple(Register(f"v{i}", 256+i, size=4) for i in range(3))
 
 # USER_SGPR=15 places WGID_X/Y/Z in s15:s17. SGPRs are allocated as even
 # 64-bit pairs, so reserve both s14:s15 and s16:s17 from the general pool.
-SGPR = tuple(Register(f"s{i}", i, size=8) for i in range(6, 104, 2) if i not in (14, 16, 102))
-SGPR32 = tuple(Register(f"s{i}", i, size=4) for i in range(6, 102) if i not in (14, 15, 16, 17))
+# Scratch (also excluded): s20/s21 permlane+SALU temps; s22:23 long-branch PC.
+# Keep scratch in the low range — parking them at s102+ forces wavefront SGPR
+# granule up to ~106 and tanks occupancy (IQ4 WMMA was 1.19× behind HIP).
+SGPR = tuple(Register(f"s{i}", i, size=8) for i in range(6, 104, 2) if i not in (14, 16, 20, 22))
+SGPR32 = tuple(Register(f"s{i}", i, size=4) for i in range(6, 102) if i not in (14, 15, 16, 17, 20, 21, 22, 23))
 VGPR = tuple(Register(f"v{i}", 256+i, size=4) for i in range(5, 254))
 
 WMMA_ACC_VGPR = VGPR[121:]
@@ -25,10 +28,10 @@ PACK_F16_VGPR = VGPR[185:244]
 PACK_F16_VGPR_UP16 = VGPR[59:121]
 LLOAD_VGPR_UP16 = VGPR[:59]
 
-# v3/v4: per-instruction VGPR scratch; s102:103: long branch; s104:105: SALU compare scratch.
+# v3/v4: per-instruction VGPR scratch; s20/s21: SALU/permlane; s22:23: long branch.
 TMP_VDATA, TMP_VADDR = v[3], v[4]
-TMP_BRANCH = s[102:103]
-TMP_SDATA0, TMP_SDATA1 = s[104], s[105]
+TMP_SDATA0, TMP_SDATA1 = s[20], s[21]
+TMP_BRANCH = s[22:23]
 
 def allow_upcast16() -> bool:
   # Off under TC_LDS_AB — product 16 still spills there.
