@@ -696,6 +696,16 @@ def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
     idx = _const_int(u.src[1])
     dt = u.dtype if _iop(u) is AMDOps.SLOAD else u.src[2].dtype
     n = _elem_count(u) if _iop(u) is AMDOps.SLOAD else _elem_count(u.src[2])
+    # WMMA→REG fragment stores need ACC-style K-carry; promoting those slots desyncs on
+    # direct ISA (flash tile-unroll+soft). Only match the stored value itself — do not
+    # walk AFTER history or every later soft store of S_reg gets poisoned.
+    if _iop(u) is AMDOps.SSTORE:
+      v = u.src[2]
+      while v.op is Ops.AFTER: v = v.src[0]
+      if v.op is Ops.INS and _iop(v) is AMDOps.EXTRACT: v = v.src[0]
+      if (v.op is Ops.WMMA) or (v.op is Ops.INS and _iop(v) is AMDOps.WMMA):
+        bad.add(base)
+        continue
     if idx is None or idx < 0 or idx >= base.max_numel() or base.max_numel() > 64 or n != 1 or dt.itemsize > 4:
       bad.add(base)
       continue
