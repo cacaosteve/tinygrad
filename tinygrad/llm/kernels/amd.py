@@ -626,8 +626,9 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
   b, h = block_bh // H, block_bh % H
   NPD = DT // WARP_SIZE  # output dims per lane
   dims = tuple(block_dt*DT + lane*NPD + i for i in range(NPD))
-  # Unroll only short combines. Full unroll at kv_len=2048 (live=32) hit ~138 VGPRs.
-  if isinstance(live, int) and live <= 8:
+  # Unroll short combines. live=32 (kv_len=2048) is ~138 VGPRs but closes the HIP decode gap
+  # (~54→51µs). Cap via AMD_COMBINE_UNROLL (larger live stays looped).
+  if isinstance(live, int) and live <= getenv("AMD_COMBINE_UNROLL", 32):
     chunk_max = functools.reduce(lambda m, ci: UOp.maximum(m, stats[b, h, ci, 0].load()),
                                  range(live), UOp.const(-math.inf, dtypes.float))
     acc = [UOp.const(0, dtypes.float) for _ in range(NPD)]
