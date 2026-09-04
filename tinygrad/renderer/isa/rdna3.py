@@ -3479,11 +3479,16 @@ def insts_from_linear(lin:UOp):
                     for k in range(j, end))
         if hi_ok and all(_vm_load_count(p) == 1 for p in parts):
           store_addr_cache.clear()
-          scales, loads = [], []
-          seen_scale: set[int] = set()
+          raw_scales, loads = [], []
           for p in parts:
             sc, ld = _split_scale_and_loads(p)
-            for s in sc:
+            raw_scales.extend(sc)
+            loads.extend(ld)
+          # Float×4 UPCAST B128s scale distinct byte offsets into TMP_VADDR; hoisting+dedup
+          # would clobber addr (both loads read slot0). Compact B half: one <<1 is OK.
+          if _tmp_vaddr_clause_safe(raw_scales, loads):
+            scales, seen_scale = [], set()
+            for s in raw_scales:
               # Compact B: one in-place <<1 per page idx; drop duplicate scales in the hoist.
               dst = getattr(s, "vdst", None)
               key = getattr(dst, "offset", None)
@@ -3491,15 +3496,14 @@ def insts_from_linear(lin:UOp):
                 if key in seen_scale: continue
                 seen_scale.add(key)
               scales.append(s)
-            loads.extend(ld)
-          for inst in scales: emit(inst)
-          emit(r3.s_clause(simm16=len(loads) - 1))
-          for inst in loads: emit(inst)
-          for k, p in enumerate(parts):
-            su = scheduled[oi + k]
-            note_vm(_reg_idxs(d16_hi_lo[su]) if su in d16_hi_lo else _reg_idxs(su), p)
-          oi = end
-          continue
+            for inst in scales: emit(inst)
+            emit(r3.s_clause(simm16=len(loads) - 1))
+            for inst in loads: emit(inst)
+            for k, p in enumerate(parts):
+              su = scheduled[oi + k]
+              note_vm(_reg_idxs(d16_hi_lo[su]) if su in d16_hi_lo else _reg_idxs(su), p)
+            oi = end
+            continue
     if u in d16_hi_lo: flush_regs(_reg_idxs(d16_hi_lo[u]))
     is_store = u.op is Ops.INS and _iop(u) is AMDOps.STORE
     emitted = _emit_uop(u, masked, with_store_cache=is_store)
