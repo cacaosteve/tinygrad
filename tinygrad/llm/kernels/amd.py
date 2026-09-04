@@ -554,10 +554,12 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   valids: list[UOp] = []
   scores: list[list[UOp]] = [[zerof]*G for _ in range(SEC)]
   vfrags: list[tuple[UOp, ...]] = [()]*SEC
-  for j0 in range(0, SEC, 2):
-    # Reduce two keys' GQA heads together (batch of 8) when possible — longer ds_swizzle
-    # streaks / fewer lgkm waits, still small enough to avoid VGPR spills.
-    js = range(j0, min(j0 + 2, SEC))
+  # Batch keys into one warp_reduce_many so swizzle/permlane stages share lgkm waits.
+  # Default 8 = full SEC at waves=8 (one reduce for the wave's keys). Smaller batches
+  # were for VGPR headroom; measured same vgpr with better wait sharing at 8.
+  score_batch = getenv("AMD_FLASH_SCORE_BATCH", 8)
+  for j0 in range(0, SEC, score_batch):
+    js = range(j0, min(j0 + score_batch, SEC))
     dots: list[UOp] = []
     for j in js:
       key = block_chunk*CHUNK + wave*SEC + j
@@ -656,7 +658,9 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
   # Eight waves keeps the LDS exchange mapping correct for both direct ISA and HIP.
-  waves = 8
+  # AMD_FLASH_WAVES overrides (must divide block_n=64).
+  waves = getenv("AMD_FLASH_WAVES", 8)
+  assert 64 % waves == 0, f"AMD_FLASH_WAVES={waves} must divide block_n=64"
   fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=64, waves=waves)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len+63)//64
