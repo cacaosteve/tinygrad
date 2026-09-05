@@ -3167,7 +3167,7 @@ def _gap_fill_after_loads(ops:list[UOp]) -> list[UOp]:
   alu = (AMDOps.FMAC, AMDOps.MUL, AMDOps.ADD, AMDOps.MAX, AMDOps.MOV, AMDOps.MULACC,
          AMDOps.EXP2, AMDOps.WHERE, AMDOps.CAST)
   max_scan = getenv("AMD_LOAD_GAP_SCAN", 16)
-  max_gap = getenv("AMD_LOAD_GAP_N", 4)
+  max_gap = getenv("AMD_LOAD_GAP_N", 8)
   taken: set[int] = set()
   out: list[UOp] = []
   i = 0
