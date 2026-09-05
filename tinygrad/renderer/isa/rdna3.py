@@ -824,7 +824,13 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
     return x.ins(AMDOps.LLOAD, dtype=x.dtype, src=src)
   if _is_scratch_ref(a.src[0]):
     if _scratch_load(x.dtype, n) is None: raise CompileError(f"no scratch load {x.dtype} x{n}")
-    return x.ins(AMDOps.SLOAD, dtype=x.dtype, src=(a.src[0], a.src[1], count))
+    # Match SSTORE: peel const byte offsets into SCRATCH's 12-bit imm (flash REG traffic).
+    item = _mem_itemsize(x.dtype)
+    idx, off = _peel_add_imm(a.src[1], item, max_byte=0xfff)
+    if off == 0 and (c := _const_int(idx)) is not None and c > 0 and c * item <= 0xfff:
+      off, idx = c * item, _tconst(0, idx.dtype)
+    src = (a.src[0], idx, count) if off == 0 else (a.src[0], idx, count, _tconst(off, dtypes.int32).rtag())
+    return x.ins(AMDOps.SLOAD, dtype=x.dtype, src=src)
   if _global_load(x.dtype, n) is None and not (x.dtype is dtypes.half and n == 16):
     raise CompileError(f"no global load {x.dtype} x{n}")
   # Compact B: peel to per-k page idx + rem≤4095 GLOBAL offset (LLVM @N≥2048). Else full-imm
@@ -2210,13 +2216,19 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       return pre + dpre + [local_store(addr=addr, data0=data, **_ds_off(_lds_byte_off(u)))]
     case AMDOps.SLOAD:
       slots = _reg_slots(u)
-      pre, addr = _scratch_addr(u.src[0], u.src[1], u.dtype.itemsize)
+      itemsize, byte_off = u.dtype.itemsize, _lds_byte_off(u)
+      soff = _scratch_base_offset(u.src[0])
+      if store_addr_cache is not None and not masked:
+        pre, addr, byte_off = store_addr_cache.addr(u.src[1], itemsize, byte_off, base_key=id(u.src[0]))
+        if pre and soff: pre = pre + [r3.v_add_nc_u32_e64(addr, soff, addr)]
+      else:
+        pre, addr = _scratch_addr(u.src[0], u.src[1], itemsize)
       pre, addr = _masked_addr(pre, addr, masked)
       if slots > 1:
         if u.dtype is not dtypes.float32: raise CompileError(f"no vec scratch load {u.dtype}")
-        return pre + [r3.scratch_load_b32(addr=addr, vdst=_reg_lane(greg(u), i), offset=i*4, sve=1) for i in range(slots)]
+        return pre + [r3.scratch_load_b32(addr=addr, vdst=_reg_lane(greg(u), i), offset=byte_off + i*4, sve=1) for i in range(slots)]
       if (scratch_load:=_scratch_load(u.dtype)) is None: raise CompileError(f"no scratch load {u.dtype}")
-      return pre + [scratch_load(addr=addr, vdst=_dst(u), offset=0, sve=1)]
+      return pre + [scratch_load(addr=addr, vdst=_dst(u), offset=byte_off, sve=1)]
     case AMDOps.SSTORE:
       slots = _reg_slots(u.src[2])
       itemsize, byte_off = u.src[2].dtype.itemsize, _lds_byte_off(u)
@@ -3698,8 +3710,8 @@ def insts_from_linear(lin:UOp):
             oi = end
             continue
     if u in d16_hi_lo: flush_regs(_reg_idxs(d16_hi_lo[u]))
-    is_store = u.op is Ops.INS and _iop(u) in (AMDOps.STORE, AMDOps.SSTORE)
-    emitted = _emit_uop(u, masked, with_store_cache=is_store)
+    is_mem_addr_cse = u.op is Ops.INS and _iop(u) in (AMDOps.STORE, AMDOps.SSTORE, AMDOps.SLOAD)
+    emitted = _emit_uop(u, masked, with_store_cache=is_mem_addr_cse)
     # VALU copy of an outstanding VMEM/LDS dest must wait first (PACK/MOV across pools).
     if emitted and u.op is Ops.INS and _iop(u) in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV):
       src = set().union(*(_reg_idxs(s) for s in u.src))
@@ -3710,10 +3722,10 @@ def insts_from_linear(lin:UOp):
     # Keep page CSE across CAST (uses TMP_VDATA, not TMP_VADDR) — cast-before-store otherwise
     # re-scales the C base for every half store (~100 extra V_LSHL_ADD).
     # half×16 STORE may V_ADD into TMP_VADDR for the second b128 — drop page CSE.
-    # Scratch SSTORE also ADDs segment base once; keep CSE across those.
+    # Scratch SSTORE/SLOAD also ADD segment base once; keep CSE across those.
     if _iop(u) is AMDOps.STORE and any(getattr(i, "op_name", "") == "V_ADD_NC_U32_E64" for i in emitted):
       store_addr_cache.clear()
-    elif not is_store and any(getattr(i, "vdst", None) == TMP_VADDR for i in emitted):
+    elif not is_mem_addr_cse and any(getattr(i, "vdst", None) == TMP_VADDR for i in emitted):
       store_addr_cache.clear()
     vm_after_wait: list = []
     saw_vm_wait0 = False
