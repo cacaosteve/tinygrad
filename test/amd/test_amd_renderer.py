@@ -3581,12 +3581,34 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertTrue(all(i.saddr.sz == 2 for i in loads))
 
   def test_lds_uses_reserved_vgprs_for_addr_and_scalar_data(self):
+    # Stores still scale through TMP_VADDR and move SGPR payloads through TMP_VDATA.
+    # Scalar LDS loads default to dest-as-addr (AMD_LDS_DEST_ADDR=1): DS addr == load vdst.
     insts = list(_REN._insts_from_linear(_prg_lin(_local_sgpr_data_program())))
-    ds_ops = [i for i in insts if getattr(i, "op_name", "").startswith("DS_")]
-    self.assertTrue(ds_ops)
-    self.assertTrue(all(i.addr == amd_lib.TMP_VADDR for i in ds_ops))
+    stores = [i for i in insts if getattr(i, "op_name", "") == "DS_STORE_B32"]
+    loads = [i for i in insts if getattr(i, "op_name", "") == "DS_LOAD_B32"]
+    self.assertTrue(stores and loads)
+    self.assertTrue(all(i.addr == amd_lib.TMP_VADDR for i in stores))
+    self.assertTrue(all(i.addr == i.vdst for i in loads))
     self.assertTrue(any(i.op_name == "V_MOV_B32_E32" and i.vdst == amd_lib.TMP_VDATA for i in insts))
     self.assertTrue(any(i.op_name == "DS_STORE_B32" and i.data0 == amd_lib.TMP_VDATA for i in insts))
+
+  def test_lds_dest_addr_opt_out_uses_tmp_vaddr(self):
+    # Opt-out path keeps the historical TMP_VADDR address register for both load and store.
+    import os
+    old = os.environ.get("AMD_LDS_DEST_ADDR")
+    os.environ["AMD_LDS_DEST_ADDR"] = "0"
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      insts = list(_REN._insts_from_linear(_prg_lin(_local_sgpr_data_program())))
+      ds_ops = [i for i in insts if getattr(i, "op_name", "").startswith("DS_")]
+      self.assertTrue(ds_ops)
+      self.assertTrue(all(i.addr == amd_lib.TMP_VADDR for i in ds_ops))
+    finally:
+      if old is None: os.environ.pop("AMD_LDS_DEST_ADDR", None)
+      else: os.environ["AMD_LDS_DEST_ADDR"] = old
+      getenv.cache_clear()
+      to_program_cache.clear()
 
   def test_narrow_lds_copy_assembles(self):
     prg = _local_program(dtypes.uint8)
@@ -3598,14 +3620,17 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertIn("DS_LOAD_U8", op_names)
 
   def test_byte_lds_lidx0_uses_byte_addr_directly(self):
-    # gfx11 packed tid: lidx0 is v_bfe from v0, then that VGPR is the DS address (byte elems, no scale).
+    # gfx11 packed tid: lidx0 is v_bfe from v0. Byte stores use that VGPR as DS addr (no scale).
+    # Scalar LDS loads default to dest-as-addr, so DS addr aliases the load destination VGPR.
     insts = list(_REN._insts_from_linear(_prg_lin(_local_program(dtypes.uint8))))
     bfes = [i for i in insts if getattr(i, "op_name", "") == "V_BFE_U32"]
     self.assertTrue(bfes)
     self.assertEqual(bfes[0].src0, amd_lib.v[0])  # packed work-item word
-    ds_ops = [i for i in insts if getattr(i, "op_name", "").startswith("DS_")]
-    self.assertTrue(ds_ops)
-    self.assertTrue(all(i.addr == bfes[0].vdst for i in ds_ops))
+    stores = [i for i in insts if getattr(i, "op_name", "") == "DS_STORE_B8"]
+    loads = [i for i in insts if getattr(i, "op_name", "") == "DS_LOAD_U8"]
+    self.assertTrue(stores and loads)
+    self.assertTrue(all(i.addr == bfes[0].vdst for i in stores))
+    self.assertTrue(all(i.addr == i.vdst for i in loads))
 
   def test_multiple_lds_buffers_get_distinct_offsets(self):
     prg = _multi_local_program()

@@ -1,4 +1,4 @@
-import functools, unittest
+import functools, os, unittest
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function
 from tinygrad.llm.kernels.amd import Linear, _amd_flash_attention, amd_custom_kernels_supported, q8_quantize, flash_attention
@@ -150,6 +150,36 @@ class TestQ8Quantize(unittest.TestCase):
                                fxn=functools.partial(_amd_flash_attention, valid_kv_len=64))[0].reshape(1, 4, 32, 64).numpy()
     expected = np.array([(32 + (i+1)*3) / (33+i) for i in range(32)], dtype=np.float32)[None, None, :, None]
     np.testing.assert_allclose(out, np.broadcast_to(expected, out.shape), rtol=2e-3, atol=2e-3)
+
+  def test_prefill_attention_nonzero_asymmetric_qk(self):
+    # Zero-Q tiles only exercise the V path. Nonzero asymmetric Q/K catches WMMA→scalar→WMMA
+    # K-carry / REG-promote desync on the direct ISA flash path (AMD_FLASH_DIRECT).
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    from tinygrad.helpers import getenv
+    from tinygrad.codegen import to_program_cache
+    Tensor.manual_seed(7)
+    q = Tensor.randn(1, 2, 32, 64, dtype=dtypes.half).realize()
+    k = Tensor.randn(1, 1, 64, 64, dtype=dtypes.half).realize()
+    v = Tensor.randn(1, 1, 64, 64, dtype=dtypes.half).realize()
+    kv = Tensor.stack(k, v)
+    old = os.environ.get("AMD_FLASH_DIRECT")
+    os.environ["AMD_FLASH_DIRECT"] = "1"
+    os.environ["AMD_FLASH_ACC_SEP"] = "1"
+    os.environ["AMD_WMMA_ACC_SMALL"] = "0"
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      out = flash_attention(q, kv, 64).realize()
+    finally:
+      if old is None: os.environ.pop("AMD_FLASH_DIRECT", None)
+      else: os.environ["AMD_FLASH_DIRECT"] = old
+      os.environ.pop("AMD_FLASH_ACC_SEP", None)
+      os.environ.pop("AMD_WMMA_ACC_SMALL", None)
+      getenv.cache_clear()
+      to_program_cache.clear()
+    mask = Tensor.full((1, 1, 32, 64), float("-inf"), dtype=q.dtype, buffer=False).triu(64 - 32 + 1)
+    expected = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
+    np.testing.assert_allclose(out.numpy(), expected.numpy(), rtol=5e-3, atol=5e-3)
 
   def test_flash_attention_decode_gqa_output_layout(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")

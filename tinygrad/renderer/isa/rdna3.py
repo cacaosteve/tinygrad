@@ -617,6 +617,8 @@ def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
   bufs: set[UOp] = set()
   packed_quant = bool(getenv("AMD_PACKED_WMMA_ACC", 1)) and any(
     u.op is Ops.INS and _iop(u) in (AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16) for u in (ctx.uops or []))
+  # AMD_WMMA_ACC_SMALL: allow ≤64-element flash-style ACC tiles (default gated off).
+  allow_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0))
   for u in ctx.uops or []:
     if u.op is not Ops.INS or _iop(u) is not AMDOps.WMMA: continue
     pack = u.src[0]
@@ -624,20 +626,26 @@ def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
     for slot in pack.src:
       if slot.op is Ops.INS and _iop(slot) is AMDOps.SLOAD:
         if (base:=_reg_buffer_base(slot.src[0])) is None: continue
-        if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant): bufs.add(base)
+        if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant or allow_small): bufs.add(base)
   # LDS zero-cin path: packs are MOV zeros, so discover oversized REG via SLOAD/SSTORE traffic.
   if not bufs and any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA and _is_wmma_acc_reload_pack(u.src[0])
                       for u in (ctx.uops or []) if u.src):
     for u in ctx.uops or []:
       if u.op is not Ops.INS or _iop(u) not in (AMDOps.SLOAD, AMDOps.SSTORE): continue
       if (base:=_reg_buffer_base(u.src[0])) is None: continue
-      if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant): bufs.add(base)
+      if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant or allow_small): bufs.add(base)
   ctx.scratch["wmma_acc_buffers"] = bufs
   return bufs
 
 def _wmma_slot_tile_lane(idx:int) -> tuple[int, int]:
   # 4×4 UPCAST packs floats as tile=(idx//32)*4+(idx%4), lane=(idx%32)//4
   return (idx // 32) * 4 + (idx % 4), (idx % 32) // 4
+
+def _wmma_linear_tile_lane(idx:int, numel:int) -> tuple[int, int]|None:
+  """Flash-style S_reg/pv_acc: reshape(TM=8, N).permute → ACC tile=col, lane=row."""
+  if numel < 8 or numel % 8: return None
+  n_tiles = numel // 8
+  return idx % n_tiles, idx // n_tiles
 
 def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dict[int|tuple[UOp, int], tuple[UOp, int]]]:
   """Zero-init WMMA ACC packs before the K-loop.
@@ -654,19 +662,31 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
   tiles: dict[int, UOp] = {}
   idx_map: dict[int|tuple[UOp, int], tuple[UOp, int]] = {}
   next_tile = 0
+  buf_next_tile: dict[UOp, int] = {}
   for u in uops:
     if u.op is not Ops.INS or _iop(u) is not AMDOps.WMMA: continue
     pack = u.src[0]
     if not _is_wmma_acc_reload_pack(pack): continue
     if not isinstance(pack.tag, tuple) or not pack.tag: continue
     if pack.tag in seen: continue
-    # SLOAD-cin: tile from REG indices. Zero-MOV cin: enumerate in expand order.
+    # SLOAD-cin: tile from REG indices. Zero-MOV / dynamic-index cin: enumerate in expand order.
     sload_idxs: list[int|None] = []
+    pack_base: UOp|None = None
+    tile_local: int|None = None
     if all(s.op is Ops.INS and _iop(s) is AMDOps.SLOAD for s in pack.src):
       if not any((b:=_reg_buffer_base(s.src[0])) is not None and b in bufs for s in pack.src): continue
+      pack_base = next(b for s in pack.src if (b:=_reg_buffer_base(s.src[0])) is not None and b in bufs)
       sload_idxs = [_const_int(s.src[1]) for s in pack.src]
-      if any(i is None for i in sload_idxs): continue
-      tile, _ = _wmma_slot_tile_lane(sload_idxs[0])  # type: ignore[arg-type]
+      if any(i is None for i in sload_idxs):
+        # Flash REG indices are loop-varying; still park ACC by expand order (AMD_WMMA_ACC_SMALL).
+        if not getenv("AMD_WMMA_ACC_SMALL", 0): continue
+        sload_idxs = []
+        tile_local = buf_next_tile.get(pack_base, 0)
+        buf_next_tile[pack_base] = tile_local + 1
+        tile = next_tile
+        next_tile += 1
+      else:
+        tile, _ = _wmma_slot_tile_lane(sload_idxs[0])  # type: ignore[arg-type]
     else:
       tile = next_tile
       next_tile += 1
@@ -677,6 +697,15 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
     for lane, (sload, idx) in enumerate(zip(pack.src, sload_idxs)):
       if idx is not None and (base:=_reg_buffer_base(sload.src[0])) is not None:
         idx_map[idx if len(bufs) == 1 else (base, idx)] = (init, lane)
+    # Small flash tiles: map linear REG idx → ACC lane for post-WMMA EXTRACT copies.
+    if getenv("AMD_WMMA_ACC_SMALL", 0) and pack_base is not None and tile_local is not None:
+      numel = pack_base.max_numel()
+      n_tiles = numel // 8 if numel >= 8 and numel % 8 == 0 else 0
+      if n_tiles and tile_local < n_tiles:
+        for lane in range(8):
+          idx = lane * n_tiles + tile_local
+          if 0 <= idx < numel:
+            idx_map[idx if len(bufs) == 1 else (pack_base, idx)] = (init, lane)
   return inits, tiles, idx_map
 
 def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
@@ -1679,13 +1708,20 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
   if _iop(x) is AMDOps.SLOAD:
     if (buf:=_reg_buffer_base(x.src[0])) is not None and buf in _wmma_acc_buffers(ctx):
       # Loop-body SLOADs only feed WMMA PACK (redirected); post-loop reads need EXTRACT.
-      if not ctx.scratch.get("wmma_past_acc"): return x, []
-      if (idx:=_const_int(x.src[1])) is None: return None
-      # Prefer exact REG-index map (product-16: interleaved tile keys collide at 0..7).
+      # AMD_WMMA_ACC_SMALL: allow mid-kernel const-index EXTRACT for flash ACC_SEP copies.
+      idx = _const_int(x.src[1])
+      if idx is None:
+        if not ctx.scratch.get("wmma_past_acc"): return x, []
+        return None
+      if not ctx.scratch.get("wmma_past_acc") and not getenv("AMD_WMMA_ACC_SMALL", 0): return x, []
       idx_map = ctx.scratch.get("wmma_acc_idx_map") or {}
       if (got:=idx_map.get((buf, idx), idx_map.get(idx))) is not None: init, lane = got
       else:
-        tile, lane = _wmma_slot_tile_lane(idx)
+        if not ctx.scratch.get("wmma_past_acc"): return x, []
+        if getenv("AMD_WMMA_ACC_SMALL", 0) and (lin:=_wmma_linear_tile_lane(idx, buf.max_numel())) is not None:
+          tile, lane = lin
+        else:
+          tile, lane = _wmma_slot_tile_lane(idx)
         tiles = ctx.scratch.get("wmma_acc_tiles") or {}
         if (init:=tiles.get(tile)) is None: return None
       n = ctx.scratch.get("wmma_ext_n", 0)
