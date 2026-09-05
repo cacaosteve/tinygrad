@@ -843,12 +843,18 @@ def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
       elif bo:
         bad.add(base)
         continue
-    if idx is None or idx < 0 or idx >= base.max_numel() or base.max_numel() > 64 or n != 1 or dt.itemsize > 4:
+    # Scalar or small const-indexed vectors (flash float4 soft copies). n!=1 used to
+    # poison the whole REG buffer and force scratch for ACC_SEP soft/pv.
+    if idx is None or idx < 0 or base.max_numel() > 64 or dt.itemsize > 4 or n not in (1, 2, 4):
       bad.add(base)
       continue
-    key = (base, idx)
-    if _iop(u) is AMDOps.SLOAD and key not in seen_store: bad.add(base)
-    if _iop(u) is AMDOps.SSTORE: seen_store.add(key)
+    if idx + n > base.max_numel():
+      bad.add(base)
+      continue
+    for ei in range(n):
+      key = (base, idx + ei)
+      if _iop(u) is AMDOps.SLOAD and key not in seen_store: bad.add(base)
+      if _iop(u) is AMDOps.SSTORE: seen_store.add(key)
   ctx.scratch["reg_promotable"] = promotable = bases - bad
   ctx.scratch["reg_values"] = {}
   ctx.scratch["reg_n"] = 0
