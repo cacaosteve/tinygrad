@@ -866,8 +866,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   if resolve(T_real == 1): return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, assigned_kv.shape[3]))
   # Direct ISA can render the hand WMMA prefill correctly, but its per-tile REG scratch
   # traffic is currently much slower than the generic fused attention lowering.
-  # Tip ~1.35ms (SOFT_SCALE + promote peel + ACC_UNROLL + SLOAD/USE batching;
-  # acc slot stays scratch). Still ~4.7× HIP flash; SDPA fallback ~320µs default.
+  # Tip ~1.05ms (SOFT_SCALE + promote peel + ACC_UNROLL + SLOAD/USE batch≤32;
+  # acc slot stays scratch). Still ~3.7× HIP flash; SDPA fallback ~320µs default.
   if amd_direct_isa(q.device) and not getenv("AMD_FLASH_DIRECT", 0):
     k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
