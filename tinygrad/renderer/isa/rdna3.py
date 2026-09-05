@@ -153,9 +153,15 @@ def _try_vopd_fmac_pair(u0:UOp, u1:UOp) -> list|None:
   if ops0 is None or ops1 is None: return None
   d0, d1 = _dst(u0), _dst(u1)
   n0, n1 = _vgpr_num(d0), _vgpr_num(d1)
+  # Allow either even→odd order; swap if the later dest is the even bank.
+  if n0 is not None and n1 is not None and n1 % 2 == 0 and n0 == n1 + 1:
+    u0, u1, ops0, ops1, d0, d1, n0, n1 = u1, u0, ops1, ops0, d1, d0, n1, n0
   if n0 is None or n1 != n0 + 1 or n0 % 2 != 0: return None
   (a0, b0), (a1, b1) = ops0, ops1
   bn0, bn1 = _vgpr_num(b0), _vgpr_num(b1)
+  if bn0 is not None and bn1 is not None and bn1 % 2 == 0 and bn0 == bn1 + 1:
+    # Mul-src1 banks reversed vs dest order — not encodable in one VOPD.
+    return None
   if bn0 is None or bn1 != bn0 + 1 or bn0 % 2 != 0: return None
   an0 = _vgpr_num(a0) if isinstance(a0, Reg) else None
   an1 = _vgpr_num(a1) if isinstance(a1, Reg) else None
@@ -3639,14 +3645,29 @@ def insts_from_linear(lin:UOp):
       for inst in emitted: emit(inst)
       oi += count
       continue
-    # Pair adjacent independent FMACs into VOPD (HIP SDPA uses dual-issue heavily).
-    if mask_depth == 0 and oi + 1 < len(scheduled) and oi + 1 not in early_emitted and \
-       (vopd:=_try_vopd_fmac_pair(u, scheduled[oi + 1])) is not None:
-      src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[oi + 1].src))
-      if src and _pending_src(src): flush_regs(src)
-      for inst in vopd: emit(inst)
-      oi += 2
-      continue
+    # Pair independent FMACs into VOPD (HIP SDPA uses dual-issue heavily).
+    # Scan a short window — bank-compatible partners are often not adjacent.
+    if mask_depth == 0 and getenv("AMD_VOPD_FMAC", 1) and u.op is Ops.INS and _iop(u) is AMDOps.FMAC:
+      partner_i: int|None = None
+      vopd: list|None = None
+      max_scan = getenv("AMD_VOPD_FMAC_SCAN", 8)
+      for k in range(oi + 1, min(oi + 1 + max_scan, len(scheduled))):
+        if k in early_emitted: continue
+        cand = scheduled[k]
+        if (pair:=_try_vopd_fmac_pair(u, cand)) is None: continue
+        # Intervening ops must not depend on u or define cand's sources.
+        if any(u in scheduled[m].toposort() or cand in scheduled[m].toposort()
+               for m in range(oi + 1, k)):
+          continue
+        partner_i, vopd = k, pair
+        break
+      if vopd is not None and partner_i is not None:
+        src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[partner_i].src))
+        if src and _pending_src(src): flush_regs(src)
+        for inst in vopd: emit(inst)
+        early_emitted.add(partner_i)
+        oi += 1
+        continue
     if mask_depth == 0 and (fused_reduce:=_fused_lds_reduce_loop(scheduled, oi)) is not None:
       count, emitted = fused_reduce
       flush("lgkm")
