@@ -8,9 +8,9 @@ Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
 Still ~2.5× HIP flash (~266µs). SDPA default remains ~307µs (faster than DIRECT).
 
 How: python-unroll QK+PV WMMA columns + `AMD_WMMA_REDEF_ACC` (incl. PACK redef) +
-renderer ≤64 ACC park when `AMD_FLASH_DIRECT` (ACC_SMALL defaults on). **Never** auto-detect
-≤64 multi-packs (bled into eye@B → PACK SPILL) and **never** set `AMD_WMMA_ACC_SMALL=1`
-globally (breaks quant).
+renderer ≤64 ACC park scoped to flash realize (`AMD_FLASH_ACC_SMALL` set only then).
+**Never** park from `AMD_FLASH_DIRECT` alone (breaks peer GEMM/eye) or auto-detect ≤64
+multi-packs (PACK SPILL). **Never** set `AMD_WMMA_ACC_SMALL=1` globally (breaks quant).
 
 See `extra/rdna3_flash_acc_small.md`.
 

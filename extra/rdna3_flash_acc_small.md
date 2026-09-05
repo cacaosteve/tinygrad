@@ -14,9 +14,9 @@
 
 1. Kernel unrolls `(tm,tn)` / `(tm,td)` so each column has its own WMMA pack tag.
 2. `AMD_WMMA_REDEF_ACC` allows PACK/WMMA tag reuse across unrolled tiles.
-3. Renderer parks ≤64 ACC buffers only when `AMD_FLASH_DIRECT` (ACC_SMALL default on)
-   or explicit `AMD_FLASH_ACC_SMALL` / `AMD_WMMA_ACC_SMALL`. No multi-pack auto-detect
-   (that bled into eye@B and forced PACK SPILL under REDEF).
+3. Renderer parks ≤64 ACC buffers only while `AMD_FLASH_ACC_SMALL` is set.
+   `flash_attention` realizes under that env when ACC_SMALL is on (default for DIRECT).
+   Do **not** key parking off `AMD_FLASH_DIRECT` alone — that broke peer matmul/eye.
 4. **Do not** set `AMD_WMMA_ACC_SMALL=1` globally — parks ≤64 quant tiles and breaks Q4/Q6.
 
 ## Remaining gap vs HIP

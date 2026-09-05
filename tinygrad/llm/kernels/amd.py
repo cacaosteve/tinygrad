@@ -1,5 +1,5 @@
 from __future__ import annotations
-import functools, math
+import functools, math, os
 from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.device import Buffer
@@ -998,9 +998,9 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
     return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
-  # Flash-only ACC residency via python-unrolled WMMA + renderer park when
-  # AMD_FLASH_DIRECT (ACC_SMALL defaults on). No auto-detect on ≤64 multi-packs —
-  # that bled into eye/quant and forced PACK spills under AMD_WMMA_REDEF_ACC.
+  # Flash-only ACC residency via python-unrolled WMMA. Renderer parks ≤64 only while
+  # AMD_FLASH_ACC_SMALL is set for this realize (not via FLASH_DIRECT process-wide —
+  # that parked every matmul and broke eye/GEMM). ACC_SMALL defaults on for DIRECT;
   # AMD_FLASH_ACC_SMALL=0 disables; AMD_WMMA_ACC_SMALL=1 forces (unsafe for quant).
   use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
   use_k_unroll = getenv("AMD_FLASH_K_UNROLL", 0) if use_acc_small else 0
@@ -1014,7 +1014,18 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start,
                           acc_small=use_acc_small, k_unroll=use_k_unroll)
   out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
-  return out if q_start is None else out[:, :, :T_real]
+  if q_start is not None: out = out[:, :, :T_real]
+  if not use_acc_small: return out
+  # Compile under ACC_SMALL env so renderer parks flash tiles without poisoning peers.
+  prev = os.environ.get("AMD_FLASH_ACC_SMALL")
+  os.environ["AMD_FLASH_ACC_SMALL"] = "1"
+  getenv.cache_clear()
+  try:
+    return out.realize()
+  finally:
+    if prev is None: os.environ.pop("AMD_FLASH_ACC_SMALL", None)
+    else: os.environ["AMD_FLASH_ACC_SMALL"] = prev
+    getenv.cache_clear()
 
 # ******** gated delta net: fused recurrent scan ********
 

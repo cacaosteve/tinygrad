@@ -722,14 +722,13 @@ def _is_wmma_acc_reload_pack(cin:UOp, ctx:PreRegAllocContext|None=None) -> bool:
   return False
 
 def _flash_acc_small_enabled() -> bool:
-  """≤64 ACC parking only via explicit env — never auto-detect (bleeds into eye/quant).
+  """≤64 ACC parking only via explicit env — never from FLASH_DIRECT alone.
 
-  Matches flash_attention: with AMD_FLASH_DIRECT=1, AMD_FLASH_ACC_SMALL defaults on.
+  FLASH_DIRECT in the process env must not park every ≤64 matmul (breaks eye/GEMM).
+  flash_attention sets AMD_FLASH_ACC_SMALL around its realize when ACC_SMALL is on.
   AMD_WMMA_ACC_SMALL forces parking for any ≤64 tile (unsafe for Q4/Q6; avoid globally).
   """
-  if getenv("AMD_WMMA_ACC_SMALL", 0): return True
-  if getenv("AMD_FLASH_DIRECT", 0): return bool(getenv("AMD_FLASH_ACC_SMALL", 1))
-  return bool(getenv("AMD_FLASH_ACC_SMALL", 0))
+  return bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 0))
 
 def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
   """REG buffers whose scalar traffic can stay resident in WMMA accumulator fragments."""
