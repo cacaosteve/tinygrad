@@ -3597,7 +3597,7 @@ def insts_from_linear(lin:UOp):
       for inst in emitted: emit(inst)
       pending["lgkm"] |= _reg_idxs(u)
       if getenv("AMD_SWIZZLE_DELAY", 0): emit(r3.s_delay_alu(1))
-      sink_valu = bool(getenv("AMD_SINK_VALU_SWIZZLE", 1))
+      sink_valu = bool(getenv("AMD_SINK_VALU_SWIZZLE", 0))
       valu_ops = (AMDOps.FMAC, AMDOps.MUL, AMDOps.ADD, AMDOps.MAX, AMDOps.FMA_MIX_F32, AMDOps.MULACC)
       k, moved = oi + 2, 0
       max_moved = getenv("AMD_SINK_SWIZZLE_MAX", 6)
