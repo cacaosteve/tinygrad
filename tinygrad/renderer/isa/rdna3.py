@@ -3157,6 +3157,63 @@ def _schedule_swizzle_mov_batches(ops:list[UOp]) -> list[UOp]:
     out.append(u); i += 1
   return out
 
+def _gap_fill_after_loads(ops:list[UOp]) -> list[UOp]:
+  """Insert independent ALU between scratch/global LOAD and its first use (overlap wait).
+
+  Flash tip still does scratch_load; waitcnt_vmcnt(0) with nothing in between (~109×).
+  """
+  if not getenv("AMD_LOAD_GAP_FILL", 1): return ops
+  load_ops = (AMDOps.SLOAD, AMDOps.LOAD)
+  alu = (AMDOps.FMAC, AMDOps.MUL, AMDOps.ADD, AMDOps.MAX, AMDOps.MOV, AMDOps.MULACC,
+         AMDOps.EXP2, AMDOps.WHERE, AMDOps.CVT_F32_F16, AMDOps.CVT_F16_F32)
+  max_scan = getenv("AMD_LOAD_GAP_SCAN", 16)
+  max_gap = getenv("AMD_LOAD_GAP_N", 4)
+  taken: set[int] = set()
+  out: list[UOp] = []
+  i = 0
+  while i < len(ops):
+    if i in taken:
+      i += 1
+      continue
+    u = ops[i]
+    if u.op is Ops.INS and _iop(u) in load_ops:
+      use_j: int|None = None
+      for j in range(i + 1, min(i + 1 + max_scan, len(ops))):
+        if j in taken: continue
+        if u in ops[j].src or any(u is s for s in ops[j].toposort()):
+          use_j = j
+          break
+      if use_j is not None and use_j == i + 1:
+        gap: list[int] = []
+        blocked = {u, ops[use_j]}
+        k = use_j + 1
+        while k < len(ops) and len(gap) < max_gap:
+          if k in taken:
+            k += 1
+            continue
+          cand = ops[k]
+          if cand.op is Ops.INS and _iop(cand) in alu and \
+             not any(s in blocked for s in cand.src) and \
+             u not in cand.toposort() and ops[use_j] not in cand.toposort() and \
+             not any(cand in ops[m].toposort() for m in range(use_j + 1, k)):
+            gap.append(k)
+            blocked.add(cand)
+            k += 1
+            continue
+          break
+        if gap:
+          out.append(u)
+          for gi in gap:
+            out.append(ops[gi])
+            taken.add(gi)
+          out.append(ops[use_j])
+          taken.add(use_j)
+          i += 1
+          continue
+    out.append(u)
+    i += 1
+  return out
+
 def _vm_load_count(insts:list) -> int:
   return sum(1 for i in insts if (n:=getattr(i, "op_name", "")) and
              (n.startswith("GLOBAL_LOAD") or n.startswith("SCRATCH_LOAD") or
@@ -3640,6 +3697,7 @@ def insts_from_linear(lin:UOp):
   scheduled = _order_d16_lo_before_hi(
     _hoist_loads_before_wmma(_sink_wmma_past_loads(_hoist_lloads_before_extracts(ops))), d16_hi_lo)
   scheduled = _schedule_swizzle_mov_batches(scheduled)
+  scheduled = _gap_fill_after_loads(scheduled)
   fma_pair_dst = _fma_pair_pack_dsts(scheduled, fma_hi_lo)
   early_emitted: set[int] = set()
   perm_selects_ready = False
@@ -4480,6 +4538,7 @@ class AMDRenderer(ISARenderer):
     # After scalar VMEM (it otherwise reopens the weight→A gap). Default on; AMD_PREFETCH_Q6_A=0 opts out.
     lst = _prefetch_a_before_dequant_mix(lst) if getenv("AMD_PREFETCH_Q6_A", 1) else lst
     lst = _schedule_swizzle_mov_batches(lst)
+    lst = _gap_fill_after_loads(lst)
     return _schedule_loop_cmps(lst)
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True
