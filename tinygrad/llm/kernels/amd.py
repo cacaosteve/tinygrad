@@ -329,8 +329,9 @@ def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_wa
     def values(acc:UOp) -> tuple[UOp, ...]:
       global _reg_swizzle_slot
       own = tuple(acc.after(update)[i].load() for i in range(8))
-      # Park peers in REG so emit sees PERMLANEX×8 consecutive (one s_mov pair + VALU burst).
-      raw = [_peer16_f32(own[i]) for i in range(8)]
+      # Park peers in REG so emit sees PERMLANEX×8 or SWIZZLE×8 consecutive.
+      # AMD_WMMA_PEER_SWIZZLE=1: ds_swizzle ^16 (HIP-like) instead of permlanex16.
+      raw = [_swizzle_f32(own[i], 16) if getenv("AMD_WMMA_PEER_SWIZZLE", 0) else _peer16_f32(own[i]) for i in range(8)]
       tmp = UOp.placeholder((8,), dtypes.float, slot=_reg_swizzle_slot, addrspace=AddrSpace.REG)
       _reg_swizzle_slot += 1
       tmp = tmp.after(UOp.group(*[tmp[i].store(sw) for i, sw in enumerate(raw)]))
