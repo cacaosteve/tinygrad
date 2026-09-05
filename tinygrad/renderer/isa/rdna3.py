@@ -3288,7 +3288,7 @@ def _batch_scratch_load_uses(ops:list[UOp]) -> list[UOp]:
     if u.op is Ops.INS and _iop(u) is AMDOps.SLOAD and i + 1 < len(ops) and u in ops[i + 1].src:
       loads, uses = [u], [ops[i + 1]]
       j = i + 2
-      while j + 1 < len(ops) and len(loads) < 8 and \
+      while j + 1 < len(ops) and len(loads) < getenv("AMD_BATCH_SLOAD_MAX", 16) and \
             ops[j].op is Ops.INS and _iop(ops[j]) is AMDOps.SLOAD and \
             ops[j] in ops[j + 1].src and \
             not any(prev in ops[j].src or prev in ops[j + 1].src for prev in loads + uses):
