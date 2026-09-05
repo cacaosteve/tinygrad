@@ -489,7 +489,17 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
     if direct_isa: return tuple(_amd_packed_f16_mul_to_f16(pair, scale, half) for pair in pairs)
     values = tuple(_half((pair >> (half*16)) & 0xffff) for pair in pairs)
     return tuple((value*scale).cast(dtypes.float16) for value in values)
-  return _quant_linear_wmma(out, x, out_features, in_features, IQ4_WORDS, layout, dequant, "linear_iq4_xs_f16_wmma", swizzle_stores=direct_isa)
+  def dequant_halves(base:UOp, subgroup:UOp) -> tuple[tuple[UOp, ...], tuple[UOp, ...]]:
+    # Share qwords+LUT pairs across both WMMA halves (only mixlo/hi differs).
+    d, scale = _iq4_scales(raw, base, subgroup)
+    scale = scale * d
+    qwords = _amd_load(raw[base+2+subgroup*4], 4, packed_u32=True)
+    pairs = tuple(lut[((qwords[word] >> (byte*8)) & 255).cast(dtypes.weakint)]
+                  for word in range(4) for byte in range(4))
+    return (tuple(_amd_packed_f16_mul_to_f16(pair, scale, 0) for pair in pairs),
+            tuple(_amd_packed_f16_mul_to_f16(pair, scale, 1) for pair in pairs))
+  return _quant_linear_wmma(out, x, out_features, in_features, IQ4_WORDS, layout, dequant, "linear_iq4_xs_f16_wmma",
+                            swizzle_stores=direct_isa, dequant_halves=dequant_halves if direct_isa else None)
 
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS)
