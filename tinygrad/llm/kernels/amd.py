@@ -453,10 +453,10 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
   token_tile = 32 if out_features <= 1024 and out.shape[0] % 32 == 0 else 64 if out.shape[0] % 64 == 0 and \
     (out_features <= 6144 or out_features == 5120 and in_features > 8192) else 128 if out.shape[0] % 128 == 0 else \
     32 if out.shape[0] % 32 == 0 else 16
-  # Dual output tiles (old default for 1024<out<=6144) inflated LUT dequant VGPR live
-  # ranges (~1.47× HIP on 4096×2048). Single tile is default; AMD_IQ4_DUAL_OUT=1 restores.
+  # Dual output tiles help some mid sizes on direct ISA (~1µs on 4096×2048 IQ4).
+  # Default on for out in (1024, 6144]; AMD_IQ4_DUAL_OUT=0 forces single tile.
   if (t:=getenv("AMD_IQ4_OUTPUT_TILES", 0)): output_tiles = t
-  elif getenv("AMD_IQ4_DUAL_OUT", 0):
+  elif getenv("AMD_IQ4_DUAL_OUT", 1):
     output_tiles = 1 if out_features <= 1024 else 2 if out_features <= 6144 else 1
   else: output_tiles = 1
   layout = _wmma_layout(out, out_features, token_tile, output_tiles)
@@ -866,7 +866,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   if resolve(T_real == 1): return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, assigned_kv.shape[3]))
   # Direct ISA can render the hand WMMA prefill correctly, but its per-tile REG scratch
   # traffic is currently much slower than the generic fused attention lowering.
-  # Recent: FLASH_SOFT_SCALE (default) ~1.82ms; still ~6× HIP flash / ~5× SDPA fallback.
+  # Tip ~1.57ms (SOFT_SCALE + RESHAPE promote peel + ACC_UNROLL; acc slot stays scratch).
   if amd_direct_isa(q.device) and not getenv("AMD_FLASH_DIRECT", 0):
     k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
