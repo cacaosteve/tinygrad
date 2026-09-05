@@ -740,7 +740,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # Scale+mask: default on WMMA/scratch buffer first. Predicated where-stores into a
   # REG-promoted const-index soft buffer were dropped (broke masked SDPA).
   # AMD_FLASH_SOFT_SCALE=1: copy raw WMMA→soft first, then scale+mask on soft (VGPR).
-  _soft_scale = bool(_acc_sep and getenv("AMD_FLASH_SOFT_SCALE", 0))
+  _soft_scale = bool(_acc_sep and getenv("AMD_FLASH_SOFT_SCALE", 1))
   if not _soft_scale:
     S_reg = S_reg.after(qk_done, S_reg.store(S_reg * SCALE))
     if _fu & 2:
