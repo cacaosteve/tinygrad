@@ -845,7 +845,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     else:
       pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
   ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
-  if _fu & 4:
+  if _fu & 4 and getenv("AMD_FLASH_ACC_UNROLL", 1):
     # Const-index acc update so REG promote can keep acc in VGPRs (ranged idx poisons).
     acc_up = UOp.group(*[acc[ri, rj].store(acc[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
                          for ri in range(TM) for rj in range(TD)])
@@ -853,7 +853,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   else:
     n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
   acc, l_i, m_i = acc.after(n_tile_end), l_i.after(n_tile_end), m_i.after(n_tile_end)
-  if _fu & 4:
+  if _fu & 4 and getenv("AMD_FLASH_ACC_UNROLL", 1) and getenv("AMD_FLASH_NORM_UNROLL", 0):
     inv = tuple((1 / l_i[ri]) for ri in range(TM))
     acc = acc.after(UOp.group(*[acc[ri, rj].store(acc[ri, rj] * inv[ri]) for ri in range(TM) for rj in range(TD)]))
   else:
