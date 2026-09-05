@@ -132,6 +132,40 @@ def _dst(x:UOp) -> Reg:
   if not isinstance(greg(x), Register): raise CompileError(f"expected reg dst {x}")
   return _reg_to_amd(greg(x), _reg_slots(x))
 
+def _vgpr_num(reg:Reg) -> int|None:
+  return reg.offset - 256 if isinstance(reg, Reg) and reg.sz == 1 and 256 <= reg.offset < 512 else None
+
+def _fmac_mul_operands(u:UOp) -> tuple[object, Reg]|None:
+  """Return (src0, src1_vgpr) for a float32 FMAC, or None if not VOPD-eligible."""
+  if u.dtype is not dtypes.float32: return None
+  a, b = _src(u.src[1]), _src(u.src[2])
+  if isinstance(b, Reg) and b.offset >= 256: return a, b
+  if isinstance(a, Reg) and a.offset >= 256: return b, a
+  return None
+
+def _try_vopd_fmac_pair(u0:UOp, u1:UOp) -> list|None:
+  """Pack two independent float32 FMACs into VOPD when dest/src banks allow."""
+  if not getenv("AMD_VOPD_FMAC", 1): return None
+  if u0.op is not Ops.INS or u1.op is not Ops.INS: return None
+  if _iop(u0) is not AMDOps.FMAC or _iop(u1) is not AMDOps.FMAC: return None
+  if u1 in u0.toposort() or u0 in u1.toposort(): return None
+  ops0, ops1 = _fmac_mul_operands(u0), _fmac_mul_operands(u1)
+  if ops0 is None or ops1 is None: return None
+  d0, d1 = _dst(u0), _dst(u1)
+  n0, n1 = _vgpr_num(d0), _vgpr_num(d1)
+  if n0 is None or n1 != n0 + 1 or n0 % 2 != 0: return None
+  (a0, b0), (a1, b1) = ops0, ops1
+  bn0, bn1 = _vgpr_num(b0), _vgpr_num(b1)
+  if bn0 is None or bn1 != bn0 + 1 or bn0 % 2 != 0: return None
+  an0 = _vgpr_num(a0) if isinstance(a0, Reg) else None
+  an1 = _vgpr_num(a1) if isinstance(a1, Reg) else None
+  if an0 is not None and an1 is not None:
+    if an1 != an0 + 1 or an0 % 2 != 0: return None
+  elif an0 is not None or an1 is not None or a0 != a1:
+    return None
+  return [r3.v_dual_fmac_f32(opy=VOPDOp.V_DUAL_FMAC_F32, vdstx=d0, vdsty=d1,
+                             srcx0=a0, srcy0=a1, vsrcx1=b0, vsrcy1=b1)]
+
 def _full_src(x:UOp) -> Reg:
   if not isinstance(greg(x), Register): raise CompileError(f"expected reg src {x}")
   return _reg_to_amd(greg(x), _reg_slots(x))
@@ -3604,6 +3638,14 @@ def insts_from_linear(lin:UOp):
       store_addr_cache.clear()
       for inst in emitted: emit(inst)
       oi += count
+      continue
+    # Pair adjacent independent FMACs into VOPD (HIP SDPA uses dual-issue heavily).
+    if mask_depth == 0 and oi + 1 < len(scheduled) and oi + 1 not in early_emitted and \
+       (vopd:=_try_vopd_fmac_pair(u, scheduled[oi + 1])) is not None:
+      src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[oi + 1].src))
+      if src and _pending_src(src): flush_regs(src)
+      for inst in vopd: emit(inst)
+      oi += 2
       continue
     if mask_depth == 0 and (fused_reduce:=_fused_lds_reduce_loop(scheduled, oi)) is not None:
       count, emitted = fused_reduce
