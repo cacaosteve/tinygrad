@@ -4004,6 +4004,32 @@ def insts_from_linear(lin:UOp):
       note_vm(set().union(*(_reg_idxs(scheduled[k]) for k in range(oi, oi + count))), emitted)
       oi += count
       continue
+    # Burst SLOAD streak: hoist addr ALU, then s_clause + scratch_load* (HIP/LLVM VMEM clause).
+    # Only when scales are TMP-safe (shared CSE'd TMP_VADDR or ≤1 TMP scale).
+    if mask_depth == 0 and getenv("AMD_SCRATCH_SCLAUSE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SLOAD:
+      j = oi + 1
+      while j < len(scheduled) and scheduled[j] not in skip and scheduled[j].op is Ops.INS and \
+            _iop(scheduled[j]) is AMDOps.SLOAD and j - oi < getenv("AMD_SCRATCH_SCLAUSE_MAX", 32):
+        j += 1
+      if j - oi >= 2:
+        cache_snap = (store_addr_cache.key, store_addr_cache.page)
+        parts = [_emit_uop(scheduled[k], with_store_cache=True) for k in range(oi, j)]
+        if all(_vm_load_count(p) >= 1 for p in parts):
+          scales, loads = [], []
+          for p in parts:
+            sc, ld = _split_scale_and_loads(p)
+            scales.extend(sc)
+            loads.extend(ld)
+          if len(loads) >= 2 and _tmp_vaddr_clause_safe(scales, loads):
+            if (deps:=set().union(*(_reg_idxs(scheduled[k].src[1]) for k in range(oi, j)))) and _pending_src(deps):
+              flush_regs(deps)
+            for inst in scales: emit(inst)
+            emit(r3.s_clause(simm16=len(loads) - 1))
+            for inst in loads: emit(inst)
+            note_vm(set().union(*(_reg_idxs(scheduled[k]) for k in range(oi, j))), loads)
+            oi = j
+            continue
+        store_addr_cache.key, store_addr_cache.page = cache_snap
     if mask_depth == 0 and (fused_load:=_fused_lds_pack_load(scheduled, oi)) is not None:
       count, emitted, deps = fused_load
       if deps and _pending_src(deps): flush_regs(deps)
