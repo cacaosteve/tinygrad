@@ -1,4 +1,4 @@
-# Overnight RDNA3 (to ~5AM PT) — tip `a1996c420`
+# Overnight RDNA3 (to ~5AM PT) — tip `05a940ba8`
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
 
@@ -34,6 +34,10 @@ See `extra/rdna3_flash_acc_small.md`.
 
 ## Also landed
 - IQ4 `dequant_halves`: share LUT pairs across halves (vgpr 102 @t16; t32 still 118/~65 vs HIP ~60)
+
+## Also landed
+- `AMD_PACK_F16_GENERAL=1`: IQ4 vgpr 118→110; Q6 sometimes ahead of HIP; **breaks FLASH_DIRECT** (nan). Leave opt-in.
+- Scalar LSTORE fix for multi-slot phys (enables experimenting with general PACK pool).
 
 ## Next leftovers
 
