@@ -845,7 +845,7 @@ def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
         continue
     # Scalar or small const-indexed vectors (flash float4 soft copies). n!=1 used to
     # poison the whole REG buffer and force scratch for ACC_SEP soft/pv.
-    if idx is None or idx < 0 or base.max_numel() > 64 or dt.itemsize > 4 or n not in (1, 2, 4):
+    if idx is None or idx < 0 or base.max_numel() > getenv("AMD_REG_PROMOTE_MAX", 64) or dt.itemsize > 4 or n not in (1, 2, 4):
       bad.add(base)
       continue
     if idx + n > base.max_numel():
