@@ -1,42 +1,41 @@
-# Overnight RDNA3 — tip `b85508fcf`
+# Overnight RDNA3 — tip `eb13b6277`
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
 
 ## Headline
 
-**Flash DIRECT ACC_SMALL** ~**700–710µs** (correct, err~1e-4). HIP ~278; SDPA ~360 (still faster default).
+**Flash DIRECT ACC_SMALL** ~**673µs** (was ~702 after cleanup; overnight ~669–710).
+HIP ~278; SDPA ~360 (still faster default). Serial correctness **13/13**.
 
-Parking is scoped: `flash_attention` realizes under `AMD_FLASH_ACC_SMALL=1` then clears it.
-Do **not** park from `AMD_FLASH_DIRECT` alone (broke peer GEMM/eye) or auto-detect ≤64 multi-packs.
+## Structural win this stretch
 
-See `extra/rdna3_flash_acc_small.md` for scratch attribution.
+Tile-local VGPR work copy for REDUCE-carried `acc` (slot 2 → promotable slot 19 for the
+tile body). Keeps `alpha*acc` overlapping V loads; cuts SLOAD/SSTORE 128→96 and machine
+scratch ~137/102 → ~97/74.
 
-## Scorecard (7900, this session)
+**Attribution correction:** soft buffers (16/17) already promote; the old “128 soft-copy”
+traffic was mostly unpromotable slot-2 `acc`. Fusing alpha into pv-add cut traffic but
+regressed to ~820µs (lost V-load overlap) — reverted.
 
-| Workload | AMD | HIP |
-|----------|-----|-----|
-| Flash DIRECT ACC_SMALL | ~705 | ~278 |
-| Flash DIRECT ACC_SMALL=0 | ~1315 | |
-| SDPA (no DIRECT) | ~360 | (HIP uses flash) |
-| Serial correctness | 13/13 OK | flash/GQA/eye/post-flash GEMM |
+## Scorecard (7900)
 
-## Cleanup landed
+| Workload | AMD | notes |
+|----------|-----|-------|
+| Flash DIRECT | ~673 | err~1e-4, vgpr 214, priv 212, SPILL 21 |
+| SDPA | ~360 | |
+| HIP flash | ~278 | |
+| Serial | 13/13 | |
 
-1. Removed ≤64 multi-pack auto-park (eye PACK SPILL under REDEF).
-2. Scoped ACC_SMALL env to flash realize only (`b85508fcf`).
-3. Local `test_amd_renderer` + `test_llm_amd`: 210 passed.
-4. `extra/rdna3_serial_correctness.py` on 7900.
+## Do not retry
 
-## Scratch attribution (ACC_SMALL)
-
-- 21 allocator SPILL (VGPR pressure from ACC)
-- 128/128 SLOAD/SSTORE soft-copy (dominant private traffic)
-- priv 212 B; machine scratch ~137 st / 102 ld
-- ACC_SMALL=0: more soft-copy (192) + priv 384 → slower despite fewer spills
+- Park from `AMD_FLASH_DIRECT` alone / ≤64 multi-pack auto-detect
+- `AMD_REG_PROMOTE_SKIP_SLOTS=` (promote slot 2) → wrong numerics
+- Fuse `acc=alpha*acc+beta*pv` as default → ~820µs regression
+- `AMD_FLASH_K_UNROLL` / PV_ACC_DIRECT / ACC_SEP=0
 
 ## Next leftovers
 
-1. Structural: cut soft-copy or ACC pressure (not new knobs) — toward HIP ~278
-2. IQ4 vgpr 118→95
-3. Decode partial 34→29
-4. Stronger quant correctness than random ggml bytes (use packed-from-float)
+1. Cut remaining slot-2 cross-tile scratch / 21 allocator spills (toward HIP ~278)
+2. Safer K unroll without MMU fault
+3. IQ4 vgpr 118→95
+4. Decode partial 34→29

@@ -1,11 +1,13 @@
 # Flash ACC_SMALL (DIRECT ISA)
 
-**Status (7900, tip `b85508fcf`):** `AMD_FLASH_DIRECT=1` defaults ACC_SMALL on
-(python-unroll QK+PV WMMA; `flash_attention` realizes under `AMD_FLASH_ACC_SMALL=1` briefly).
+**Status (7900, tip `eb13b6277`):** `AMD_FLASH_DIRECT=1` defaults ACC_SMALL on
+(python-unroll QK+PV WMMA; `flash_attention` realizes under `AMD_FLASH_ACC_SMALL=1` briefly;
+tile-local VGPR work copy for REDUCE-carried `acc`).
 
 | Path | median µs | err | notes |
 |------|-----------|-----|-------|
-| DIRECT + ACC_SMALL | ~700–710 | ~1e-4 | 189 VGPR, priv 212, 21 SPILL, 128 SLOAD/SSTORE |
+| DIRECT + ACC_SMALL | ~673 | ~1e-4 | 214 VGPR, priv 212, 21 SPILL, 96 SLOAD/SSTORE |
+| DIRECT (pre work-copy) | ~702 | ~1e-4 | 189 VGPR, 128 SLOAD/SSTORE |
 | DIRECT + ACC_SMALL=0 | ~1315 | ~1e-4 | 149 VGPR, priv 384, 16 SPILL, 192 SLOAD/SSTORE |
 | HIP flash | ~278 | ~1e-4 | 0 scratch path |
 | SDPA (no DIRECT) | ~360 | ~1e-6 | still default / faster than DIRECT |
@@ -14,14 +16,16 @@
 
 | Bucket | Count | Meaning |
 |--------|------:|---------|
-| Allocator `SPILL`/`FILL` | 21 / 22 | LinearScan spills under ACC VGPR pressure (ACC from v121) |
-| REG soft-copy `SLOAD`/`SSTORE` | 128 / 128 | S/PV ACC↔private REG copies (kept; PV ACC-direct ~810µs worse) |
-| Machine `scratch_store`/`load` | 137 / 102 | Private segment is scratch-backed; ≈ soft-copy + spills |
-| `private_segment_size` | 212 B | Down from 384 B with ACC_SMALL=0 |
+| Slot-2 `acc` SLOAD/SSTORE | 96 / 96 | REDUCE-carried output; **cannot** promote across `n_tile` |
+| Soft/stats REG (slots 16/17/3/…) | 0 scratch | Already VGPR-promoted (`REG_STORE` elided) |
+| Allocator `SPILL`/`FILL` | 21 / 22 | LinearScan under ACC VGPR pressure (ACC from pool idx 121 → v126) |
+| Machine `scratch_store`/`load` | ~97 / 74 | With tile-local work copy (was ~137 / 102) |
+| `private_segment_size` | 212 B | |
 
-**Takeaway:** ACC_SMALL wins by cutting soft-copy + private size (~192→128 SLOAD, priv 384→212),
-not by killing allocator spills (those rise 16→21 because ACC eats VGPRs). Next structural
-lever is fewer soft-copies or less ACC pressure — not more env knobs.
+**Corrected takeaway:** the old “128 soft-copy” count was mostly **slot-2 acc**, not S_soft/pv_soft
+(those already promote). Tile-local slot-19 work copy cuts mid-tile scratch while keeping
+`alpha*acc` before V load (latency hiding). Fusing `acc=alpha*acc+beta*pv` cut traffic but
+**regressed to ~820µs** — lost overlap with V loads; do not revive.
 
 ## How it works
 
@@ -30,15 +34,16 @@ lever is fewer soft-copies or less ACC pressure — not more env knobs.
 3. Renderer parks ≤64 ACC buffers only while `AMD_FLASH_ACC_SMALL` is set.
    `flash_attention` realizes under that env when ACC_SMALL is on (default for DIRECT).
    Do **not** key parking off `AMD_FLASH_DIRECT` alone — that broke peer matmul/eye.
-4. **Do not** set `AMD_WMMA_ACC_SMALL=1` globally — parks ≤64 quant tiles and breaks Q4/Q6.
+4. Tile-local `acc` work copy (slot 19) for ACC_SMALL + unroll correction path.
+5. **Do not** set `AMD_WMMA_ACC_SMALL=1` globally — parks ≤64 quant tiles and breaks Q4/Q6.
 
 ## Remaining gap vs HIP
 
 - HIP fully unrolls more WMMA (24 vs 6) and keeps 0 scratch.
-- Direct still spills (~21) under ACC VGPR pressure (`WMMA_ACC_VGPR` from v121).
+- Direct still spills (~21) under ACC VGPR pressure; slot-2 still scratch-backed across tiles.
+- Promoting slot 2 (`AMD_REG_PROMOTE_SKIP_SLOTS=`) → err~135 — leave skipped.
 - QK-only unroll regresses (~833µs); keep full QK+PV unroll.
 - `AMD_FLASH_K_UNROLL=1` full K chain **MMU-faults**; `=2` nan; `=4` err~1.17 — leave 0.
-  Scalarize FILL→v_pack fix remains (harmless for tip).
 
 ## Toggles
 
