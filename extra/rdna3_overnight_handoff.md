@@ -1,4 +1,4 @@
-# Overnight RDNA3 (to ~5AM PT) — tip `05a940ba8`
+# Overnight RDNA3 (to ~5AM PT) — tip `13daf34d9`
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
 
@@ -45,3 +45,8 @@ See `extra/rdna3_flash_acc_small.md`.
 2. IQ4 vgpr 118→95 (~5µs)
 3. Decode partial 34→29
 4. SDPA 307→~267 only if safe VOPD (bank pairing)
+
+
+## Session end
+
+Gaming PC unreachable ~4:48 PT (network down / powered off). Loop stopped.
