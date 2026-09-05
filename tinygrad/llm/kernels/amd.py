@@ -331,11 +331,15 @@ def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_wa
       own = tuple(acc.after(update)[i].load() for i in range(8))
       # Park peers in REG so emit sees PERMLANEX×8 or SWIZZLE×8 consecutive.
       # AMD_WMMA_PEER_SWIZZLE=1: ds_swizzle ^16 (HIP-like) instead of permlanex16.
-      raw = [_swizzle_f32(own[i], 16) if getenv("AMD_WMMA_PEER_SWIZZLE", 1) else _peer16_f32(own[i]) for i in range(8)]
-      tmp = UOp.placeholder((8,), dtypes.float, slot=_reg_swizzle_slot, addrspace=AddrSpace.REG)
-      _reg_swizzle_slot += 1
-      tmp = tmp.after(UOp.group(*[tmp[i].store(sw) for i, sw in enumerate(raw)]))
-      peer = tuple(tmp[i].load() for i in range(8))
+      peer_op = (lambda v: _swizzle_f32(v, 16)) if getenv("AMD_WMMA_PEER_SWIZZLE", 1) else _peer16_f32
+      raw = [peer_op(own[i]) for i in range(8)]
+      if getenv("AMD_WMMA_PEER_NOPARK", 0):
+        peer = tuple(raw)
+      else:
+        tmp = UOp.placeholder((8,), dtypes.float, slot=_reg_swizzle_slot, addrspace=AddrSpace.REG)
+        _reg_swizzle_slot += 1
+        tmp = tmp.after(UOp.group(*[tmp[i].store(sw) for i, sw in enumerate(raw)]))
+        peer = tuple(tmp[i].load() for i in range(8))
       low = half.eq(0)
       return tuple(low.where(own[i], peer[i+4]) if j == 0 else low.where(peer[i], own[i+4]) for i in range(4) for j in range(2))
     return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
