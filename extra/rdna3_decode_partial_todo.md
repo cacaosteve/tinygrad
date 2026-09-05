@@ -32,7 +32,9 @@ lgkm gap). Direct now batches G=4 per stage; HIP often batches more aggressively
 - Global swizzle-breadth ready-list (FMAC hoist / uncapped) → spills or VMEM overlap loss
 - Emit-time SWIZZLE/MOV reorder after regalloc → **wrong numerics** (VGPR alias)
 - Soft lgkm alone without park → streak always 1
-- VALU/ADD gap sink → GPU hang; `AMD_SWIZZLE_DELAY=1` → neutral
+- VALU/ADD gap sink → GPU hang; `AMD_SWIZZLE_DELAY=1` → neutral on park path
+- `AMD_SWIZZLE_NO_PARK=1` (direct SW→ADD, HIP-like wait→add): correct with stage-safe
+  batching, but **partial ~46 µs** (worse than park ~34). Leave off.
 
 ```bash
 DEV=AMD:AMD  PYTHONPATH=.:extra python extra/diff_flash_decode_partial_asm.py -o /tmp/direct.json

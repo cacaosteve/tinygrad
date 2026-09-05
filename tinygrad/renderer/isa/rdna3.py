@@ -3940,6 +3940,9 @@ def insts_from_linear(lin:UOp):
       regs = _reg_idxs(d16_hi_lo[u]) if u in d16_hi_lo else _reg_idxs(u)
       if domain == "vm": note_vm(regs, vm_after_wait if saw_vm_wait0 else emitted)
       else: pending[domain] |= regs
+      # HIP flash_decode emits s_delay_alu after ds_swizzle; opt-in overlap with lgkm.
+      if domain == "lgkm" and _iop(u) is AMDOps.SWIZZLE and getenv("AMD_SWIZZLE_DELAY", 0):
+        emit(r3.s_delay_alu(1))
     if (domain:=_wait_domain_for_store(u)) is not None:
       pending[domain] |= _store_src_regs(u)
     oi += 1
