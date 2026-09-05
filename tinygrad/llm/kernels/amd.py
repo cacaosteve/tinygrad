@@ -721,7 +721,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # AMD_FLASH_UNROLL: 0=off; 1 or 6=soft+corr python-unroll (const REG slots). WMMA stays ranged —
   # frag.after(store) cin was wrong; const_like(0) chains break direct-ISA emit (half2 LDS).
   # AMD_FLASH_ACC_SEP: keep WMMA C in ACC; copy out to a const-indexed soft buffer before softmax.
-  _acc_sep = bool(getenv("AMD_FLASH_ACC_SEP", 0))
+  # Default on: after soft vscnt + scratch addr CSE this is faster (~2.1ms vs ~2.7ms prefill).
+  _acc_sep = bool(getenv("AMD_FLASH_ACC_SEP", 1))
   _fu = getenv("AMD_FLASH_UNROLL", 0)
   if _fu == 1: _fu = 6
   if _acc_sep: _fu |= 6  # soft/corr need const REG indices on the working buffer
@@ -829,8 +830,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
     return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
-  # AMD_FLASH_ACC_SEP / AMD_WMMA_ACC_SMALL stay explicit: ACC_SEP is correct after
-  # mask-before-copy but still scratch-bound; ACC_SMALL still NaNs on flash.
+  # AMD_FLASH_ACC_SEP defaults on (faster than in-place soft REG after scratch CSE);
+  # AMD_WMMA_ACC_SMALL still NaNs on flash — leave gated off.
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]
