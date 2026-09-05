@@ -721,27 +721,23 @@ def _is_wmma_acc_reload_pack(cin:UOp, ctx:PreRegAllocContext|None=None) -> bool:
     return bool(tile_inits) and all(s.src[0] in tile_inits for s in cin.src)
   return False
 
+def _flash_acc_small_enabled() -> bool:
+  """≤64 ACC parking only via explicit env — never auto-detect (bleeds into eye/quant).
+
+  Matches flash_attention: with AMD_FLASH_DIRECT=1, AMD_FLASH_ACC_SMALL defaults on.
+  AMD_WMMA_ACC_SMALL forces parking for any ≤64 tile (unsafe for Q4/Q6; avoid globally).
+  """
+  if getenv("AMD_WMMA_ACC_SMALL", 0): return True
+  if getenv("AMD_FLASH_DIRECT", 0): return bool(getenv("AMD_FLASH_ACC_SMALL", 1))
+  return bool(getenv("AMD_FLASH_ACC_SMALL", 0))
+
 def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
   """REG buffers whose scalar traffic can stay resident in WMMA accumulator fragments."""
   if (cached:=ctx.scratch.get("wmma_acc_buffers")) is not None: return cached
   bufs: set[UOp] = set()
   packed_quant = bool(getenv("AMD_PACKED_WMMA_ACC", 1)) and any(
     u.op is Ops.INS and _iop(u) in (AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16) for u in (ctx.uops or []))
-  # AMD_WMMA_ACC_SMALL: force ≤64 tiles (also parks some quant — breaks Q4/Q6; avoid globally).
-  # AMD_FLASH_ACC_SMALL / auto: ≤64 REG with ≥2 distinct WMMA reload packs (unrolled flash).
-  allow_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 0))
-  pack_tags_by_buf: dict[UOp, set] = {}
-  for u in ctx.uops or []:
-    if u.op is not Ops.INS or _iop(u) is not AMDOps.WMMA: continue
-    pack = u.src[0]
-    if not _is_wmma_acc_reload_pack(pack): continue
-    if not (isinstance(pack.tag, tuple) and pack.tag): continue
-    if all(s.op is Ops.INS and _iop(s) is AMDOps.SLOAD for s in pack.src):
-      for s in pack.src:
-        if (base:=_reg_buffer_base(s.src[0])) is not None:
-          pack_tags_by_buf.setdefault(base, set()).add(pack.tag)
-          break
-  auto_small = {b for b, tags in pack_tags_by_buf.items() if len(tags) >= 2 and b.max_numel() <= 64}
+  allow_small = _flash_acc_small_enabled()
   for u in ctx.uops or []:
     if u.op is not Ops.INS or _iop(u) is not AMDOps.WMMA: continue
     pack = u.src[0]
@@ -749,7 +745,7 @@ def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
     for slot in pack.src:
       if slot.op is Ops.INS and _iop(slot) is AMDOps.SLOAD:
         if (base:=_reg_buffer_base(slot.src[0])) is None: continue
-        if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant or allow_small or base in auto_small):
+        if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant or allow_small):
           bufs.add(base)
   # LDS zero-cin path: packs are MOV zeros, so discover oversized REG via SLOAD/SSTORE traffic.
   if not bufs and any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA and _is_wmma_acc_reload_pack(u.src[0])
@@ -757,19 +753,14 @@ def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
     for u in ctx.uops or []:
       if u.op is not Ops.INS or _iop(u) not in (AMDOps.SLOAD, AMDOps.SSTORE): continue
       if (base:=_reg_buffer_base(u.src[0])) is None: continue
-      if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant or allow_small or base in auto_small):
+      if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant or allow_small):
         bufs.add(base)
   ctx.scratch["wmma_acc_buffers"] = bufs
-  ctx.scratch["wmma_acc_auto_small"] = auto_small
   return bufs
 
 def _wmma_acc_small_mode(ctx:PreRegAllocContext|None=None) -> bool:
-  """Flash-style ≤64 ACC parking (env or auto-detected unrolled multi-pack)."""
-  if getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 0): return True
-  if ctx is not None:
-    _wmma_acc_buffers(ctx)  # populate auto_small
-    return bool(ctx.scratch.get("wmma_acc_auto_small"))
-  return False
+  """Flash-style ≤64 ACC parking (explicit env only; ctx unused, kept for call sites)."""
+  return _flash_acc_small_enabled()
 
 def _wmma_slot_tile_lane(idx:int) -> tuple[int, int]:
   # 4×4 UPCAST packs floats as tile=(idx//32)*4+(idx%4), lane=(idx%32)//4

@@ -998,7 +998,9 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
     return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
-  # Flash-only ACC residency via python-unrolled WMMA (≥2 packs → renderer auto-park).
+  # Flash-only ACC residency via python-unrolled WMMA + renderer park when
+  # AMD_FLASH_DIRECT (ACC_SMALL defaults on). No auto-detect on ≤64 multi-packs —
+  # that bled into eye/quant and forced PACK spills under AMD_WMMA_REDEF_ACC.
   # AMD_FLASH_ACC_SMALL=0 disables; AMD_WMMA_ACC_SMALL=1 forces (unsafe for quant).
   use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
   use_k_unroll = getenv("AMD_FLASH_K_UNROLL", 0) if use_acc_small else 0

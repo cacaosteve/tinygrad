@@ -1,7 +1,7 @@
 # Flash ACC_SMALL (DIRECT ISA)
 
 **Status (7900, tip):** `AMD_FLASH_DIRECT=1` defaults `AMD_FLASH_ACC_SMALL=1`
-(python-unroll QK+PV WMMA + renderer auto-park ≤64 REG with ≥2 packs).
+(python-unroll QK+PV WMMA + renderer ≤64 ACC park when DIRECT/ACC_SMALL env is on).
 
 | Path | median µs | err | notes |
 |------|-----------|-----|-------|
@@ -14,7 +14,9 @@
 
 1. Kernel unrolls `(tm,tn)` / `(tm,td)` so each column has its own WMMA pack tag.
 2. `AMD_WMMA_REDEF_ACC` allows PACK/WMMA tag reuse across unrolled tiles.
-3. Renderer auto-parks ≤64 buffers with ≥2 reload packs (no process-wide env needed).
+3. Renderer parks ≤64 ACC buffers only when `AMD_FLASH_DIRECT` (ACC_SMALL default on)
+   or explicit `AMD_FLASH_ACC_SMALL` / `AMD_WMMA_ACC_SMALL`. No multi-pack auto-detect
+   (that bled into eye@B and forced PACK SPILL under REDEF).
 4. **Do not** set `AMD_WMMA_ACC_SMALL=1` globally — parks ≤64 quant tiles and breaks Q4/Q6.
 
 ## Remaining gap vs HIP

@@ -1130,16 +1130,18 @@ class TestAMDRenderer(unittest.TestCase):
     lut = UOp.placeholder((256,), dtypes.uint32, 3)
     prg = _to_prg(_iq4_linear_f16_wmma_kernel(out, raw, x, lut, rows, cols, direct_isa=True))
     names = _amd_inst_names(prg)
-    # One packed quant load plus four activation loads; the LUT and two-word header remain scalar.
-    self.assertEqual(names.count("GLOBAL_LOAD_B128"), 5)
-    self.assertEqual(names.count("GLOBAL_LOAD_B32"), 6)
+    # dequant_halves: one packed weight B128 + five activation B128 (shared LUT halves);
+    # header words stay scalar B32. LUT fill coalesces to one DS_STORE_B128.
+    self.assertEqual(names.count("GLOBAL_LOAD_B128"), 6)
+    self.assertEqual(names.count("GLOBAL_LOAD_B32"), 2)
     self.assertEqual(names.count("V_FMA_MIXHI_F16"), 16)
     self.assertNotIn("V_PACK_B32_F16", names)
-    # LUT install stays scalar; peer16/permlanex accumulator exchange no longer needs DS B128.
-    self.assertEqual(names.count("DS_STORE_B32"), 4)
-    self.assertNotIn("DS_STORE_B128", names)
+    self.assertEqual(names.count("DS_STORE_B128"), 1)
+    self.assertEqual(names.count("DS_STORE_B32"), 0)
     wide = [i for i,name in enumerate(names) if name == "GLOBAL_LOAD_B128"]
-    self.assertLessEqual(wide[-1] - wide[0], 8)  # activations issue while the packed quant load is in flight
+    # Weight B128 issues early; activation B128 cluster while that load is in flight.
+    self.assertLess(wide[0], wide[1])
+    self.assertLessEqual(wide[-1] - wide[1], 8)
     # mixhi without pack-dst coalesce may MOV packed words into WMMA lanes
     self.assertLessEqual(names.count("V_MOV_B32_E32"), 16)
     self.assertNotIn("SCRATCH_STORE_B32", names)
@@ -1154,7 +1156,7 @@ class TestAMDRenderer(unittest.TestCase):
     prg = _to_prg(_iq4_linear_f16_wmma_kernel(out, raw, x, lut, rows, cols, direct_isa=True))
     names = _amd_inst_names(prg)
     wide = [i for i,name in enumerate(names) if name == "GLOBAL_LOAD_B128"]
-    self.assertEqual(len(wide), 9)  # one packed weight plus eight activation reads
+    self.assertEqual(len(wide), 10)  # one packed weight plus nine activation reads (halves path)
     self.assertLess(wide[-1], names.index("V_FMA_MIXLO_F16"))
     self.assertIn("V_LSHLREV_B32_E32", names)
     self.assertIn("V_ADD_NC_U32_E32", names)
