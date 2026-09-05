@@ -107,7 +107,11 @@ class LinearScanRegallocContext:
           # reuse the already-allocated phys reg instead of asserting.
           if not isinstance(v, Register): raise AssertionError(f"expected Register tag {v}")
           if lr[v][0] != i:
-            if ren.is_two_address(u) and j == 0 and getenv("AMD_WMMA_REDEF_ACC", 1):
+            # Two-address WMMA/FMAC, or ACC reload PACK (EXTRACT×8 / zero init) that
+            # shares the parked pack tag across unrolled flash tiles.
+            is_acc_pack = (u.op is Ops.INS and isinstance(u.arg, tuple) and
+                           "PACK" in str(u.arg[0]) and not str(u.arg[0]).endswith("PACK_F16"))
+            if j == 0 and getenv("AMD_WMMA_REDEF_ACC", 1) and (ren.is_two_address(u) or is_acc_pack):
               if v in live:
                 self.reals.setdefault(i, {})[v] = live[v]
                 continue
