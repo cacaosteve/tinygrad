@@ -4195,6 +4195,13 @@ class AMDRenderer(ISARenderer):
     inits, tiles, idx_map, buf_tiles = _wmma_acc_zero_inits(lst)
     if not inits: return lst, {}
     loop_i = next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), 0)
+    init_tags = {u.tag for u in inits}
+    # Drop the in-loop reload PACKs that share tags with the pre-loop zero inits. Leaving both
+    # in the statement list double-defines the same Register tags (regalloc assert) — product-16
+    # avoids this because those packs are only reachable via WMMA.src and get rewritten away;
+    # flash ACC_SMALL unrolled tiles keep them as list items.
+    lst = [u for u in lst if not (u.op is Ops.INS and _iop(u) is AMDOps.PACK and u.tag in init_tags)]
+    loop_i = next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), 0)
     return lst[:loop_i] + inits + lst[loop_i:], {
       "wmma_acc_inits": {u.tag: u for u in inits},
       "wmma_acc_tiles": tiles,
