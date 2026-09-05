@@ -3332,6 +3332,17 @@ def _split_scale_and_loads(emitted:list) -> tuple[list, list]:
   while i > 0 and _vm_load_count([emitted[i - 1]]): i -= 1
   return emitted[:i], emitted[i:]
 
+def _vm_store_count(insts:list) -> int:
+  return sum(1 for i in insts if (n:=getattr(i, "op_name", "")) and
+             (n.startswith("GLOBAL_STORE") or n.startswith("SCRATCH_STORE") or
+              n.startswith("BUFFER_STORE") or n.startswith("FLAT_STORE")))
+
+def _split_scale_and_stores(emitted:list) -> tuple[list, list]:
+  """Split scratch/global store emit into addr/data ALU vs trailing VMEM stores."""
+  i = len(emitted)
+  while i > 0 and _vm_store_count([emitted[i - 1]]): i -= 1
+  return emitted[:i], emitted[i:]
+
 def _tmp_vaddr_clause_safe(scales:list, loads:list) -> bool:
   # Multi-slot loads scale into TMP_VADDR. Hoisting ≥2 such scales before TMP-addr loads
   # clobbers addr (load0 sees addr1). One scale + several loads is OK (half×16 B128 pair).
@@ -4008,6 +4019,32 @@ def insts_from_linear(lin:UOp):
       pending["vs"].add(-1)
       oi += count
       continue
+    # Burst SSTORE streak: hoist addr ALU, then s_clause + scratch_store* (soft/ACC spills).
+    if mask_depth == 0 and getenv("AMD_SCRATCH_SCLAUSE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SSTORE:
+      j = oi + 1
+      while j < len(scheduled) and scheduled[j] not in skip and scheduled[j].op is Ops.INS and \
+            _iop(scheduled[j]) is AMDOps.SSTORE and j - oi < getenv("AMD_SCRATCH_SCLAUSE_MAX", 32):
+        j += 1
+      if j - oi >= 2:
+        cache_snap = (store_addr_cache.key, store_addr_cache.page)
+        parts = [_emit_uop(scheduled[k], with_store_cache=True) for k in range(oi, j)]
+        if all(_vm_store_count(p) >= 1 for p in parts):
+          scales, stores = [], []
+          for p in parts:
+            sc, st = _split_scale_and_stores(p)
+            scales.extend(sc)
+            stores.extend(st)
+          if len(stores) >= 2 and _tmp_vaddr_clause_safe(scales, stores):
+            deps = set().union(*(_reg_idxs(scheduled[k].src[2]) for k in range(oi, j))) | \
+                   set().union(*(_reg_idxs(scheduled[k].src[1]) for k in range(oi, j)))
+            if deps and _pending_src(deps): flush_regs(deps)
+            for inst in scales: emit(inst)
+            emit(r3.s_clause(simm16=len(stores) - 1))
+            for inst in stores: emit(inst)
+            pending["vs"].add(-1)
+            oi = j
+            continue
+        store_addr_cache.key, store_addr_cache.page = cache_snap
     # Contiguous SLOAD×4 → scratch_load_b128 (soft/ACC epilogue reads).
     if mask_depth == 0 and (fused_sload:=_fused_scratch_contig_load(scheduled, oi, store_addr_cache)) is not None:
       count, emitted, deps = fused_sload
