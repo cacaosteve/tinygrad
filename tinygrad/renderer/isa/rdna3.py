@@ -325,6 +325,11 @@ def _mem_store(kind:int, dt:DType, n:int=1):
       if nbytes == 4: return (r3.global_store_b32, r3.scratch_store_b32, r3.ds_store_b32)[kind]
       if kind != 1 and nbytes in _WIDE_STORE: return _WIDE_STORE[nbytes][0 if kind == 0 else 1]
       return None
+    # Match wide loads: int/uint32×2/×3/×4 → b64/b96/b128 (IQ4 LUT LDS fill; HIP ds_store_b128).
+    if dt in (dtypes.int32, dtypes.uint32):
+      if kind == 1: return None  # no wide scratch int path yet
+      wide_ops = _WIDE_STORE.get(nbytes)
+      return None if wide_ops is None else wide_ops[0 if kind == 0 else 1]
     if dt is not dtypes.float32: return None
     wide_ops = _WIDE_STORE.get(nbytes)
     return None if wide_ops is None else wide_ops[0 if kind == 0 else 1]
@@ -3145,24 +3150,54 @@ def _schedule_fma_mixhi_pairs(uops:list[UOp]) -> list[UOp]:
   return out
 
 def _fused_lds_pack_store(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
-  """Fold four aliasing f32 EXTRACT+LSTORE pairs into one DS_STORE_B128."""
+  """Fold four aliasing EXTRACT+LSTORE pairs into one DS_STORE_B128 (f32 PACK or u32×4 LOAD)."""
   if i + 7 >= len(uops): return None
   extracts, stores = uops[i:i+8:2], uops[i+1:i+8:2]
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.EXTRACT for x in extracts): return None
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.LSTORE and x.src[2] is extracts[n] for n,x in enumerate(stores)): return None
   pack, lane0 = extracts[0].src[0], _const_int(extracts[0].src[1])
   off0 = _lds_byte_off(stores[0])
-  if (_iop(pack) is not AMDOps.PACK or pack.dtype is not dtypes.float32 or lane0 is None or lane0 % 4 or off0 % 16 or
-      _reg_slots(pack) < lane0 + 4 or not isinstance(greg(pack), Register)): return None
+  dt = stores[0].src[2].dtype
+  if dt not in (dtypes.float32, dtypes.uint32, dtypes.int32): return None
+  if lane0 is None or lane0 % 4 or off0 % 16 or not isinstance(greg(pack), Register) or _reg_slots(pack) < lane0 + 4:
+    return None
+  # f32 epilogue PACK, or quant LUT fill from packed global LOAD (u32×4).
+  if _iop(pack) is AMDOps.PACK:
+    if pack.dtype is not dtypes.float32: return None
+  elif _iop(pack) is AMDOps.LOAD:
+    if pack.dtype not in (dtypes.uint32, dtypes.int32, dtypes.float32) or _elem_count(pack) < lane0 + 4: return None
+  else: return None
   if not all(x.src[0] is pack and _const_int(x.src[1]) == lane0+n and isinstance(greg(x), Register) and
              greg(x).index == greg(pack).index+lane0+n for n,x in enumerate(extracts)): return None
   base, idx = stores[0].src[:2]
   if not all(x.src[0] is base and x.src[1] is idx and _lds_byte_off(x) == off0+4*n and
-             x.src[2].dtype is dtypes.float32 for n,x in enumerate(stores)): return None
-  pre, addr = _local_addr(base, idx, dtypes.float32.itemsize)
+             x.src[2].dtype is dt for n,x in enumerate(stores)): return None
+  pre, addr = _local_addr(base, idx, dt.itemsize)
   data = _reg_chunk(greg(pack), lane0, 4)
   deps = _reg_idxs(pack) | _reg_idxs(idx)
   return 8, pre + [r3.ds_store_b128(addr=addr, data0=data, **_ds_off(off0))], deps
+
+def _fused_lds_contig_store(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
+  """Fold four contiguous scalar LSTORE (offs +0..+12, consecutive data VGPRs) into DS_STORE_B128.
+
+  IQ4 LUT fill schedules EXTRACT×4 then LSTORE×4 (not interleaved), so pack-store fold misses.
+  """
+  if i + 3 >= len(uops): return None
+  stores = uops[i:i+4]
+  if not all(x.op is Ops.INS and _iop(x) is AMDOps.LSTORE for x in stores): return None
+  dt = stores[0].src[2].dtype
+  if dt not in (dtypes.float32, dtypes.uint32, dtypes.int32): return None
+  if not all(x.src[2].dtype is dt and _elem_count(x.src[2]) == 1 and isinstance(greg(x.src[2]), Register)
+             for x in stores): return None
+  r0 = greg(stores[0].src[2])
+  if not all(greg(x.src[2]).index == r0.index + n for n, x in enumerate(stores)): return None
+  base, idx, off0 = stores[0].src[0], stores[0].src[1], _lds_byte_off(stores[0])
+  if off0 % 16: return None
+  if not all(x.src[0] is base and x.src[1] is idx and _lds_byte_off(x) == off0 + 4 * n for n, x in enumerate(stores)):
+    return None
+  pre, addr = _local_addr(base, idx, dt.itemsize)
+  deps = set().union(*(_reg_idxs(x.src[2]) for x in stores)) | _reg_idxs(idx)
+  return 4, pre + [r3.ds_store_b128(addr=addr, data0=_reg_chunk(r0, 0, 4), **_ds_off(off0))], deps
 
 def _fused_lds_pack_load(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
   """Fold four contiguous f32 LLOAD (same base, offs +0..+12) into one DS_LOAD_B128."""
@@ -3465,6 +3500,15 @@ def insts_from_linear(lin:UOp):
     # aliasing EXTRACT+LSTORE pairs. Rejoin only exact four-f32 groups after regalloc.
     if mask_depth == 0 and (fused_store:=_fused_lds_pack_store(scheduled, oi)) is not None:
       count, emitted, deps = fused_store
+      if deps and _pending_src(deps): flush_regs(deps)
+      store_addr_cache.clear()
+      for inst in emitted: emit(inst)
+      pending["lgkm"].add(-1)
+      oi += count
+      continue
+    # Contiguous LSTORE×4 (IQ4 LUT: EXTRACT×4 then stores) → ds_store_b128.
+    if mask_depth == 0 and (fused_cstore:=_fused_lds_contig_store(scheduled, oi)) is not None:
+      count, emitted, deps = fused_cstore
       if deps and _pending_src(deps): flush_regs(deps)
       store_addr_cache.clear()
       for inst in emitted: emit(inst)
@@ -4042,10 +4086,13 @@ class AMDRenderer(ISARenderer):
         if src_phys[1] in x.tag[0].cons: return src_phys[1]
     # EXTRACT from a multi-VGPR value → alias onto its source lane. Besides WMMA
     # float stores, packed quantized byte loads use uint32 lanes exactly once.
+    # Also IQ4 LUT fill: u32×4 nontemporal LOAD → LSTORE (needs alias for ds_store_b128 fold).
     if x.op is not Ops.INS or _iop(x) is not AMDOps.EXTRACT: return None
     packed_bytes = x.dtype is dtypes.uint32 and x.src and x.src[0].op is Ops.INS and _iop(x.src[0]) is AMDOps.LOAD and \
       _reg_slots(x.src[0]) == 4 and _is_byte_addr_load(x.src[0])
-    if x.dtype is not dtypes.float32 and not packed_bytes: return None
+    packed_u32 = x.dtype in (dtypes.uint32, dtypes.int32) and x.src and x.src[0].op is Ops.INS and \
+      _iop(x.src[0]) is AMDOps.LOAD and _reg_slots(x.src[0]) >= 4
+    if x.dtype is not dtypes.float32 and not packed_bytes and not packed_u32: return None
     if not src_phys or src_phys[0] is None or not isinstance(x.tag, tuple): return None
     if (lane := _const_int(x.src[1])) is None: return None
     want = src_phys[0].index + int(lane)

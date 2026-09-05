@@ -455,7 +455,16 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
   output_waves, _, _, lane, wave, _, _, _, _ = layout
   local_lut = UOp.placeholder((256,), dtypes.uint32, slot=32, addrspace=AddrSpace.LOCAL)
   tid, lut_items = wave*32+lane, 256//(32*output_waves)
-  lut = local_lut.after(UOp.group(*(local_lut[tid*lut_items+i].store(lut[tid*lut_items+i]) for i in range(lut_items))).barrier())
+  # Packed global→LDS fill (HIP ds_store_b128): load u32×4 then scalar stores; emit folds to B128.
+  if direct_isa and lut_items >= 4 and lut_items % 4 == 0:
+    stores = []
+    for i in range(0, lut_items, 4):
+      packed = _amd_load(lut[tid*lut_items+i], 4, packed_u32=True)
+      stores.extend(local_lut[tid*lut_items+i+j].store(packed[j]) for j in range(4))
+    lut_fill = UOp.group(*stores)
+  else:
+    lut_fill = UOp.group(*(local_lut[tid*lut_items+i].store(lut[tid*lut_items+i]) for i in range(lut_items)))
+  lut = local_lut.after(lut_fill.barrier())
   def dequant(base:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
     d, scale = _iq4_scales(raw, base, subgroup)
     scale = scale * d
