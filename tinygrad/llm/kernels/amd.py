@@ -872,13 +872,25 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   pv_barrier = UOp.barrier(UOp.group(P_store, V_store))
   P_lds, V_lds = P_lds.after(pv_barrier), V_lds.after(pv_barrier)
   pv_acc = _reg((TM, TD), 10, 0, n_tile).after(pv_barrier)
-  # Keep PV ranged (scratch ACC reload). Unrolling PV parks 4 more ACC packs and
-  # pushes VGPR→spill (~189 vgpr / 21 spills); QK-only ACC_SMALL is the win path.
-  k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
-  pv_frag = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[tm2, tn2]
-  p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, tm2, lane_n, k_pv]
-  v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2, lane_n, k_pv]
-  pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
+  k_pv = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE)
+  pv_view = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)
+  P_view = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)
+  V_view = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)
+  if _acc_small:
+    pv_stores = []
+    for td_i in range(TD):
+      for tm_i in range(TM // WMMA_ACC):
+        pv_frag = pv_view[tm_i, td_i]
+        p_frag = P_view[wave_m, tm_i, lane_n, k_pv]
+        v_frag = V_view[wave_n, td_i, lane_n, k_pv]
+        pv_stores.append(pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)))
+    pv_done = UOp.group(*pv_stores).end(k_pv)
+  else:
+    tm2, tn2 = UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
+    pv_frag = pv_view[tm2, tn2]
+    p_frag = P_view[wave_m, tm2, lane_n, k_pv]
+    v_frag = V_view[wave_n, tn2, lane_n, k_pv]
+    pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
   pv_acc = pv_acc.after(pv_done)
   if _acc_sep:
     # Fully overwritten before read — skip REG zero-fill (same as S_soft).
