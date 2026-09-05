@@ -732,15 +732,16 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   if _acc_sep: _fu |= 6  # soft/corr need const REG indices on the working buffer
   if _acc_small:
     # Unroll QK WMMA over (tm1, tn1) so ACC_SMALL parks TN packs for S_reg.
+    # One shared K range; tile WMMAs are separate ops with distinct ACC inits.
+    k_qk = UOp.range(D // WMMA_K, 101, AxisType.REDUCE)
     qk_stores = []
     for tm1_i in range(TM // WMMA_ACC):
       for tn1_i in range(TN):
-        k_qk = UOp.range(D // WMMA_K, 101 + tm1_i * TN + tn1_i, AxisType.REDUCE)
         S_frag = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[tm1_i, tn1_i]
         q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1_i, lane_n, k_qk]
         k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1_i, lane_n, k_qk]
-        qk_stores.append(S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(k_qk))
-    qk_done = UOp.group(*qk_stores)
+        qk_stores.append(S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)))
+    qk_done = UOp.group(*qk_stores).end(k_qk)
   else:
     k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
     S_frag = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[tm1, tn1]
@@ -828,15 +829,15 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   P_lds, V_lds = P_lds.after(pv_barrier), V_lds.after(pv_barrier)
   pv_acc = _reg((TM, TD), 10, 0, n_tile).after(pv_barrier)
   if _acc_small:
+    k_pv = UOp.range(BLOCK_N // WMMA_K, 400, AxisType.REDUCE)
     pv_stores = []
     for tm2_i in range(TM // WMMA_ACC):
       for tn2_i in range(TD):
-        k_pv = UOp.range(BLOCK_N // WMMA_K, 400 + tm2_i * TD + tn2_i, AxisType.REDUCE)
         pv_frag = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[tm2_i, tn2_i]
         p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, tm2_i, lane_n, k_pv]
         v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2_i, lane_n, k_pv]
-        pv_stores.append(pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(k_pv))
-    pv_done = UOp.group(*pv_stores)
+        pv_stores.append(pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)))
+    pv_done = UOp.group(*pv_stores).end(k_pv)
   else:
     k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
     pv_frag = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[tm2, tn2]
