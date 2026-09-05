@@ -3319,7 +3319,11 @@ def _fused_scratch_contig_store(uops:list[UOp], i:int, store_addr_cache:_StoreAd
   return 4, pre + [r3.scratch_store_b128(addr=addr, data=_reg_chunk(r0, 0, 4), offset=byte_off, sve=1)], deps
 
 def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAddrCache|None=None) -> tuple[int, list, set[int]]|None:
-  """Fold four contiguous scalar SLOAD (offs +0..+12, consecutive dest VGPRs) into SCRATCH_LOAD_B128."""
+  """Fold four contiguous scalar SLOAD (offs +0..+12, consecutive dest VGPRs) into SCRATCH_LOAD_B128.
+
+  Accepts either shared idx + byte_off 0/4/8/12, or consecutive const element indices
+  (flash soft-copy SLOAD(base, i)..SLOAD(base, i+3)).
+  """
   if i + 3 >= len(uops): return None
   loads = uops[i:i+4]
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.SLOAD for x in loads): return None
@@ -3328,12 +3332,24 @@ def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAdd
   if not all(x.dtype is dt and _elem_count(x) == 1 and isinstance(greg(x), Register) for x in loads): return None
   r0 = greg(loads[0])
   if not all(greg(x).index == r0.index + n for n, x in enumerate(loads)): return None
-  base, idx, off0 = loads[0].src[0], loads[0].src[1], _lds_byte_off(loads[0])
-  if off0 % 16 or off0 + 12 > 0xfff: return None
-  if not all(x.src[0] is base and x.src[1] is idx and _lds_byte_off(x) == off0 + 4 * n for n, x in enumerate(loads)):
+  base = loads[0].src[0]
+  if not all(x.src[0] is base for x in loads): return None
+  offs = [_lds_byte_off(x) for x in loads]
+  idxs = [_const_int(x.src[1]) for x in loads]
+  byte_off = 0
+  idx = loads[0].src[1]
+  if all(x.src[1] is idx for x in loads) and offs[0] % 16 == 0 and \
+     all(offs[n] == offs[0] + 4 * n for n in range(4)) and offs[0] + 12 <= 0xfff:
+    byte_off = offs[0]
+  elif (all(i is not None for i in idxs) and all(o == 0 for o in offs) and
+        idxs[0] % 4 == 0 and all(idxs[n] == idxs[0] + n for n in range(4)) and
+        (idxs[0] + 3) * dt.itemsize <= 0xfff):  # type: ignore[operator]
+    # Const element indices → encode as byte offset from a zero index.
+    byte_off = int(idxs[0]) * dt.itemsize  # type: ignore[arg-type]
+    idx = _tconst(0, dtypes.int32).rtag()
+  else:
     return None
   soff = _scratch_base_offset(base)
-  byte_off = off0
   if store_addr_cache is not None:
     pre, addr, byte_off = store_addr_cache.addr(idx, dt.itemsize, byte_off, base_key=id(base))
     if pre and soff: pre = pre + [r3.v_add_nc_u32_e64(addr, soff, addr)]
@@ -3341,7 +3357,7 @@ def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAdd
     pre, addr = _scaled_addr(TMP_VADDR, idx, dt.itemsize)
     if soff: pre = pre + [r3.v_add_nc_u32_e64(TMP_VADDR, soff, addr)]
     addr = TMP_VADDR
-  deps = _reg_idxs(idx)
+  deps = set().union(*(_reg_idxs(x.src[1]) for x in loads))
   return 4, pre + [r3.scratch_load_b128(addr=addr, vdst=_reg_chunk(r0, 0, 4), offset=byte_off, sve=1)], deps
 
 def _fused_lds_pack_load(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
