@@ -561,6 +561,9 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[
   uses: dict[UOp, list[UOp]] = {}
   for u in uops:
     for s in u.src: uses.setdefault(s, []).append(u)
+  # Optional: only fold when the f32 sibling is EXP2-derived (softmax@V). Avoids SDPA
+  # correctness hits when AMD_FMA_MIX=1 with larger cast caps.
+  exp_only = bool(getenv("AMD_FMA_MIX_EXP", 0))
   folds: dict[UOp, tuple[UOp, UOp]] = {}
   skip: set[UOp] = set()
   for cast, consumers in uses.items():
@@ -577,6 +580,8 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[
       f32 = u.src[f32_i]
       # Skip QK-style half×half; both casts would still need a cvt or a second mix.
       if not allow_hh and _is_f16_to_f32_cast(f32):
+        ok = False; break
+      if exp_only and not (f32.op is Ops.INS and _iop(f32) is AMDOps.EXP2):
         ok = False; break
       folds[u] = (hbase, f32)
     if ok: skip.add(cast)
