@@ -22,6 +22,8 @@
 - HIP fully unrolls more WMMA (24 vs 6) and keeps 0 scratch.
 - Direct still spills (~21) under ACC VGPR pressure (`WMMA_ACC_VGPR` from v121).
 - QK-only unroll regresses (~833µs); keep full QK+PV unroll.
+- `AMD_FLASH_K_UNROLL=1` (chained K) currently fails emit (`v_pack_b32_f16` src0 sz=2);
+  left opt-in for later, not default.
 
 ## Toggles
 
