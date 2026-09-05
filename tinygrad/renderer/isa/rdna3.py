@@ -3162,10 +3162,10 @@ def _gap_fill_after_loads(ops:list[UOp]) -> list[UOp]:
 
   Flash tip still does scratch_load; waitcnt_vmcnt(0) with nothing in between (~109×).
   """
-  if not getenv("AMD_LOAD_GAP_FILL", 1): return ops
+  if not getenv("AMD_LOAD_GAP_FILL", 0): return ops
   load_ops = (AMDOps.SLOAD, AMDOps.LOAD)
   alu = (AMDOps.FMAC, AMDOps.MUL, AMDOps.ADD, AMDOps.MAX, AMDOps.MOV, AMDOps.MULACC,
-         AMDOps.EXP2, AMDOps.WHERE, AMDOps.CVT_F32_F16, AMDOps.CVT_F16_F32)
+         AMDOps.EXP2, AMDOps.WHERE, AMDOps.CAST)
   max_scan = getenv("AMD_LOAD_GAP_SCAN", 16)
   max_gap = getenv("AMD_LOAD_GAP_N", 4)
   taken: set[int] = set()
@@ -3180,7 +3180,8 @@ def _gap_fill_after_loads(ops:list[UOp]) -> list[UOp]:
       use_j: int|None = None
       for j in range(i + 1, min(i + 1 + max_scan, len(ops))):
         if j in taken: continue
-        if u in ops[j].src or any(u is s for s in ops[j].toposort()):
+        # Direct src use only — full toposort here is O(n²) and too heavy.
+        if u in ops[j].src:
           use_j = j
           break
       if use_j is not None and use_j == i + 1:
@@ -3194,8 +3195,7 @@ def _gap_fill_after_loads(ops:list[UOp]) -> list[UOp]:
           cand = ops[k]
           if cand.op is Ops.INS and _iop(cand) in alu and \
              not any(s in blocked for s in cand.src) and \
-             u not in cand.toposort() and ops[use_j] not in cand.toposort() and \
-             not any(cand in ops[m].toposort() for m in range(use_j + 1, k)):
+             u not in cand.src and ops[use_j] not in cand.src:
             gap.append(k)
             blocked.add(cand)
             k += 1
