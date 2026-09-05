@@ -1,54 +1,42 @@
-# Overnight RDNA3 (to ~5AM PT) — tip `13daf34d9`
+# Overnight RDNA3 — tip `b85508fcf`
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
 
-## Headline win this stretch
+## Headline
 
-**Flash DIRECT ACC_SMALL is correct and default-on for DIRECT:** ~**669µs** (was ~1030µs scratch ACC).
-Still ~2.5× HIP flash (~266µs). SDPA default remains ~307µs (faster than DIRECT).
+**Flash DIRECT ACC_SMALL** ~**700–710µs** (correct, err~1e-4). HIP ~278; SDPA ~360 (still faster default).
 
-How: python-unroll QK+PV WMMA columns + `AMD_WMMA_REDEF_ACC` (incl. PACK redef) +
-renderer ≤64 ACC park scoped to flash realize (`AMD_FLASH_ACC_SMALL` set only then).
-**Never** park from `AMD_FLASH_DIRECT` alone (breaks peer GEMM/eye) or auto-detect ≤64
-multi-packs (PACK SPILL). **Never** set `AMD_WMMA_ACC_SMALL=1` globally (breaks quant).
+Parking is scoped: `flash_attention` realizes under `AMD_FLASH_ACC_SMALL=1` then clears it.
+Do **not** park from `AMD_FLASH_DIRECT` alone (broke peer GEMM/eye) or auto-detect ≤64 multi-packs.
 
-See `extra/rdna3_flash_acc_small.md`.
+See `extra/rdna3_flash_acc_small.md` for scratch attribution.
 
-## Scorecard (7900)
+## Scorecard (7900, this session)
 
 | Workload | AMD | HIP |
 |----------|-----|-----|
-| Flash DIRECT | ~669 | ~266 |
-| SDPA (no DIRECT) | ~307 | (HIP uses flash) |
-| Decode e2e | ~49.5 | ~54 |
-| Decode partial | ~34 | ~29 |
-| Q5_K t32 | ~61 | ~61 |
-| Q6_K t32 | ~65 | ~64 |
-| IQ4_XS t32 | ~65 | ~60 (vgpr 118 vs 95) |
+| Flash DIRECT ACC_SMALL | ~705 | ~278 |
+| Flash DIRECT ACC_SMALL=0 | ~1315 | |
+| SDPA (no DIRECT) | ~360 | (HIP uses flash) |
+| Serial correctness | 13/13 OK | flash/GQA/eye/post-flash GEMM |
 
-## Tried / leave off
+## Cleanup landed
 
-- K_UNROLL=1 MMU fault; =2 nan; =4 wrong — leave 0
-- QK-only ACC unroll ~833µs — worse
-- PV ACC direct (skip soft) ~810µs — worse; soft copy stays
-- REMAT_ADDR=1 — no spill change on flash
-- Decode score_batch/delay/gap — flat vs tip
+1. Removed ≤64 multi-pack auto-park (eye PACK SPILL under REDEF).
+2. Scoped ACC_SMALL env to flash realize only (`b85508fcf`).
+3. Local `test_amd_renderer` + `test_llm_amd`: 210 passed.
+4. `extra/rdna3_serial_correctness.py` on 7900.
 
-## Also landed
-- IQ4 `dequant_halves`: share LUT pairs across halves (vgpr 102 @t16; t32 still 118/~65 vs HIP ~60)
+## Scratch attribution (ACC_SMALL)
 
-## Also landed
-- `AMD_PACK_F16_GENERAL=1`: IQ4 vgpr 118→110; Q6 sometimes ahead of HIP; **breaks FLASH_DIRECT** (nan). Leave opt-in.
-- Scalar LSTORE fix for multi-slot phys (enables experimenting with general PACK pool).
+- 21 allocator SPILL (VGPR pressure from ACC)
+- 128/128 SLOAD/SSTORE soft-copy (dominant private traffic)
+- priv 212 B; machine scratch ~137 st / 102 ld
+- ACC_SMALL=0: more soft-copy (192) + priv 384 → slower despite fewer spills
 
 ## Next leftovers
 
-1. Flash 669→266: cut 21 spills / 128 SLOAD-SSTORE; more correct static WMMA without MMU fault
-2. IQ4 vgpr 118→95 (~5µs)
+1. Structural: cut soft-copy or ACC pressure (not new knobs) — toward HIP ~278
+2. IQ4 vgpr 118→95
 3. Decode partial 34→29
-4. SDPA 307→~267 only if safe VOPD (bank pairing)
-
-
-## Session end
-
-Gaming PC unreachable ~4:48 PT (network down / powered off). Loop stopped.
+4. Stronger quant correctness than random ggml bytes (use packed-from-float)
