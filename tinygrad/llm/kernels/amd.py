@@ -174,7 +174,9 @@ def _amd_load(ptr:UOp, lanes:int|None=None, packed_u32:bool=False) -> UOp:
   return shrink.load()
 
 def _load_byte(raw:UOp, base:UOp, offset:UOp) -> UOp: return (raw[base + offset//4] >> ((offset&3)*8).cast(dtypes.uint32)) & 255
-def _half(value:UOp) -> UOp: return value.cast(dtypes.uint16).bitcast(dtypes.float16).float()
+def _half(value:UOp) -> UOp:
+  if value.dtype is not dtypes.uint16: value = value.cast(dtypes.uint16)
+  return value.bitcast(dtypes.float16).float()
 
 def _iq4_bytes(packed:UOp, shift:int) -> UOp:
   # the non-linear iq4nl table as a byte lookup: 3 byte_perms beat any arithmetic/select-tree form (~60% decode)

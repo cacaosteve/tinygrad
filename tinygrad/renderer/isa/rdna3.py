@@ -602,6 +602,17 @@ def _const_int(x:UOp) -> int|None:
     except (OverflowError, ValueError): return None
   return None
 
+def _u32_high_bits_clear(src:UOp, bits:int) -> bool:
+  """True when src is already in [0, 2^bits) so a narrowing AND is a no-op (Q5 scale f16 extract)."""
+  mask = (1 << bits) - 1
+  if src.op is not Ops.INS: return False
+  if _iop(src) is AMDOps.AND:
+    for a, b in ((src.src[0], src.src[1]), (src.src[1], src.src[0])):
+      if (m := _const_int(b)) is not None and m == mask: return True
+  if _iop(src) is AMDOps.SHR:
+    if (sh := _const_int(src.src[1])) is not None and sh >= 32 - bits: return True
+  return False
+
 def _is_wmma_acc_reload_pack(cin:UOp, ctx:PreRegAllocContext|None=None) -> bool:
   if cin.op is not Ops.INS or _iop(cin) is not AMDOps.PACK or len(cin.src) != 8: return False
   if all(s.op is Ops.INS and _iop(s) is AMDOps.SLOAD for s in cin.src): return True
@@ -2032,7 +2043,14 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if u.dtype in dtypes.ints and u.src[0].dtype in dtypes.ints:
         if u.dtype.itemsize > 4 or u.src[0].dtype.itemsize > 4: raise CompileError(f"no cast {u.src[0].dtype} -> {u.dtype}")
         narrow = u.src[0].dtype if u.src[0].dtype.itemsize <= u.dtype.itemsize else u.dtype
-        if narrow in dtypes.uints: return pre + [r3.v_and_b32_e32(_dst(u), (1 << (narrow.itemsize * 8)) - 1, cast_src)]
+        if narrow in dtypes.uints:
+          bits = narrow.itemsize * 8
+          # (x & 0xffff).cast(u16) / (x >> 16).cast(u16): mask already applied — skip AND (HIP).
+          if _u32_high_bits_clear(u.src[0], bits):
+            if isinstance(greg(u), Register) and isinstance(greg(u.src[0]), Register) and \
+               greg(u).index == greg(u.src[0]).index: return pre
+            return pre + [r3.v_mov_b32_e32(_dst(u), cast_src)]
+          return pre + [r3.v_and_b32_e32(_dst(u), (1 << bits) - 1, cast_src)]
         return pre + [r3.v_bfe_i32(_dst(u), cast_src, 0, narrow.itemsize * 8)]
       if u.dtype is dtypes.float32 and u.src[0].dtype is dtypes.float16:
         return pre + [r3.v_cvt_f32_f16_e32(_dst(u), cast_src)]
@@ -4084,6 +4102,12 @@ class AMDRenderer(ISARenderer):
     if x.op is Ops.INS and _iop(x) is AMDOps.WHERE and getenv("AMD_WHERE_ALIAS", 0):
       if len(src_phys) > 1 and src_phys[1] is not None and isinstance(x.tag, tuple):
         if src_phys[1] in x.tag[0].cons: return src_phys[1]
+    # Redundant u32→u16 CAST after &0xffff / >>16: alias onto src (no mov).
+    if x.op is Ops.INS and _iop(x) is AMDOps.CAST and x.dtype in dtypes.uints and x.src and \
+       x.src[0].dtype in dtypes.uints and x.dtype.itemsize < x.src[0].dtype.itemsize and \
+       _u32_high_bits_clear(x.src[0], x.dtype.itemsize * 8):
+      if src_phys and src_phys[0] is not None and isinstance(x.tag, tuple) and src_phys[0] in x.tag[0].cons:
+        return src_phys[0]
     # EXTRACT from a multi-VGPR value → alias onto its source lane. Besides WMMA
     # float stores, packed quantized byte loads use uint32 lanes exactly once.
     # Also IQ4 LUT fill: u32×4 nontemporal LOAD → LSTORE (needs alias for ds_store_b128 fold).
