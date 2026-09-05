@@ -584,7 +584,7 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   # Batch keys into one warp_reduce_many so swizzle/permlane stages share lgkm waits.
   # Default 8 = full SEC at waves=8 (one reduce for the wave's keys). Smaller batches
   # were for VGPR headroom; measured same vgpr with better wait sharing at 8.
-  score_batch = getenv("AMD_FLASH_SCORE_BATCH", 8)
+  score_batch = getenv("AMD_FLASH_SCORE_BATCH", 16)
   for j0 in range(0, SEC, score_batch):
     js = range(j0, min(j0 + score_batch, SEC))
     dots: list[UOp] = []
