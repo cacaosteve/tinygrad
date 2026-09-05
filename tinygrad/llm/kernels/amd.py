@@ -887,26 +887,17 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     .reshape(THREADS_PER_BLOCK, TM, TN)
   P_store = P_write[tid].store(S_reg.cast(dtypes.half))
   beta_i = UOp.placeholder((TM,), dtypes.float, slot=9, addrspace=AddrSpace.REG)
-  # Defer acc*=alpha into the pv add (acc = alpha*acc + beta*pv) to cut one slot-2
-  # scratch round-trip. alpha_i holds the scale across the V/PV barrier.
-  _fuse_acc = bool((_fu & 4) and getenv("AMD_FLASH_FUSE_ACC", 1))
-  alpha_i = UOp.placeholder((TM,), dtypes.float, slot=18, addrspace=AddrSpace.REG) if _fuse_acc else None
   if _fu & 4:
     acc_c, l_c, m_c = acc.after(n_tile), l_i.after(n_tile), m_i.after(n_tile)
     corr = []
     for ri in range(TM):
       m_new = m_c[ri].maximum(m_ij[ri])
       alpha_val, beta_val = ((m_c[ri] - m_new) * LOG2E).exp2(), ((m_ij[ri] - m_new) * LOG2E).exp2()
-      if _fuse_acc:
-        corr.append(UOp.group(l_c[ri].store(alpha_val * l_c[ri] + beta_val * p_sum[ri]),
-                              m_c[ri].store(m_new), alpha_i[ri].store(alpha_val), beta_i[ri].store(beta_val)))
-      else:
-        corr.append(UOp.group(*[acc_c[ri, rj].store(alpha_val * acc_c[ri, rj]) for rj in range(TD)],
-                             l_c[ri].store(alpha_val * l_c[ri] + beta_val * p_sum[ri]),
-                             m_c[ri].store(m_new), beta_i[ri].store(beta_val)))
+      corr.append(UOp.group(*[acc_c[ri, rj].store(alpha_val * acc_c[ri, rj]) for rj in range(TD)],
+                           l_c[ri].store(alpha_val * l_c[ri] + beta_val * p_sum[ri]),
+                           m_c[ri].store(m_new), beta_i[ri].store(beta_val)))
     correction = UOp.group(*corr)
     acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
-    if _fuse_acc: alpha_i = alpha_i.after(correction)
   else:
     ri4, rj4 = UOp.range(TM, 330), UOp.range(TD, 331)
     m_new = m_i[ri4].maximum(m_ij[ri4])
@@ -981,14 +972,11 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
   ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
   if _fu & 4 and getenv("AMD_FLASH_ACC_UNROLL", 1):
-    # Const-index acc update. Slot 2 stays unpromoted (REDUCE-carried); soft/stats promote.
+    # Const-index acc+= (better addressing). Slots 2/3/4 stay unpromoted via
+    # AMD_REG_PROMOTE_SKIP_SLOTS so REDUCE-carried values remain correct.
     acc_c = acc.after(n_tile)
-    if _fuse_acc:
-      acc_up = UOp.group(*[acc_c[ri, rj].store(alpha_i[ri] * acc_c[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
-                           for ri in range(TM) for rj in range(TD)])
-    else:
-      acc_up = UOp.group(*[acc_c[ri, rj].store(acc_c[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
-                           for ri in range(TM) for rj in range(TD)])
+    acc_up = UOp.group(*[acc_c[ri, rj].store(acc_c[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
+                         for ri in range(TM) for rj in range(TD)])
     n_tile_end = acc_up.barrier().end(n_tile)
   else:
     n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
