@@ -734,14 +734,31 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # AMD_FLASH_ACC_SEP: keep WMMA C in ACC; copy out to a const-indexed soft buffer before softmax.
   # Default on: after soft vscnt + scratch addr CSE this is faster (~2.1ms vs ~2.7ms prefill).
   _acc_sep = bool(getenv("AMD_FLASH_ACC_SEP", 1))
+  # Opt-in: park one ACC pack per (tm,tn) via python-unrolled WMMA so columns do not
+  # clobber (ranged tn parks a single pack). Needs AMD_WMMA_ACC_SMALL + REDEF_ACC.
+  _acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0))
   _fu = getenv("AMD_FLASH_UNROLL", 0)
   if _fu == 1: _fu = 6
   if _acc_sep: _fu |= 6  # soft/corr need const REG indices on the working buffer
-  k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
-  S_frag = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[tm1, tn1]
-  q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1, lane_n, k_qk]
-  k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1, lane_n, k_qk]
-  qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk)
+  k_qk = UOp.range(D//WMMA_K, 101, AxisType.REDUCE)
+  S_view = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)
+  Q_view = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)
+  K_view = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)
+  if _acc_small:
+    qk_stores = []
+    for tn_i in range(TN):
+      for tm_i in range(TM // WMMA_ACC):
+        S_frag = S_view[tm_i, tn_i]
+        q_frag = Q_view[wave_m, tm_i, lane_n, k_qk]
+        k_frag = K_view[tn_i, lane_n, k_qk]
+        qk_stores.append(S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)))
+    qk_done = UOp.group(*qk_stores).end(k_qk)
+  else:
+    tm1, tn1 = UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
+    S_frag = S_view[tm1, tn1]
+    q_frag = Q_view[wave_m, tm1, lane_n, k_qk]
+    k_frag = K_view[tn1, lane_n, k_qk]
+    qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk)
   # Scale+mask: default on WMMA/scratch buffer first. Predicated where-stores into a
   # REG-promoted const-index soft buffer were dropped (broke masked SDPA).
   # AMD_FLASH_SOFT_SCALE=1: copy raw WMMA→soft first, then scale+mask on soft (VGPR).
@@ -854,11 +871,25 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   pv_barrier = UOp.barrier(UOp.group(P_store, V_store))
   P_lds, V_lds = P_lds.after(pv_barrier), V_lds.after(pv_barrier)
   pv_acc = _reg((TM, TD), 10, 0, n_tile).after(pv_barrier)
-  k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
-  pv_frag = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[tm2, tn2]
-  p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, tm2, lane_n, k_pv]
-  v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2, lane_n, k_pv]
-  pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
+  k_pv = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE)
+  pv_view = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)
+  P_view = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)
+  V_view = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)
+  if _acc_small:
+    pv_stores = []
+    for td_i in range(TD):
+      for tm_i in range(TM // WMMA_ACC):
+        pv_frag = pv_view[tm_i, td_i]
+        p_frag = P_view[wave_m, tm_i, lane_n, k_pv]
+        v_frag = V_view[wave_n, td_i, lane_n, k_pv]
+        pv_stores.append(pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)))
+    pv_done = UOp.group(*pv_stores).end(k_pv)
+  else:
+    tm2, tn2 = UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
+    pv_frag = pv_view[tm2, tn2]
+    p_frag = P_view[wave_m, tm2, lane_n, k_pv]
+    v_frag = V_view[wave_n, tn2, lane_n, k_pv]
+    pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
   pv_acc = pv_acc.after(pv_done)
   if _acc_sep:
     # Fully overwritten before read — skip REG zero-fill (same as S_soft).
@@ -898,12 +929,10 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
     return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   # AMD_FLASH_ACC_SEP defaults on (faster than in-place soft REG after scratch CSE).
-  # AMD_WMMA_ACC_SMALL still gated off (HIP same source ~284µs / 24 WMMA / 0 scratch):
-  #  - Ranged (tm,tn) parks one ACC pack; later columns clobber → err~1.5 at ~730µs.
-  #  - Unroll / multi-WMMA / in-range soft copy: LinearScanRegalloc double-def on PACK tags.
-  #  - Scale on ACC needs ACC→soft before scale/mask (err=inf otherwise).
-  # Infrastructure kept: wmma_acc_buf_tiles + ACC-lane SSTORE writeback helpers in rdna3.py.
-  # Scratch b128: const-idx SLOAD/SSTORE fusion + 4-wide vec emit (flash ~2171→2074 insn).
+  # AMD_WMMA_ACC_SMALL still gated off: ranged (tm,tn) parks one ACC pack → column clobber.
+  # Opt-in path python-unrolls QK/PV WMMA for unique packs per column (AMD_WMMA_REDEF_ACC).
+  # Still validate correctness before defaulting; tip stays scratch ACC (~1.03ms).
+  # Infrastructure: wmma_acc_buf_tiles + ACC-lane SSTORE writeback helpers in rdna3.py.
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]
