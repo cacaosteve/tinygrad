@@ -811,7 +811,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
   pv_acc = pv_acc.after(pv_done)
   if _acc_sep:
-    pv_soft = _reg((TM, TD), 17, 0)
+    # Fully overwritten before read — skip REG zero-fill (same as S_soft).
+    pv_soft = UOp.placeholder((TM, TD), dtypes.float, slot=17, addrspace=AddrSpace.REG)
     pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
   ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
   n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
