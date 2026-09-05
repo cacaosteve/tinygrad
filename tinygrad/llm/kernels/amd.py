@@ -751,7 +751,12 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     # Copy post-mask scores into a const-index soft buffer (REG-promotable) for softmax.
     # Skip zero-init: every slot is overwritten by the copy before any read.
     S_soft = UOp.placeholder((TM, TN), dtypes.float, slot=16, addrspace=AddrSpace.REG)
-    S_reg = S_soft.after(UOp.group(*[S_soft[ri, rj].store(S_masked[ri, rj]) for ri in range(TM) for rj in range(TN)]))
+    if getenv("AMD_FLASH_VEC_COPY", 1) and (TM * TN) % 4 == 0:
+      # float4 shrink copies → vec SLOAD/SSTORE → scratch_*_b128 on the S_reg side.
+      src, dst = S_masked.reshape(TM * TN), S_soft.reshape(TM * TN)
+      S_reg = S_soft.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TN, 4)]))
+    else:
+      S_reg = S_soft.after(UOp.group(*[S_soft[ri, rj].store(S_masked[ri, rj]) for ri in range(TM) for rj in range(TN)]))
   else:
     S_reg = S_masked
   if _fu & 2:
@@ -813,7 +818,11 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   if _acc_sep:
     # Fully overwritten before read — skip REG zero-fill (same as S_soft).
     pv_soft = UOp.placeholder((TM, TD), dtypes.float, slot=17, addrspace=AddrSpace.REG)
-    pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
+    if getenv("AMD_FLASH_VEC_COPY", 1) and (TM * TD) % 4 == 0:
+      src, dst = pv_acc.reshape(TM * TD), pv_soft.reshape(TM * TD)
+      pv_acc = pv_soft.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)]))
+    else:
+      pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
   ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
   n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
   acc, l_i, m_i = acc.after(n_tile_end), l_i.after(n_tile_end), m_i.after(n_tile_end)
