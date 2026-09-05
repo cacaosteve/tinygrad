@@ -762,22 +762,41 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     # Copy into a const-index soft buffer (REG-promotable) for softmax.
     # Skip zero-init: every slot is overwritten by the copy before any read.
     S_soft = UOp.placeholder((TM, TN), dtypes.float, slot=16, addrspace=AddrSpace.REG)
-    if getenv("AMD_FLASH_VEC_COPY", 0) and (TM * TN) % 4 == 0:
-      # float4 shrink copies → vec SLOAD/SSTORE → scratch_*_b128 on the S_reg side.
-      src, dst = S_masked.reshape(TM * TN), S_soft.reshape(TM * TN)
-      S_reg = S_soft.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TN, 4)]))
-    else:
-      S_reg = S_soft.after(UOp.group(*[S_soft[ri, rj].store(S_masked[ri, rj]) for ri in range(TM) for rj in range(TN)]))
-    if _soft_scale:
-      # Per-element scale+mask so REG promote sees scalar SSTOREs (bulk store desyncs slots).
+    if _soft_scale and getenv("AMD_FLASH_SOFT_FUSE", 1):
+      # Scale+mask while copying ACC→soft (one SSTORE wave; was copy then rewrite).
       sm_stores = []
       for rm_i in range(TM):
         for rn_i in range(TN):
           q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
           k_idx = n_tile * BLOCK_N + rn_i * LANES_PER_WAVE_N + lane_n
-          scaled = S_reg[rm_i, rn_i] * SCALE
-          sm_stores.append(S_reg[rm_i, rn_i].store((k_idx <= q_idx).where(scaled, scaled.const_like(-math.inf))))
-      S_reg = S_reg.after(UOp.group(*sm_stores))
+          scaled = S_masked[rm_i, rn_i] * SCALE
+          sm_stores.append(S_soft[rm_i, rn_i].store((k_idx <= q_idx).where(scaled, scaled.const_like(-math.inf))))
+      S_reg = S_soft.after(UOp.group(*sm_stores))
+    elif getenv("AMD_FLASH_VEC_COPY", 0) and (TM * TN) % 4 == 0:
+      # float4 shrink copies → vec SLOAD/SSTORE → scratch_*_b128 on the S_reg side.
+      src, dst = S_masked.reshape(TM * TN), S_soft.reshape(TM * TN)
+      S_reg = S_soft.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TN, 4)]))
+      if _soft_scale:
+        sm_stores = []
+        for rm_i in range(TM):
+          for rn_i in range(TN):
+            q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
+            k_idx = n_tile * BLOCK_N + rn_i * LANES_PER_WAVE_N + lane_n
+            scaled = S_reg[rm_i, rn_i] * SCALE
+            sm_stores.append(S_reg[rm_i, rn_i].store((k_idx <= q_idx).where(scaled, scaled.const_like(-math.inf))))
+        S_reg = S_reg.after(UOp.group(*sm_stores))
+    else:
+      S_reg = S_soft.after(UOp.group(*[S_soft[ri, rj].store(S_masked[ri, rj]) for ri in range(TM) for rj in range(TN)]))
+      if _soft_scale:
+        # Per-element scale+mask so REG promote sees scalar SSTOREs (bulk store desyncs slots).
+        sm_stores = []
+        for rm_i in range(TM):
+          for rn_i in range(TN):
+            q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
+            k_idx = n_tile * BLOCK_N + rn_i * LANES_PER_WAVE_N + lane_n
+            scaled = S_reg[rm_i, rn_i] * SCALE
+            sm_stores.append(S_reg[rm_i, rn_i].store((k_idx <= q_idx).where(scaled, scaled.const_like(-math.inf))))
+        S_reg = S_reg.after(UOp.group(*sm_stores))
   else:
     S_reg = S_masked
   if _fu & 2:
