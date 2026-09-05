@@ -2273,6 +2273,8 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       pre, addr = _masked_addr(pre, addr, masked)
       if slots > 1:
         if u.dtype is not dtypes.float32: raise CompileError(f"no vec scratch load {u.dtype}")
+        if slots == 4 and byte_off % 16 == 0 and byte_off + 12 <= 0xfff:
+          return pre + [r3.scratch_load_b128(addr=addr, vdst=_reg_chunk(greg(u), 0, 4), offset=byte_off, sve=1)]
         return pre + [r3.scratch_load_b32(addr=addr, vdst=_reg_lane(greg(u), i), offset=byte_off + i*4, sve=1) for i in range(slots)]
       if (scratch_load:=_scratch_load(u.dtype)) is None: raise CompileError(f"no scratch load {u.dtype}")
       return pre + [scratch_load(addr=addr, vdst=_dst(u), offset=byte_off, sve=1)]
@@ -2289,6 +2291,8 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       pre, addr = _masked_addr(pre, addr, masked)
       if slots > 1:
         if u.src[2].dtype is not dtypes.float32: raise CompileError(f"no vec scratch store {u.src[2].dtype}")
+        if slots == 4 and byte_off % 16 == 0 and byte_off + 12 <= 0xfff and isinstance(greg(u.src[2]), Register):
+          return pre + [r3.scratch_store_b128(addr=addr, data=_reg_chunk(greg(u.src[2]), 0, 4), offset=byte_off, sve=1)]
         return pre + [r3.scratch_store_b32(addr=addr, data=_reg_lane(greg(u.src[2]), i), offset=byte_off + i*4, sve=1)
                       for i in range(slots)]
       if (scratch_store:=_scratch_store(u.src[2].dtype)) is None:
