@@ -2364,8 +2364,9 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       itemsize, byte_off = u.dtype.itemsize, _lds_byte_off(u)
       soff = _scratch_base_offset(u.src[0])
       # Dest-as-addr scalar: each load scales into its own VGPR so SLOAD streaks can
-      # s_clause (TMP_VADDR CSE blocks multi-index clauses).
-      if getenv("AMD_SCRATCH_DEST_ADDR", 1) and not masked and slots == 1 and isinstance(greg(u), Register) and \
+      # s_clause (TMP_VADDR CSE blocks multi-index clauses). Off by default — without
+      # AMD_SCRATCH_SCLAUSE it regresses flash ~1.05→1.38ms and blocks b128 fusion.
+      if getenv("AMD_SCRATCH_DEST_ADDR", 0) and not masked and slots == 1 and isinstance(greg(u), Register) and \
          itemsize in (1, 2, 4) and byte_off <= 0xfff:
         dst = _dst(u)
         pre, addr = _scaled_addr(dst, u.src[1], itemsize)
