@@ -895,7 +895,12 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   if _fu & 4:
     acc_c, l_c, m_c = acc.after(n_tile), l_i.after(n_tile), m_i.after(n_tile)
     if _acc_work:
-      acc_work = acc_work.after(UOp.group(*[acc_work[ri, rj].store(acc_c[ri, rj]) for ri in range(TM) for rj in range(TD)]))
+      # float4 copy: fewer scratch ops than 32 scalar SLOAD/SSTORE (promoted dst still VGPR).
+      if (TM * TD) % 4 == 0:
+        src, dst = acc_c.reshape(TM * TD), acc_work.reshape(TM * TD)
+        acc_work = acc_work.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)]))
+      else:
+        acc_work = acc_work.after(UOp.group(*[acc_work[ri, rj].store(acc_c[ri, rj]) for ri in range(TM) for rj in range(TD)]))
       work = acc_work
     else:
       work = acc_c
@@ -993,7 +998,11 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
       acc_up = UOp.group(*[work[ri, rj].store(work[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
                            for ri in range(TM) for rj in range(TD)])
       work = work.after(acc_up)
-      writeback = UOp.group(*[acc_c[ri, rj].store(work[ri, rj]) for ri in range(TM) for rj in range(TD)])
+      if (TM * TD) % 4 == 0:
+        src, dst = work.reshape(TM * TD), acc_c.reshape(TM * TD)
+        writeback = UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)])
+      else:
+        writeback = UOp.group(*[acc_c[ri, rj].store(work[ri, rj]) for ri in range(TM) for rj in range(TD)])
       n_tile_end = writeback.barrier().end(n_tile)
     else:
       acc_up = UOp.group(*[acc_c[ri, rj].store(acc_c[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
@@ -1002,10 +1011,11 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   else:
     n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
   acc, l_i, m_i = acc.after(n_tile_end), l_i.after(n_tile_end), m_i.after(n_tile_end)
-  acc = acc.after(acc.store(acc * (1 / l_i).reshape(TM, 1).expand(TM, TD)))
+  # Fuse normalize into the global store — avoid writing scaled acc back through slot-2 scratch.
+  inv_l = (1 / l_i).reshape(TM, 1).expand(TM, TD)
   o = o.reshape(WAVES_M, TM, LANES_PER_WAVE_M, 1, WAVES_N, TD, LANES_PER_WAVE_N, 1) \
     .permute((0, 4, 2, 6, 1, 3, 5, 7)).reshape(THREADS_PER_BLOCK, TM, TD)
-  return o[tid].store(acc).end(wave_m, wave_n, lane).end(block_m, block_bh).sink(arg=KernelInfo(opts_to_apply=()))
+  return o[tid].store(acc * inv_l).end(wave_m, wave_n, lane).end(block_m, block_bh).sink(arg=KernelInfo(opts_to_apply=()))
 
 def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
