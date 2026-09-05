@@ -244,16 +244,16 @@ def _wait_domain_for_load(u:UOp) -> str|None:
   return None
 
 def _wait_domain_for_store(u:UOp) -> str|None:
-  # RDNA3: vector store completion is vscnt. Track global stores for end/branch drain only
-  # (hand-kernel style). Scratch uses inline vscnt; LDS stores scoreboard on lgkm (flush before BARRIER).
+  # RDNA3: vector store completion is vscnt. Track global + scratch stores for scoreboard
+  # flush (hand-kernel style: burst stores, one wait before use). LDS stores use lgkm.
   if u.op is not Ops.INS: return None
-  if _iop(u) is AMDOps.STORE: return "vs"
+  if _iop(u) in (AMDOps.STORE, AMDOps.SSTORE): return "vs"
   if _iop(u) is AMDOps.LSTORE: return "lgkm"
   return None
 
 def _store_src_regs(u:UOp) -> set[int]:
-  # Sentinel: any outstanding global/LDS store. Do not scoreboard TMP_VADDR — addr is sampled at issue.
-  if _iop(u) in (AMDOps.STORE, AMDOps.LSTORE): return {-1}
+  # Sentinel: any outstanding global/LDS/scratch store. Do not scoreboard TMP_VADDR — addr is sampled at issue.
+  if _iop(u) in (AMDOps.STORE, AMDOps.LSTORE, AMDOps.SSTORE): return {-1}
   return set()
 
 def _needs_vm_flush(u:UOp) -> bool:
@@ -2215,12 +2215,12 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       pre, addr = _masked_addr(pre, addr, masked)
       if slots > 1:
         if u.src[2].dtype is not dtypes.float32: raise CompileError(f"no vec scratch store {u.src[2].dtype}")
-        return pre + [r3.scratch_store_b32(addr=addr, data=_reg_lane(greg(u.src[2]), i), offset=i*4, sve=1) for i in range(slots)] + \
-               [r3.s_waitcnt_vscnt(sdst=NULL, simm16=0)]
+        # Soft vscnt: scoreboard flushes once before SLOAD / endpgm (flash REG init storm).
+        return pre + [r3.scratch_store_b32(addr=addr, data=_reg_lane(greg(u.src[2]), i), offset=i*4, sve=1) for i in range(slots)]
       if (scratch_store:=_scratch_store(u.src[2].dtype)) is None:
         raise CompileError(f"no scratch store {u.src[2].dtype}")
       dpre, data = _vgpr_data(TMP_VDATA, u.src[2])
-      return pre + dpre + [scratch_store(addr=addr, data=data, offset=0, sve=1), r3.s_waitcnt_vscnt(sdst=NULL, simm16=0)]
+      return pre + dpre + [scratch_store(addr=addr, data=data, offset=0, sve=1)]
     case AMDOps.BARRIER:
       return [r3.s_barrier()]
     case AMDOps.FILL:
@@ -3453,6 +3453,9 @@ def insts_from_linear(lin:UOp):
       flush("lgkm")
     elif u.op is Ops.INS and _iop(u) is AMDOps.LLOAD and -1 in pending["lgkm"]:
       flush("lgkm")
+    # Scratch stores must complete before SLOAD / FILL (soft vscnt — was per-store wait storm).
+    elif u.op is Ops.INS and _iop(u) in (AMDOps.SLOAD, AMDOps.FILL) and -1 in pending["vs"]:
+      flush("vs")
     masked = mask_depth > 0 and u.op is Ops.INS and _iop(u) in _MASKED_MEM
     if u in skip:
       if u.op is Ops.INS and _iop(u) is AMDOps.END_MASK: mask_depth -= 1
