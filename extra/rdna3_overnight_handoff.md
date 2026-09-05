@@ -1,4 +1,4 @@
-# Overnight RDNA3 (to ~5AM PT) — tip `806a75c6a`
+# Overnight RDNA3 (to ~5AM PT) — tip `a1996c420`
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
 
@@ -31,6 +31,9 @@ See `extra/rdna3_flash_acc_small.md`.
 - PV ACC direct (skip soft) ~810µs — worse; soft copy stays
 - REMAT_ADDR=1 — no spill change on flash
 - Decode score_batch/delay/gap — flat vs tip
+
+## Also landed
+- IQ4 `dequant_halves`: share LUT pairs across halves (vgpr 102 @t16; t32 still 118/~65 vs HIP ~60)
 
 ## Next leftovers
 
