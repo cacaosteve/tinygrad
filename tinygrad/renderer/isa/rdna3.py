@@ -4182,9 +4182,12 @@ class AMDRenderer(ISARenderer):
     if x.op is Ops.INS and _iop(x) is AMDOps.LOOP_CMP: return x.src[2] if len(x.src) == 3 else x.src[3]
     return super().loop_end(x)
   def prefer_phys(self, x:UOp, src_phys:list) -> Register|None:
-    # WHERE/cndmask: prefer aliasing onto the true-value VGPR (HIP-style; kills E_32 mov chains).
-    if x.op is Ops.INS and _iop(x) is AMDOps.WHERE and getenv("AMD_WHERE_ALIAS", 0):
-      if len(src_phys) > 1 and src_phys[1] is not None and isinstance(x.tag, tuple):
+    # WHERE/cndmask: alias onto the true-value VGPR when safe (kills E_32 mov chains).
+    # Unrestricted AMD_WHERE_ALIAS=1 matches HIP but breaks quant / asymmetric QK.
+    # Default: only when the false arm is a literal (common mask→0 / mask→-inf selects).
+    if x.op is Ops.INS and _iop(x) is AMDOps.WHERE:
+      alias = bool(getenv("AMD_WHERE_ALIAS", 0)) or (len(x.src) > 2 and _unwrap_const(x.src[2]) is not None)
+      if alias and len(src_phys) > 1 and src_phys[1] is not None and isinstance(x.tag, tuple):
         if src_phys[1] in x.tag[0].cons: return src_phys[1]
     # Redundant u32→u16 CAST after &0xffff / >>16: alias onto src (no mov).
     if x.op is Ops.INS and _iop(x) is AMDOps.CAST and x.dtype in dtypes.uints and x.src and \
