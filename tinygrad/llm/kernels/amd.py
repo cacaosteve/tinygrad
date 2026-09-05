@@ -896,7 +896,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # AMD_WMMA_ACC_SMALL still gated off:
   #  - Ranged (tm,tn) WMMA parks only one 8-wide ACC pack per buffer (need TN/TD packs).
   #    Later columns clobber earlier ACC → ~all outputs wrong (err~1.5) while ~730µs.
-  #  - Unrolling TN/TD for distinct packs: LinearScanRegalloc assert (double-def PACK tags).
+  #  - Unrolling TN/TD or stream-per-column for distinct packs: LinearScanRegalloc
+  #    assert (double-def PACK tags) — need unique pack tags per column WMMA first.
   #  - Scale uses non-const REG indices → SSTORE→scratch while EXTRACT reads ACC (err=inf)
   #    unless copy ACC→soft before scale/mask.
   # HIP flash (same source) is 0-scratch / 24 unrolled WMMA ~284µs — ACC_SMALL is the path.
