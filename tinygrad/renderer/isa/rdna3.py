@@ -758,11 +758,14 @@ def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
         bad.add(base)
         continue
     bo = _lds_byte_off(u)
-    if idx is not None and dt.itemsize and bo % dt.itemsize == 0:
-      idx = idx + bo // dt.itemsize
-    elif bo:
-      bad.add(base)
-      continue
+    if idx is not None:
+      # Const index + peeled imm: fold into the element slot. Dynamic idx + peel is fine
+      # (still non-promotable via idx is None below) — do not poison the whole buffer.
+      if dt.itemsize and bo % dt.itemsize == 0:
+        idx = idx + bo // dt.itemsize
+      elif bo:
+        bad.add(base)
+        continue
     if idx is None or idx < 0 or idx >= base.max_numel() or base.max_numel() > 64 or n != 1 or dt.itemsize > 4:
       bad.add(base)
       continue
