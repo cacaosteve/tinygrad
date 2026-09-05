@@ -79,6 +79,7 @@ class LinearScanRegallocContext:
             if pin: pinned.update(range(live[sv].index, live[sv].index + slots(sv)))
       elif v not in self.spills:
         sz = ren.spill_size(vd, v)
+        if sz <= 0: sz = 4  # void/empty cons under ACC promote must not ZeroDivisionError
         offset = self.stack_size + (sz - self.stack_size % sz) % sz
         self.spills[v] = UOp.cconst(offset, dtypes.int32)
         self.stack_size = offset + sz
