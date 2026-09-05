@@ -698,7 +698,8 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   return Tensor.custom_kernel(out, partial, stats, fxn=fxn)[0]
 
 @functools.cache
-def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None) -> UOp:
+def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None,
+                         acc_small:bool=False) -> UOp:
   valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start) if q_start is not None else None
   BH, M, D = q.shape
   _, B, H_KV, physical_n, cache_dim = cache.shape
@@ -734,9 +735,9 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # AMD_FLASH_ACC_SEP: keep WMMA C in ACC; copy out to a const-indexed soft buffer before softmax.
   # Default on: after soft vscnt + scratch addr CSE this is faster (~2.1ms vs ~2.7ms prefill).
   _acc_sep = bool(getenv("AMD_FLASH_ACC_SEP", 1))
-  # Opt-in: park one ACC pack per (tm,tn) via python-unrolled WMMA so columns do not
-  # clobber (ranged tn parks a single pack). Needs AMD_WMMA_ACC_SMALL + REDEF_ACC.
-  _acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0))
+  # Park one ACC pack per column (python-unrolled WMMA). Flash-only — AMD_WMMA_ACC_SMALL
+  # also parks ≤64 quant tiles and breaks Q4/Q6; prefer AMD_FLASH_ACC_SMALL / acc_small arg.
+  _acc_small = bool(acc_small or getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 0))
   _fu = getenv("AMD_FLASH_UNROLL", 0)
   if _fu == 1: _fu = 6
   if _acc_sep: _fu |= 6  # soft/corr need const REG indices on the working buffer
@@ -919,20 +920,17 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
   T_real, q_start = q.shape[2], None
   if resolve(T_real == 1): return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, assigned_kv.shape[3]))
-  # Direct ISA can render the hand WMMA prefill correctly, but its per-tile REG scratch
-  # traffic is currently much slower than the generic fused attention lowering.
-  # Tip ~1.05ms (SOFT_SCALE + promote peel + ACC_UNROLL + SLOAD/USE batch≤32 +
-  # scratch s_clause on CSE'd TMP streaks; acc slot stays scratch). Still ~3.7× HIP
-  # flash; SDPA fallback ~320µs default. AMD_SCRATCH_DEST_ADDR needs s_clause or regresses.
+  # Direct ISA can render the hand WMMA prefill correctly, but still trails HIP and
+  # often SDPA. With AMD_FLASH_ACC_SMALL (default on for DIRECT): ~670µs vs ~1030µs
+  # scratch ACC; HIP ~268µs. SDPA fallback ~306µs remains the non-DIRECT default.
+  # Do NOT set AMD_WMMA_ACC_SMALL globally — parks ≤64 quant tiles and breaks Q4/Q6.
   if amd_direct_isa(q.device) and not getenv("AMD_FLASH_DIRECT", 0):
     k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
     return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
-  # AMD_FLASH_ACC_SEP defaults on (faster than in-place soft REG after scratch CSE).
-  # AMD_WMMA_ACC_SMALL still gated off: ranged (tm,tn) parks one ACC pack → column clobber.
-  # Opt-in path python-unrolls QK/PV WMMA for unique packs per column (AMD_WMMA_REDEF_ACC).
-  # Still validate correctness before defaulting; tip stays scratch ACC (~1.03ms).
-  # Infrastructure: wmma_acc_buf_tiles + ACC-lane SSTORE writeback helpers in rdna3.py.
+  # Flash-only ACC residency via python-unrolled WMMA (≥2 packs → renderer auto-park).
+  # AMD_FLASH_ACC_SMALL=0 disables; AMD_WMMA_ACC_SMALL=1 forces (unsafe for quant).
+  use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]
@@ -940,7 +938,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     q, q_start = q.pad_to((*q.shape[:2], T_pad, q.shape[3])), valid_end - T_real
   B, H, T, D = q.shape
   out = Tensor.empty(B*H, T, D, dtype="float32", device=q.device)
-  fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start)
+  fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start, acc_small=use_acc_small)
   out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
   return out if q_start is None else out[:, :, :T_real]
 

@@ -727,8 +727,21 @@ def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
   bufs: set[UOp] = set()
   packed_quant = bool(getenv("AMD_PACKED_WMMA_ACC", 1)) and any(
     u.op is Ops.INS and _iop(u) in (AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16) for u in (ctx.uops or []))
-  # AMD_WMMA_ACC_SMALL: allow ≤64-element flash-style ACC tiles (default gated off).
-  allow_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0))
+  # AMD_WMMA_ACC_SMALL: force ≤64 tiles (also parks some quant — breaks Q4/Q6; avoid globally).
+  # AMD_FLASH_ACC_SMALL / auto: ≤64 REG with ≥2 distinct WMMA reload packs (unrolled flash).
+  allow_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 0))
+  pack_tags_by_buf: dict[UOp, set] = {}
+  for u in ctx.uops or []:
+    if u.op is not Ops.INS or _iop(u) is not AMDOps.WMMA: continue
+    pack = u.src[0]
+    if not _is_wmma_acc_reload_pack(pack): continue
+    if not (isinstance(pack.tag, tuple) and pack.tag): continue
+    if all(s.op is Ops.INS and _iop(s) is AMDOps.SLOAD for s in pack.src):
+      for s in pack.src:
+        if (base:=_reg_buffer_base(s.src[0])) is not None:
+          pack_tags_by_buf.setdefault(base, set()).add(pack.tag)
+          break
+  auto_small = {b for b, tags in pack_tags_by_buf.items() if len(tags) >= 2 and b.max_numel() <= 64}
   for u in ctx.uops or []:
     if u.op is not Ops.INS or _iop(u) is not AMDOps.WMMA: continue
     pack = u.src[0]
@@ -736,16 +749,27 @@ def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
     for slot in pack.src:
       if slot.op is Ops.INS and _iop(slot) is AMDOps.SLOAD:
         if (base:=_reg_buffer_base(slot.src[0])) is None: continue
-        if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant or allow_small): bufs.add(base)
+        if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant or allow_small or base in auto_small):
+          bufs.add(base)
   # LDS zero-cin path: packs are MOV zeros, so discover oversized REG via SLOAD/SSTORE traffic.
   if not bufs and any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA and _is_wmma_acc_reload_pack(u.src[0])
                       for u in (ctx.uops or []) if u.src):
     for u in ctx.uops or []:
       if u.op is not Ops.INS or _iop(u) not in (AMDOps.SLOAD, AMDOps.SSTORE): continue
       if (base:=_reg_buffer_base(u.src[0])) is None: continue
-      if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant or allow_small): bufs.add(base)
+      if base.max_numel() <= 128 and (base.max_numel() > 64 or packed_quant or allow_small or base in auto_small):
+        bufs.add(base)
   ctx.scratch["wmma_acc_buffers"] = bufs
+  ctx.scratch["wmma_acc_auto_small"] = auto_small
   return bufs
+
+def _wmma_acc_small_mode(ctx:PreRegAllocContext|None=None) -> bool:
+  """Flash-style ≤64 ACC parking (env or auto-detected unrolled multi-pack)."""
+  if getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 0): return True
+  if ctx is not None:
+    _wmma_acc_buffers(ctx)  # populate auto_small
+    return bool(ctx.scratch.get("wmma_acc_auto_small"))
+  return False
 
 def _wmma_slot_tile_lane(idx:int) -> tuple[int, int]:
   # 4×4 UPCAST packs floats as tile=(idx//32)*4+(idx%4), lane=(idx%32)//4
@@ -761,7 +785,7 @@ def _wmma_acc_lane(ctx:PreRegAllocContext, buf:UOp, idx:int) -> tuple[UOp, int]|
   """Map a const REG index on a WMMA ACC buffer to (zero-init PACK, lane)."""
   idx_map = ctx.scratch.get("wmma_acc_idx_map") or {}
   if (got:=idx_map.get((buf, idx), idx_map.get(idx))) is not None: return got
-  if getenv("AMD_WMMA_ACC_SMALL", 0) and (lin:=_wmma_linear_tile_lane(idx, buf.max_numel())) is not None:
+  if _wmma_acc_small_mode(ctx) and (lin:=_wmma_linear_tile_lane(idx, buf.max_numel())) is not None:
     tile_local, lane = lin
     if (init:=(ctx.scratch.get("wmma_acc_buf_tiles") or {}).get(buf, {}).get(tile_local)) is not None:
       return init, lane
@@ -809,8 +833,8 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
       pack_base = next(b for s in pack.src if (b:=_reg_buffer_base(s.src[0])) is not None and b in bufs)
       sload_idxs = [_const_int(s.src[1]) for s in pack.src]
       if any(i is None for i in sload_idxs):
-        # Flash REG indices are loop-varying; still park ACC by expand order (AMD_WMMA_ACC_SMALL).
-        if not getenv("AMD_WMMA_ACC_SMALL", 0): continue
+        # Flash REG indices are loop-varying; still park ACC by expand order (flash ACC_SMALL).
+        if not _wmma_acc_small_mode(ctx): continue
         sload_idxs = []
         tile_local = buf_next_tile.get(pack_base, 0)
         buf_next_tile[pack_base] = tile_local + 1
@@ -831,7 +855,7 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
       if idx is not None and (base:=_reg_buffer_base(sload.src[0])) is not None:
         idx_map[idx if len(bufs) == 1 else (base, idx)] = (init, lane)
     # Small flash tiles: map linear REG idx → ACC lane for post-WMMA EXTRACT copies.
-    if getenv("AMD_WMMA_ACC_SMALL", 0) and pack_base is not None and tile_local is not None:
+    if _wmma_acc_small_mode(ctx) and pack_base is not None and tile_local is not None:
       numel = pack_base.max_numel()
       n_tiles = numel // 8 if numel >= 8 and numel % 8 == 0 else 0
       if n_tiles and tile_local < n_tiles:
@@ -1871,7 +1895,7 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
       elif bo:
         idx = None
       if idx is None: return x, []
-      if not ctx.scratch.get("wmma_past_acc") and not getenv("AMD_WMMA_ACC_SMALL", 0): return x, []
+      if not ctx.scratch.get("wmma_past_acc") and not _wmma_acc_small_mode(ctx): return x, []
       if (got:=_wmma_acc_lane(ctx, buf, idx)) is None: return None
       init, lane = got
       ext = _wmma_acc_extract(ctx, init, lane)
@@ -1889,7 +1913,7 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
   if _iop(x) is AMDOps.SLOAD:
     if (buf:=_reg_buffer_base(x.src[0])) is not None and buf in _wmma_acc_buffers(ctx):
       # Loop-body SLOADs only feed WMMA PACK (redirected); post-loop reads need EXTRACT.
-      # AMD_WMMA_ACC_SMALL: allow mid-kernel const-index EXTRACT for flash ACC_SEP copies.
+      # Flash ACC_SMALL: allow mid-kernel const-index EXTRACT for flash ACC_SEP copies.
       idx = _const_int(x.src[1])
       bo = _lds_byte_off(x)
       if idx is not None and x.dtype.itemsize and bo % x.dtype.itemsize == 0:
@@ -1899,7 +1923,7 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
       if idx is None:
         if not ctx.scratch.get("wmma_past_acc"): return x, []
         return None
-      if not ctx.scratch.get("wmma_past_acc") and not getenv("AMD_WMMA_ACC_SMALL", 0): return x, []
+      if not ctx.scratch.get("wmma_past_acc") and not _wmma_acc_small_mode(ctx): return x, []
       if (got:=_wmma_acc_lane(ctx, buf, idx)) is None: return None
       init, lane = got
       ext = _wmma_acc_extract(ctx, init, lane)
