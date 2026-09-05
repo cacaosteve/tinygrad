@@ -769,14 +769,15 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     else:
       S_reg = S_soft.after(UOp.group(*[S_soft[ri, rj].store(S_masked[ri, rj]) for ri in range(TM) for rj in range(TN)]))
     if _soft_scale:
-      S_reg = S_reg.after(S_reg.store(S_reg * SCALE))
-      mask_stores = []
+      # Per-element scale+mask so REG promote sees scalar SSTOREs (bulk store desyncs slots).
+      sm_stores = []
       for rm_i in range(TM):
         for rn_i in range(TN):
           q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
           k_idx = n_tile * BLOCK_N + rn_i * LANES_PER_WAVE_N + lane_n
-          mask_stores.append(S_reg[rm_i, rn_i].store((k_idx <= q_idx).where(S_reg[rm_i, rn_i], S_reg[rm_i, rn_i].const_like(-math.inf))))
-      S_reg = S_reg.after(UOp.group(*mask_stores))
+          scaled = S_reg[rm_i, rn_i] * SCALE
+          sm_stores.append(S_reg[rm_i, rn_i].store((k_idx <= q_idx).where(scaled, scaled.const_like(-math.inf))))
+      S_reg = S_reg.after(UOp.group(*sm_stores))
   else:
     S_reg = S_masked
   if _fu & 2:
