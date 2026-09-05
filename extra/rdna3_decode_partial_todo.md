@@ -1,8 +1,8 @@
 # flash_decode_partial: HIP gap follow-up
 
-**Status (7900 XTX):** decode e2e ~**54 µs** AMD:AMD vs ~**52.3 µs** HIP (~1.7 µs gap).
-`flash_decode_partial` ~**35.3 µs** direct (was ~45, then ~37.3 with G=4 batches) vs ~28 µs HIP.
-`flash_decode_combine` already faster than HIP (~9 vs ~11.5 µs).
+**Status (7900 XTX):** decode e2e ~**49 µs** AMD:AMD vs ~**49.5 µs** HIP (parity / slight AMD lead).
+`flash_decode_partial` ~**34 µs** direct (score_batch default **16**) vs ~28 µs HIP.
+`flash_decode_combine` already faster than HIP (~9.4 vs ~11.5 µs).
 
 ## Landed: spill-safe same-stage swizzle batching
 
