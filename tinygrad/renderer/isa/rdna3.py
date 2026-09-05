@@ -2993,6 +2993,15 @@ def _clauseable_scalar_vmem_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
     return u.dtype in (dtypes.float32, dtypes.float) and slots <= 4
   return u.dtype in (dtypes.half, dtypes.uint8, dtypes.int8, dtypes.uint, dtypes.int, dtypes.uint32, dtypes.int32, dtypes.float32, dtypes.float)
 
+def _quant_b128_clause_info(u:UOp, skip:set[UOp], mask_depth:int) -> tuple[UOp, UOp, int]|None:
+  """Packed quant weight LOAD (uint32×4 / B128): (saddr, base_idx, byte_off) or None."""
+  if u in skip or mask_depth or u.op is not Ops.INS or _iop(u) is not AMDOps.LOAD: return None
+  if _is_lds_ref(u.src[0]) or _is_scratch_ref(u.src[0]): return None
+  if u.dtype not in (dtypes.uint32, dtypes.uint) or _reg_slots(u) != 4: return None
+  if not isinstance(greg(u), Register): return None
+  base, byte_off = _peel_add_imm(u.src[1], 4, max_byte=0xfff, deep=True)
+  return u.src[0], base, byte_off
+
 def _clauseable_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   return _clauseable_scalar_vmem_gload(u, skip, mask_depth) and u.dtype is dtypes.half
 
@@ -3534,6 +3543,37 @@ def insts_from_linear(lin:UOp):
           for k in idxs: note_vm(_reg_idxs(scheduled[k]), parts[k - oi])
           oi = j
           continue
+    # Cluster packed quant B128 weight loads (uint32×4): one <<2 of the shared base, then
+    # s_clause + global_load_b128 with imm offsets (HIP/LLVM pattern for Q5/Q4 tiles).
+    if getenv("AMD_QUANT_B128_CLAUSE", 1) and (info0:=_quant_b128_clause_info(u, skip, mask_depth)) is not None:
+      saddr0, base0, off0 = info0
+      group = [(u, off0)]
+      j = oi + 1
+      while len(group) < 8:
+        # Index ADDs (base+4/base+8) sit between packed B128 loads; skip — offsets cover them.
+        k = j
+        while k < len(scheduled) and scheduled[k].op is Ops.INS and _iop(scheduled[k]) is AMDOps.ADD:
+          k += 1
+        if k >= len(scheduled): break
+        info = _quant_b128_clause_info(scheduled[k], skip, mask_depth)
+        if info is None: break
+        saddr, base, off = info
+        if saddr is not saddr0 or base is not base0: break
+        if off <= group[-1][1] or off > 0xfff: break
+        group.append((scheduled[k], off))
+        j = k + 1
+      if len(group) >= 2:
+        store_addr_cache.clear()
+        pre, addr = _scaled_addr(TMP_VADDR, base0, 4)
+        for inst in pre: emit(inst)
+        emit(r3.s_clause(simm16=len(group) - 1))
+        for su, off in group:
+          kw = {"offset": off} if off else {}
+          ld = r3.global_load_b128(_dst(su), addr, saddr=_src(saddr0), **kw)
+          emit(ld)
+          note_vm(_reg_idxs(su), [ld])
+        oi = j
+        continue
     # Cluster scalar half loads: dest-as-addr scales, then s_clause + tight VMEM (LLVM-style B).
     # Quant decode uses the same pattern for packed u32 weight reads (linear_q6).
     # Always on. With AMD_D16_HI lo+…hi+ batch: extend the clause through following d16_his
