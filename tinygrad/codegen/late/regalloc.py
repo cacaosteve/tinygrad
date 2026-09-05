@@ -107,10 +107,15 @@ class LinearScanRegallocContext:
           # reuse the already-allocated phys reg instead of asserting.
           if not isinstance(v, Register): raise AssertionError(f"expected Register tag {v}")
           if lr[v][0] != i:
-            if ren.is_two_address(u) and j == 0 and v in live and getenv("AMD_WMMA_REDEF_ACC", 1):
-              self.reals.setdefault(i, {})[v] = live[v]
-              continue
-            assert lr[v][0] == i
+            if ren.is_two_address(u) and j == 0 and getenv("AMD_WMMA_REDEF_ACC", 1):
+              if v in live:
+                self.reals.setdefault(i, {})[v] = live[v]
+                continue
+              # Not currently live (gap between unrolled WMMA). Treat as a fresh def
+              # at this index so alloc can run; two-address coalesce uses cin below.
+              lr[v][0] = i
+            else:
+              assert lr[v][0] == i
           cons = v.cons
           if ren.is_two_address(u) and j == 0:
             uses = tuple(live.get(greg(s)) for s in u.src)
