@@ -723,6 +723,9 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # AMD_FLASH_ACC_SEP: keep WMMA C in ACC; copy out to a const-indexed soft buffer before softmax.
   # Default on: after soft vscnt + scratch addr CSE this is faster (~2.1ms vs ~2.7ms prefill).
   _acc_sep = bool(getenv("AMD_FLASH_ACC_SEP", 1))
+  # AMD_WMMA_ACC_SMALL: park ≤64 flash ACC tiles. Copy ACC→soft before scale/mask so ACC stays
+  # read-only (bulk scale uses non-const REG indices; writeback-to-scratch desyncs EXTRACT).
+  _acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0))
   _fu = getenv("AMD_FLASH_UNROLL", 0)
   if _fu == 1: _fu = 6
   if _acc_sep: _fu |= 6  # soft/corr need const REG indices on the working buffer
@@ -731,9 +734,16 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1, lane_n, k_qk]
   k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1, lane_n, k_qk]
   qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk)
-  # Scale+mask on the WMMA/scratch buffer first. Predicated where-stores into a REG-promoted
-  # const-index soft buffer are dropped (ACC_SEP previously matched unmasked SDPA).
-  S_reg = S_reg.after(qk_done, S_reg.store(S_reg * SCALE))
+  if _acc_sep and _acc_small:
+    # EXTRACT-copy raw WMMA C into soft, then scale+mask on the REG-promoted soft buffer.
+    S_raw = S_reg.after(qk_done)
+    S_soft = UOp.placeholder((TM, TN), dtypes.float, slot=16, addrspace=AddrSpace.REG)
+    S_reg = S_soft.after(UOp.group(*[S_soft[ri, rj].store(S_raw[ri, rj]) for ri in range(TM) for rj in range(TN)]))
+    S_reg = S_reg.after(S_reg.store(S_reg * SCALE))
+  else:
+    # Scale+mask on the WMMA/scratch buffer first. Predicated where-stores into a REG-promoted
+    # const-index soft buffer are dropped (ACC_SEP previously matched unmasked SDPA).
+    S_reg = S_reg.after(qk_done, S_reg.store(S_reg * SCALE))
   if _fu & 2:
     mask_stores = []
     for rm_i in range(TM):
@@ -747,7 +757,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm * LANES_PER_WAVE_M + lane_m
     k_idx = n_tile * BLOCK_N + rn * LANES_PER_WAVE_N + lane_n
     S_masked = S_reg.after(S_reg[rm, rn].store((k_idx <= q_idx).where(S_reg[rm, rn], S_reg[rm, rn].const_like(-math.inf))).end(rm, rn))
-  if _acc_sep:
+  if _acc_sep and not _acc_small:
     # Copy post-mask scores into a const-index soft buffer (REG-promotable) for softmax.
     # Skip zero-init: every slot is overwritten by the copy before any read.
     S_soft = UOp.placeholder((TM, TN), dtypes.float, slot=16, addrspace=AddrSpace.REG)
@@ -832,9 +842,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
     return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
-  # AMD_FLASH_ACC_SEP defaults on (faster than in-place soft REG after scratch CSE);
-  # AMD_WMMA_ACC_SMALL: ACC-lane writeback + per-buffer tile map (see rdna3.py). Default off
-  # until HW validates patterned prefill + test_llm_amd; expected ~1.5ms vs ~1.9ms ACC_SEP.
+  # AMD_FLASH_ACC_SEP defaults on (faster than in-place soft REG after scratch CSE).
+  # AMD_WMMA_ACC_SMALL: copy ACC→soft before scale/mask + buf_tiles (default off until HW OK).
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]
