@@ -741,11 +741,25 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   _fu = getenv("AMD_FLASH_UNROLL", 0)
   if _fu == 1: _fu = 6
   if _acc_sep: _fu |= 6  # soft/corr need const REG indices on the working buffer
-  k_qk = UOp.range(D//WMMA_K, 101, AxisType.REDUCE)
   S_view = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)
   Q_view = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)
   K_view = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)
-  if _acc_small:
+  # AMD_FLASH_K_UNROLL: chain K WMMA in Python (more static WMMA like HIP). Opt-in.
+  _k_unroll = bool(_acc_small and getenv("AMD_FLASH_K_UNROLL", 0))
+  if _acc_small and _k_unroll:
+    qk_stores = []
+    for tn_i in range(TN):
+      for tm_i in range(TM // WMMA_ACC):
+        S_frag = S_view[tm_i, tn_i]
+        acc = S_frag  # zero-init / parked ACC
+        for k_i in range(D // WMMA_K):
+          q_frag = Q_view[wave_m, tm_i, lane_n, k_i]
+          k_frag = K_view[tn_i, lane_n, k_i]
+          acc = UOp.wmma(q_frag, k_frag, acc, *WMMA_ARG)
+        qk_stores.append(S_frag.store(acc))
+    qk_done = UOp.group(*qk_stores)
+  elif _acc_small:
+    k_qk = UOp.range(D//WMMA_K, 101, AxisType.REDUCE)
     qk_stores = []
     for tn_i in range(TN):
       for tm_i in range(TM // WMMA_ACC):
@@ -755,7 +769,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         qk_stores.append(S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)))
     qk_done = UOp.group(*qk_stores).end(k_qk)
   else:
-    tm1, tn1 = UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
+    k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
     S_frag = S_view[tm1, tn1]
     q_frag = Q_view[wave_m, tm1, lane_n, k_qk]
     k_frag = K_view[tn1, lane_n, k_qk]
@@ -872,11 +886,23 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   pv_barrier = UOp.barrier(UOp.group(P_store, V_store))
   P_lds, V_lds = P_lds.after(pv_barrier), V_lds.after(pv_barrier)
   pv_acc = _reg((TM, TD), 10, 0, n_tile).after(pv_barrier)
-  k_pv = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE)
   pv_view = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)
   P_view = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)
   V_view = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)
-  if _acc_small:
+  if _acc_small and _k_unroll:
+    pv_stores = []
+    for td_i in range(TD):
+      for tm_i in range(TM // WMMA_ACC):
+        pv_frag = pv_view[tm_i, td_i]
+        acc = pv_frag
+        for k_i in range(BLOCK_N // WMMA_K):
+          p_frag = P_view[wave_m, tm_i, lane_n, k_i]
+          v_frag = V_view[wave_n, td_i, lane_n, k_i]
+          acc = UOp.wmma(p_frag, v_frag, acc, *WMMA_ARG)
+        pv_stores.append(pv_frag.store(acc))
+    pv_done = UOp.group(*pv_stores)
+  elif _acc_small:
+    k_pv = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE)
     pv_stores = []
     for td_i in range(TD):
       for tm_i in range(TM // WMMA_ACC):
@@ -886,7 +912,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         pv_stores.append(pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)))
     pv_done = UOp.group(*pv_stores).end(k_pv)
   else:
-    tm2, tn2 = UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
+    k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
     pv_frag = pv_view[tm2, tn2]
     p_frag = P_view[wave_m, tm2, lane_n, k_pv]
     v_frag = V_view[wave_n, tn2, lane_n, k_pv]
