@@ -845,9 +845,9 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     else:
       pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
   ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
-  if _fu & 4 and getenv("AMD_FLASH_ACC_UNROLL", 0):
-    # Opt-in: const-index acc+= for promote experiments. Default off — promoting acc
-    # across n_tile REDUCE drops loop-carried values (err=nan) even with after(n_tile).
+  if _fu & 4 and getenv("AMD_FLASH_ACC_UNROLL", 1):
+    # Const-index acc+= (better addressing). Slots 2/3/4 stay unpromoted via
+    # AMD_REG_PROMOTE_SKIP_SLOTS so REDUCE-carried values remain correct.
     acc_c = acc.after(n_tile)
     acc_up = UOp.group(*[acc_c[ri, rj].store(acc_c[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
                          for ri in range(TM) for rj in range(TD)])

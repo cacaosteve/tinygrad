@@ -477,6 +477,9 @@ def _scratch_addr(base:UOp, idx:UOp, itemsize:int) -> tuple[list, Reg]:
 
 def _reg_buffer_base(x:UOp) -> UOp|None:
   if x.op is Ops.AFTER: return _reg_buffer_base(x.src[0])
+  # Placeholders are RESHAPE(BUFFER); peel so promote/skip see the REG BUFFER.
+  if x.op in (Ops.RESHAPE, Ops.PERMUTE, Ops.EXPAND, Ops.SHRINK, Ops.FLIP, Ops.PAD) and x.src:
+    return _reg_buffer_base(x.src[0])
   return x if x.op is Ops.BUFFER and x.addrspace is AddrSpace.REG else None
 
 def _reg_mem_key(base:UOp, idx:UOp, byte_off:int=0, itemsize:int=4) -> tuple[UOp, int]|None:
@@ -820,6 +823,11 @@ def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
     if u.op is not Ops.INS or _iop(u) not in (AMDOps.SLOAD, AMDOps.SSTORE): continue
     if (base:=_reg_buffer_base(u.src[0])) is None: continue
     bases.add(base)
+    # Flash output acc / row stats are REDUCE-carried; promoting them drops loop values.
+    if (slot:=getattr(base.arg, "slot", None)) is not None and \
+       slot in {int(s) for s in getenv("AMD_REG_PROMOTE_SKIP_SLOTS", "2,3,4").split(",") if s.strip()}:
+      bad.add(base)
+      continue
     if base in wmma_bufs: continue  # handled by WMMA ACC aliasing
     idx = _const_int(u.src[1])
     dt = u.dtype if _iop(u) is AMDOps.SLOAD else u.src[2].dtype
