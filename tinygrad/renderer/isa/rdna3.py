@@ -3162,7 +3162,7 @@ def _gap_fill_after_loads(ops:list[UOp]) -> list[UOp]:
 
   Flash tip still does scratch_load; waitcnt_vmcnt(0) with nothing in between (~109×).
   """
-  if not getenv("AMD_LOAD_GAP_FILL", 0): return ops
+  if not getenv("AMD_LOAD_GAP_FILL", 1): return ops
   load_ops = (AMDOps.SLOAD, AMDOps.LOAD)
   alu = (AMDOps.FMAC, AMDOps.MUL, AMDOps.ADD, AMDOps.MAX, AMDOps.MOV, AMDOps.MULACC,
          AMDOps.EXP2, AMDOps.WHERE, AMDOps.CAST)
