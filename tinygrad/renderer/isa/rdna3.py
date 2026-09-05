@@ -3590,27 +3590,32 @@ def insts_from_linear(lin:UOp):
     # REG-stack park of same-stage swizzles is scheduled pre-regalloc as SWIZZLE×N,MOV×N
     # (_schedule_swizzle_mov_batches). Soft lgkm then shares one wait on the first MOV.
     # Do not emit-reorder here — that extends live ranges past regalloc and corrupts results.
-    # Overlap independent VMEM with in-flight ds_swizzle (emit after swizzle, before add's lgkm wait).
+    # Overlap independent VMEM/VALU with in-flight ds_swizzle (emit after swizzle, before add's lgkm wait).
     if mask_depth == 0 and getenv("AMD_SINK_VMEM_SWIZZLE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SWIZZLE and \
        oi + 1 < len(scheduled) and (add:=scheduled[oi + 1]).op is Ops.INS and _iop(add) in (AMDOps.ADD, AMDOps.MAX) and u in add.src:
       emitted = _emit_uop(u)
       for inst in emitted: emit(inst)
       pending["lgkm"] |= _reg_idxs(u)
       if getenv("AMD_SWIZZLE_DELAY", 0): emit(r3.s_delay_alu(1))
+      sink_valu = bool(getenv("AMD_SINK_VALU_SWIZZLE", 1))
+      valu_ops = (AMDOps.FMAC, AMDOps.MUL, AMDOps.ADD, AMDOps.MAX, AMDOps.FMA_MIX_F32, AMDOps.MULACC)
       k, moved = oi + 2, 0
-      while k < len(scheduled) and moved < 4:
+      max_moved = getenv("AMD_SINK_SWIZZLE_MAX", 6)
+      while k < len(scheduled) and moved < max_moved:
         if k in early_emitted or scheduled[k] in skip:
           k += 1
           continue
         cand = scheduled[k]
-        if cand.op is Ops.INS and _iop(cand) is AMDOps.LOAD and _vmem_schedulable_load(cand) and \
+        if cand.op is Ops.INS and (
+             (_iop(cand) is AMDOps.LOAD and _vmem_schedulable_load(cand)) or
+             (sink_valu and _iop(cand) in valu_ops)) and \
            u not in cand.toposort() and add not in cand.toposort() and \
            not any(cand in scheduled[m].toposort() for m in range(oi + 2, k)):
           src_regs = set().union(*(_reg_idxs(s) for s in cand.src))
           if src_regs and _pending_src(src_regs): flush_regs(src_regs)
           gap_emitted = _emit_uop(cand)
           for inst in gap_emitted: emit(inst)
-          note_vm(_reg_idxs(cand), gap_emitted)
+          if _iop(cand) is AMDOps.LOAD: note_vm(_reg_idxs(cand), gap_emitted)
           early_emitted.add(k)
           moved += 1
           k += 1
