@@ -893,14 +893,10 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
     return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   # AMD_FLASH_ACC_SEP defaults on (faster than in-place soft REG after scratch CSE).
-  # AMD_WMMA_ACC_SMALL still gated off:
-  #  - Ranged (tm,tn) WMMA parks only one 8-wide ACC pack per buffer (need TN/TD packs).
-  #    Later columns clobber earlier ACC → ~all outputs wrong (err~1.5) while ~730µs.
-  #  - Unrolling TN/TD or stream-per-column for distinct packs: LinearScanRegalloc
-  #    assert (double-def PACK tags) — need unique pack tags per column WMMA first.
-  #  - Scale uses non-const REG indices → SSTORE→scratch while EXTRACT reads ACC (err=inf)
-  #    unless copy ACC→soft before scale/mask.
-  # HIP flash (same source) is 0-scratch / 24 unrolled WMMA ~284µs — ACC_SMALL is the path.
+  # AMD_WMMA_ACC_SMALL still gated off (HIP same source ~284µs / 24 WMMA / 0 scratch):
+  #  - Ranged (tm,tn) parks one ACC pack; later columns clobber → err~1.5 at ~730µs.
+  #  - Unroll / multi-WMMA / in-range soft copy: LinearScanRegalloc double-def on PACK tags.
+  #  - Scale on ACC needs ACC→soft before scale/mask (err=inf otherwise).
   # Infrastructure kept: wmma_acc_buf_tiles + ACC-lane SSTORE writeback helpers in rdna3.py.
   # Scratch b128: const-idx SLOAD/SSTORE fusion + 4-wide vec emit (flash ~2171→2074 insn).
   if isinstance(T_real, UOp):
