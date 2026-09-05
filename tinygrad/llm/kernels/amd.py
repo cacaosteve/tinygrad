@@ -730,10 +730,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   Q_ELEMS_PER_THREAD, KV_ELEMS_PER_THREAD = BLOCK_M * D // THREADS_PER_BLOCK, BLOCK_N * D // THREADS_PER_BLOCK
   QP_lds = UOp.placeholder((BLOCK_M, D + LDS_PAD), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)
   KV_lds = UOp.placeholder((BLOCK_N, D + LDS_PAD), dtypes.half, slot=1, addrspace=AddrSpace.LOCAL)[:, :D]
-  acc, m_i, l_i = _reg((TM, TD), 19, 0), _reg((TM,), 3, -math.inf), _reg((TM,), 4, 0)
-  # Slot 19 (not 2): REDUCE-carried output acc on a REG-promotable slot. Slot 2 is
-  # AMD_REG_PROMOTE_SKIP_SLOTS-default and forced per-tile scratch; m_i/l_i already
-  # promote successfully as REDUCE-carried, so try the same for acc.
+  acc, m_i, l_i = _reg((TM, TD), 2, 0), _reg((TM,), 3, -math.inf), _reg((TM,), 4, 0)
   n_tile = UOp.range((q_base + (block_m + 1) * BLOCK_M + BLOCK_N - 1) // BLOCK_N, 100, AxisType.REDUCE)
   Q_lds = QP_lds[:, :D]
   Q_store = Q_lds.after(n_tile).reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid].store(q.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid])
@@ -890,17 +887,31 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     .reshape(THREADS_PER_BLOCK, TM, TN)
   P_store = P_write[tid].store(S_reg.cast(dtypes.half))
   beta_i = UOp.placeholder((TM,), dtypes.float, slot=9, addrspace=AddrSpace.REG)
+  # Tile-local promotable working copy of REDUCE-carried acc (slot 2 is unpromotable).
+  # One scratch load at tile start + one store at tile end; alpha*acc still runs before
+  # V load (keeps latency hiding). Soft/stats buffers already promote on their own.
+  _acc_work = bool((_fu & 4) and _acc_small)
+  acc_work = UOp.placeholder((TM, TD), dtypes.float, slot=19, addrspace=AddrSpace.REG) if _acc_work else None
   if _fu & 4:
     acc_c, l_c, m_c = acc.after(n_tile), l_i.after(n_tile), m_i.after(n_tile)
+    if _acc_work:
+      acc_work = acc_work.after(UOp.group(*[acc_work[ri, rj].store(acc_c[ri, rj]) for ri in range(TM) for rj in range(TD)]))
+      work = acc_work
+    else:
+      work = acc_c
     corr = []
     for ri in range(TM):
       m_new = m_c[ri].maximum(m_ij[ri])
       alpha_val, beta_val = ((m_c[ri] - m_new) * LOG2E).exp2(), ((m_ij[ri] - m_new) * LOG2E).exp2()
-      corr.append(UOp.group(*[acc_c[ri, rj].store(alpha_val * acc_c[ri, rj]) for rj in range(TD)],
+      corr.append(UOp.group(*[work[ri, rj].store(alpha_val * work[ri, rj]) for rj in range(TD)],
                            l_c[ri].store(alpha_val * l_c[ri] + beta_val * p_sum[ri]),
                            m_c[ri].store(m_new), beta_i[ri].store(beta_val)))
     correction = UOp.group(*corr)
-    acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
+    if _acc_work:
+      acc_work = work.after(correction)
+      acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
+    else:
+      acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
   else:
     ri4, rj4 = UOp.range(TM, 330), UOp.range(TD, 331)
     m_new = m_i[ri4].maximum(m_ij[ri4])
@@ -975,11 +986,19 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
   ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
   if _fu & 4 and getenv("AMD_FLASH_ACC_UNROLL", 1):
-    # Const-index acc+= on promotable slot 19 (REDUCE-carried; see acc alloc above).
+    # Const-index acc update. Slot 2 stays unpromoted (REDUCE-carried); soft/stats promote.
     acc_c = acc.after(n_tile)
-    acc_up = UOp.group(*[acc_c[ri, rj].store(acc_c[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
-                         for ri in range(TM) for rj in range(TD)])
-    n_tile_end = acc_up.barrier().end(n_tile)
+    if _acc_work:
+      work = acc_work
+      acc_up = UOp.group(*[work[ri, rj].store(work[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
+                           for ri in range(TM) for rj in range(TD)])
+      work = work.after(acc_up)
+      writeback = UOp.group(*[acc_c[ri, rj].store(work[ri, rj]) for ri in range(TM) for rj in range(TD)])
+      n_tile_end = writeback.barrier().end(n_tile)
+    else:
+      acc_up = UOp.group(*[acc_c[ri, rj].store(acc_c[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
+                           for ri in range(TM) for rj in range(TD)])
+      n_tile_end = acc_up.barrier().end(n_tile)
   else:
     n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
   acc, l_i, m_i = acc.after(n_tile_end), l_i.after(n_tile_end), m_i.after(n_tile_end)
