@@ -2272,7 +2272,7 @@ class TestAMDRenderer(unittest.TestCase):
       tag = (Register(f"acc{p}", 200 + p * 8),)
       pack = _uop(Ops.INS, dtypes.float, tuple(loads), AMDOps.PACK, tag)
       uops += [pack, _uop(Ops.INS, dtypes.float, (pack, ab, ab), AMDOps.WMMA, tag)]
-    inits, tiles, idx_map = _wmma_acc_zero_inits(uops)
+    inits, tiles, idx_map, _buf_tiles = _wmma_acc_zero_inits(uops)
     self.assertEqual(len(inits), 16)
     self.assertEqual(len(idx_map), 128)
     # tiles[first_idx_tile] alone cannot name 16 packs
@@ -2302,13 +2302,54 @@ class TestAMDRenderer(unittest.TestCase):
       tag = (Register(f"acc{bidx}", 200 + bidx * 8),)
       pack = _uop(Ops.INS, dtypes.float, tuple(loads), AMDOps.PACK, tag)
       uops += [*loads, pack, _uop(Ops.INS, dtypes.float, (pack, ab, ab), AMDOps.WMMA, tag)]
-    inits, _, idx_map = _wmma_acc_zero_inits(uops)
+    inits, _, idx_map, _buf_tiles = _wmma_acc_zero_inits(uops)
     self.assertEqual(len(inits), 2)
     self.assertEqual(len(idx_map), 16)
     self.assertNotEqual(id(idx_map[(bufs[0], 0)][0]), id(idx_map[(bufs[1], 0)][0]))
     for bidx, buf in enumerate(bufs):
       self.assertEqual({id(idx_map[(buf, lane)][0]) for lane in range(8)}, {id(inits[bidx])})
       self.assertEqual([idx_map[(buf, lane)][1] for lane in range(8)], list(range(8)))
+
+  def test_wmma_acc_small_buf_tiles_separate_buffers(self):
+    # Flash ACC_SEP: S_reg (16) then pv_acc (32) both park ACC with dynamic SLOAD indices.
+    # Global expand-order tile ids collide (both have tile_local 0); linear lookup needs buf_tiles.
+    import os
+    from tinygrad.renderer.isa.rdna3 import _wmma_acc_zero_inits, _wmma_linear_tile_lane
+    prev = os.environ.get("AMD_WMMA_ACC_SMALL")
+    os.environ["AMD_WMMA_ACC_SMALL"] = "1"
+    getenv.cache_clear()
+    try:
+      zero = UOp.const(0.0, dtypes.float32)
+      ab = _uop(Ops.INS, dtypes.float, tuple(
+        _uop(Ops.INS, dtypes.float, (zero,), AMDOps.MOV, (Register(f"ab{i}", i),)) for i in range(8)),
+        AMDOps.PACK, (Register("ab", 10),))
+      s_reg = UOp.placeholder((16,), dtypes.float32, slot=6, addrspace=AddrSpace.REG)
+      pv = UOp.placeholder((32,), dtypes.float32, slot=10, addrspace=AddrSpace.REG)
+      dyn = _uop(Ops.INS, dtypes.int32, (), AMDOps.MOV, (Register("dyn", 50),))
+      uops: list[UOp] = []
+      for buf, n_tiles in ((s_reg, 2), (pv, 4)):
+        for t in range(n_tiles):
+          loads = [_uop(Ops.INS, dtypes.float, (buf, dyn), AMDOps.SLOAD,
+                        (Register(f"l{buf.arg}_{t}_{lane}", 100 + t * 8 + lane),)) for lane in range(8)]
+          tag = (Register(f"acc{buf.arg}_{t}", 200 + t * 8),)
+          pack = _uop(Ops.INS, dtypes.float, tuple(loads), AMDOps.PACK, tag)
+          uops += [*loads, pack, _uop(Ops.INS, dtypes.float, (pack, ab, ab), AMDOps.WMMA, tag)]
+      inits, tiles, idx_map, buf_tiles = _wmma_acc_zero_inits(uops)
+      self.assertEqual(len(inits), 6)
+      self.assertEqual(len(buf_tiles[s_reg]), 2)
+      self.assertEqual(len(buf_tiles[pv]), 4)
+      self.assertNotEqual(id(buf_tiles[s_reg][0]), id(buf_tiles[pv][0]))
+      # Linear idx 0 on each buffer must resolve to that buffer's tile0, not a collided global tile.
+      for buf, numel in ((s_reg, 16), (pv, 32)):
+        tile, lane = _wmma_linear_tile_lane(0, numel)
+        self.assertEqual(tile, 0)
+        self.assertEqual(lane, 0)
+        self.assertEqual(id(buf_tiles[buf][tile]), id(idx_map[(buf, 0)][0]))
+      self.assertEqual(len(tiles), 6)  # global keys still unique by expand order
+    finally:
+      if prev is None: os.environ.pop("AMD_WMMA_ACC_SMALL", None)
+      else: os.environ["AMD_WMMA_ACC_SMALL"] = prev
+      getenv.cache_clear()
 
   def test_after_pre_regalloc_schedules_cast_before_store(self):
     # Product-16 epilogue: f32→f16 CAST must sit immediately before its STORE so half temps

@@ -669,19 +669,40 @@ def _wmma_linear_tile_lane(idx:int, numel:int) -> tuple[int, int]|None:
   n_tiles = numel // 8
   return idx % n_tiles, idx // n_tiles
 
-def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dict[int|tuple[UOp, int], tuple[UOp, int]]]:
+def _wmma_acc_lane(ctx:PreRegAllocContext, buf:UOp, idx:int) -> tuple[UOp, int]|None:
+  """Map a const REG index on a WMMA ACC buffer to (zero-init PACK, lane)."""
+  idx_map = ctx.scratch.get("wmma_acc_idx_map") or {}
+  if (got:=idx_map.get((buf, idx), idx_map.get(idx))) is not None: return got
+  if getenv("AMD_WMMA_ACC_SMALL", 0) and (lin:=_wmma_linear_tile_lane(idx, buf.max_numel())) is not None:
+    tile_local, lane = lin
+    if (init:=(ctx.scratch.get("wmma_acc_buf_tiles") or {}).get(buf, {}).get(tile_local)) is not None:
+      return init, lane
+  tile, lane = _wmma_slot_tile_lane(idx)
+  if (init:=(ctx.scratch.get("wmma_acc_tiles") or {}).get(tile)) is None: return None
+  return init, lane
+
+def _wmma_acc_extract(ctx:PreRegAllocContext, init:UOp, lane:int) -> UOp:
+  n = ctx.scratch.get("wmma_ext_n", 0)
+  ctx.scratch["wmma_ext_n"] = n + 1
+  return UOp(Ops.INS, src=(init, _tconst(lane, dtypes.int32).rtag()), arg=(AMDOps.EXTRACT, dtypes.float32),
+             tag=(Register(f"wmma_ext{n}", 0, _cons=VGPR),))
+
+def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dict[int|tuple[UOp, int], tuple[UOp, int]], dict[UOp, dict[int, UOp]]]:
   """Zero-init WMMA ACC packs before the K-loop.
 
-  Returns (inits, tile->init, reg_idx-or-(buffer,reg_idx)->(init,lane)).
+  Returns (inits, tile->init, reg_idx-or-(buffer,reg_idx)->(init,lane), buf->tile_local->init).
   tile->init uses the 4×4 interleaved formula. Consecutive product-16 SLOAD packs collide
   on first-idx tile keys (4 keys for 16 packs), so epilogue SLOADs use reg_idx->init.
+  Flash ACC_SMALL parks multiple ≤64 buffers; linear tile lookups must use buf_tiles, not the
+  global expand-order counter (S_reg tile0 would collide with pv_acc tile0).
   """
   ctx = PreRegAllocContext(uops)
   bufs = _wmma_acc_buffers(ctx)
-  if not bufs: return [], {}, {}
+  if not bufs: return [], {}, {}, {}
   seen: set[tuple] = set()
   inits: list[UOp] = []
   tiles: dict[int, UOp] = {}
+  buf_tiles: dict[UOp, dict[int, UOp]] = {}
   idx_map: dict[int|tuple[UOp, int], tuple[UOp, int]] = {}
   next_tile = 0
   buf_next_tile: dict[UOp, int] = {}
@@ -716,6 +737,8 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
     init = UOp(Ops.INS, src=tuple(_tconst(0.0, dtypes.float32) for _ in range(8)), arg=(AMDOps.PACK, dtypes.float), tag=pack.tag)
     inits.append(init)
     tiles[tile] = init
+    if pack_base is not None and tile_local is not None:
+      buf_tiles.setdefault(pack_base, {})[tile_local] = init
     for lane, (sload, idx) in enumerate(zip(pack.src, sload_idxs)):
       if idx is not None and (base:=_reg_buffer_base(sload.src[0])) is not None:
         idx_map[idx if len(bufs) == 1 else (base, idx)] = (init, lane)
@@ -728,7 +751,7 @@ def _wmma_acc_zero_inits(uops:list[UOp]) -> tuple[list[UOp], dict[int, UOp], dic
           idx = lane * n_tiles + tile_local
           if 0 <= idx < numel:
             idx_map[idx if len(bufs) == 1 else (pack_base, idx)] = (init, lane)
-  return inits, tiles, idx_map
+  return inits, tiles, idx_map, buf_tiles
 
 def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
   if (promotable:=ctx.scratch.get("reg_promotable")) is not None: return promotable
@@ -1738,7 +1761,23 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
     return nx, [nx]
   if _iop(x) is AMDOps.SSTORE:
     if (buf:=_reg_buffer_base(x.src[0])) is not None and buf in _wmma_acc_buffers(ctx):
-      return x, []  # acc stays in WMMA VGPR across K-loop
+      # K-loop WMMA results use dynamic REG indices: ACC is updated in-place by two-address
+      # WMMA; leave the SSTORE (dead scratch) alone so promote does not invent a VGPR.
+      # Flash ACC_SMALL scale/mask use const indices and must write back into ACC lanes —
+      # otherwise SLOAD EXTRACTs stale ACC while SSTORE only updates scratch (err=inf).
+      idx = _const_int(x.src[1])
+      bo = _lds_byte_off(x)
+      if idx is not None and x.src[2].dtype.itemsize and bo % x.src[2].dtype.itemsize == 0:
+        idx = idx + bo // x.src[2].dtype.itemsize
+      elif bo:
+        idx = None
+      if idx is None: return x, []
+      if not ctx.scratch.get("wmma_past_acc") and not getenv("AMD_WMMA_ACC_SMALL", 0): return x, []
+      if (got:=_wmma_acc_lane(ctx, buf, idx)) is None: return None
+      init, lane = got
+      ext = _wmma_acc_extract(ctx, init, lane)
+      st = UOp(Ops.INS, src=(ext, x.src[2]), arg=(AMDOps.REG_STORE, dtypes.void))
+      return ext, [ext, st]
     if (slot:=_reg_promote_slot(ctx, x.src[0], x.src[1], _lds_byte_off(x), x.src[2].dtype.itemsize)) is None: return None
     val = x.src[2]
     reg_values = ctx.scratch["reg_values"]
@@ -1762,20 +1801,9 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
         if not ctx.scratch.get("wmma_past_acc"): return x, []
         return None
       if not ctx.scratch.get("wmma_past_acc") and not getenv("AMD_WMMA_ACC_SMALL", 0): return x, []
-      idx_map = ctx.scratch.get("wmma_acc_idx_map") or {}
-      if (got:=idx_map.get((buf, idx), idx_map.get(idx))) is not None: init, lane = got
-      else:
-        if not ctx.scratch.get("wmma_past_acc"): return x, []
-        if getenv("AMD_WMMA_ACC_SMALL", 0) and (lin:=_wmma_linear_tile_lane(idx, buf.max_numel())) is not None:
-          tile, lane = lin
-        else:
-          tile, lane = _wmma_slot_tile_lane(idx)
-        tiles = ctx.scratch.get("wmma_acc_tiles") or {}
-        if (init:=tiles.get(tile)) is None: return None
-      n = ctx.scratch.get("wmma_ext_n", 0)
-      ctx.scratch["wmma_ext_n"] = n + 1
-      ext = UOp(Ops.INS, src=(init, _tconst(lane, dtypes.int32).rtag()), arg=(AMDOps.EXTRACT, dtypes.float32),
-                tag=(Register(f"wmma_ext{n}", 0, _cons=VGPR),))
+      if (got:=_wmma_acc_lane(ctx, buf, idx)) is None: return None
+      init, lane = got
+      ext = _wmma_acc_extract(ctx, init, lane)
       return ext, [ext]
     if (slot:=_reg_promote_slot(ctx, x.src[0], x.src[1], _lds_byte_off(x), x.dtype.itemsize)) is None: return None
     loaded = ctx.scratch["reg_values"].get(slot)
@@ -4164,12 +4192,13 @@ class AMDRenderer(ISARenderer):
         ins = loop_i + 1
         if ins < len(lst) and lst[ins].op is Ops.AFTER: ins += 1
         lst = lst[:ins] + packs + lst[ins:]
-    inits, tiles, idx_map = _wmma_acc_zero_inits(lst)
+    inits, tiles, idx_map, buf_tiles = _wmma_acc_zero_inits(lst)
     if not inits: return lst, {}
     loop_i = next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), 0)
     return lst[:loop_i] + inits + lst[loop_i:], {
       "wmma_acc_inits": {u.tag: u for u in inits},
       "wmma_acc_tiles": tiles,
+      "wmma_acc_buf_tiles": buf_tiles,
       "wmma_acc_idx_map": idx_map,
     }
 
