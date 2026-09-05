@@ -176,12 +176,15 @@ class _StoreAddrCache:
   __slots__ = ("key", "page")
   def __init__(self): self.clear()
   def clear(self): self.key, self.page = None, None
-  def addr(self, idx:UOp, itemsize:int, byte_off:int) -> tuple[list, Reg, int]:
+  def addr(self, idx:UOp, itemsize:int, byte_off:int, base_key:object=None) -> tuple[list, Reg, int]:
     src = _src(idx)
     # Key by the logical index, not its allocated register. Regalloc can reuse one
     # VGPR for different indices between stores; treating that as the same base
     # reuses a stale TMP_VADDR and writes the later value to the wrong element.
-    key = (id(idx), itemsize)
+    # Const indices (flash REG init peel → fresh _tconst(0) each time) key by value.
+    # base_key separates scratch REG buffers that share a const-0 index.
+    ikey = ("c", _const_int(idx)) if _const_int(idx) is not None else ("u", id(idx))
+    key = (ikey, itemsize, base_key)
     page, rem = divmod(max(byte_off, 0), 0x1000)
     if self.key == key and self.page == page: return [], TMP_VADDR, rem
     if itemsize == 1:
@@ -862,12 +865,17 @@ def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
       raise CompileError(f"no store {val.dtype}")
     if peel:
       # Peel base+imm so one addr VGPR is shared (TC_LDS C-stores: 64 ADD(base,imm) → few bases).
-      idx, off = _peel_add_imm(a.src[1], _mem_itemsize(val.dtype), max_byte=max_byte, deep=deep)
+      item = _mem_itemsize(val.dtype)
+      idx, off = _peel_add_imm(a.src[1], item, max_byte=max_byte, deep=deep)
+      # Pure const index (flash REG init): fold to offset0 + imm so stores share a zero base.
+      if off == 0 and (c := _const_int(idx)) is not None and c > 0 and c * item <= max_byte:
+        off, idx = c * item, _tconst(0, idx.dtype)
       src = (a.src[0], idx, val) if off == 0 else (a.src[0], idx, val, _tconst(off, dtypes.int32).rtag())
       return x.ins(op, src=src)
     return x.ins(op, src=(a.src[0], a.src[1], val))
   if _is_lds_ref(a.src[0]): return try_store(_local_store, AMDOps.LSTORE, peel=True)
-  if _is_scratch_ref(a.src[0]): return try_store(_scratch_store, AMDOps.SSTORE)
+  # Peel scratch REG stores to shared base + imm offset (flash init: 200× lshl+add → few bases).
+  if _is_scratch_ref(a.src[0]): return try_store(_scratch_store, AMDOps.SSTORE, peel=True, max_byte=0xfff)
   # Soft-peel any ADD+imm (incl. nested). Emit uses GLOBAL offset when ≤4095 else v_lshl_add.
   # (Hard-peel-only-≤4095 left ~120 addr VGPRs + LSHL/store for WMMA C.)
   return try_store(_global_store, AMDOps.STORE, peel=True, max_byte=0x7fffffff, deep=True)
@@ -2211,16 +2219,23 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       return pre + [scratch_load(addr=addr, vdst=_dst(u), offset=0, sve=1)]
     case AMDOps.SSTORE:
       slots = _reg_slots(u.src[2])
-      pre, addr = _scratch_addr(u.src[0], u.src[1], u.src[2].dtype.itemsize)
+      itemsize, byte_off = u.src[2].dtype.itemsize, _lds_byte_off(u)
+      soff = _scratch_base_offset(u.src[0])
+      if store_addr_cache is not None and not masked:
+        pre, addr, byte_off = store_addr_cache.addr(u.src[1], itemsize, byte_off, base_key=id(u.src[0]))
+        # Bake scratch segment base into the CSE'd TMP_VADDR on first use of this buffer+index.
+        if pre and soff: pre = pre + [r3.v_add_nc_u32_e64(addr, soff, addr)]
+      else:
+        pre, addr = _scratch_addr(u.src[0], u.src[1], itemsize)
       pre, addr = _masked_addr(pre, addr, masked)
       if slots > 1:
         if u.src[2].dtype is not dtypes.float32: raise CompileError(f"no vec scratch store {u.src[2].dtype}")
-        # Soft vscnt: scoreboard flushes once before SLOAD / endpgm (flash REG init storm).
-        return pre + [r3.scratch_store_b32(addr=addr, data=_reg_lane(greg(u.src[2]), i), offset=i*4, sve=1) for i in range(slots)]
+        return pre + [r3.scratch_store_b32(addr=addr, data=_reg_lane(greg(u.src[2]), i), offset=byte_off + i*4, sve=1)
+                      for i in range(slots)]
       if (scratch_store:=_scratch_store(u.src[2].dtype)) is None:
         raise CompileError(f"no scratch store {u.src[2].dtype}")
       dpre, data = _vgpr_data(TMP_VDATA, u.src[2])
-      return pre + dpre + [scratch_store(addr=addr, data=data, offset=0, sve=1)]
+      return pre + dpre + [scratch_store(addr=addr, data=data, offset=byte_off, sve=1)]
     case AMDOps.BARRIER:
       return [r3.s_barrier()]
     case AMDOps.FILL:
@@ -3683,7 +3698,7 @@ def insts_from_linear(lin:UOp):
             oi = end
             continue
     if u in d16_hi_lo: flush_regs(_reg_idxs(d16_hi_lo[u]))
-    is_store = u.op is Ops.INS and _iop(u) is AMDOps.STORE
+    is_store = u.op is Ops.INS and _iop(u) in (AMDOps.STORE, AMDOps.SSTORE)
     emitted = _emit_uop(u, masked, with_store_cache=is_store)
     # VALU copy of an outstanding VMEM/LDS dest must wait first (PACK/MOV across pools).
     if emitted and u.op is Ops.INS and _iop(u) in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV):
@@ -3695,7 +3710,8 @@ def insts_from_linear(lin:UOp):
     # Keep page CSE across CAST (uses TMP_VDATA, not TMP_VADDR) — cast-before-store otherwise
     # re-scales the C base for every half store (~100 extra V_LSHL_ADD).
     # half×16 STORE may V_ADD into TMP_VADDR for the second b128 — drop page CSE.
-    if is_store and any(getattr(i, "op_name", "") == "V_ADD_NC_U32_E64" for i in emitted):
+    # Scratch SSTORE also ADDs segment base once; keep CSE across those.
+    if _iop(u) is AMDOps.STORE and any(getattr(i, "op_name", "") == "V_ADD_NC_U32_E64" for i in emitted):
       store_addr_cache.clear()
     elif not is_store and any(getattr(i, "vdst", None) == TMP_VADDR for i in emitted):
       store_addr_cache.clear()
