@@ -431,10 +431,12 @@ def _reg_buffer_base(x:UOp) -> UOp|None:
   if x.op is Ops.AFTER: return _reg_buffer_base(x.src[0])
   return x if x.op is Ops.BUFFER and x.addrspace is AddrSpace.REG else None
 
-def _reg_mem_key(base:UOp, idx:UOp) -> tuple[UOp, int]|None:
+def _reg_mem_key(base:UOp, idx:UOp, byte_off:int=0, itemsize:int=4) -> tuple[UOp, int]|None:
+  # Include peeled SCRATCH imm offsets so const-fold to idx=0 + byte_off stays distinct.
   if (buf:=_reg_buffer_base(base)) is None: return None
   if (off:=_const_int(idx)) is None or off < 0: return None
-  return buf, off
+  if itemsize <= 0 or byte_off % itemsize: return None
+  return buf, off + byte_off // itemsize
 
 def _is_zero_val(val:UOp) -> bool:
   if (c:=_unwrap_const(val)) is not None: return c.val == 0
@@ -443,7 +445,8 @@ def _is_zero_val(val:UOp) -> bool:
   return False
 
 def _is_identity_sload(val:UOp, key:tuple[UOp, int]) -> bool:
-  return val.op is Ops.INS and _iop(val) is AMDOps.SLOAD and _reg_mem_key(val.src[0], val.src[1]) == key
+  if val.op is not Ops.INS or _iop(val) is not AMDOps.SLOAD: return False
+  return _reg_mem_key(val.src[0], val.src[1], _lds_byte_off(val), val.dtype.itemsize) == key
 
 def _is_identity_load(val:UOp, addr:UOp) -> bool:
   if val.op is not Ops.LOAD or not val.src: return False
@@ -460,7 +463,7 @@ def _compute_amd_skip(uops:list[UOp]) -> set[UOp]:
                      (buf:=_reg_buffer_base(u.src[0])) is not None and _const_int(u.src[1]) is None}
   for u in uops:
     if u.op is Ops.INS and _iop(u) is AMDOps.SSTORE and len(u.src) >= 3:
-      if (key:=_reg_mem_key(u.src[0], u.src[1])) is None: continue
+      if (key:=_reg_mem_key(u.src[0], u.src[1], _lds_byte_off(u), u.src[2].dtype.itemsize)) is None: continue
       val = u.src[2]
       is_identity, is_zero = _is_identity_sload(val, key), _is_zero_val(val)
     elif u.op is Ops.STORE and len(u.src) >= 2:
@@ -754,6 +757,12 @@ def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
       if (v.op is Ops.WMMA) or (v.op is Ops.INS and _iop(v) is AMDOps.WMMA):
         bad.add(base)
         continue
+    bo = _lds_byte_off(u)
+    if idx is not None and dt.itemsize and bo % dt.itemsize == 0:
+      idx = idx + bo // dt.itemsize
+    elif bo:
+      bad.add(base)
+      continue
     if idx is None or idx < 0 or idx >= base.max_numel() or base.max_numel() > 64 or n != 1 or dt.itemsize > 4:
       bad.add(base)
       continue
@@ -765,10 +774,11 @@ def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
   ctx.scratch["reg_n"] = 0
   return promotable
 
-def _reg_promote_slot(ctx:PreRegAllocContext, base:UOp, idx:UOp) -> tuple[UOp, int]|None:
+def _reg_promote_slot(ctx:PreRegAllocContext, base:UOp, idx:UOp, byte_off:int=0, itemsize:int=4) -> tuple[UOp, int]|None:
   buf = _reg_buffer_base(base)
   if buf is None or buf not in _reg_promotable_buffers(ctx): return None
-  return None if (slot:=_const_int(idx)) is None else (buf, slot)
+  if (slot:=_const_int(idx)) is None or itemsize <= 0 or byte_off % itemsize: return None
+  return buf, slot + byte_off // itemsize
 
 def _new_promoted_reg(ctx:PreRegAllocContext, val:UOp) -> UOp:
   n = ctx.scratch["reg_n"]
@@ -826,9 +836,9 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
     if _scratch_load(x.dtype, n) is None: raise CompileError(f"no scratch load {x.dtype} x{n}")
     # Match SSTORE: peel const byte offsets into SCRATCH's 12-bit imm (flash REG traffic).
     item = _mem_itemsize(x.dtype)
+    # Peel ADD+imm only. Do not const-fold idx→0+off: that collapses REG promote/skip
+    # slots unless every consumer accounts for byte_off (flash wants shared dynamic bases).
     idx, off = _peel_add_imm(a.src[1], item, max_byte=0xfff)
-    if off == 0 and (c := _const_int(idx)) is not None and c > 0 and c * item <= 0xfff:
-      off, idx = c * item, _tconst(0, idx.dtype)
     src = (a.src[0], idx, count) if off == 0 else (a.src[0], idx, count, _tconst(off, dtypes.int32).rtag())
     return x.ins(AMDOps.SLOAD, dtype=x.dtype, src=src)
   if _global_load(x.dtype, n) is None and not (x.dtype is dtypes.half and n == 16):
@@ -1726,7 +1736,7 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
   if _iop(x) is AMDOps.SSTORE:
     if (buf:=_reg_buffer_base(x.src[0])) is not None and buf in _wmma_acc_buffers(ctx):
       return x, []  # acc stays in WMMA VGPR across K-loop
-    if (slot:=_reg_promote_slot(ctx, x.src[0], x.src[1])) is None: return None
+    if (slot:=_reg_promote_slot(ctx, x.src[0], x.src[1], _lds_byte_off(x), x.src[2].dtype.itemsize)) is None: return None
     val = x.src[2]
     reg_values = ctx.scratch["reg_values"]
     if slot not in reg_values:
@@ -1740,6 +1750,11 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
       # Loop-body SLOADs only feed WMMA PACK (redirected); post-loop reads need EXTRACT.
       # AMD_WMMA_ACC_SMALL: allow mid-kernel const-index EXTRACT for flash ACC_SEP copies.
       idx = _const_int(x.src[1])
+      bo = _lds_byte_off(x)
+      if idx is not None and x.dtype.itemsize and bo % x.dtype.itemsize == 0:
+        idx = idx + bo // x.dtype.itemsize
+      elif bo:
+        idx = None
       if idx is None:
         if not ctx.scratch.get("wmma_past_acc"): return x, []
         return None
@@ -1759,7 +1774,7 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
       ext = UOp(Ops.INS, src=(init, _tconst(lane, dtypes.int32).rtag()), arg=(AMDOps.EXTRACT, dtypes.float32),
                 tag=(Register(f"wmma_ext{n}", 0, _cons=VGPR),))
       return ext, [ext]
-    if (slot:=_reg_promote_slot(ctx, x.src[0], x.src[1])) is None: return None
+    if (slot:=_reg_promote_slot(ctx, x.src[0], x.src[1], _lds_byte_off(x), x.dtype.itemsize)) is None: return None
     loaded = ctx.scratch["reg_values"].get(slot)
     if loaded is None: return None
     return loaded, []
