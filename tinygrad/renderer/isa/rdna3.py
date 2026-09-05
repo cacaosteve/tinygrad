@@ -1247,8 +1247,11 @@ def _pack_f16_insts(u:UOp, fma_hi_lo:dict[UOp, UOp]|None=None, fma_pair_dst:dict
       continue
     # Always v_pack from lo/hi. Do not shortcut through the half2 load VGPR: EXTRACT(hi)
     # may LSHR that load in place, so a later mov from the load reg sees [hi,0] (2026-07-20).
+    # Spill FILL of a multi-slot value can surface as v[n:n+k]; v_pack needs scalar lanes.
     pre0, a = _vgpr_data(TMP_VDATA, lo)
     pre1, b = _vgpr_data(TMP_VADDR, hi)
+    if isinstance(a, Reg) and a.sz > 1: a = a[0]
+    if isinstance(b, Reg) and b.sz > 1: b = b[0]
     ret += pre0 + pre1 + [r3.v_pack_b32_f16(_reg_lane(greg(u), i), a, b)]
   return ret
 
