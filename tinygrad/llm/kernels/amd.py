@@ -845,9 +845,19 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     else:
       pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
   ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
-  n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
+  if _fu & 4:
+    # Const-index acc update so REG promote can keep acc in VGPRs (ranged idx poisons).
+    acc_up = UOp.group(*[acc[ri, rj].store(acc[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
+                         for ri in range(TM) for rj in range(TD)])
+    n_tile_end = acc_up.barrier().end(n_tile)
+  else:
+    n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
   acc, l_i, m_i = acc.after(n_tile_end), l_i.after(n_tile_end), m_i.after(n_tile_end)
-  acc = acc.after(acc.store(acc * (1 / l_i).reshape(TM, 1).expand(TM, TD)))
+  if _fu & 4:
+    inv = tuple((1 / l_i[ri]) for ri in range(TM))
+    acc = acc.after(UOp.group(*[acc[ri, rj].store(acc[ri, rj] * inv[ri]) for ri in range(TM) for rj in range(TD)]))
+  else:
+    acc = acc.after(acc.store(acc * (1 / l_i).reshape(TM, 1).expand(TM, TD)))
   o = o.reshape(WAVES_M, TM, LANES_PER_WAVE_M, 1, WAVES_N, TD, LANES_PER_WAVE_N, 1) \
     .permute((0, 4, 2, 6, 1, 3, 5, 7)).reshape(THREADS_PER_BLOCK, TM, TD)
   return o[tid].store(acc).end(wave_m, wave_n, lane).end(block_m, block_bh).sink(arg=KernelInfo(opts_to_apply=()))
