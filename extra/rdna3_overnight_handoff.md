@@ -1,41 +1,40 @@
-# Overnight RDNA3 — tip `eb13b6277`
+# Overnight RDNA3 — tip `4d1547216`
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
 
 ## Headline
 
-**Flash DIRECT ACC_SMALL** ~**673µs** (was ~702 after cleanup; overnight ~669–710).
-HIP ~278; SDPA ~360 (still faster default). Serial correctness **13/13**.
+**Flash DIRECT ACC_SMALL** ~**672µs** (err~1e-4). HIP ~278; SDPA ~360.
+Decode e2e ~49 vs HIP ~46; partial ~34 vs HIP ~29. Serial **13/13**.
 
-## Structural win this stretch
+## This session
 
-Tile-local VGPR work copy for REDUCE-carried `acc` (slot 2 → promotable slot 19 for the
-tile body). Keeps `alpha*acc` overlapping V loads; cuts SLOAD/SSTORE 128→96 and machine
-scratch ~137/102 → ~97/74.
-
-**Attribution correction:** soft buffers (16/17) already promote; the old “128 soft-copy”
-traffic was mostly unpromotable slot-2 `acc`. Fusing alpha into pv-add cut traffic but
-regressed to ~820µs (lost V-load overlap) — reverted.
+1. **Confirmed tip** on 7900 XTX (`gfx1100`, `AMDRenderer`).
+2. **Tried REDUCE-carried acc on promotable slot 19** — err~135, ~963µs, SPILL 110.
+   Same failure mode as clearing `AMD_REG_PROMOTE_SKIP_SLOTS`. Reverted.
+3. **Kept:** float4 tile work-copy + fuse `acc*(1/l)` into global store.
+   SLOAD/SSTORE **96→64**, machine scratch **~97/74→65/62**, time ~flat (~672).
 
 ## Scorecard (7900)
 
-| Workload | AMD | notes |
-|----------|-----|-------|
-| Flash DIRECT | ~673 | err~1e-4, vgpr 214, priv 212, SPILL 21 |
+| Workload | AMD | HIP |
+|----------|-----|-----|
+| Flash DIRECT | ~672 | ~278 |
 | SDPA | ~360 | |
-| HIP flash | ~278 | |
-| Serial | 13/13 | |
+| Decode e2e | ~49 | ~46 |
+| Decode partial | ~34 | ~29 |
+| IQ4_XS t32 | ~66 | (see benches) |
 
 ## Do not retry
 
 - Park from `AMD_FLASH_DIRECT` alone / ≤64 multi-pack auto-detect
-- `AMD_REG_PROMOTE_SKIP_SLOTS=` (promote slot 2) → wrong numerics
-- Fuse `acc=alpha*acc+beta*pv` as default → ~820µs regression
+- Promote slot 2 / move acc to slot 19 as REDUCE-carried → wrong numerics + spill thrash
+- Fuse `acc=alpha*acc+beta*pv` as default → ~820µs (lost V-load overlap)
 - `AMD_FLASH_K_UNROLL` / PV_ACC_DIRECT / ACC_SEP=0
 
 ## Next leftovers
 
-1. Cut remaining slot-2 cross-tile scratch / 21 allocator spills (toward HIP ~278)
-2. Safer K unroll without MMU fault
-3. IQ4 vgpr 118→95
-4. Decode partial 34→29
+1. Cut 21 allocator spills / remaining 64 slot-2 tile copies (toward HIP ~278)
+2. Decode partial 34→29 (`s_delay_alu` / batching — see `rdna3_decode_partial_todo.md`)
+3. Safer K unroll without MMU fault
+4. IQ4 vgpr if HIP still ahead on matched shape

@@ -1,12 +1,12 @@
 # Flash ACC_SMALL (DIRECT ISA)
 
-**Status (7900, tip `eb13b6277`):** `AMD_FLASH_DIRECT=1` defaults ACC_SMALL on
+**Status (7900, tip `4d1547216`):** `AMD_FLASH_DIRECT=1` defaults ACC_SMALL on
 (python-unroll QK+PV WMMA; `flash_attention` realizes under `AMD_FLASH_ACC_SMALL=1` briefly;
-tile-local VGPR work copy for REDUCE-carried `acc`).
+tile-local VGPR work copy + float4 copies + normalize fused into store).
 
 | Path | median µs | err | notes |
 |------|-----------|-----|-------|
-| DIRECT + ACC_SMALL | ~673 | ~1e-4 | 214 VGPR, priv 212, 21 SPILL, 96 SLOAD/SSTORE |
+| DIRECT + ACC_SMALL | ~672 | ~1e-4 | 214 VGPR, priv 212, 21 SPILL, 64 SLOAD/SSTORE |
 | DIRECT (pre work-copy) | ~702 | ~1e-4 | 189 VGPR, 128 SLOAD/SSTORE |
 | DIRECT + ACC_SMALL=0 | ~1315 | ~1e-4 | 149 VGPR, priv 384, 16 SPILL, 192 SLOAD/SSTORE |
 | HIP flash | ~278 | ~1e-4 | 0 scratch path |
@@ -16,16 +16,17 @@ tile-local VGPR work copy for REDUCE-carried `acc`).
 
 | Bucket | Count | Meaning |
 |--------|------:|---------|
-| Slot-2 `acc` SLOAD/SSTORE | 96 / 96 | REDUCE-carried output; **cannot** promote across `n_tile` |
+| Slot-2 `acc` SLOAD/SSTORE | 64 / 64 | Tile load+writeback only (normalize fused into global store) |
 | Soft/stats REG (slots 16/17/3/…) | 0 scratch | Already VGPR-promoted (`REG_STORE` elided) |
 | Allocator `SPILL`/`FILL` | 21 / 22 | LinearScan under ACC VGPR pressure (ACC from pool idx 121 → v126) |
-| Machine `scratch_store`/`load` | ~97 / 74 | With tile-local work copy (was ~137 / 102) |
+| Machine `scratch_store`/`load` | ~65 / 62 | After float4 work-copy + fused normalize |
 | `private_segment_size` | 212 B | |
 
 **Corrected takeaway:** the old “128 soft-copy” count was mostly **slot-2 acc**, not S_soft/pv_soft
 (those already promote). Tile-local slot-19 work copy cuts mid-tile scratch while keeping
 `alpha*acc` before V load (latency hiding). Fusing `acc=alpha*acc+beta*pv` cut traffic but
-**regressed to ~820µs** — lost overlap with V loads; do not revive.
+**regressed to ~820µs** — lost overlap with V loads; do not revive. Promoting REDUCE-carried
+acc (slot 2 or 19) → err~135 + spill thrash; leave skipped.
 
 ## How it works
 
