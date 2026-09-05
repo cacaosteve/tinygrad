@@ -949,16 +949,17 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     v_frag = V_view[wave_n, tn2, lane_n, k_pv]
     pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
   pv_acc = pv_acc.after(pv_done)
-  # With ACC_SMALL, const-index pv reads EXTRACT from parked ACC — skip soft copy
-  # (saves EXTRACT/SSTORE traffic that inflated spills under ACC VGPR pressure).
-  if _acc_sep and not (_acc_small and getenv("AMD_FLASH_PV_ACC_DIRECT", 1)):
+  if _acc_sep:
     # Fully overwritten before read — skip REG zero-fill (same as S_soft).
-    pv_soft = UOp.placeholder((TM, TD), dtypes.float, slot=17, addrspace=AddrSpace.REG)
-    if getenv("AMD_FLASH_VEC_COPY", 0) and (TM * TD) % 4 == 0:
-      src, dst = pv_acc.reshape(TM * TD), pv_soft.reshape(TM * TD)
-      pv_acc = pv_soft.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)]))
-    else:
-      pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
+    # Keep soft copy even under ACC_SMALL: PV ACC→soft is faster than EXTRACT-at-use
+    # (~670 vs ~810µs). AMD_FLASH_PV_ACC_DIRECT=1 skips copy (slower on HW).
+    if not (_acc_small and getenv("AMD_FLASH_PV_ACC_DIRECT", 0)):
+      pv_soft = UOp.placeholder((TM, TD), dtypes.float, slot=17, addrspace=AddrSpace.REG)
+      if getenv("AMD_FLASH_VEC_COPY", 0) and (TM * TD) % 4 == 0:
+        src, dst = pv_acc.reshape(TM * TD), pv_soft.reshape(TM * TD)
+        pv_acc = pv_soft.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)]))
+      else:
+        pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
   ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
   if _fu & 4 and getenv("AMD_FLASH_ACC_UNROLL", 1):
     # Const-index acc+= (better addressing). Slots 2/3/4 stay unpromoted via
