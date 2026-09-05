@@ -2363,6 +2363,18 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       slots = _reg_slots(u)
       itemsize, byte_off = u.dtype.itemsize, _lds_byte_off(u)
       soff = _scratch_base_offset(u.src[0])
+      # Dest-as-addr scalar: each load scales into its own VGPR so SLOAD streaks can
+      # s_clause (TMP_VADDR CSE blocks multi-index clauses).
+      if getenv("AMD_SCRATCH_DEST_ADDR", 1) and not masked and slots == 1 and isinstance(greg(u), Register) and \
+         itemsize in (1, 2, 4) and byte_off <= 0xfff:
+        dst = _dst(u)
+        pre, addr = _scaled_addr(dst, u.src[1], itemsize)
+        if addr != dst:
+          pre, addr = pre + [r3.v_mov_b32_e32(dst, addr)], dst
+        if soff:
+          pre, addr = pre + [r3.v_add_nc_u32_e64(dst, soff, addr)], dst
+        if (scratch_load:=_scratch_load(u.dtype)) is None: raise CompileError(f"no scratch load {u.dtype}")
+        return pre + [scratch_load(addr=addr, vdst=dst, offset=byte_off, sve=1)]
       if store_addr_cache is not None and not masked:
         pre, addr, byte_off = store_addr_cache.addr(u.src[1], itemsize, byte_off, base_key=id(u.src[0]))
         if pre and soff: pre = pre + [r3.v_add_nc_u32_e64(addr, soff, addr)]
