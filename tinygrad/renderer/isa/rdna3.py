@@ -3697,7 +3697,7 @@ def insts_from_linear(lin:UOp):
       count, emitted, deps = fused_sload
       if deps and _pending_src(deps): flush_regs(deps)
       for inst in emitted: emit(inst)
-      for k in range(oi, oi + count): pending["vm"] |= _reg_idxs(scheduled[k])
+      note_vm(set().union(*(_reg_idxs(scheduled[k]) for k in range(oi, oi + count))), emitted)
       oi += count
       continue
     if mask_depth == 0 and (fused_load:=_fused_lds_pack_load(scheduled, oi)) is not None:
