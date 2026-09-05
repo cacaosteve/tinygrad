@@ -733,16 +733,43 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   _fu = getenv("AMD_FLASH_UNROLL", 0)
   if _fu == 1: _fu = 6
   if _acc_sep: _fu |= 6  # soft/corr need const REG indices on the working buffer
-  k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
-  S_frag = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[tm1, tn1]
-  q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1, lane_n, k_qk]
-  k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1, lane_n, k_qk]
-  qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk)
+  # ACC_SMALL single-workspace stream: reuse S_reg/pv[:,0] as the only ACC pack,
+  # copy each finished column into soft before the next WMMA (needs AMD_WMMA_REDEF_ACC).
+  _acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0))
+  _stream_ws = bool(_acc_sep and _acc_small and TM // WMMA_ACC == 1 and getenv("AMD_FLASH_STREAM_SOFT", 1))
+  if _stream_ws:
+    S_soft = UOp.placeholder((TM, TN), dtypes.float, slot=16, addrspace=AddrSpace.REG)
+    soft_stores, S_cur = [], S_reg
+    for tn_i in range(TN):
+      k_qk = UOp.range(D // WMMA_K, 101 + tn_i, AxisType.REDUCE)
+      S_frag = S_cur.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[0, 0]
+      q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, 0, lane_n, k_qk]
+      k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn_i, lane_n, k_qk]
+      col_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(k_qk)
+      S_cur = S_cur.after(col_done)
+      for rm_i in range(TM):
+        q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
+        k_idx = n_tile * BLOCK_N + tn_i * LANES_PER_WAVE_N + lane_n
+        scaled = S_cur[rm_i, 0] * SCALE
+        soft_stores.append(S_soft[rm_i, tn_i].store((k_idx <= q_idx).where(scaled, scaled.const_like(-math.inf))))
+    S_reg = S_soft.after(UOp.group(*soft_stores))
+    qk_done = S_reg
+    _soft_scale = False
+    _acc_sep_qk = False
+  else:
+    k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
+    S_frag = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[tm1, tn1]
+    q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1, lane_n, k_qk]
+    k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1, lane_n, k_qk]
+    qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk)
+    _soft_scale = bool(_acc_sep and getenv("AMD_FLASH_SOFT_SCALE", 1))
+    _acc_sep_qk = _acc_sep
   # Scale+mask: default on WMMA/scratch buffer first. Predicated where-stores into a
   # REG-promoted const-index soft buffer were dropped (broke masked SDPA).
   # AMD_FLASH_SOFT_SCALE=1: copy raw WMMA→soft first, then scale+mask on soft (VGPR).
-  _soft_scale = bool(_acc_sep and getenv("AMD_FLASH_SOFT_SCALE", 1))
-  if not _soft_scale:
+  if _stream_ws:
+    S_masked = S_reg
+  elif not _soft_scale:
     S_reg = S_reg.after(qk_done, S_reg.store(S_reg * SCALE))
     if _fu & 2:
       mask_stores = []
@@ -759,7 +786,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
       S_masked = S_reg.after(S_reg[rm, rn].store((k_idx <= q_idx).where(S_reg[rm, rn], S_reg[rm, rn].const_like(-math.inf))).end(rm, rn))
   else:
     S_masked = S_reg.after(qk_done)
-  if _acc_sep:
+  if _acc_sep_qk:
     # Copy into a const-index soft buffer (REG-promotable) for softmax.
     # Skip zero-init: every slot is overwritten by the copy before any read.
     S_soft = UOp.placeholder((TM, TN), dtypes.float, slot=16, addrspace=AddrSpace.REG)
@@ -850,20 +877,33 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   pv_barrier = UOp.barrier(UOp.group(P_store, V_store))
   P_lds, V_lds = P_lds.after(pv_barrier), V_lds.after(pv_barrier)
   pv_acc = _reg((TM, TD), 10, 0, n_tile).after(pv_barrier)
-  k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
-  pv_frag = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[tm2, tn2]
-  p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, tm2, lane_n, k_pv]
-  v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2, lane_n, k_pv]
-  pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
-  pv_acc = pv_acc.after(pv_done)
-  if _acc_sep:
-    # Fully overwritten before read — skip REG zero-fill (same as S_soft).
+  if _stream_ws:
     pv_soft = UOp.placeholder((TM, TD), dtypes.float, slot=17, addrspace=AddrSpace.REG)
-    if getenv("AMD_FLASH_VEC_COPY", 0) and (TM * TD) % 4 == 0:
-      src, dst = pv_acc.reshape(TM * TD), pv_soft.reshape(TM * TD)
-      pv_acc = pv_soft.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)]))
-    else:
-      pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
+    pv_stores, pv_cur = [], pv_acc
+    for td_i in range(TD):
+      k_pv = UOp.range(BLOCK_N // WMMA_K, 400 + td_i, AxisType.REDUCE)
+      pv_frag = pv_cur.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[0, 0]
+      p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, 0, lane_n, k_pv]
+      v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, td_i, lane_n, k_pv]
+      col_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(k_pv)
+      pv_cur = pv_cur.after(col_done)
+      pv_stores.extend(pv_soft[ri, td_i].store(pv_cur[ri, 0]) for ri in range(TM))
+    pv_acc = pv_soft.after(UOp.group(*pv_stores))
+  else:
+    k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
+    pv_frag = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[tm2, tn2]
+    p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, tm2, lane_n, k_pv]
+    v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2, lane_n, k_pv]
+    pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
+    pv_acc = pv_acc.after(pv_done)
+    if _acc_sep:
+      # Fully overwritten before read — skip REG zero-fill (same as S_soft).
+      pv_soft = UOp.placeholder((TM, TD), dtypes.float, slot=17, addrspace=AddrSpace.REG)
+      if getenv("AMD_FLASH_VEC_COPY", 0) and (TM * TD) % 4 == 0:
+        src, dst = pv_acc.reshape(TM * TD), pv_soft.reshape(TM * TD)
+        pv_acc = pv_soft.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)]))
+      else:
+        pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
   ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
   if _fu & 4 and getenv("AMD_FLASH_ACC_UNROLL", 1):
     # Const-index acc+= (better addressing). Slots 2/3/4 stay unpromoted via
