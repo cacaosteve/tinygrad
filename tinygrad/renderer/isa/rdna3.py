@@ -172,6 +172,37 @@ def _try_vopd_fmac_pair(u0:UOp, u1:UOp) -> list|None:
   return [r3.v_dual_fmac_f32(opy=VOPDOp.V_DUAL_FMAC_F32, vdstx=d0, vdsty=d1,
                              srcx0=a0, srcy0=a1, vsrcx1=b0, vsrcy1=b1)]
 
+def _add_operands(u:UOp) -> tuple[object, object]|None:
+  if u.dtype is not dtypes.float32 or len(u.src) < 2: return None
+  return _src(u.src[0]), _src(u.src[1])
+
+def _try_vopd_add_pair(u0:UOp, u1:UOp) -> list|None:
+  """Pack two independent float32 ADDs into VOPD when dest/src banks allow."""
+  if not getenv("AMD_VOPD_ADD", 1): return None
+  if u0.op is not Ops.INS or u1.op is not Ops.INS: return None
+  if _iop(u0) is not AMDOps.ADD or _iop(u1) is not AMDOps.ADD: return None
+  if u0.dtype is not dtypes.float32 or u1.dtype is not dtypes.float32: return None
+  if u1 in u0.src or u0 in u1.src: return None
+  ops0, ops1 = _add_operands(u0), _add_operands(u1)
+  if ops0 is None or ops1 is None: return None
+  d0, d1 = _dst(u0), _dst(u1)
+  n0, n1 = _vgpr_num(d0), _vgpr_num(d1)
+  if n0 is not None and n1 is not None and n1 % 2 == 0 and n0 == n1 + 1:
+    u0, u1, ops0, ops1, d0, d1, n0, n1 = u1, u0, ops1, ops0, d1, d0, n1, n0
+  if n0 is None or n1 != n0 + 1 or n0 % 2 != 0: return None
+  (a0, b0), (a1, b1) = ops0, ops1
+  # Prefer VGPR pairs on src0; src1 must be VGPR even/odd for VOPD.
+  bn0, bn1 = (_vgpr_num(b0) if isinstance(b0, Reg) else None), (_vgpr_num(b1) if isinstance(b1, Reg) else None)
+  if bn0 is None or bn1 != bn0 + 1 or bn0 % 2 != 0: return None
+  an0 = _vgpr_num(a0) if isinstance(a0, Reg) else None
+  an1 = _vgpr_num(a1) if isinstance(a1, Reg) else None
+  if an0 is not None and an1 is not None:
+    if an1 != an0 + 1 or an0 % 2 != 0: return None
+  elif an0 is not None or an1 is not None or a0 != a1:
+    return None
+  return [r3.v_dual_add_f32(opy=VOPDOp.V_DUAL_ADD_F32, vdstx=d0, vdsty=d1,
+                            srcx0=a0, srcy0=a1, vsrcx1=b0, vsrcy1=b1)]
+
 def _full_src(x:UOp) -> Reg:
   if not isinstance(greg(x), Register): raise CompileError(f"expected reg src {x}")
   return _reg_to_amd(greg(x), _reg_slots(x))
@@ -3760,6 +3791,25 @@ def insts_from_linear(lin:UOp):
         # Intervening ops must not depend on u or define cand's sources.
         if any(u in scheduled[m].toposort() or cand in scheduled[m].toposort()
                for m in range(oi + 1, k)):
+          continue
+        partner_i, vopd = k, pair
+        break
+      if vopd is not None and partner_i is not None:
+        src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[partner_i].src))
+        if src and _pending_src(src): flush_regs(src)
+        for inst in vopd: emit(inst)
+        early_emitted.add(partner_i)
+        oi += 1
+        continue
+    if mask_depth == 0 and getenv("AMD_VOPD_ADD", 1) and u.op is Ops.INS and _iop(u) is AMDOps.ADD:
+      partner_i = None
+      vopd = None
+      max_scan = getenv("AMD_VOPD_ADD_SCAN", 8)
+      for k in range(oi + 1, min(oi + 1 + max_scan, len(scheduled))):
+        if k in early_emitted: continue
+        cand = scheduled[k]
+        if (pair:=_try_vopd_add_pair(u, cand)) is None: continue
+        if any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
           continue
         partner_i, vopd = k, pair
         break
