@@ -949,7 +949,9 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     v_frag = V_view[wave_n, tn2, lane_n, k_pv]
     pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
   pv_acc = pv_acc.after(pv_done)
-  if _acc_sep:
+  # With ACC_SMALL, const-index pv reads EXTRACT from parked ACC — skip soft copy
+  # (saves EXTRACT/SSTORE traffic that inflated spills under ACC VGPR pressure).
+  if _acc_sep and not (_acc_small and getenv("AMD_FLASH_PV_ACC_DIRECT", 1)):
     # Fully overwritten before read — skip REG zero-fill (same as S_soft).
     pv_soft = UOp.placeholder((TM, TD), dtypes.float, slot=17, addrspace=AddrSpace.REG)
     if getenv("AMD_FLASH_VEC_COPY", 0) and (TM * TD) % 4 == 0:
