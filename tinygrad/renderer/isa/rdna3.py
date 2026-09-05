@@ -1434,7 +1434,9 @@ def _alloc_vregs(ctx:IselContext, x:UOp, sgpr_pool:tuple[Register, ...], vgpr_po
     # occupancy even when only a few low VGPRs remain live.
     has_wmma = ctx.scratch.setdefault("has_wmma", any(u.op is Ops.WMMA or
       (u.op is Ops.INS and _iop(u) is AMDOps.WMMA) for u in ctx.uses))
-    pack_pool = (PACK_F16_VGPR_UP16 if allow_upcast16() else PACK_F16_VGPR) if has_wmma else vgpr_pool
+    # AMD_PACK_F16_GENERAL=1: general VGPR pool (IQ4 vgpr 118→110; flash needs scalar LSTORE fix).
+    if getenv("AMD_PACK_F16_GENERAL", 0): pack_pool = vgpr_pool
+    else: pack_pool = (PACK_F16_VGPR_UP16 if allow_upcast16() else PACK_F16_VGPR) if has_wmma else vgpr_pool
     return x.replace(tag=(ctx.vreg(pack_pool),))
   if iop is AMDOps.LLOAD:
     return x.replace(tag=(ctx.vreg(LLOAD_VGPR_UP16 if allow_upcast16() else LLOAD_VGPR),))
@@ -2383,7 +2385,13 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if (local_store:=_local_store(u.src[2].dtype, _elem_count(u.src[2]))) is None: raise CompileError(f"no lds store {u.src[2].dtype}")
       pre, addr = _local_addr(u.src[0], u.src[1], _mem_itemsize(u.src[2].dtype))
       pre, addr = _masked_addr(pre, addr, masked)
-      dpre, data = ([], _full_src(u.src[2])) if _reg_slots(u.src[2]) > 1 else _vgpr_data(TMP_VDATA, u.src[2])
+      if _elem_count(u.src[2]) == 1:
+        # Scalar LDS store: PACK_F16 in the general pool can surface as a multi-slot
+        # phys; ds_store_* wants a single VGPR lane.
+        dpre, data = _vgpr_data(TMP_VDATA, u.src[2])
+        if isinstance(data, Reg) and data.sz > 1: data = data[0]
+      else:
+        dpre, data = ([], _full_src(u.src[2])) if _reg_slots(u.src[2]) > 1 else _vgpr_data(TMP_VDATA, u.src[2])
       # No per-store lgkmcnt — scoreboard flushes once before BARRIER / LLOAD use (hand-style).
       return pre + dpre + [local_store(addr=addr, data0=data, **_ds_off(_lds_byte_off(u)))]
     case AMDOps.SLOAD:
