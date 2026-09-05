@@ -3214,6 +3214,35 @@ def _gap_fill_after_loads(ops:list[UOp]) -> list[UOp]:
     i += 1
   return out
 
+def _cluster_const_scratch_stores(ops:list[UOp]) -> list[UOp]:
+  """Sort independent const-index SSTORE to the same base so b128 fusion can match."""
+  if not getenv("AMD_CLUSTER_SSTORE", 1): return ops
+  out: list[UOp] = []
+  i = 0
+  while i < len(ops):
+    u = ops[i]
+    if u.op is Ops.INS and _iop(u) is AMDOps.SSTORE and _const_int(u.src[1]) is not None and _lds_byte_off(u) == 0:
+      base = u.src[0]
+      group = [u]
+      j = i + 1
+      while j < len(ops) and len(group) < 32:
+        v = ops[j]
+        if v.op is Ops.INS and _iop(v) is AMDOps.SSTORE and v.src[0] is base and \
+           _const_int(v.src[1]) is not None and _lds_byte_off(v) == 0 and \
+           not any(g in v.src or v in g.src for g in group):
+          group.append(v)
+          j += 1
+          continue
+        break
+      if len(group) >= 4:
+        group.sort(key=lambda x: int(_const_int(x.src[1])))  # type: ignore[arg-type]
+        out.extend(group)
+        i = j
+        continue
+    out.append(u)
+    i += 1
+  return out
+
 def _vm_load_count(insts:list) -> int:
   return sum(1 for i in insts if (n:=getattr(i, "op_name", "")) and
              (n.startswith("GLOBAL_LOAD") or n.startswith("SCRATCH_LOAD") or
@@ -3698,6 +3727,7 @@ def insts_from_linear(lin:UOp):
     _hoist_loads_before_wmma(_sink_wmma_past_loads(_hoist_lloads_before_extracts(ops))), d16_hi_lo)
   scheduled = _schedule_swizzle_mov_batches(scheduled)
   scheduled = _gap_fill_after_loads(scheduled)
+  scheduled = _cluster_const_scratch_stores(scheduled)
   fma_pair_dst = _fma_pair_pack_dsts(scheduled, fma_hi_lo)
   early_emitted: set[int] = set()
   perm_selects_ready = False
@@ -4539,6 +4569,7 @@ class AMDRenderer(ISARenderer):
     lst = _prefetch_a_before_dequant_mix(lst) if getenv("AMD_PREFETCH_Q6_A", 1) else lst
     lst = _schedule_swizzle_mov_batches(lst)
     lst = _gap_fill_after_loads(lst)
+    lst = _cluster_const_scratch_stores(lst)
     return _schedule_loop_cmps(lst)
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True
