@@ -699,7 +699,7 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
 
 @functools.cache
 def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None,
-                         acc_small:bool=False, k_unroll:bool=False) -> UOp:
+                         acc_small:bool=False, k_unroll:int=0) -> UOp:
   valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start) if q_start is not None else None
   BH, M, D = q.shape
   _, B, H_KV, physical_n, cache_dim = cache.shape
@@ -744,9 +744,12 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   S_view = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)
   Q_view = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)
   K_view = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)
-  # AMD_FLASH_K_UNROLL: chain K WMMA in Python (more static WMMA like HIP). Opt-in.
-  _k_unroll = bool(k_unroll or (_acc_small and getenv("AMD_FLASH_K_UNROLL", 0)))
-  if _acc_small and _k_unroll:
+  # AMD_FLASH_K_UNROLL: 0=ranged K; N>=2=outer range of K/N with N chained WMMA;
+  # 1=full python K chain (MMU-faults on gfx1100 — keep off).
+  _k_factor = int(k_unroll) if _acc_small else 0
+  _k_unroll_full = _k_factor == 1
+  _k_unroll_factor = _k_factor if _k_factor >= 2 and (D // WMMA_K) % _k_factor == 0 else 0
+  if _acc_small and _k_unroll_full:
     qk_stores = []
     for tn_i in range(TN):
       for tm_i in range(TM // WMMA_ACC):
@@ -758,6 +761,20 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
           wmma_c = UOp.wmma(q_frag, k_frag, wmma_c, *WMMA_ARG)
         qk_stores.append(S_frag.store(wmma_c))
     qk_done = UOp.group(*qk_stores)
+  elif _acc_small and _k_unroll_factor:
+    k_outer = UOp.range((D // WMMA_K) // _k_unroll_factor, 101, AxisType.REDUCE)
+    qk_stores = []
+    for tn_i in range(TN):
+      for tm_i in range(TM // WMMA_ACC):
+        S_frag = S_view[tm_i, tn_i]
+        wmma_c = S_frag.after(k_outer)
+        for k_off in range(_k_unroll_factor):
+          k_i = k_outer * _k_unroll_factor + k_off
+          q_frag = Q_view[wave_m, tm_i, lane_n, k_i]
+          k_frag = K_view[tn_i, lane_n, k_i]
+          wmma_c = UOp.wmma(q_frag, k_frag, wmma_c, *WMMA_ARG)
+        qk_stores.append(S_frag.store(wmma_c))
+    qk_done = UOp.group(*qk_stores).end(k_outer)
   elif _acc_small:
     k_qk = UOp.range(D//WMMA_K, 101, AxisType.REDUCE)
     qk_stores = []
@@ -889,7 +906,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   pv_view = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)
   P_view = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)
   V_view = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)
-  if _acc_small and _k_unroll:
+  if _acc_small and _k_unroll_full:
     pv_stores = []
     for td_i in range(TD):
       for tm_i in range(TM // WMMA_ACC):
@@ -901,6 +918,20 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
           wmma_c = UOp.wmma(p_frag, v_frag, wmma_c, *WMMA_ARG)
         pv_stores.append(pv_frag.store(wmma_c))
     pv_done = UOp.group(*pv_stores)
+  elif _acc_small and _k_unroll_factor and (BLOCK_N // WMMA_K) % _k_unroll_factor == 0:
+    k_outer = UOp.range((BLOCK_N // WMMA_K) // _k_unroll_factor, 400, AxisType.REDUCE)
+    pv_stores = []
+    for td_i in range(TD):
+      for tm_i in range(TM // WMMA_ACC):
+        pv_frag = pv_view[tm_i, td_i]
+        wmma_c = pv_frag.after(k_outer)
+        for k_off in range(_k_unroll_factor):
+          k_i = k_outer * _k_unroll_factor + k_off
+          p_frag = P_view[wave_m, tm_i, lane_n, k_i]
+          v_frag = V_view[wave_n, td_i, lane_n, k_i]
+          wmma_c = UOp.wmma(p_frag, v_frag, wmma_c, *WMMA_ARG)
+        pv_stores.append(pv_frag.store(wmma_c))
+    pv_done = UOp.group(*pv_stores).end(k_outer)
   elif _acc_small:
     k_pv = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE)
     pv_stores = []
@@ -957,7 +988,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # Flash-only ACC residency via python-unrolled WMMA (≥2 packs → renderer auto-park).
   # AMD_FLASH_ACC_SMALL=0 disables; AMD_WMMA_ACC_SMALL=1 forces (unsafe for quant).
   use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
-  use_k_unroll = bool(use_acc_small and getenv("AMD_FLASH_K_UNROLL", 0))
+  use_k_unroll = getenv("AMD_FLASH_K_UNROLL", 0) if use_acc_small else 0
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]
