@@ -22,8 +22,8 @@
 - HIP fully unrolls more WMMA (24 vs 6) and keeps 0 scratch.
 - Direct still spills (~21) under ACC VGPR pressure (`WMMA_ACC_VGPR` from v121).
 - QK-only unroll regresses (~833µs); keep full QK+PV unroll.
-- `AMD_FLASH_K_UNROLL=1` (chained K) emits more WMMA but **MMU-faults** on gfx1100;
-  left opt-in off. Scalarize FILL→v_pack fix remains (harmless for tip).
+- `AMD_FLASH_K_UNROLL=1` full K chain **MMU-faults**; `=2` nan; `=4` err~1.17 — leave 0.
+  Scalarize FILL→v_pack fix remains (harmless for tip).
 
 ## Toggles
 
