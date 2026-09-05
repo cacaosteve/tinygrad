@@ -87,16 +87,24 @@ def _parallel_vmov(moves:list[tuple[Reg, Reg|int|float]]) -> list:
   pending = [(dst, src) for dst,src in moves if not isinstance(src, Reg) or dst != src]
   ret: list = []
   while pending:
-    # Pair zero-imm into VOPD on even/odd VGPR banks (hand WMMA ACC init).
-    if len(pending) >= 2:
+    # Pair into VOPD on even/odd VGPR banks (hand WMMA ACC init + consecutive copies).
+    if len(pending) >= 2 and getenv("AMD_VOPD_MOV", 1):
       (d0, s0), (d1, s1) = pending[0], pending[1]
       n0 = d0.offset - 256 if d0.sz == 1 and 256 <= d0.offset < 512 else None
       n1 = d1.offset - 256 if d1.sz == 1 and 256 <= d1.offset < 512 else None
-      if (n0 is not None and n1 == n0 + 1 and n0 % 2 == 0 and
-          not isinstance(s0, Reg) and not isinstance(s1, Reg) and s0 == 0 and s1 == 0):
-        ret.append(r3.v_dual_mov_b32(opy=VOPDOp.V_DUAL_MOV_B32, vdstx=d0, vdsty=d1, srcx0=0, srcy0=0))
-        pending = pending[2:]
-        continue
+      if n0 is not None and n1 == n0 + 1 and n0 % 2 == 0:
+        if not isinstance(s0, Reg) and not isinstance(s1, Reg) and s0 == 0 and s1 == 0:
+          ret.append(r3.v_dual_mov_b32(opy=VOPDOp.V_DUAL_MOV_B32, vdstx=d0, vdsty=d1, srcx0=0, srcy0=0))
+          pending = pending[2:]
+          continue
+        if isinstance(s0, Reg) and isinstance(s1, Reg) and s0.sz == 1 and s1.sz == 1:
+          sn0 = s0.offset - 256 if 256 <= s0.offset < 512 else None
+          sn1 = s1.offset - 256 if 256 <= s1.offset < 512 else None
+          # Dual-issue bank rule: X even, Y odd for both dst and src pairs.
+          if sn0 is not None and sn1 == sn0 + 1 and sn0 % 2 == 0:
+            ret.append(r3.v_dual_mov_b32(opy=VOPDOp.V_DUAL_MOV_B32, vdstx=d0, vdsty=d1, srcx0=s0, srcy0=s1))
+            pending = pending[2:]
+            continue
     src_regs = {src for _,src in pending if isinstance(src, Reg)}
     for i,(dst,src) in enumerate(pending):
       if not isinstance(src, Reg) or dst not in src_regs:
