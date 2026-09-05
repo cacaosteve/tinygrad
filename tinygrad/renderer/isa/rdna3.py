@@ -3046,13 +3046,19 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
   return out
 
 def _schedule_swizzle_mov_batches(ops:list[UOp]) -> list[UOp]:
-  """Rewrite (SWIZZLE|PERMLANEX16),MOV×… into op×N,MOV×N before regalloc.
+  """Rewrite (SWIZZLE|PERMLANEX16),MOV×… into op×N[, VALU×G],MOV×N before regalloc.
 
   Emit-time reordering of the same pattern extends live ranges past what
   regalloc assumed (aliased VGPRs → wrong results). Scheduling here keeps liveness honest.
+
+  AMD_SWIZZLE_VALU_GAP: pull independent FMAC/MUL/ADD from immediately after the MOV
+  block into the swizzle→MOV gap so lgkm wait can overlap VALU (HIP flash_decode).
   """
   if not getenv("AMD_BATCH_SWIZZLE_MOV", 1): return ops
   batchable = (AMDOps.SWIZZLE, AMDOps.PERMLANEX16)
+  valu_gap = (AMDOps.FMAC, AMDOps.MUL, AMDOps.ADD, AMDOps.MAX, AMDOps.MULACC)
+  pull_valu = bool(getenv("AMD_SWIZZLE_VALU_GAP", 0))
+  max_gap = getenv("AMD_SWIZZLE_VALU_GAP_MAX", 4)
   out: list[UOp] = []
   i = 0
   while i < len(ops):
@@ -3068,7 +3074,24 @@ def _schedule_swizzle_mov_batches(ops:list[UOp]) -> list[UOp]:
             ops[j] in ops[j + 1].src:
         sws.append(ops[j]); movs.append(ops[j + 1]); j += 2
       if len(sws) >= 2:
-        out.extend(sws); out.extend(movs); i = j
+        gap: list[UOp] = []
+        if pull_valu:
+          blocked = set(sws) | set(movs)
+          k = j
+          while k < len(ops) and len(gap) < max_gap:
+            cand = ops[k]
+            if cand.op is Ops.INS and _iop(cand) in valu_gap and \
+               not any(s in blocked for s in cand.src) and \
+               not any(cand in m.toposort() for m in movs):
+              gap.append(cand)
+              blocked.add(cand)
+              k += 1
+              continue
+            break
+        out.extend(sws)
+        out.extend(gap)
+        out.extend(movs)
+        i = j + len(gap)
         continue
     out.append(u); i += 1
   return out
