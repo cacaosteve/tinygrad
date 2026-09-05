@@ -1,7 +1,7 @@
 import itertools
 from bisect import bisect_left
 from tinygrad.device import CompileError
-from tinygrad.helpers import dedup
+from tinygrad.helpers import dedup, getenv
 from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat
 from tinygrad.renderer.isa import ISARenderer, Register, greg
 from tinygrad.dtype import dtypes, AddrSpace
@@ -102,7 +102,15 @@ class LinearScanRegallocContext:
 
       if isinstance(u.tag, tuple):
         for j,v in enumerate(u.tag):
-          assert isinstance(v, Register) and lr[v][0] == i
+          # Two-address WMMA/FMAC may redefine the same ACC pack tag across unrolled
+          # tiles (flash ACC_SMALL). Live range starts at the first def; later defs
+          # reuse the already-allocated phys reg instead of asserting.
+          if not isinstance(v, Register): raise AssertionError(f"expected Register tag {v}")
+          if lr[v][0] != i:
+            if ren.is_two_address(u) and j == 0 and v in live and getenv("AMD_WMMA_REDEF_ACC", 1):
+              self.reals.setdefault(i, {})[v] = live[v]
+              continue
+            assert lr[v][0] == i
           cons = v.cons
           if ren.is_two_address(u) and j == 0:
             uses = tuple(live.get(greg(s)) for s in u.src)
