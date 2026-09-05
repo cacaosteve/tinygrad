@@ -842,9 +842,14 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
     return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   # AMD_FLASH_ACC_SEP defaults on (faster than in-place soft REG after scratch CSE).
-  # AMD_WMMA_ACC_SMALL still gated off: ranged (tm,tn) WMMA only parks one 8-wide ACC pack per
-  # buffer (need TN/TD packs). Unrolling tiles hits regalloc double-defs on shared PACK tags;
-  # prepare-list pack strip/dedupe regresses product-16. buf_tiles + ACC writeback are in rdna3.
+  # AMD_WMMA_ACC_SMALL still gated off:
+  #  - Ranged (tm,tn) WMMA parks only one 8-wide ACC pack per buffer (need TN/TD packs).
+  #  - Unrolling tiles: regalloc double-defs on shared PACK tags; prepare-list pack strip/dedupe
+  #    regresses product-16.
+  #  - Scale uses non-const REG indices → SSTORE→scratch while EXTRACT reads ACC (err=inf)
+  #    unless copy ACC→soft before scale/mask.
+  # Infrastructure kept: wmma_acc_buf_tiles + ACC-lane SSTORE writeback helpers in rdna3.py.
+  # Scratch b128: const-idx SLOAD/SSTORE fusion + 4-wide vec emit (flash ~2171→2074 insn).
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]
