@@ -825,7 +825,7 @@ def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
     bases.add(base)
     # Flash output acc / row stats are REDUCE-carried; promoting them drops loop values.
     if (slot:=getattr(base.arg, "slot", None)) is not None and \
-       slot in {int(s) for s in getenv("AMD_REG_PROMOTE_SKIP_SLOTS", "2,3,4").split(",") if s.strip()}:
+       slot in {int(s) for s in getenv("AMD_REG_PROMOTE_SKIP_SLOTS", "2").split(",") if s.strip()}:
       bad.add(base)
       continue
     if base in wmma_bufs: continue  # handled by WMMA ACC aliasing
