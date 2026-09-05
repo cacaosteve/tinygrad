@@ -3274,6 +3274,33 @@ def _cluster_const_scratch_stores(ops:list[UOp]) -> list[UOp]:
     i += 1
   return out
 
+def _batch_scratch_load_uses(ops:list[UOp]) -> list[UOp]:
+  """Rewrite SLOAD,USE,SLOAD,USE → SLOAD×N,USE×N so waitcnt can cover a load burst.
+
+  Flash tip still pairs each scratch_load with an immediate wait0; batching independent
+  scalar SLOADs before their first uses mirrors HIP vmem overlap.
+  """
+  if not getenv("AMD_BATCH_SLOAD_USE", 1): return ops
+  out: list[UOp] = []
+  i = 0
+  while i < len(ops):
+    u = ops[i]
+    if u.op is Ops.INS and _iop(u) is AMDOps.SLOAD and i + 1 < len(ops) and u in ops[i + 1].src:
+      loads, uses = [u], [ops[i + 1]]
+      j = i + 2
+      while j + 1 < len(ops) and len(loads) < 8 and \
+            ops[j].op is Ops.INS and _iop(ops[j]) is AMDOps.SLOAD and \
+            ops[j] in ops[j + 1].src and \
+            not any(prev in ops[j].src or prev in ops[j + 1].src for prev in loads + uses):
+        loads.append(ops[j]); uses.append(ops[j + 1]); j += 2
+      if len(loads) >= 2:
+        out.extend(loads)
+        out.extend(uses)
+        i = j
+        continue
+    out.append(u); i += 1
+  return out
+
 def _vm_load_count(insts:list) -> int:
   return sum(1 for i in insts if (n:=getattr(i, "op_name", "")) and
              (n.startswith("GLOBAL_LOAD") or n.startswith("SCRATCH_LOAD") or
@@ -3759,6 +3786,7 @@ def insts_from_linear(lin:UOp):
   scheduled = _schedule_swizzle_mov_batches(scheduled)
   scheduled = _gap_fill_after_loads(scheduled)
   scheduled = _cluster_const_scratch_stores(scheduled)
+  scheduled = _batch_scratch_load_uses(scheduled)
   fma_pair_dst = _fma_pair_pack_dsts(scheduled, fma_hi_lo)
   early_emitted: set[int] = set()
   perm_selects_ready = False
@@ -4620,6 +4648,7 @@ class AMDRenderer(ISARenderer):
     lst = _schedule_swizzle_mov_batches(lst)
     lst = _gap_fill_after_loads(lst)
     lst = _cluster_const_scratch_stores(lst)
+    lst = _batch_scratch_load_uses(lst)
     return _schedule_loop_cmps(lst)
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True
