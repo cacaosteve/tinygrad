@@ -749,7 +749,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     S_masked = S_reg.after(S_reg[rm, rn].store((k_idx <= q_idx).where(S_reg[rm, rn], S_reg[rm, rn].const_like(-math.inf))).end(rm, rn))
   if _acc_sep:
     # Copy post-mask scores into a const-index soft buffer (REG-promotable) for softmax.
-    S_soft = _reg((TM, TN), 16, 0)
+    # Skip zero-init: every slot is overwritten by the copy before any read.
+    S_soft = UOp.placeholder((TM, TN), dtypes.float, slot=16, addrspace=AddrSpace.REG)
     S_reg = S_soft.after(UOp.group(*[S_soft[ri, rj].store(S_masked[ri, rj]) for ri in range(TM) for rj in range(TN)]))
   else:
     S_reg = S_masked
