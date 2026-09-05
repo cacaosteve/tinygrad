@@ -4021,12 +4021,14 @@ def insts_from_linear(lin:UOp):
       oi += count
       continue
     # Burst SSTORE streak: hoist addr ALU, then s_clause + scratch_store* (soft/ACC spills).
-    if mask_depth == 0 and getenv("AMD_SCRATCH_SCLAUSE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SSTORE:
+    # Skip if any 4-window in the streak can b128-fuse — greedy clausing would swallow that window.
+    if mask_depth == 0 and getenv("AMD_SCRATCH_STORE_SCLAUSE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SSTORE:
       j = oi + 1
       while j < len(scheduled) and scheduled[j] not in skip and scheduled[j].op is Ops.INS and \
             _iop(scheduled[j]) is AMDOps.SSTORE and j - oi < getenv("AMD_SCRATCH_SCLAUSE_MAX", 32):
         j += 1
-      if j - oi >= 2:
+      if j - oi >= 2 and not any(_fused_scratch_contig_store(scheduled, start, None) is not None
+                                  for start in range(oi, j - 3)):
         cache_snap = (store_addr_cache.key, store_addr_cache.page)
         parts = [_emit_uop(scheduled[k], with_store_cache=True) for k in range(oi, j)]
         if all(_vm_store_count(p) >= 1 for p in parts):
@@ -4056,12 +4058,14 @@ def insts_from_linear(lin:UOp):
       continue
     # Burst SLOAD streak: hoist addr ALU, then s_clause + scratch_load* (HIP/LLVM VMEM clause).
     # Only when scales are TMP-safe (shared CSE'd TMP_VADDR or ≤1 TMP scale).
+    # Skip if any 4-window can b128-fuse (same greed trap as stores).
     if mask_depth == 0 and getenv("AMD_SCRATCH_SCLAUSE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SLOAD:
       j = oi + 1
       while j < len(scheduled) and scheduled[j] not in skip and scheduled[j].op is Ops.INS and \
             _iop(scheduled[j]) is AMDOps.SLOAD and j - oi < getenv("AMD_SCRATCH_SCLAUSE_MAX", 32):
         j += 1
-      if j - oi >= 2:
+      if j - oi >= 2 and not any(_fused_scratch_contig_load(scheduled, start, None) is not None
+                                  for start in range(oi, j - 3)):
         cache_snap = (store_addr_cache.key, store_addr_cache.page)
         parts = [_emit_uop(scheduled[k], with_store_cache=True) for k in range(oi, j)]
         if all(_vm_load_count(p) >= 1 for p in parts):
