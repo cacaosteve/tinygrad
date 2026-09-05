@@ -833,7 +833,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
     return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   # AMD_FLASH_ACC_SEP defaults on (faster than in-place soft REG after scratch CSE);
-  # AMD_WMMA_ACC_SMALL still NaNs on flash — leave gated off.
+  # AMD_WMMA_ACC_SMALL still wrong: K-loop stays in ACC (~1.5ms) but epilogue scale/mask
+  # SSTORE hits scratch while SLOAD EXTRACTs ACC → desync/Inf. Needs ACC lane writeback.
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]
