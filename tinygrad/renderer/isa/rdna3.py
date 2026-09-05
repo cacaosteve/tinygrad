@@ -3292,7 +3292,10 @@ def _fused_lds_contig_store(uops:list[UOp], i:int) -> tuple[int, list, set[int]]
   return 4, pre + [r3.ds_store_b128(addr=addr, data0=_reg_chunk(r0, 0, 4), **_ds_off(off0))], deps
 
 def _fused_scratch_contig_store(uops:list[UOp], i:int, store_addr_cache:_StoreAddrCache|None=None) -> tuple[int, list, set[int]]|None:
-  """Fold four contiguous scalar SSTORE (offs +0..+12, consecutive data VGPRs) into SCRATCH_STORE_B128."""
+  """Fold four contiguous scalar SSTORE into SCRATCH_STORE_B128.
+
+  Accepts shared idx + byte_off 0/4/8/12, or consecutive const element indices.
+  """
   if i + 3 >= len(uops): return None
   stores = uops[i:i+4]
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.SSTORE for x in stores): return None
@@ -3302,12 +3305,23 @@ def _fused_scratch_contig_store(uops:list[UOp], i:int, store_addr_cache:_StoreAd
              for x in stores): return None
   r0 = greg(stores[0].src[2])
   if not all(greg(x.src[2]).index == r0.index + n for n, x in enumerate(stores)): return None
-  base, idx, off0 = stores[0].src[0], stores[0].src[1], _lds_byte_off(stores[0])
-  if off0 % 16 or off0 + 12 > 0xfff: return None
-  if not all(x.src[0] is base and x.src[1] is idx and _lds_byte_off(x) == off0 + 4 * n for n, x in enumerate(stores)):
+  base = stores[0].src[0]
+  if not all(x.src[0] is base for x in stores): return None
+  offs = [_lds_byte_off(x) for x in stores]
+  idxs = [_const_int(x.src[1]) for x in stores]
+  byte_off = 0
+  idx = stores[0].src[1]
+  if all(x.src[1] is idx for x in stores) and offs[0] % 16 == 0 and \
+     all(offs[n] == offs[0] + 4 * n for n in range(4)) and offs[0] + 12 <= 0xfff:
+    byte_off = offs[0]
+  elif (all(i is not None for i in idxs) and all(o == 0 for o in offs) and
+        idxs[0] % 4 == 0 and all(idxs[n] == idxs[0] + n for n in range(4)) and
+        (idxs[0] + 3) * dt.itemsize <= 0xfff):  # type: ignore[operator]
+    byte_off = int(idxs[0]) * dt.itemsize  # type: ignore[arg-type]
+    idx = _tconst(0, dtypes.int32).rtag()
+  else:
     return None
   soff = _scratch_base_offset(base)
-  byte_off = off0
   if store_addr_cache is not None:
     pre, addr, byte_off = store_addr_cache.addr(idx, dt.itemsize, byte_off, base_key=id(base))
     if pre and soff: pre = pre + [r3.v_add_nc_u32_e64(addr, soff, addr)]
@@ -3315,7 +3329,7 @@ def _fused_scratch_contig_store(uops:list[UOp], i:int, store_addr_cache:_StoreAd
     pre, addr = _scaled_addr(TMP_VADDR, idx, dt.itemsize)
     if soff: pre = pre + [r3.v_add_nc_u32_e64(TMP_VADDR, soff, addr)]
     addr = TMP_VADDR
-  deps = set().union(*(_reg_idxs(x.src[2]) for x in stores)) | _reg_idxs(idx)
+  deps = set().union(*(_reg_idxs(x.src[2]) for x in stores)) | set().union(*(_reg_idxs(x.src[1]) for x in stores))
   return 4, pre + [r3.scratch_store_b128(addr=addr, data=_reg_chunk(r0, 0, 4), offset=byte_off, sve=1)], deps
 
 def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAddrCache|None=None) -> tuple[int, list, set[int]]|None:
