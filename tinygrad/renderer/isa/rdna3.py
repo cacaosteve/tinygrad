@@ -3076,6 +3076,9 @@ def _schedule_swizzle_mov_batches(ops:list[UOp]) -> list[UOp]:
             ops[j].op is Ops.INS and _iop(ops[j]) is kind and \
             ops[j + 1].op is Ops.INS and _iop(ops[j + 1]) is use_kind and \
             ops[j] in ops[j + 1].src:
+        # Same-stage keys only: next SW must not depend on an earlier use in this batch
+        # (no-park SW,ADD,SW,ADD crosses stages otherwise → use-before-def).
+        if any(prev in ops[j].toposort() for prev in uses): break
         sws.append(ops[j]); uses.append(ops[j + 1]); j += 2
       if len(sws) >= 2:
         gap: list[UOp] = []
