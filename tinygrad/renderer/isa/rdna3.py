@@ -545,9 +545,11 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[
   if not (getenv("AMD_FMA_MIX", 0) or getenv("AMD_FMA_MIX_ALL", 0)): return {}, set()
   if not getenv("AMD_FMA_MIX_ALL", 0):
     if not any(u.op is Ops.INS and _iop(u) is AMDOps.EXP2 for u in uops): return {}, set()
-    # QK-sized mix storms (64+) add MOVs; only fold small EXP kernels (softmax@V).
+    # Cap total f16→f32 casts so huge kernels stay off. Half×half QK storms are already
+    # skipped unless AMD_FMA_MIX_HH=1; raise the default so flash_decode_partial (≈96 cvts)
+    # can fold softmax@V FMACs into v_fma_mix_f32 like HIP.
     ncast = sum(1 for u in uops if _is_f16_to_f32_cast(u))
-    if ncast > 24: return {}, set()
+    if ncast > getenv("AMD_FMA_MIX_MAX_CAST", 128): return {}, set()
   allow_hh = getenv("AMD_FMA_MIX_HH", 0)
   uses: dict[UOp, list[UOp]] = {}
   for u in uops:
