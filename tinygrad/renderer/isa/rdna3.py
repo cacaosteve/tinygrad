@@ -3262,6 +3262,33 @@ def _fused_lds_contig_store(uops:list[UOp], i:int) -> tuple[int, list, set[int]]
   deps = set().union(*(_reg_idxs(x.src[2]) for x in stores)) | _reg_idxs(idx)
   return 4, pre + [r3.ds_store_b128(addr=addr, data0=_reg_chunk(r0, 0, 4), **_ds_off(off0))], deps
 
+def _fused_scratch_contig_store(uops:list[UOp], i:int, store_addr_cache:_StoreAddrCache|None=None) -> tuple[int, list, set[int]]|None:
+  """Fold four contiguous scalar SSTORE (offs +0..+12, consecutive data VGPRs) into SCRATCH_STORE_B128."""
+  if i + 3 >= len(uops): return None
+  stores = uops[i:i+4]
+  if not all(x.op is Ops.INS and _iop(x) is AMDOps.SSTORE for x in stores): return None
+  dt = stores[0].src[2].dtype
+  if dt not in (dtypes.float32, dtypes.uint32, dtypes.int32): return None
+  if not all(x.src[2].dtype is dt and _elem_count(x.src[2]) == 1 and isinstance(greg(x.src[2]), Register)
+             for x in stores): return None
+  r0 = greg(stores[0].src[2])
+  if not all(greg(x.src[2]).index == r0.index + n for n, x in enumerate(stores)): return None
+  base, idx, off0 = stores[0].src[0], stores[0].src[1], _lds_byte_off(stores[0])
+  if off0 % 16 or off0 + 12 > 0xfff: return None
+  if not all(x.src[0] is base and x.src[1] is idx and _lds_byte_off(x) == off0 + 4 * n for n, x in enumerate(stores)):
+    return None
+  soff = _scratch_base_offset(base)
+  byte_off = off0
+  if store_addr_cache is not None:
+    pre, addr, byte_off = store_addr_cache.addr(idx, dt.itemsize, byte_off, base_key=id(base))
+    if pre and soff: pre = pre + [r3.v_add_nc_u32_e64(addr, soff, addr)]
+  else:
+    pre, addr = _scaled_addr(TMP_VADDR, idx, dt.itemsize)
+    if soff: pre = pre + [r3.v_add_nc_u32_e64(TMP_VADDR, soff, addr)]
+    addr = TMP_VADDR
+  deps = set().union(*(_reg_idxs(x.src[2]) for x in stores)) | _reg_idxs(idx)
+  return 4, pre + [r3.scratch_store_b128(addr=addr, data=_reg_chunk(r0, 0, 4), offset=byte_off, sve=1)], deps
+
 def _fused_lds_pack_load(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
   """Fold four contiguous f32 LLOAD (same base, offs +0..+12) into one DS_LOAD_B128."""
   if i + 3 >= len(uops): return None
@@ -3579,6 +3606,14 @@ def insts_from_linear(lin:UOp):
       store_addr_cache.clear()
       for inst in emitted: emit(inst)
       pending["lgkm"].add(-1)
+      oi += count
+      continue
+    # Contiguous SSTORE×4 (flash ACC spill / soft copy) → scratch_store_b128.
+    if mask_depth == 0 and (fused_sstore:=_fused_scratch_contig_store(scheduled, oi, store_addr_cache)) is not None:
+      count, emitted, deps = fused_sstore
+      if deps and _pending_src(deps): flush_regs(deps)
+      for inst in emitted: emit(inst)
+      pending["vs"].add(-1)
       oi += count
       continue
     if mask_depth == 0 and (fused_load:=_fused_lds_pack_load(scheduled, oi)) is not None:
