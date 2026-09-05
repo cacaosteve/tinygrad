@@ -80,8 +80,14 @@ def warp_reduce_many(vals:list[UOp], maximum:bool=False, full_wave:bool=False) -
   chunk = list(vals)
   for i, v in enumerate(chunk):
     if v.op is Ops.INDEX and v.addrspace == AddrSpace.REG: chunk[i] = v.load()
+  no_park = bool(getenv("AMD_SWIZZLE_NO_PARK", 0))
   for offset in offsets:
     raw = [_peer16_f32(v) if offset == 16 else _swizzle_f32(v, offset) for v in chunk]
+    if no_park:
+      # HIP-like: ADD reads swizzle/permlane dests directly (no REG park MOVs).
+      # `_schedule_swizzle_mov_batches` still batches SW×N,ADD×N before regalloc.
+      chunk = [v.maximum(o) if maximum else v + o for v, o in zip(chunk, raw)]
+      continue
     tmp = UOp.placeholder((len(chunk),), dtypes.float, slot=_reg_swizzle_slot, addrspace=AddrSpace.REG)
     _reg_swizzle_slot += 1
     tmp = tmp.after(UOp.group(*[tmp[i].store(sw) for i, sw in enumerate(raw)]))

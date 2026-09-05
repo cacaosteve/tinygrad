@@ -3046,16 +3046,20 @@ def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:b
   return out
 
 def _schedule_swizzle_mov_batches(ops:list[UOp]) -> list[UOp]:
-  """Rewrite (SWIZZLE|PERMLANEX16),MOV×… into op×N[, VALU×G],MOV×N before regalloc.
+  """Rewrite (SWIZZLE|PERMLANEX16),(MOV|ADD|MAX)×… into op×N[, VALU×G],use×N before regalloc.
+
+  Park path: SW,MOV pairs (REG temps). No-park path (`AMD_SWIZZLE_NO_PARK`): SW,ADD/MAX
+  pairs so wait→ADD matches HIP (no park MOVs).
 
   Emit-time reordering of the same pattern extends live ranges past what
   regalloc assumed (aliased VGPRs → wrong results). Scheduling here keeps liveness honest.
 
-  AMD_SWIZZLE_VALU_GAP: pull independent FMAC/MUL/ADD from immediately after the MOV
-  block into the swizzle→MOV gap so lgkm wait can overlap VALU (HIP flash_decode).
+  AMD_SWIZZLE_VALU_GAP: pull independent FMAC/MUL/ADD from immediately after the use
+  block into the swizzle→use gap so lgkm wait can overlap VALU (HIP flash_decode).
   """
   if not getenv("AMD_BATCH_SWIZZLE_MOV", 1): return ops
   batchable = (AMDOps.SWIZZLE, AMDOps.PERMLANEX16)
+  use_ops = (AMDOps.MOV, AMDOps.ADD, AMDOps.MAX)
   valu_gap = (AMDOps.FMAC, AMDOps.MUL, AMDOps.ADD, AMDOps.MAX, AMDOps.MULACC)
   pull_valu = bool(getenv("AMD_SWIZZLE_VALU_GAP", 0))
   max_gap = getenv("AMD_SWIZZLE_VALU_GAP_MAX", 4)
@@ -3064,25 +3068,25 @@ def _schedule_swizzle_mov_batches(ops:list[UOp]) -> list[UOp]:
   while i < len(ops):
     u = ops[i]
     if u.op is Ops.INS and _iop(u) in batchable and i + 1 < len(ops) and \
-       ops[i + 1].op is Ops.INS and _iop(ops[i + 1]) is AMDOps.MOV and u in ops[i + 1].src:
-      kind = _iop(u)
-      sws, movs = [u], [ops[i + 1]]
+       ops[i + 1].op is Ops.INS and _iop(ops[i + 1]) in use_ops and u in ops[i + 1].src:
+      kind, use_kind = _iop(u), _iop(ops[i + 1])
+      sws, uses = [u], [ops[i + 1]]
       j = i + 2
       while j + 1 < len(ops) and len(sws) < 8 and \
             ops[j].op is Ops.INS and _iop(ops[j]) is kind and \
-            ops[j + 1].op is Ops.INS and _iop(ops[j + 1]) is AMDOps.MOV and \
+            ops[j + 1].op is Ops.INS and _iop(ops[j + 1]) is use_kind and \
             ops[j] in ops[j + 1].src:
-        sws.append(ops[j]); movs.append(ops[j + 1]); j += 2
+        sws.append(ops[j]); uses.append(ops[j + 1]); j += 2
       if len(sws) >= 2:
         gap: list[UOp] = []
         if pull_valu:
-          blocked = set(sws) | set(movs)
+          blocked = set(sws) | set(uses)
           k = j
           while k < len(ops) and len(gap) < max_gap:
             cand = ops[k]
             if cand.op is Ops.INS and _iop(cand) in valu_gap and \
                not any(s in blocked for s in cand.src) and \
-               not any(cand in m.toposort() for m in movs):
+               not any(cand in m.toposort() for m in uses):
               gap.append(cand)
               blocked.add(cand)
               k += 1
@@ -3090,7 +3094,7 @@ def _schedule_swizzle_mov_batches(ops:list[UOp]) -> list[UOp]:
             break
         out.extend(sws)
         out.extend(gap)
-        out.extend(movs)
+        out.extend(uses)
         i = j + len(gap)
         continue
     out.append(u); i += 1
