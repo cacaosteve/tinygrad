@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`61ccf010c`**.
+Tip: **`08d6c2765`** (merged `origin/master`).
 
 ## Headline
 
@@ -9,6 +9,10 @@ Tip: **`61ccf010c`**.
 disconnect: **61 clean rounds** (~69 min), zero failures. Flash DIRECT still
 **opt-in** (`AMD_FLASH_DIRECT=1`); do not flip the prefill default. Packing /
 FMA_MIX / K-unroll / perf stay off. (HIP prefill ~3× faster today.)
+
+Merged upstream master (65 commits): decode>16k online-softmax fix, V-load
+masking, shape/LDS SDPA fallback gates, plus CALLIFY/x86/validate cleanups.
+Kept dedicated P LDS + workgroup barrier before V.
 
 ## Fix (`478c23b49`)
 
