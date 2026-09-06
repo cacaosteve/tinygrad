@@ -3405,24 +3405,46 @@ def _cluster_const_scratch_loads(ops:list[UOp]) -> list[UOp]:
     i += 1
   return out
 
+# Memory writes as the immediate "USE" of an SLOAD: batching would hoist later
+# loads before that write (CPU-repro: load[0]; store[1]=a; load[1] → wrong).
+_SCRATCH_BATCH_UNSAFE_USE = (AMDOps.SSTORE, AMDOps.STORE, AMDOps.SPILL)
+
+def _scratch_batch_use_safe(u:UOp) -> bool:
+  """True if `u` is a register-only consumer safe to delay past later SLOADs."""
+  if u.op is not Ops.INS: return False
+  iop = _iop(u)
+  if iop in _SCRATCH_BATCH_UNSAFE_USE or iop in _SCRATCH_CLUSTER_CF: return False
+  return True
+
+def _schedule_scratch_load_passes(ops:list[UOp]) -> list[UOp]:
+  """Composed scratch scheduling: store cluster → load/use batch → load cluster."""
+  ops = _cluster_const_scratch_stores(ops)
+  ops = _batch_scratch_load_uses(ops)
+  ops = _cluster_const_scratch_loads(ops)
+  return ops
+
 def _batch_scratch_load_uses(ops:list[UOp]) -> list[UOp]:
   """Rewrite SLOAD,USE,SLOAD,USE → SLOAD×N,USE×N so waitcnt can cover a load burst.
 
   Flash tip still pairs each scratch_load with an immediate wait0; batching independent
   scalar SLOADs before their first uses mirrors HIP vmem overlap.
   Sort batched loads by const index so SCRATCH_LOAD_B128 fusion can match (0,1,2,3).
+
+  USE must be register-only: an SSTORE/STORE/SPILL use must not be batched, or a
+  later load can move before that write (same-base alias via memory, not SSA).
   """
   if not getenv("AMD_BATCH_SLOAD_USE", 1): return ops
   out: list[UOp] = []
   i = 0
   while i < len(ops):
     u = ops[i]
-    if u.op is Ops.INS and _iop(u) is AMDOps.SLOAD and i + 1 < len(ops) and u in ops[i + 1].src:
+    if (u.op is Ops.INS and _iop(u) is AMDOps.SLOAD and i + 1 < len(ops) and u in ops[i + 1].src and
+        _scratch_batch_use_safe(ops[i + 1])):
       loads, uses = [u], [ops[i + 1]]
       j = i + 2
       while j + 1 < len(ops) and len(loads) < getenv("AMD_BATCH_SLOAD_MAX", 32) and \
             ops[j].op is Ops.INS and _iop(ops[j]) is AMDOps.SLOAD and \
-            ops[j] in ops[j + 1].src and \
+            ops[j] in ops[j + 1].src and _scratch_batch_use_safe(ops[j + 1]) and \
             not any(prev in ops[j].src or prev in ops[j + 1].src for prev in loads + uses):
         loads.append(ops[j]); uses.append(ops[j + 1]); j += 2
       if len(loads) >= 2:
@@ -5020,9 +5042,7 @@ class AMDRenderer(ISARenderer):
     lst = _prefetch_a_before_dequant_mix(lst) if getenv("AMD_PREFETCH_Q6_A", 1) else lst
     lst = _schedule_swizzle_mov_batches(lst)
     lst = _gap_fill_after_loads(lst)
-    lst = _cluster_const_scratch_stores(lst)
-    lst = _batch_scratch_load_uses(lst)
-    lst = _cluster_const_scratch_loads(lst)
+    lst = _schedule_scratch_load_passes(lst)
     lst = _pack_aligned_const_scratch_sloads(lst)
     return _schedule_loop_cmps(lst)
   def _pure_addr(self, x:UOp) -> bool:

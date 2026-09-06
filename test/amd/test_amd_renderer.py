@@ -2603,6 +2603,56 @@ class TestAMDRenderer(unittest.TestCase):
     os.environ.pop("AMD_CLUSTER_SLOAD", None)
     getenv.cache_clear()
 
+  def test_batch_sload_use_does_not_hoist_load_past_store_use(self):
+    """SLOAD whose USE is SSTORE must not batch with a later load (memory alias)."""
+    from tinygrad.renderer.isa.rdna3 import _batch_scratch_load_uses, _schedule_scratch_load_passes
+    os.environ["AMD_BATCH_SLOAD_USE"] = "1"
+    os.environ["AMD_CLUSTER_SLOAD"] = "1"
+    getenv.cache_clear()
+    base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
+    def sload(i):
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
+                 tag=(Register(f"l{i}", 0, _cons=amd_lib.VGPR),))
+    def sstore(i, val):
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag(), val), arg=(AMDOps.SSTORE, dtypes.void))
+    a, b = sload(0), sload(1)
+    st = sstore(1, a)  # USE of a is a same-base store to idx 1
+    use_b = UOp(Ops.INS, src=(b, UOp.cconst(1.0, dtypes.float32)), arg=(AMDOps.MUL, dtypes.float32),
+                tag=(Register("ub", 0, _cons=amd_lib.VGPR),))
+    # a=load[0]; store[1]=a; b=load[1]; use(b)  — must not become load,load,store,use
+    ops = [a, st, b, use_b]
+    for name, out in (("batch", _batch_scratch_load_uses(ops)),
+                      ("composed", _schedule_scratch_load_passes(ops))):
+      with self.subTest(name):
+        self.assertLess(out.index(st), out.index(b), f"{name}: load[1] must stay after store[1]=a")
+        self.assertEqual(out.index(a), out.index(st) - 1)  # load[0] still feeds the store
+    os.environ.pop("AMD_BATCH_SLOAD_USE", None)
+    os.environ.pop("AMD_CLUSTER_SLOAD", None)
+    getenv.cache_clear()
+
+  def test_batch_sload_use_still_batches_alu_uses(self):
+    """Independent register-only USEs may still batch into a load burst."""
+    from tinygrad.renderer.isa.rdna3 import _batch_scratch_load_uses
+    os.environ["AMD_BATCH_SLOAD_USE"] = "1"
+    getenv.cache_clear()
+    base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
+    def sload(i):
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
+                 tag=(Register(f"l{i}", 0, _cons=amd_lib.VGPR),))
+    loads = [sload(i) for i in range(2)]
+    uses = [
+      UOp(Ops.INS, src=(loads[0], UOp.cconst(1.0, dtypes.float32)), arg=(AMDOps.MUL, dtypes.float32),
+          tag=(Register("u0", 0, _cons=amd_lib.VGPR),)),
+      UOp(Ops.INS, src=(loads[1], UOp.cconst(2.0, dtypes.float32)), arg=(AMDOps.MUL, dtypes.float32),
+          tag=(Register("u1", 0, _cons=amd_lib.VGPR),)),
+    ]
+    ops = [loads[0], uses[0], loads[1], uses[1]]
+    out = _batch_scratch_load_uses(ops)
+    self.assertEqual(out[:2], loads)
+    self.assertEqual(out[2:], uses)
+    os.environ.pop("AMD_BATCH_SLOAD_USE", None)
+    getenv.cache_clear()
+
   def test_regalloc_rewrites_surviving_shrink(self):
     renderer = _REN
     src = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32).rtag(),), AMDOps.MOV,
