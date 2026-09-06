@@ -3334,7 +3334,7 @@ def _cluster_const_scratch_stores(ops:list[UOp]) -> list[UOp]:
           continue
         break
       if len(group) >= 4:
-        group.sort(key=lambda x: int(_const_int(x.src[1])))  # type: ignore[arg-type]
+        group.sort(key=lambda x: (int(_const_int(x.src[1])), _lds_byte_off(x)))  # type: ignore[arg-type]
         out.extend(group)
         i = j
         continue
