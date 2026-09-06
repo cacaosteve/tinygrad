@@ -70,7 +70,8 @@ class LinearScanRegallocContext:
         for vr, phys in victims:
           if vr not in self.spills:
             vd = self.vdef(vr)
-            sz = ren.spill_size(vd, vr)
+            # Match FILL/SPILL width: multi-slot VGPRs need register_slots*4 bytes, not dtype.itemsize.
+            sz = max(ren.spill_size(vd, vr), ren.register_slots(vd, vr) * 4)
             if sz <= 0: sz = 4
             offset = self.stack_size + (sz - self.stack_size % sz) % sz
             self.spills[vr] = UOp.cconst(offset, dtypes.int32)
@@ -240,7 +241,7 @@ def wide_restore(ctx, v, r, i):
 def wide_regalloc_rewrite(ctx, x:UOp):
   i = ctx.regalloc_i
   if x.op in {Ops.CONST, Ops.NOOP, Ops.AFTER, Ops.BARRIER, Ops.GROUP, Ops.STACK}: return None
-  if x.op in (Ops.LOAD, Ops.STORE) and not ctx.insert_before.get(i):
+  if x.op in (Ops.LOAD, Ops.STORE) and not ctx.insert_before.get(i) and i not in ctx.spill_on_evict:
     spilled = any(i in ctx.reals and ((vr:=greg(ctx.uops[i].src[j])) in ctx.spills or vr in ctx.remat)
                   for j in range(len(x.src)))
     if not spilled and i not in (ctx.first_real_idx, ctx.last_real_idx): return None
@@ -263,8 +264,20 @@ def wide_regalloc_rewrite(ctx, x:UOp):
     else: nx = ctx.ren.isel_matcher.rewrite(ctx.ren.stack_pointer().index(ctx.locals[x], tag=ndefs))
   else: nx = x.replace(src=tuple(nsrc), tag=ndefs)
   # Spill victims before this insn clobbers their phys regs (spill-on-evict), then fills.
-  before = [ctx.ren.spill(ctx.spills[vr], ctx.ren.bind(ctx.vdef(vr).dtype, phys))
-            for vr, phys in ctx.spill_on_evict.get(i, [])]
+  # bind() alone reports 1 slot; pass register_slots so multi-VGPR live values are fully stored.
+  evicts = ctx.spill_on_evict.get(i, [])
+  before = [ctx.ren.spill(ctx.spills[vr], ctx.ren.bind(ctx.vdef(vr).dtype, phys),
+                          slots=ctx.ren.register_slots(ctx.vdef(vr), vr))
+            for vr, phys in evicts]
+  # Dest alloc can steal pinned source phys under pressure. Spill keeps the VGPR value until
+  # the def overwrites it, but reload sources that were spill-on-evict victims so a later
+  # TMP_VADDR/scratch sequence cannot leave a stale identity-only FILL in nsrc without a real load.
+  src_vrs: set[Register] = set()
+  if i in ctx.reals:
+    for j in range(len(x.src)):
+      if isinstance(vr:=greg(ctx.uops[i].src[j]), Register): src_vrs.add(vr)
+  before += [ctx.ren.fill(ctx.spills[vr], ctx.vdef(vr), phys)
+             for vr, phys in evicts if vr in src_vrs]
   before += [wide_restore(ctx, vr, r, i) for vr,r in ctx.insert_before.get(i, [])]
   after = [ctx.ren.spill(ctx.spills[vr], nx) for vr in x.tag if vr in ctx.spills] if isinstance(x.tag, tuple) else []
   if ctx.stack_size > 0:

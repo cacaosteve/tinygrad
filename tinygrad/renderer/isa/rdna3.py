@@ -2495,7 +2495,9 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       return [r3.v_mov_b32_e32(TMP_VADDR, disp & ~0xfff),
               scratch_load(addr=TMP_VADDR, vdst=_dst(u), offset=disp & 0xfff, sve=1)]
     case AMDOps.SPILL:
-      slots = _reg_slots(u.src[1])
+      # Prefer explicit slot count (spill-on-evict) over _reg_slots(bind) which is often 1.
+      if len(u.src) > 2 and (n:=_unwrap_const(u.src[2])) is not None: slots = int(n)
+      else: slots = _reg_slots(u.src[1])
       if (disp_uop:=_unwrap_const(u.src[0])) is None: raise CompileError("non-constant scratch spill offset")
       disp = int(disp_uop.val)
       if disp < 0 or disp + (slots-1)*4 > 0xffffffff: raise CompileError(f"scratch spill oob: offset={disp}, slots={slots}")
@@ -4280,6 +4282,9 @@ def insts_from_linear(lin:UOp):
             continue
     if u in d16_hi_lo: flush_regs(_reg_idxs(d16_hi_lo[u]))
     is_mem_addr_cse = u.op is Ops.INS and _iop(u) in (AMDOps.STORE, AMDOps.SSTORE, AMDOps.SLOAD)
+    # Scratch SPILL/FILL always clobber TMP_VADDR (page base). Clear before emit so a
+    # following STORE/SLOAD CSE cannot reuse a stale TMP_VADDR across spill-on-evict.
+    if u.op is Ops.INS and _iop(u) in (AMDOps.SPILL, AMDOps.FILL): store_addr_cache.clear()
     emitted = _emit_uop(u, masked, with_store_cache=is_mem_addr_cse)
     # VALU copy of an outstanding VMEM/LDS dest must wait first (PACK/MOV across pools).
     if emitted and u.op is Ops.INS and _iop(u) in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV):
@@ -4293,6 +4298,8 @@ def insts_from_linear(lin:UOp):
     # half×16 STORE may V_ADD into TMP_VADDR for the second b128 — drop page CSE.
     # Scratch SSTORE/SLOAD also ADD segment base once; keep CSE across those.
     if _iop(u) is AMDOps.STORE and any(getattr(i, "op_name", "") == "V_ADD_NC_U32_E64" for i in emitted):
+      store_addr_cache.clear()
+    elif u.op is Ops.INS and _iop(u) in (AMDOps.SPILL, AMDOps.FILL):
       store_addr_cache.clear()
     elif not is_mem_addr_cse and any(getattr(i, "vdst", None) == TMP_VADDR for i in emitted):
       store_addr_cache.clear()
@@ -4699,9 +4706,13 @@ class AMDRenderer(ISARenderer):
     if _iop(x) in (AMDOps.WMMA, AMDOps.FMAC, AMDOps.FMA_MIX_F32, AMDOps.REG_STORE): return True
     # PACK_F16(half×16 LOAD) — coalesce onto the load (hand FA/FB).
     return _iop(x) is AMDOps.PACK_F16 and _pack_f16_is_vec_load(x) and len(x.src) == 1
-  def spill(self, disp:UOp, x:UOp) -> UOp:
+  def spill(self, disp:UOp, x:UOp, slots:int|None=None) -> UOp:
     # REG_STORE is void; spill the written value, not the void node.
     if x.op is Ops.INS and _iop(x) is AMDOps.REG_STORE: x = x.src[1]
+    # Optional slots: spill-on-evict binds a phys with a scalar dtype (1-slot _reg_slots);
+    # multi-VGPR victims need an explicit width matching register_slots / FILL.
+    if slots is not None and slots > 1:
+      return UOp(Ops.INS, src=(disp, x, _tconst(slots, dtypes.int32).rtag()), arg=(AMDOps.SPILL, dtypes.void))
     return UOp(Ops.INS, src=(disp, x), arg=(AMDOps.SPILL, dtypes.void))
   def loop_end(self, x:UOp) -> UOp|None:
     if x.op is Ops.INS and _iop(x) is AMDOps.LOOP_CMP: return x.src[2] if len(x.src) == 3 else x.src[3]

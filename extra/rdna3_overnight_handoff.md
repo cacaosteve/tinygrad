@@ -1,11 +1,12 @@
-# Overnight RDNA3 — tip `6f5a8e053`
+# Overnight RDNA3 — tip `515113c7d` (+ local spill-on-evict emit WIP)
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
 
 ## Headline
 
-**Flash DIRECT ACC_SMALL** ~**675µs** (err~1e-4). HIP ~278; SDPA ~360.
+**Flash DIRECT ACC_SMALL** ~**676–680µs** (err~1e-4). HIP ~278; SDPA ~360.
 Keep default **`AMD_REG_PROMOTE_SKIP_SLOTS=2`** + slot-19 work-copy.
+**`AMD_SPILL_ON_EVICT` stays 0** — enabling still MMU-faults flash even on SKIP=2.
 
 ## Promote diagnosis (closed for now)
 
@@ -50,10 +51,19 @@ Do **not** ship `SKIP_SLOTS=` (also parks slot 2 in peer GEMMs).
 - Fuse `acc=alpha*acc+beta*pv` as default
 - `AMD_FLASH_K_UNROLL` / PV_ACC_DIRECT / ACC_SEP=0
 
+## Spill-on-evict status (WIP)
+
+- Default **off**. `=1` on shipping SKIP=2 flash: **MMU** (`NotPresent`), stack/pss still ~212B, ~22 evicts
+  (mostly addr ALU temps before LLOAD/EXTRACT). Not a 4K scratch undercount.
+- Promote loop repro stays OK with `=1` (little pressure).
+- Local WIP (not proven on HW yet): multi-slot SPILL width via explicit `slots=`, clear
+  `store_addr_cache` on SPILL/FILL, reload spill-on-evict victims that are sources of the insn.
+- Do **not** leave `AMD_SPILL_ON_EVICT=1` on the 7900 — faults can sticky-wedge until a clean kernel.
+
 ## Next leftovers
 
-1. **Spill-on-evict** landed gated `AMD_SPILL_ON_EVICT=0` (default off) — `=1` MMU-faults on
-   multi-tile promote; needs a safer emit path before enabling. Dedicated VGPR[89:121] pool alone → nan on pn>=64
+1. Finish safer spill-on-evict emit (TMP_VADDR / LLOAD dest-as-addr interaction) — then retest
+   multi-tile `SKIP_SLOTS=` promote. Dedicated VGPR[89:121] pool alone → nan on pn>=64
 2. Cut 21 allocator spills / slot-2 tile copies on baseline (~675→HIP)
-3. Decode partial 34→29
+3. Decode partial 34→29 (isolated partial still ~34 vs HIP ~28; e2e ~58)
 4. eye/GEMM serial fails exist since before this tip (TC_LDS_AB) — separate track
