@@ -305,18 +305,13 @@ def run_mode(mode: str, prg, q_np, kv_np, T: int, replays: int, art: Path,
       if i < 4 or i + 1 == replays or (i + 1) % 25 == 0:
         print(f"  replay[{i}] mean={float(outs[-1].mean()):.8g}")
   elif mode == "fixed":
-    # One allocation; same runtime/buffers/args. Optionally refill out with sentinel.
+    # Same runtime + q/kv/out buffers + launch args. No intervening helper kernels:
+    # do NOT Tensor.assign the out buffer (that would enqueue a fill kernel).
     state = make_fixed_state(prg, q_np, kv_np, T)
-    # Ensure scratch exists before first fill
-    _ = state["rt"]
+    _ = state["rt"]  # ensure scratch sized for this program
     for i in range(replays):
       if scratch_mode:
         scratch_info = fill_scratch(scratch_mode)
-      # Do not recreate inputs; rewrite out sentinel so unwritten lanes stay visible.
-      try:
-        refill_out_sentinel(state)
-      except Exception as e:
-        print(f"  WARN: out sentinel refill failed: {e}")
       outs.append(launch_fixed(state))
       if i < 4 or i + 1 == replays or (i + 1) % 25 == 0:
         print(f"  replay[{i}] mean={float(outs[-1].mean()):.8g}")
@@ -441,10 +436,7 @@ def main() -> None:
   hip_outs = []
   hip_state = make_fixed_state(hip_prg, q_np, kv_np, T)
   for i in range(args.replays):
-    try:
-      refill_out_sentinel(hip_state)
-    except Exception:
-      pass
+    # No out-refill helper kernel between HIP launches either.
     hip_outs.append(launch_fixed(hip_state))
   hip_row = summarize_outs(hip_outs, None, args.ref_tol)
   hip_art = art / "hip_fixed"
