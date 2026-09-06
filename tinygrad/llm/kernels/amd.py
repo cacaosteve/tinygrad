@@ -981,10 +981,10 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         p_reg_stores.append(dp[block_bh, block_m, n_tile, wave_n, qrow, kcol].store(S_reg[ri, rj]))
     S_reg = S_reg.after(UOp.group(*p_reg_stores))
   # QK reads Q from QP_lds and K from KV_lds. P used to reuse QP_lds and V reuses KV_lds
-  # (slot 1). Without a sync, early waves overwrite Q/K while peers are still in the K-loop
-  # → wave_n=1-only QK nondeterminism with exact post-load LDS dumps. Dedicated P buffer
-  # removes Q/P aliasing; barrier before V_store protects K until all waves finish QK.
-  lds_reuse_barrier = UOp.barrier(S_reg)
+  # (slot 1). after(qk_done) on V was per-wave only — early waves could V-store over K while
+  # peers were still in the K-loop. Dedicated P removes Q/P aliasing; workgroup barrier on
+  # qk_done gates V until every wave finishes QK.
+  lds_reuse_barrier = UOp.barrier(qk_done)
   P_lds = UOp.placeholder((WAVES_N, BLOCK_M, BLOCK_N), dtypes.half, slot=5, addrspace=AddrSpace.LOCAL)
   P_write = P_lds.reshape(WAVES_N, WAVES_M, TM, LANES_PER_WAVE_M, 1, TN, LANES_PER_WAVE_N, 1).permute((1, 0, 3, 6, 2, 4, 5, 7)) \
     .reshape(THREADS_PER_BLOCK, TM, TN)
