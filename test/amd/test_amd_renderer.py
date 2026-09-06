@@ -2636,18 +2636,20 @@ class TestAMDRenderer(unittest.TestCase):
     os.environ["AMD_BATCH_SLOAD_USE"] = "1"
     getenv.cache_clear()
     base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
-    def sload(i, v):
+    # Genuine virtual regs: distinct SSA tags, all placeholder index 0 (pre-regalloc).
+    def sload(i):
       return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
-                 tag=(Register(f"l{i}", v, _cons=amd_lib.VGPR),))
-    loads = [sload(0, 10), sload(1, 11)]  # distinct phys dests (pre-regalloc-safe)
+                 tag=(Register(f"l{i}", 0, _cons=amd_lib.VGPR),))
+    loads = [sload(0), sload(1)]
     uses = [
       UOp(Ops.INS, src=(loads[0], UOp.cconst(1.0, dtypes.float32)), arg=(AMDOps.MUL, dtypes.float32),
-          tag=(Register("u0", 20, _cons=amd_lib.VGPR),)),
+          tag=(Register("u0", 0, _cons=amd_lib.VGPR),)),
       UOp(Ops.INS, src=(loads[1], UOp.cconst(2.0, dtypes.float32)), arg=(AMDOps.MUL, dtypes.float32),
-          tag=(Register("u1", 21, _cons=amd_lib.VGPR),)),
+          tag=(Register("u1", 0, _cons=amd_lib.VGPR),)),
     ]
     ops = [loads[0], uses[0], loads[1], uses[1]]
-    out = _batch_scratch_load_uses(ops)
+    # Pre-regalloc must not treat placeholder index 0 as phys overlap.
+    out = _batch_scratch_load_uses(ops, check_phys=False)
     self.assertEqual(out[:2], loads)
     self.assertEqual(out[2:], uses)
     os.environ.pop("AMD_BATCH_SLOAD_USE", None)
@@ -2673,10 +2675,48 @@ class TestAMDRenderer(unittest.TestCase):
                 tag=(Register("ub", 7, _cons=amd_lib.VGPR),))
     ops = [load_a, use_a, load_b, use_b]
     self.assertTrue(_scratch_batch_phys_conflict([load_a], [use_a], load_b, use_b))
-    out = _batch_scratch_load_uses(ops)
+    # Without check_phys (pre-regalloc style) this would incorrectly batch; with check_phys it must not.
+    out_pre = _batch_scratch_load_uses(ops, check_phys=False)
+    self.assertEqual(out_pre[:2], [load_a, load_b])  # UOp-only would batch
+    out = _batch_scratch_load_uses(ops, check_phys=True)
     self.assertEqual(out, ops, "must not batch when load dests share a physical VGPR")
     os.environ.pop("AMD_BATCH_SLOAD_USE", None)
     getenv.cache_clear()
+
+  def test_batch_sload_use_virt_regs_index0_still_batch(self):
+    """Placeholder index 0 on distinct virtual regs must not trip the phys guard."""
+    from tinygrad.renderer.isa.rdna3 import _batch_scratch_load_uses, _scratch_batch_phys_conflict
+    os.environ["AMD_BATCH_SLOAD_USE"] = "1"
+    getenv.cache_clear()
+    base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
+    load_a = UOp(Ops.INS, src=(base, UOp.cconst(0, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
+                 tag=(Register("va", 0, _cons=amd_lib.VGPR),))
+    use_a = UOp(Ops.INS, src=(load_a,), arg=(AMDOps.MOV, dtypes.float32),
+                tag=(Register("ua", 0, _cons=amd_lib.VGPR),))
+    load_b = UOp(Ops.INS, src=(base, UOp.cconst(1, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
+                 tag=(Register("vb", 0, _cons=amd_lib.VGPR),))
+    use_b = UOp(Ops.INS, src=(load_b,), arg=(AMDOps.MOV, dtypes.float32),
+                tag=(Register("ub", 0, _cons=amd_lib.VGPR),))
+    # Phys helper reports overlap on placeholder 0 — that is why check_phys must stay off pre-alloc.
+    self.assertTrue(_scratch_batch_phys_conflict([load_a], [use_a], load_b, use_b))
+    out = _batch_scratch_load_uses([load_a, use_a, load_b, use_b], check_phys=False)
+    self.assertEqual(out, [load_a, load_b, use_a, use_b])
+    os.environ.pop("AMD_BATCH_SLOAD_USE", None)
+    getenv.cache_clear()
+
+  def test_in_order_emit_disables_optional_motion(self):
+    """AMD_IN_ORDER_EMIT must turn off VOPD/WMMA-sink optional emit transforms."""
+    from tinygrad.renderer.isa import rdna3 as r
+    os.environ["AMD_IN_ORDER_EMIT"] = "1"
+    getenv.cache_clear()
+    self.assertFalse(r._emit_optional())
+    self.assertIsNone(r._try_vopd_fmac_pair(
+      UOp(Ops.INS, arg=(AMDOps.FMAC, dtypes.float32)),
+      UOp(Ops.INS, arg=(AMDOps.FMAC, dtypes.float32))))
+    self.assertEqual(r._sink_wmma_past_loads([]), [])
+    os.environ.pop("AMD_IN_ORDER_EMIT", None)
+    getenv.cache_clear()
+    self.assertTrue(r._emit_optional())
 
   def test_regalloc_rewrites_surviving_shrink(self):
     renderer = _REN

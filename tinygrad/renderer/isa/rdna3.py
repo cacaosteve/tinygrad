@@ -25,7 +25,14 @@ from tinygrad.renderer.isa.rdna3_tc import expand_wmma_lds_tiles, pm_stage_wmma_
 # AMD_PREFETCH_A (default 1): within-K next-A B128 before PACK so A tiles overlap WMMA; 0 opts out.
 # AMD_COALESCE_U8 (default 1): combine adjacent byte loads into packed U16/B32/B64/B128 VMEM operations.
 # AMD_UNIFORM_INT (default 1): move wave-uniform packed-byte extraction and integer address chains to SGPRs.
+# AMD_IN_ORDER_EMIT=1: diagnostic — disable optional post-alloc motion/fusions (VOPD, WMMA sink/hoist,
+#   emit store/load clauses, fused loops, SINK_VMEM_SWIZZLE). Required lowering (d16 order, waits) stays.
+# AMD_INSTR_WAIT=1: after each tracked mem burst, hard waitcnt(0) for that domain (ignores soft pending).
 _PREFETCH_NEXT_A = False
+
+def _emit_optional() -> bool:
+  """False under AMD_IN_ORDER_EMIT — no optional post-allocation emit motion/fusions."""
+  return not bool(getenv("AMD_IN_ORDER_EMIT", 0))
 
 _F32_UNARY = {AMDOps.RECIPROCAL: r3.v_rcp_f32_e32, AMDOps.EXP2: r3.v_exp_f32_e32, AMDOps.LOG2: r3.v_log_f32_e32,
               AMDOps.SQRT: r3.v_sqrt_f32_e32, AMDOps.TRUNC: r3.v_trunc_f32_e32}
@@ -89,7 +96,7 @@ def _parallel_vmov(moves:list[tuple[Reg, Reg|int|float]]) -> list:
   ret: list = []
   while pending:
     # Pair into VOPD on even/odd VGPR banks (hand WMMA ACC init + consecutive copies).
-    if len(pending) >= 2 and getenv("AMD_VOPD_MOV", 1):
+    if len(pending) >= 2 and _emit_optional() and getenv("AMD_VOPD_MOV", 1):
       (d0, s0), (d1, s1) = pending[0], pending[1]
       n0 = d0.offset - 256 if d0.sz == 1 and 256 <= d0.offset < 512 else None
       n1 = d1.offset - 256 if d1.sz == 1 and 256 <= d1.offset < 512 else None
@@ -146,7 +153,7 @@ def _fmac_mul_operands(u:UOp) -> tuple[object, Reg]|None:
 
 def _try_vopd_fmac_pair(u0:UOp, u1:UOp) -> list|None:
   """Pack two independent float32 FMACs into VOPD when dest/src banks allow."""
-  if not getenv("AMD_VOPD_FMAC", 1): return None
+  if not _emit_optional() or not getenv("AMD_VOPD_FMAC", 1): return None
   if u0.op is not Ops.INS or u1.op is not Ops.INS: return None
   if _iop(u0) is not AMDOps.FMAC or _iop(u1) is not AMDOps.FMAC: return None
   if u1 in u0.toposort() or u0 in u1.toposort(): return None
@@ -179,7 +186,7 @@ def _add_operands(u:UOp) -> tuple[object, object]|None:
 
 def _try_vopd_add_pair(u0:UOp, u1:UOp) -> list|None:
   """Pack two independent float32 ADDs into VOPD when dest/src banks allow."""
-  if not getenv("AMD_VOPD_ADD", 1): return None
+  if not _emit_optional() or not getenv("AMD_VOPD_ADD", 1): return None
   if u0.op is not Ops.INS or u1.op is not Ops.INS: return None
   if _iop(u0) is not AMDOps.ADD or _iop(u1) is not AMDOps.ADD: return None
   if u0.dtype is not dtypes.float32 or u1.dtype is not dtypes.float32: return None
@@ -2647,6 +2654,7 @@ _SINKABLE_PAST_WMMA = frozenset({
 
 def _sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
   # Sink WMMA (+ its ACC EXTRACTs) past independent loads — not past peer WMMAs.
+  if not _emit_optional(): return ops
   out = list(ops)
   i = 0
   while i < len(out):
@@ -2987,6 +2995,7 @@ def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
   # Bubble LOAD/PACK_F16 (+ int addr) above preceding WMMAs when independent.
   # Must not clobber a WMMA's A/B/ACC — UPCAST≥4 reuses PACK VGPRs across tiles; hoisting
   # the next tile's load above a prior WMMA left only the last A in those regs (wrong results).
+  if not _emit_optional(): return ops
   if not any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops): return ops
   out = list(ops)
   i = 0
@@ -3417,10 +3426,13 @@ def _scratch_batch_use_safe(u:UOp) -> bool:
   return True
 
 def _scratch_batch_phys_conflict(loads:list[UOp], uses:list[UOp], new_load:UOp, new_use:UOp) -> bool:
-  """True if appending new_load/new_use would clobber a live physical dest under load×N,use×N.
+  """True if appending new_load/new_use would clobber a live *physical* dest under load×N,use×N.
 
   After batching, all loads run before any use. An earlier load's dest must stay intact until
   its use — a later load that reuses the same VGPR (legal post-regalloc) would overwrite it.
+
+  Only meaningful after physical assignment. Virtual regs from isel use placeholder index 0
+  for every distinct SSA value — treating those as overlapping falsely kills pre-regalloc batching.
   """
   cand_loads, cand_uses = loads + [new_load], uses + [new_use]
   for i, ld in enumerate(cand_loads):
@@ -3428,18 +3440,18 @@ def _scratch_batch_phys_conflict(loads:list[UOp], uses:list[UOp], new_load:UOp, 
     if not live: continue
     for later in cand_loads[i + 1:]:
       if _reg_idxs(later) & live: return True
-      # Later load may also clobber other phys regs the earlier use still reads.
       if _reg_idxs(later) & set().union(*(_reg_idxs(s) for s in cand_uses[i].src)): return True
   return False
 
 def _schedule_scratch_load_passes(ops:list[UOp]) -> list[UOp]:
   """Composed scratch scheduling: store cluster → load/use batch → load cluster."""
   ops = _cluster_const_scratch_stores(ops)
-  ops = _batch_scratch_load_uses(ops)
+  # Pre-regalloc: virtual regs share placeholder index 0 — never apply phys-overlap checks here.
+  ops = _batch_scratch_load_uses(ops, check_phys=False)
   ops = _cluster_const_scratch_loads(ops)
   return ops
 
-def _batch_scratch_load_uses(ops:list[UOp]) -> list[UOp]:
+def _batch_scratch_load_uses(ops:list[UOp], *, check_phys:bool=False) -> list[UOp]:
   """Rewrite SLOAD,USE,SLOAD,USE → SLOAD×N,USE×N so waitcnt can cover a load burst.
 
   Flash tip still pairs each scratch_load with an immediate wait0; batching independent
@@ -3449,9 +3461,8 @@ def _batch_scratch_load_uses(ops:list[UOp]) -> list[UOp]:
   USE must be register-only: an SSTORE/STORE/SPILL use must not be batched, or a
   later load can move before that write (same-base alias via memory, not SSA).
 
-  Must not run after physical regalloc without phys checks: regalloc reuses VGPRs, so
-  UOp-independent pairs can still conflict (v5=load A; v6=v5; v5=load B → batch clobbers).
-  Emit path therefore skips this pass; after_pre_regalloc is the intended call site.
+  `check_phys=True` only after physical regalloc (emit must not call this without it).
+  Pre-regalloc must use check_phys=False — virtual regs all carry placeholder index 0.
   """
   if not getenv("AMD_BATCH_SLOAD_USE", 1): return ops
   out: list[UOp] = []
@@ -3466,7 +3477,7 @@ def _batch_scratch_load_uses(ops:list[UOp]) -> list[UOp]:
             ops[j].op is Ops.INS and _iop(ops[j]) is AMDOps.SLOAD and \
             ops[j] in ops[j + 1].src and _scratch_batch_use_safe(ops[j + 1]) and \
             not any(prev in ops[j].src or prev in ops[j + 1].src for prev in loads + uses) and \
-            not _scratch_batch_phys_conflict(loads, uses, ops[j], ops[j + 1]):
+            not (check_phys and _scratch_batch_phys_conflict(loads, uses, ops[j], ops[j + 1])):
         loads.append(ops[j]); uses.append(ops[j + 1]); j += 2
       if len(loads) >= 2:
         # Index order matters for b128 fusion; USE order follows its load.
@@ -3603,7 +3614,7 @@ def _clauseable_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
 
 def _fuse_kernarg_smem_loads(scheduled:list[UOp], oi:int, skip:set[UOp], mask_depth:int) -> tuple[int, list, list[UOp]]|None:
   """Fuse contiguous ulong KERNARGs into s_load_b128/b256 when SGPR dests are contiguous."""
-  if mask_depth or not getenv("AMD_FUSE_KERNARG", 1) or oi >= len(scheduled): return None
+  if not _emit_optional() or mask_depth or not getenv("AMD_FUSE_KERNARG", 1) or oi >= len(scheduled): return None
   u = scheduled[oi]
   if u in skip or u.op is not Ops.INS or _iop(u) is not AMDOps.KERNARG or u.dtype.itemsize != 8: return None
   if not isinstance(greg(u), Register) or (base_off:=_const_int(u.src[0])) is None: return None
@@ -3742,7 +3753,7 @@ def _schedule_fma_mixhi_pairs(uops:list[UOp]) -> list[UOp]:
 
 def _fused_lds_pack_store(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
   """Fold four aliasing EXTRACT+LSTORE pairs into one DS_STORE_B128 (f32 PACK or u32×4 LOAD)."""
-  if i + 7 >= len(uops): return None
+  if not _emit_optional() or i + 7 >= len(uops): return None
   extracts, stores = uops[i:i+8:2], uops[i+1:i+8:2]
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.EXTRACT for x in extracts): return None
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.LSTORE and x.src[2] is extracts[n] for n,x in enumerate(stores)): return None
@@ -3773,7 +3784,7 @@ def _fused_lds_contig_store(uops:list[UOp], i:int) -> tuple[int, list, set[int]]
 
   IQ4 LUT fill schedules EXTRACT×4 then LSTORE×4 (not interleaved), so pack-store fold misses.
   """
-  if i + 3 >= len(uops): return None
+  if not _emit_optional() or i + 3 >= len(uops): return None
   stores = uops[i:i+4]
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.LSTORE for x in stores): return None
   dt = stores[0].src[2].dtype
@@ -3795,7 +3806,7 @@ def _fused_scratch_contig_store(uops:list[UOp], i:int, store_addr_cache:_StoreAd
 
   Accepts shared idx + byte_off 0/4/8/12, or consecutive const element indices.
   """
-  if i + 3 >= len(uops): return None
+  if not _emit_optional() or i + 3 >= len(uops): return None
   stores = uops[i:i+4]
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.SSTORE for x in stores): return None
   dt = stores[0].src[2].dtype
@@ -3833,7 +3844,7 @@ def _fused_scratch_contig_store(uops:list[UOp], i:int, store_addr_cache:_StoreAd
 
 def _fused_scratch_contig_store_b64(uops:list[UOp], i:int, store_addr_cache:_StoreAddrCache|None=None) -> tuple[int, list, set[int]]|None:
   """Fold two contiguous scalar SSTORE into SCRATCH_STORE_B64."""
-  if not getenv("AMD_SCRATCH_STORE_B64", 0) or i + 1 >= len(uops): return None
+  if not _emit_optional() or not getenv("AMD_SCRATCH_STORE_B64", 0) or i + 1 >= len(uops): return None
   stores = uops[i:i+2]
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.SSTORE for x in stores): return None
   dt = stores[0].src[2].dtype
@@ -3874,7 +3885,7 @@ def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAdd
   Accepts either shared idx + byte_off 0/4/8/12, or consecutive const element indices
   (flash soft-copy SLOAD(base, i)..SLOAD(base, i+3)).
   """
-  if i + 3 >= len(uops): return None
+  if not _emit_optional() or i + 3 >= len(uops): return None
   loads = uops[i:i+4]
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.SLOAD for x in loads): return None
   dt = loads[0].dtype
@@ -3912,7 +3923,7 @@ def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAdd
 
 def _fused_scratch_contig_load_b64(uops:list[UOp], i:int, store_addr_cache:_StoreAddrCache|None=None) -> tuple[int, list, set[int]]|None:
   """Fold two contiguous scalar SLOAD into SCRATCH_LOAD_B64 (8-byte aligned)."""
-  if not getenv("AMD_SCRATCH_LOAD_B64", 1) or i + 1 >= len(uops): return None
+  if not _emit_optional() or not getenv("AMD_SCRATCH_LOAD_B64", 1) or i + 1 >= len(uops): return None
   loads = uops[i:i+2]
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.SLOAD for x in loads): return None
   dt = loads[0].dtype
@@ -3948,7 +3959,7 @@ def _fused_scratch_contig_load_b64(uops:list[UOp], i:int, store_addr_cache:_Stor
 
 def _fused_lds_pack_load(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
   """Fold four contiguous f32 LLOAD (same base, offs +0..+12) into one DS_LOAD_B128."""
-  if i + 3 >= len(uops): return None
+  if not _emit_optional() or i + 3 >= len(uops): return None
   loads = uops[i:i+4]
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.LLOAD and x.dtype is dtypes.float32 and _elem_count(x) == 1
              for x in loads): return None
@@ -3964,7 +3975,7 @@ def _fused_lds_pack_load(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|No
 
 def _fused_mixed_dot4_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
   """Wide-load an exact four-element f16*f32 dot while retaining its sequential FMA order."""
-  if i + 14 >= len(uops): return None
+  if not _emit_optional() or i + 14 >= len(uops): return None
   init, ctr, loop, cmp, exit_branch = uops[i:i+5]
   if not (all(u.op is Ops.INS for u in (init, ctr, loop, cmp, exit_branch)) and
           _iop(init) is AMDOps.MOV and init.dtype is dtypes.float32 and init.src and _is_zero_val(init.src[0]) and
@@ -4019,6 +4030,7 @@ def _fused_mixed_dot4_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
 
 def _fused_lds_reduce_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
   """Vector-load an exact 16-value f32 LDS reduction while preserving its left-to-right sum order."""
+  if not _emit_optional(): return None
   if i == 0 or i + 10 >= len(uops) or uops[i-1].op is not Ops.INS or _iop(uops[i-1]) is not AMDOps.BARRIER: return None
   barrier = uops[i-1]
   init, ctr, loop, cmp, exit_branch, load, add, copy, inc, back, out = uops[i:i+11]
@@ -4047,7 +4059,7 @@ def _fused_lds_reduce_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
 def insts_from_linear(lin:UOp):
   ops = list(lin.src)
   skip = _compute_amd_skip(ops)  # fused d16 hi LOADs still emit (d16_hi into lo)
-  where_load_exec, where_load_skip = _where_load_exec_fuses(ops)
+  where_load_exec, where_load_skip = ({}, set()) if not _emit_optional() else _where_load_exec_fuses(ops)
   skip |= where_load_skip
   exec_save = _exec_save_pair(ops) if where_load_exec else TMP_BRANCH
   d16_hi_lo = _d16_hi_lo_map(ops)
@@ -4086,7 +4098,8 @@ def insts_from_linear(lin:UOp):
         emit(_wait_for_domain(domain))
         pending[domain].clear()
   def flush_regs(regs:set[int]):
-    if getenv("AMD_CONSERVATIVE_WAIT", 0):
+    # INSTR_WAIT / CONSERVATIVE_WAIT: full drain — do not trust soft pending accounting.
+    if getenv("AMD_INSTR_WAIT", 0) or getenv("AMD_CONSERVATIVE_WAIT", 0):
       flush("vm", "lgkm", "vs")
       return
     need_i = next((i for i in range(len(pending_vm) - 1, -1, -1) if pending_vm[i][0] & regs), -1)
@@ -4094,8 +4107,24 @@ def insts_from_linear(lin:UOp):
     if pending["lgkm"] & regs: flush("lgkm")
   def note_vm(regs:set[int], insts:list):
     if (n:=_vm_load_count(insts)) and regs: pending_vm.append((regs, n))
+    # Instr-level: hard wait after the burst — does not depend on later soft flush_regs.
+    if getenv("AMD_INSTR_WAIT", 0):
+      emit(_wait_for_domain("vm", 0))
+      pending_vm.clear()
+      return
     # Opt-in: drain VMEM after every tracked load burst (isolates missing-wait bugs).
     if getenv("AMD_CONSERVATIVE_WAIT", 0): flush("vm")
+  def note_lgkm(regs:set[int]):
+    pending["lgkm"] |= regs
+    if getenv("AMD_INSTR_WAIT", 0):
+      emit(_wait_for_domain("lgkm"))
+      pending["lgkm"].clear()
+  def note_vs(regs:set[int]|int=-1):
+    if isinstance(regs, int): pending["vs"].add(regs)
+    else: pending["vs"] |= regs
+    if getenv("AMD_INSTR_WAIT", 0):
+      emit(_wait_for_domain("vs"))
+      pending["vs"].clear()
   def _pending_src(regs:set[int]) -> bool:
     return any(pr & regs for pr, _ in pending_vm) or bool(pending["lgkm"] & regs)
   last_vcc_key: tuple|None = None
@@ -4113,12 +4142,13 @@ def insts_from_linear(lin:UOp):
       last_vcc_key = None
     return list(insts_for_uop(u, skip, masked, store_addr_cache if with_store_cache else None,
                               d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst))
+  # Required: d16 lo-before-hi. Optional: WMMA hoist/sink + emit-time store cluster.
   scheduled = _order_d16_lo_before_hi(
     _hoist_loads_before_wmma(_sink_wmma_past_loads(ops)), d16_hi_lo)
   # Post-regalloc UOp-only reordering is unsound: regalloc reuses VGPRs, so SSA-independent
   # ops can still conflict in phys regs (load A→use; load B both in v5 → batch clobbers A).
   # Swizzle/SLOAD batch, LLOAD hoist, and load gap-fill run in after_pre_regalloc instead.
-  scheduled = _cluster_const_scratch_stores(scheduled)
+  if _emit_optional(): scheduled = _cluster_const_scratch_stores(scheduled)
   fma_pair_dst = _fma_pair_pack_dsts(scheduled, fma_hi_lo)
   early_emitted: set[int] = set()
   perm_selects_ready = False
@@ -4191,7 +4221,7 @@ def insts_from_linear(lin:UOp):
       count, emitted, kas = fused_ka
       store_addr_cache.clear()
       for inst in emitted: emit(inst)
-      for ka in kas: pending["lgkm"] |= _reg_idxs(ka)
+      for ka in kas: note_lgkm(_reg_idxs(ka))
       oi += count
       continue
     if u.op is Ops.INS and _iop(u) is AMDOps.LABEL:
@@ -4224,6 +4254,7 @@ def insts_from_linear(lin:UOp):
       mask_depth += 1
       if (domain:=_wait_domain_for_load(u)) is not None:
         if domain == "vm": note_vm(_reg_idxs(u), emitted)
+        elif domain == "lgkm": note_lgkm(_reg_idxs(u))
         else: pending[domain] |= _reg_idxs(u)
       oi += 1
       continue
@@ -4269,11 +4300,11 @@ def insts_from_linear(lin:UOp):
     # (_schedule_swizzle_mov_batches). Soft lgkm then shares one wait on the first MOV.
     # Do not emit-reorder here — that extends live ranges past regalloc and corrupts results.
     # Overlap independent VMEM/VALU with in-flight ds_swizzle (emit after swizzle, before add's lgkm wait).
-    if mask_depth == 0 and getenv("AMD_SINK_VMEM_SWIZZLE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SWIZZLE and \
+    if mask_depth == 0 and _emit_optional() and getenv("AMD_SINK_VMEM_SWIZZLE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SWIZZLE and \
        oi + 1 < len(scheduled) and (add:=scheduled[oi + 1]).op is Ops.INS and _iop(add) in (AMDOps.ADD, AMDOps.MAX) and u in add.src:
       emitted = _emit_uop(u)
       for inst in emitted: emit(inst)
-      pending["lgkm"] |= _reg_idxs(u)
+      note_lgkm(_reg_idxs(u))
       if getenv("AMD_SWIZZLE_DELAY", 0): emit(r3.s_delay_alu(1))
       sink_valu = bool(getenv("AMD_SINK_VALU_SWIZZLE", 0))
       valu_ops = (AMDOps.FMAC, AMDOps.MUL, AMDOps.ADD, AMDOps.MAX, AMDOps.FMA_MIX_F32, AMDOps.MULACC)
@@ -4308,7 +4339,7 @@ def insts_from_linear(lin:UOp):
       if deps and _pending_src(deps): flush_regs(deps)
       store_addr_cache.clear()
       for inst in emitted: emit(inst)
-      pending["lgkm"].add(-1)
+      note_lgkm({-1})
       oi += count
       continue
     # Contiguous LSTORE×4 (IQ4 LUT: EXTRACT×4 then stores) → ds_store_b128.
@@ -4317,7 +4348,7 @@ def insts_from_linear(lin:UOp):
       if deps and _pending_src(deps): flush_regs(deps)
       store_addr_cache.clear()
       for inst in emitted: emit(inst)
-      pending["lgkm"].add(-1)
+      note_lgkm({-1})
       oi += count
       continue
     # Contiguous SSTORE×4 (flash ACC spill / soft copy) → scratch_store_b128.
@@ -4325,19 +4356,19 @@ def insts_from_linear(lin:UOp):
       count, emitted, deps = fused_sstore
       if deps and _pending_src(deps): flush_regs(deps)
       for inst in emitted: emit(inst)
-      pending["vs"].add(-1)
+      note_vs(-1)
       oi += count
       continue
     if mask_depth == 0 and (fused_ss64:=_fused_scratch_contig_store_b64(scheduled, oi, store_addr_cache)) is not None:
       count, emitted, deps = fused_ss64
       if deps and _pending_src(deps): flush_regs(deps)
       for inst in emitted: emit(inst)
-      pending["vs"].add(-1)
+      note_vs(-1)
       oi += count
       continue
     # Burst SSTORE streak: hoist addr ALU, then s_clause + scratch_store* (soft/ACC spills).
     # Skip if any 4-window in the streak can b128-fuse — greedy clausing would swallow that window.
-    if mask_depth == 0 and getenv("AMD_SCRATCH_STORE_SCLAUSE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SSTORE:
+    if mask_depth == 0 and _emit_optional() and getenv("AMD_SCRATCH_STORE_SCLAUSE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SSTORE:
       j = oi + 1
       while j < len(scheduled) and scheduled[j] not in skip and scheduled[j].op is Ops.INS and \
             _iop(scheduled[j]) is AMDOps.SSTORE and j - oi < getenv("AMD_SCRATCH_SCLAUSE_MAX", 32):
@@ -4361,7 +4392,7 @@ def insts_from_linear(lin:UOp):
             for inst in scales: emit(inst)
             emit(r3.s_clause(simm16=len(stores) - 1))
             for inst in stores: emit(inst)
-            pending["vs"].add(-1)
+            note_vs(-1)
             oi = j
             continue
         store_addr_cache.key, store_addr_cache.page = cache_snap
@@ -4384,7 +4415,7 @@ def insts_from_linear(lin:UOp):
     # Burst SLOAD streak: hoist addr ALU, then s_clause + scratch_load* (HIP/LLVM VMEM clause).
     # Only when scales are TMP-safe (shared CSE'd TMP_VADDR or ≤1 TMP scale).
     # Skip if any 4-window can b128-fuse (same greed trap as stores).
-    if mask_depth == 0 and getenv("AMD_SCRATCH_SCLAUSE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SLOAD:
+    if mask_depth == 0 and _emit_optional() and getenv("AMD_SCRATCH_SCLAUSE", 1) and u.op is Ops.INS and _iop(u) is AMDOps.SLOAD:
       j = oi + 1
       while j < len(scheduled) and scheduled[j] not in skip and scheduled[j].op is Ops.INS and \
             _iop(scheduled[j]) is AMDOps.SLOAD and j - oi < getenv("AMD_SCRATCH_SCLAUSE_MAX", 32):
@@ -4416,7 +4447,7 @@ def insts_from_linear(lin:UOp):
       if deps and _pending_src(deps): flush_regs(deps)
       store_addr_cache.clear()
       for inst in emitted: emit(inst)
-      for k in range(oi, oi + count): pending["lgkm"] |= _reg_idxs(scheduled[k])
+      for k in range(oi, oi + count): note_lgkm(_reg_idxs(scheduled[k]))
       oi += count
       continue
     # PERMLANEX16: install lane-select SGPRs once across EXTRACT-separated peers.
@@ -4434,7 +4465,7 @@ def insts_from_linear(lin:UOp):
     # Cluster consecutive LLOAD streaks (post _hoist_lloads_before_extracts): s_clause + ds_load burst.
     # Must not hoist multiple TMP_VADDR scales before loads (same bug as VMEM clause).
     # With AMD_LDS_DEST_ADDR, scales target distinct load VGPRs so the TMP check allows the burst.
-    if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.LLOAD:
+    if mask_depth == 0 and _emit_optional() and u.op is Ops.INS and _iop(u) is AMDOps.LLOAD:
       j = oi + 1
       while j < len(scheduled) and scheduled[j] not in skip and scheduled[j].op is Ops.INS and \
             _iop(scheduled[j]) is AMDOps.LLOAD: j += 1
@@ -4451,12 +4482,12 @@ def insts_from_linear(lin:UOp):
             for inst in scales: emit(inst)
             emit(r3.s_clause(simm16=len(loads) - 1))
             for inst in loads: emit(inst)
-            for k in range(oi, j): pending["lgkm"] |= _reg_idxs(scheduled[k])
+            for k in range(oi, j): note_lgkm(_reg_idxs(scheduled[k]))
             oi = j
             continue
     # Cluster contiguous A B128 (half×8+): one s_clause over the burst (LLVM B128×8).
     # Per-tile s_clause stripped from _global_load_insts. Skip addr ALU between wide A tiles.
-    if _clauseable_wide_half_gload(u, skip, mask_depth):
+    if _emit_optional() and _clauseable_wide_half_gload(u, skip, mask_depth):
       j = oi + 1
       while j < len(scheduled):
         if _is_addr_alu(scheduled[j]):
@@ -4485,7 +4516,7 @@ def insts_from_linear(lin:UOp):
           continue
     # Cluster packed quant B128 weight loads (uint32×4): one <<2 of the shared base, then
     # s_clause + global_load_b128 with imm offsets (HIP/LLVM pattern for Q5/Q4 tiles).
-    if getenv("AMD_QUANT_B128_CLAUSE", 1) and (info0:=_quant_b128_clause_info(u, skip, mask_depth)) is not None:
+    if _emit_optional() and getenv("AMD_QUANT_B128_CLAUSE", 1) and (info0:=_quant_b128_clause_info(u, skip, mask_depth)) is not None:
       saddr0, base0, off0 = info0
       group = [(u, off0)]
       j = oi + 1
@@ -4518,7 +4549,7 @@ def insts_from_linear(lin:UOp):
     # Quant decode uses the same pattern for packed u32 weight reads (linear_q6).
     # Always on. With AMD_D16_HI lo+…hi+ batch: extend the clause through following d16_his
     # (u16+d16_hi in one s_clause); do not hard-flush on lo mid-clause.
-    if u not in d16_hi_lo and _clauseable_scalar_vmem_gload(u, skip, mask_depth):
+    if _emit_optional() and u not in d16_hi_lo and _clauseable_scalar_vmem_gload(u, skip, mask_depth):
       j = oi + 1
       while j < len(scheduled) and scheduled[j] not in d16_hi_lo and \
             _clauseable_scalar_vmem_gload(scheduled[j], skip, mask_depth): j += 1
@@ -4594,12 +4625,16 @@ def insts_from_linear(lin:UOp):
     if (domain:=_wait_domain_for_load(u)) is not None:
       regs = _reg_idxs(d16_hi_lo[u]) if u in d16_hi_lo else _reg_idxs(u)
       if domain == "vm": note_vm(regs, vm_after_wait if saw_vm_wait0 else emitted)
+      elif domain == "lgkm": note_lgkm(regs)
       else: pending[domain] |= regs
       # HIP flash_decode emits s_delay_alu after ds_swizzle; opt-in overlap with lgkm.
       if domain == "lgkm" and _iop(u) is AMDOps.SWIZZLE and getenv("AMD_SWIZZLE_DELAY", 0):
         emit(r3.s_delay_alu(1))
     if (domain:=_wait_domain_for_store(u)) is not None:
-      pending[domain] |= _store_src_regs(u)
+      regs = _store_src_regs(u)
+      if domain == "vs": note_vs(regs)
+      elif domain == "lgkm": note_lgkm(regs)
+      else: pending[domain] |= regs
     oi += 1
   # Drain outstanding global stores before s_endpgm (appended by the renderer).
   flush("vs")

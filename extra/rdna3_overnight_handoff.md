@@ -1,39 +1,46 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`ae28b7b25`**.
+Tip: **(pending push)**.
 
 ## Headline — correctness first
 
 **Do not treat ~685µs Flash DIRECT ACC_SMALL as validated-correct.** Frozen-ELF
-replay still shows **launch nondeterminism** under shipping SKIP=2 (fails under
-12–16 replays). Normal DIRECT prefill still defaults to **SDPA** unless
-`AMD_FLASH_DIRECT=1`. Packing / FMA_MIX / eviction stay **off**.
+replay still showed **launch nondeterminism** under shipping SKIP=2. Normal
+prefill still defaults to **SDPA** unless `AMD_FLASH_DIRECT=1`. Packing /
+FMA_MIX / eviction stay **off**. Flash DIRECT remains blocked until freeze
+replay is bit-exact vs a reference.
 
-## Post-regalloc hazard (landed)
+## Phys-guard stage fix (this tip)
 
-Emit-time `_batch_scratch_load_uses` was UOp-only after phys regalloc — VGPR reuse
-makes SSA-independent pairs unsafe. **Removed post-alloc batching**, emit-time
-swizzle batch / gap-fill / LLOAD hoist (moved LLOAD hoist to `after_pre_regalloc`).
-Added phys-overlap guard + regression test.
+`_scratch_batch_phys_conflict` must **not** run pre-regalloc: virtual regs share
+placeholder index `0`, so distinct SSA values look overlapping and suppress
+valid batching (batch-on/off identical ELF was a scheduling regression, not
+“batching never matters”). Pre-regalloc uses `_batch_scratch_load_uses(...,
+check_phys=False)`; phys checks remain for any post-alloc caller.
 
-`AMD_CONSERVATIVE_WAIT=1` (full vm/lgkm/vs drain on `flush_regs` / after `note_vm`)
-**does not** stabilize freeze replay — not a trivial soft-wait miss on that path.
+## Emit diagnostics (new)
 
-## Freeze/replay (after post-alloc batch removal)
+- `AMD_IN_ORDER_EMIT=1` — disable optional post-alloc motion/fusions together
+  (VOPD FMAC/ADD/MOV, WMMA hoist/sink, emit store/load clauses, fused loops,
+  `AMD_SINK_VMEM_SWIZZLE`, WHERE-load exec fuse). Required lowering (d16 order,
+  waits) stays.
+- `AMD_INSTR_WAIT=1` — hard `waitcnt(0)` after each tracked mem burst (does not
+  rely on soft pending bookkeeping). `AMD_CONSERVATIVE_WAIT` still exists and
+  remains insufficient alone on the prior path.
 
-| config | unique ELF | 12+ replay |
-|--------|------------|------------|
-| skip2 (defaults) | 1 | still **diverges** (earlier 8-replay pass was luck) |
-| skip2_nobatch | 1 (same ELF as skip2 now) | diverges |
-| prom | 1 | diverges |
+Harness: `extra/rdna3_flash_backend_diag.py` — same `_amd_flash_attention` graph
+through **HIP** (`AMD:HIP`) vs DIRECT emit configs; default **100 replays** +
+reference compare (stable-but-wrong fails).
 
-Device q/kv readbacks match; outs are not all-sentinel. First-mismatch coords are
-**flattened output order**, not first workgroup.
+```bash
+PYTHONPATH=.:extra python extra/rdna3_flash_backend_diag.py \
+  --configs hip,direct,inorder,inorder_instr --replays 100 --S 128
+```
 
-## Next leftovers
+## Prior leftovers
 
-1. Remaining launch nondeterminism: uninit VGPR/scratch, other emit reorders
-   (WMMA hoist/sink, d16, store cluster, `AMD_SINK_VMEM_SWIZZLE`), or algo race
-2. Decode only after `AMD_FLASH_DIRECT=1` freeze replay is bit-exact
-3. eye/GEMM TC_LDS_AB
+1. If in-order(+instr) stabilizes → re-enable transform groups to isolate culprit
+2. If neither stabilizes → instrument intermediate kernel phases for first wrong value
+3. Decode only after DIRECT freeze replay is bit-exact
+4. eye/GEMM TC_LDS_AB
