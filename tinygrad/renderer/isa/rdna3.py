@@ -919,10 +919,27 @@ def _reg_promote_slot(ctx:PreRegAllocContext, base:UOp, idx:UOp, byte_off:int=0,
   if (slot:=_const_int(idx)) is None or itemsize <= 0 or byte_off % itemsize: return None
   return buf, slot + byte_off // itemsize
 
-def _new_promoted_reg(ctx:PreRegAllocContext, val:UOp) -> UOp:
+def _new_promoted_reg(ctx:PreRegAllocContext, val:UOp, cons:tuple[Register, ...]|None=None) -> UOp:
   n = ctx.scratch["reg_n"]
   ctx.scratch["reg_n"] = n + 1
-  return UOp(Ops.INS, src=(val,), arg=(AMDOps.MOV, val.dtype), tag=(Register(f"reg{n}", 0, _cons=VGPR),))
+  if cons is None: cons = VGPR
+  return UOp(Ops.INS, src=(val,), arg=(AMDOps.MOV, val.dtype), tag=(Register(f"reg{n}", 0, _cons=cons),))
+
+def _promote_reg_cons(ctx:PreRegAllocContext, buf:UOp) -> tuple[Register, ...]:
+  """VGPR pool for a promoted REG buffer.
+
+  Flash REDUCE-carried output acc (slot 2) must not share parked WMMA ACC (v126+):
+  under pressure those lanes land in ACC and WMMA clobbers them (SKIP='' → nan).
+  Do **not** constrain slot 19 (tile work-copy) — that broke the SKIP=2 baseline.
+  """
+  if getattr(buf.arg, "slot", None) != 2: return VGPR
+  uops = ctx.uops or []
+  if not any(u.op is Ops.WMMA or (u.op is Ops.INS and _iop(u) is AMDOps.WMMA) for u in uops):
+    return VGPR
+  packed_quant = bool(getenv("AMD_PACKED_WMMA_ACC", 1)) and any(
+    u.op is Ops.INS and _iop(u) in (AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16) for u in uops)
+  cut = len(VGPR) - len(WMMA_ACC_QUANT_VGPR if packed_quant else WMMA_ACC_VGPR)
+  return VGPR[:cut]
 
 def _peel_add_imm(idx:UOp, itemsize:int, max_byte:int=0xffff, deep:bool=False) -> tuple[UOp, int]:
   """Peel ADD+imm from an index into a byte offset. Keeps one address base live.
@@ -1904,7 +1921,7 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
     val = x.src[2]
     reg_values = ctx.scratch["reg_values"]
     if slot not in reg_values:
-      reg_values[slot] = acc = _new_promoted_reg(ctx, val)
+      reg_values[slot] = acc = _new_promoted_reg(ctx, val, _promote_reg_cons(ctx, slot[0]))
       return acc, [acc]
     acc = reg_values[slot]
     # Same vreg as the first promote MOV; tag makes this a defining redef for linear-scan

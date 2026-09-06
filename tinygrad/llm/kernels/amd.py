@@ -709,7 +709,7 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
 
 @functools.cache
 def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None,
-                         acc_small:bool=False, k_unroll:int=0) -> UOp:
+                         acc_small:bool=False, k_unroll:int=0, use_acc_work:bool=False) -> UOp:
   valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start) if q_start is not None else None
   BH, M, D = q.shape
   _, B, H_KV, physical_n, cache_dim = cache.shape
@@ -887,10 +887,11 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     .reshape(THREADS_PER_BLOCK, TM, TN)
   P_store = P_write[tid].store(S_reg.cast(dtypes.half))
   beta_i = UOp.placeholder((TM,), dtypes.float, slot=9, addrspace=AddrSpace.REG)
-  # Tile-local promotable working copy of REDUCE-carried acc (slot 2 is unpromotable).
+  # Tile-local promotable working copy of REDUCE-carried acc when slot 2 stays scratch.
+  # Never combine with promoting slot 2 — both-promoted copy/writeback nans on gfx1100.
   # One scratch load at tile start + one store at tile end; alpha*acc still runs before
   # V load (keeps latency hiding). Soft/stats buffers already promote on their own.
-  _acc_work = bool((_fu & 4) and _acc_small)
+  _acc_work = bool(use_acc_work and (_fu & 4) and _acc_small)
   acc_work = UOp.placeholder((TM, TD), dtypes.float, slot=19, addrspace=AddrSpace.REG) if _acc_work else None
   if _fu & 4:
     acc_c, l_c, m_c = acc.after(n_tile), l_i.after(n_tile), m_i.after(n_tile)
@@ -1035,6 +1036,10 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # AMD_FLASH_ACC_SMALL=0 disables; AMD_WMMA_ACC_SMALL=1 forces (unsafe for quant).
   use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
   use_k_unroll = getenv("AMD_FLASH_K_UNROLL", 0) if use_acc_small else 0
+  # Work-copy (slot 19) only while slot 2 is in SKIP_SLOTS. Promoting slot 2 with the
+  # work-copy active nans; promoting slot 2 alone is the alternate path (see handoff).
+  _skip_reg = {int(s) for s in getenv("AMD_REG_PROMOTE_SKIP_SLOTS", "2").split(",") if s.strip()}
+  use_acc_work = bool(use_acc_small and (2 in _skip_reg) and getenv("AMD_FLASH_ACC_WORK", 1))
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]
@@ -1043,7 +1048,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   B, H, T, D = q.shape
   out = Tensor.empty(B*H, T, D, dtype="float32", device=q.device)
   fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start,
-                          acc_small=use_acc_small, k_unroll=use_k_unroll)
+                          acc_small=use_acc_small, k_unroll=use_k_unroll, use_acc_work=use_acc_work)
   out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
   if q_start is not None: out = out[:, :, :T_real]
   if not use_acc_small: return out
