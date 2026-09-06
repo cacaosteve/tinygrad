@@ -1818,15 +1818,17 @@ def _lower_loop_cmp(x:UOp) -> tuple[UOp, list[UOp]]:
 
 def _lower_reg_store(x:UOp) -> tuple[UOp, list[UOp]]:
   acc, val = x.src
-  if acc.op is Ops.INS and _iop(acc) is AMDOps.FILL:
-    # spilled acc: write update back to scratch slot
-    sp = UOp(Ops.INS, src=(acc.src[0], val), arg=(AMDOps.SPILL, dtypes.void))
-    return sp, [sp]
   # Prefer the (post-regalloc) dest tag when present; src[0] may be a bind/fill alias.
   dest = x.tag[0] if isinstance(x.tag, tuple) and x.tag else greg(acc)
   if not isinstance(dest, Register) or dest.index < 256:
     raise CompileError(f"bad reg store dest {dest} acc {acc}")
+  # Always redefine the phys: allocator treats REG_STORE as a two-address def.
   st = UOp(Ops.INS, src=(val,), arg=(AMDOps.MOV, val.dtype), tag=(dest,))
+  if acc.op is Ops.INS and _iop(acc) is AMDOps.FILL:
+    # Spilled acc: keep scratch in sync with the updated phys (MOV alone left scratch stale
+    # the other way; SPILL-only left the phys stale — both must match).
+    sp = UOp(Ops.INS, src=(acc.src[0], st), arg=(AMDOps.SPILL, dtypes.void))
+    return st, [st, sp]
   return st, [st]
 
 post_regalloc_matcher = PatternMatcher([

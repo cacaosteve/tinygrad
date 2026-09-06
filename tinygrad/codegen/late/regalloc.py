@@ -59,7 +59,7 @@ class LinearScanRegallocContext:
 
     pinned: set[int] = set()  # live source phys regs; defs must not steal (except two-address)
 
-    def alloc(cons:tuple[Register, ...], i:int, v:Register|None=None, *, pin:bool=True) -> Register:
+    def alloc(cons:tuple[Register, ...], i:int, v:Register|None=None, *, pin:bool=True, spill_at:int|None=None) -> Register:
       if self.wide:
         assert v is not None
         victims: list[tuple[Register, Register]] = []
@@ -67,6 +67,8 @@ class LinearScanRegallocContext:
                          spill_victims=victims if getenv("AMD_SPILL_ON_EVICT", 0) else None, remat=self.remat)
         # Spill-on-evict: store victim phys before this insn overwrites it. Without this,
         # loop-carried promoted REG (flash slot-2) loses values under pressure (pn>=64).
+        # Record at spill_at (the defining insn), not `i` — callers pass i+1 for next-use scoring.
+        at = spill_at if spill_at is not None else i
         for vr, phys in victims:
           if vr not in self.spills:
             vd = self.vdef(vr)
@@ -76,7 +78,7 @@ class LinearScanRegallocContext:
             offset = self.stack_size + (sz - self.stack_size % sz) % sz
             self.spills[vr] = UOp.cconst(offset, dtypes.int32)
             self.stack_size = offset + sz
-          self.spill_on_evict.setdefault(i, []).append((vr, phys))
+          self.spill_on_evict.setdefault(at, []).append((vr, phys))
         return reg
       live_inv = {rv:k for k,rv in live.items()}
       reg,vreg = max(((r,live_inv.get(r)) for r in cons),
@@ -155,7 +157,7 @@ class LinearScanRegallocContext:
             elif len(cons) > 1:
               raise CompileError(f"no unpinned regs for {v}")
             # len==1: dest constrained to one phys (may alias a pinned src) — allow
-          live[v] = alloc(cons, i+1 if u.op is not Ops.RANGE else i, v)
+          live[v] = alloc(cons, i+1 if u.op is not Ops.RANGE else i, v, spill_at=i)
           self.reals.setdefault(i, {})[v] = live[v]
 
       for rv in [rv for rv in live if rv in self.remat and not ren.keep_remat(self.vdef(rv))]: live.pop(rv, None)

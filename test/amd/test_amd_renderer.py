@@ -1,4 +1,4 @@
-import itertools, math, struct, unittest
+import itertools, math, os, struct, unittest
 from dataclasses import replace
 
 from tinygrad import Tensor
@@ -2469,11 +2469,14 @@ class TestAMDRenderer(unittest.TestCase):
     disp = UOp.const(128, dtypes.int32)
     acc = _uop(Ops.INS, dtypes.float32, (disp,), AMDOps.FILL, (Register("v10", 266),))
     val = _uop(Ops.INS, dtypes.float32, (), AMDOps.MOV, (Register("v11", 267),))
-    out, lst = amd_lib._lower_reg_store(_uop(Ops.INS, dtypes.void, (acc, val), AMDOps.REG_STORE))
-    self.assertIs(_iop(out), AMDOps.SPILL)
-    self.assertIs(out.src[0], disp)
-    self.assertIs(out.src[1], val)
-    self.assertEqual(lst, [out])
+    out, lst = amd_lib._lower_reg_store(_uop(Ops.INS, dtypes.void, (acc, val), AMDOps.REG_STORE, (greg(acc),)))
+    # Phys must be redefined (MOV) and scratch kept in sync (SPILL) — SPILL-only left phys stale.
+    self.assertIs(_iop(out), AMDOps.MOV)
+    self.assertEqual(len(lst), 2)
+    self.assertIs(lst[0], out)
+    self.assertIs(_iop(lst[1]), AMDOps.SPILL)
+    self.assertIs(lst[1].src[0], disp)
+    self.assertIs(lst[1].src[1], out)
 
   def test_reg_store_redef_is_two_address(self):
     # Loop-carried promote: REG_STORE must redefine the same vreg (spill-after-write).
@@ -2487,6 +2490,56 @@ class TestAMDRenderer(unittest.TestCase):
     sp = _REN.spill(UOp.const(0, dtypes.int32), st)
     self.assertIs(_iop(sp), AMDOps.SPILL)
     self.assertIs(sp.src[1], val)
+
+  def test_reg_store_after_spill_updates_phys_and_scratch(self):
+    """Three values, two VGPRs: spilled acc then REG_STORE must observe the new value.
+
+    CPU interpreter over the post-regalloc MOV/FILL/SPILL list (no GPU).
+    """
+    from tinygrad.renderer.isa.rdna3 import _const_value
+    def mov(name, value):
+      return UOp(Ops.INS, src=(UOp.cconst(value, dtypes.float32),), arg=(AMDOps.MOV, dtypes.float32),
+                 tag=(Register(name, 0, _cons=amd_lib.VGPR[:2]),))
+    def observe(value):
+      return UOp(Ops.INS, src=(value,), arg=(AMDOps.STORE, dtypes.void))
+
+    def run_case(*, update, evict):
+      os.environ["AMD_SPILL_ON_EVICT"] = str(int(evict))
+      getenv.cache_clear()
+      acc, b, c = mov("acc", 1.0), mov("b", 2.0), mov("c", 3.0)
+      ops = [acc, b, c, observe(b), observe(c)]
+      if update:
+        new = mov("new", 9.0)
+        store = UOp(Ops.INS, src=(acc, new), arg=(AMDOps.REG_STORE, dtypes.void), tag=(greg(acc),))
+        ops += [new, store]
+      ops += [observe(acc)]
+      ctx = LinearScanRegallocContext(ops, _REN)
+      allocated = line_rewrite(ops, pm_regalloc_rewrite, ctx)
+      lowered = line_rewrite(allocated, _REN.post_regalloc_matcher)
+      registers, scratch, observed = {}, {}, []
+      def value(node):
+        if greg(node) is not None: return registers[greg(node).name]
+        return float(_const_value(node))
+      for node in lowered:
+        op = node.arg[0]
+        if op is AMDOps.SCRATCH_SIZE: continue
+        if op is AMDOps.MOV: registers[greg(node).name] = value(node.src[0])
+        elif op is AMDOps.FILL: registers[greg(node).name] = scratch[int(_const_value(node.src[0]))]
+        elif op is AMDOps.SPILL: scratch[int(_const_value(node.src[0]))] = value(node.src[1])
+        elif op is AMDOps.STORE: observed.append(value(node.src[0]))
+        else: raise AssertionError(f"unsupported fixture op {op}")
+      expected = [2.0, 3.0, 9.0 if update else 1.0]
+      self.assertEqual(observed, expected, f"update={update} evict={evict}")
+      return ctx
+
+    run_case(update=False, evict=False)
+    run_case(update=True, evict=False)
+    # Eviction stays default-off in prod; when on, spill must run before the clobbering def.
+    ctx = run_case(update=False, evict=True)
+    self.assertTrue(ctx.spill_on_evict)
+    self.assertIn(2, ctx.spill_on_evict)  # scheduled at defining insn, not i+1
+    os.environ.pop("AMD_SPILL_ON_EVICT", None)
+    getenv.cache_clear()
 
   def test_regalloc_rewrites_surviving_shrink(self):
     renderer = _REN

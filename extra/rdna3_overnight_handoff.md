@@ -53,13 +53,12 @@ Do **not** ship `SKIP_SLOTS=` (also parks slot 2 in peer GEMMs).
 
 ## Spill-on-evict status (WIP)
 
-- Default **off**. `=1` on shipping SKIP=2 flash: **MMU** (`NotPresent`), stack/pss still ~212B, ~22 evicts
-  (mostly addr ALU temps before LLOAD/EXTRACT). Not a 4K scratch undercount.
-- Promote loop repro stays OK with `=1` (little pressure).
-- Local WIP (not proven on HW yet — **7900 SSH down** at tick 2): multi-slot SPILL width,
-  `store_addr_cache` clear, source reload, **VGPR scratch page via TMP_VDATA** (keep TMP_VADDR
-  for mem CSE — likely MMU cause when spill-on-evict sits before LLOAD). Tip `cbc505270`.
-- Do **not** leave `AMD_SPILL_ON_EVICT=1` on the 7900 — faults can sticky-wedge until a clean kernel.
+- Default **off**. Earlier `=1` on shipping SKIP=2 flash: **MMU** (`NotPresent`).
+- **Fixed (CPU):** spilled `REG_STORE` now MOV+SPILL (phys and scratch stay in sync). Eviction
+  spill records at defining insn (`spill_at=i`), not `i+1` next-use score. Regression:
+  `test_reg_store_after_spill_updates_phys_and_scratch`.
+- Still need 7900: multi-tile flash vs ref + ~675µs revalidate after TMP_VDATA scratch page.
+- Do **not** leave `AMD_SPILL_ON_EVICT=1` on the 7900 until that HW pass is clean.
 
 ## Next leftovers
 
