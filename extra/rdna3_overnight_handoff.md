@@ -1,14 +1,14 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`b9cfd9a35`**.
+Tip: **`575e5481e`**.
 
 ## Headline
 
-**QK LDS reuse race fixed and validated** — including real prefill/decode shapes
-via `rdna3_serial_correctness` and multi-shape state-diag soaks. Flash DIRECT
-still **opt-in** (`AMD_FLASH_DIRECT=1`); do not flip the prefill default yet.
-Packing / FMA_MIX / K-unroll / perf stay off. (HIP prefill ~3× faster today.)
+**QK LDS reuse race fixed and validated.** Continuous multi-shape + serial soak
+running on gaming PC (10+ clean rounds so far). Flash DIRECT still **opt-in**
+(`AMD_FLASH_DIRECT=1`); do not flip the prefill default. Packing / FMA_MIX /
+K-unroll / perf stay off. (HIP prefill ~3× faster today.)
 
 ## Fix (`478c23b49`)
 
@@ -21,21 +21,20 @@ Packing / FMA_MIX / K-unroll / perf stay off. (HIP prefill ~3× faster today.)
 | Test | Result |
 |------|--------|
 | fixed ×5000 | **exact=True maxdiff=0 ref_ok** |
-| fixed multi-shape ×500 each | S/T = 128/128, 256/64, 512/32, **2048/32** all exact |
-| recreate ×1000 | **exact=True** |
+| continuous soak | multi-shape fixed ×500 (128/128,256/64,512/32,2048/32) + serial DIRECT + recreate ×300 per round — **10+ rounds clean** |
 | all phases ×50 | **instrumented_stable**; hip_near ≈1.8e-7 |
-| serial DIRECT+HIP | **13/13** each (prefill+decode) |
+| serial DIRECT+HIP | **13/13** each |
 
 ## Cleanup
 
 - Renamed `QP_lds` → `Q_lds`.
 - Phase stability: `hip_out_near` / `hip_maxdiff`.
 - Serial harness selects `AMD:AMD` vs `AMD:HIP`.
-- State diag `--shapes S:T,...` for multi-shape soaks.
+- State diag `--shapes S:T,...` (`b9cfd9a35`).
 
 ## Next
 
-1. Keep continuous multi-shape + serial soak until gaming PC disconnects.
+1. Keep soak until gaming PC disconnects; then record final round count.
 2. Keep DIRECT opt-in; more soak before flipping defaults.
 3. Perf leftovers only after more confidence.
 
