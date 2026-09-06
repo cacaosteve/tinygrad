@@ -420,7 +420,6 @@ def trace_pv_slots(prg, *, focus: dict | None = None) -> dict:
       "note": "pv_acc / parked ACC C",
     })
 
-  acc_idxs = {greg(u).index for _, u in pv_wmmas if greg(u) is not None}
   # Each PV ACC pack occupies name v{base}..v{base+7} after EXTRACT.
   acc_bases = []
   for a in wmma_accs:
