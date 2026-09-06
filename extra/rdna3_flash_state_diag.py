@@ -99,6 +99,9 @@ def phase_shapes(BH: int, M: int, S: int, D: int = 128,
     "qk": (BH, nm, ntiles, BLOCK_M, BLOCK_N),
     "soft_m": (BH, nm, ntiles, BLOCK_M),
     "soft_l": (BH, nm, ntiles, BLOCK_M),
+    "p_reg": (BH, nm, ntiles, WAVES_N, BLOCK_M, BLOCK_N),
+    "p_lds": (BH, nm, ntiles, WAVES_N, BLOCK_M, BLOCK_N),
+    "v_lds": (BH, nm, ntiles, D, BLOCK_N),
     "pv_wmma": (BH, nm, ntiles, BLOCK_M, D),
     "pv": (BH, nm, ntiles, BLOCK_M, D),
     "acc": (BH, nm, BLOCK_M, D),
@@ -665,29 +668,45 @@ def run_phase_fail_capture(S: int, T: int, acc_work: bool, art: Path, q_np, kv_n
   else:
     print("  WARNING: out diverged but selected phase dumps match — try more phases")
 
-  # Probe table: pre-copy vs post-copy PV
+  # Probe table: pre-WMMA inputs → WMMA → post-copy
   probe = None
-  if "pv_wmma" in cmp["phases"] or "pv" in cmp["phases"]:
+  if any(p in cmp["phases"] for p in ("p_reg", "p_lds", "v_lds", "pv_wmma", "pv", "acc")):
     def _phase_has_div(name: str) -> bool:
       p = cmp["phases"].get(name)
       if not p: return False
       return p.get("full_fail_vs_pred") is not None or any(x.get("div") for x in p.get("per_ntile", []))
-    wmma_bad, pv_bad, acc_bad = _phase_has_div("pv_wmma"), _phase_has_div("pv"), _phase_has_div("acc")
-    if wmma_bad:
-      probe = "pv_wmma_before_copy_wrong"
-      note = "P/V LDS, WMMA inputs, ACC init, or WMMA scheduling"
-    elif pv_bad:
-      probe = "pv_wmma_ok_post_copy_wrong"
-      note = "REG_STORE/MOV copy, phys overlap, or spill/reload of slot 17"
-    elif acc_bad:
-      probe = "both_pv_ok_acc_diverges"
-      note = "loop-carried slot-2 accumulator path"
+    flags = {n: _phase_has_div(n) for n in ("p_reg", "p_lds", "v_lds", "pv_wmma", "pv", "acc")}
+    if flags.get("p_reg"):
+      probe, note = "p_reg_wrong", "softmax P in REG already diverges (before LDS; check per-wave)"
+    elif flags.get("p_lds") and not flags.get("p_reg"):
+      probe, note = "p_lds_wrong", "P REG ok but P LDS after barrier diverges (write/barrier/wave_n slice)"
+    elif flags.get("v_lds"):
+      probe, note = "v_lds_wrong", "V LDS after barrier diverges (global→LDS or layout)"
+    elif flags.get("pv_wmma"):
+      probe, note = "pv_wmma_before_copy_wrong", "P/V LDS ok (or not dumped); WMMA/ACC cin/scheduling"
+    elif flags.get("pv"):
+      probe, note = "pv_wmma_ok_post_copy_wrong", "REG_STORE/MOV copy, phys overlap, or spill/reload of slot 17"
+    elif flags.get("acc"):
+      probe, note = "both_pv_ok_acc_diverges", "loop-carried slot-2 accumulator path"
     else:
-      probe = "pv_stages_match"
-      note = "selected PV dumps match fail vs pred"
-    cmp["probe"] = {"verdict": probe, "note": note,
-                    "pv_wmma_div": wmma_bad, "pv_div": pv_bad, "acc_div": acc_bad}
+      probe, note = "selected_phases_match", "selected dumps match fail vs pred"
+    cmp["probe"] = {"verdict": probe, "note": note, **{f"{k}_div": v for k, v in flags.items()}}
     print(f"  PROBE: {probe} — {note}")
+    # Cross-check: wave_n=0 vs wave_n=1 on pred for p_reg / p_lds
+    for pname in ("p_reg", "p_lds"):
+      if pname not in dump_hist[pred_i]: continue
+      pl = dump_hist[pred_i][pname]
+      if pl.ndim >= 4 and pl.shape[3] >= 2:
+        p_wn = first_divergent(pl[focus_head, focus_bm, :, 0], pl[focus_head, focus_bm, :, 1])
+        print(f"  {pname} wave_n0 vs wave_n1 (pred focus): {'EXACT' if p_wn is None else p_wn}")
+        cmp["probe"][f"{pname}_wave_n_mismatch_pred"] = p_wn
+        for nt_info in cmp["phases"].get(pname, {}).get("per_ntile", []):
+          if nt_info.get("div") is None: continue
+          nt = nt_info["n_tile"]
+          for wn in range(2):
+            d = first_divergent(dump_hist[pred_i][pname][focus_head, focus_bm, nt, wn],
+                                dump_hist[fail_i][pname][focus_head, focus_bm, nt, wn])
+            print(f"  {pname} n_tile={nt} wave_n={wn} fail_vs_pred={'EXACT' if d is None else d}")
 
   # Compile-time slot 10/17 trace (same ELF for all launches)
   slot_trace = None
@@ -731,8 +750,7 @@ def main() -> None:
   p.add_argument("--phase-only", action="store_true",
                  help="skip recreate/fixed/scratch; only instrumented fail capture")
   p.add_argument("--phases", default="qk",
-                 help="comma dumps: qk,soft_m,soft_l,pv_wmma,pv,acc "
-                      "(pv_wmma=pre ACC→soft copy; pv=post-copy)")
+                 help="comma dumps: qk,soft_m,soft_l,p_reg,p_lds,v_lds,pv_wmma,pv,acc")
   p.add_argument("--focus-head", type=int, default=None)
   p.add_argument("--focus-bm", type=int, default=None)
   p.add_argument("--artifacts", default="extra/rdna3_state_diag")

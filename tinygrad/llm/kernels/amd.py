@@ -724,6 +724,9 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     qk:      (BH, M//BLOCK_M, Ntiles, BLOCK_M, BLOCK_N) — scaled+masked S; writer wave_n==0
     soft_m:  (BH, M//BLOCK_M, Ntiles, BLOCK_M) — softmax max; writer wave_n==0 & lane_n==0
     soft_l:  (BH, M//BLOCK_M, Ntiles, BLOCK_M) — softmax sum; writer wave_n==0 & lane_n==0
+    p_reg:   (BH, M//BLOCK_M, Ntiles, WAVES_N, BLOCK_M, BLOCK_N) — softmax P in REG before LDS (per wave)
+    p_lds:   (BH, M//BLOCK_M, Ntiles, WAVES_N, BLOCK_M, BLOCK_N) — P after pv_barrier (per wave_n slice)
+    v_lds:   (BH, M//BLOCK_M, Ntiles, D, BLOCK_N) — V after pv_barrier; unique (d,n) writers
     pv_wmma: (BH, M//BLOCK_M, Ntiles, BLOCK_M, D) — PV *before* ACC→pv_soft copy (slot 10)
     pv:      (BH, M//BLOCK_M, Ntiles, BLOCK_M, D) — PV *after* copy (slot 17 / current reader)
     acc:     (BH, M//BLOCK_M, BLOCK_M, D) — pre-norm acc; all threads unique (qrow,dcol)
@@ -925,6 +928,16 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         soft_stores.append(dumps["soft_l"][block_bh, block_m, n_tile, qrow.valid(writer)].store(p_sum[ri]))
     gate = UOp.group(*soft_stores)
     S_reg, m_ij, p_sum = S_reg.after(gate), m_ij.after(gate), p_sum.after(gate)
+  # Diagnostic: softmax P in REG before LDS write (per wave_n — waves should match).
+  if dumps and "p_reg" in dumps:
+    dp = dumps["p_reg"]  # (BH, Nm, Ntiles, WAVES_N, BLOCK_M, BLOCK_N)
+    p_reg_stores = []
+    for ri in range(TM):
+      for rj in range(TN):
+        qrow = wave_m * WMMA_M + ri * LANES_PER_WAVE_M + lane_m
+        kcol = rj * LANES_PER_WAVE_N + lane_n
+        p_reg_stores.append(dp[block_bh, block_m, n_tile, wave_n, qrow, kcol].store(S_reg[ri, rj]))
+    S_reg = S_reg.after(UOp.group(*p_reg_stores))
   P_lds = QP_lds.flatten()[:WAVES_N * BLOCK_M * BLOCK_N].reshape(WAVES_N, BLOCK_M, BLOCK_N)
   P_write = P_lds.reshape(WAVES_N, WAVES_M, TM, LANES_PER_WAVE_M, 1, TN, LANES_PER_WAVE_N, 1).permute((1, 0, 3, 6, 2, 4, 5, 7)) \
     .reshape(THREADS_PER_BLOCK, TM, TN)
@@ -975,6 +988,25 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   V_store = V_copy.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_v].store(vval).end(load_v)
   pv_barrier = UOp.barrier(UOp.group(P_store, V_store))
   P_lds, V_lds = P_lds.after(pv_barrier), V_lds.after(pv_barrier)
+  # Diagnostic: P/V LDS after barrier (pre-WMMA inputs).
+  if dumps and "p_lds" in dumps:
+    dp = dumps["p_lds"]  # (BH, Nm, Ntiles, WAVES_N, BLOCK_M, BLOCK_N)
+    p_lds_stores = []
+    for ri in range(TM):
+      for rj in range(TN):
+        qrow = wave_m * WMMA_M + ri * LANES_PER_WAVE_M + lane_m
+        kcol = rj * LANES_PER_WAVE_N + lane_n
+        p_lds_stores.append(dp[block_bh, block_m, n_tile, wave_n, qrow, kcol].store(P_lds[wave_n, qrow, kcol].float()))
+    P_lds = P_lds.after(UOp.group(*p_lds_stores))
+  if dumps and "v_lds" in dumps:
+    dv = dumps["v_lds"]  # (BH, Nm, Ntiles, D, BLOCK_N) — unique (drow, ncol) per thread
+    v_lds_stores = []
+    for ei in range(KV_ELEMS_PER_THREAD):
+      # V_store writes V_lds.permute(1,0)==(BLOCK_N,D) as (THREADS, KV_ELEMS) row-major.
+      flat = tid * KV_ELEMS_PER_THREAD + ei
+      ncol, drow = flat // D, flat % D
+      v_lds_stores.append(dv[block_bh, block_m, n_tile, drow, ncol].store(V_lds[drow, ncol].float()))
+    V_lds = V_lds.after(UOp.group(*v_lds_stores))
   pv_acc = _reg((TM, TD), 10, 0, n_tile).after(pv_barrier)
   pv_view = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)
   P_view = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)

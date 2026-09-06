@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`0bd065a1f`**.
+Tip: **(pending)**.
 
 ## Headline — correctness first
 
@@ -9,45 +9,45 @@ Tip: **`0bd065a1f`**.
 SDPA unless `AMD_FLASH_DIRECT=1`. Packing / FMA_MIX / K-unroll / eviction / scratch
 zeroing / perf tuning stay **off**.
 
-## PV split probe (pre-copy vs post-copy)
+## Pre-WMMA localization (strongest so far)
 
-`pv` dump was after ACC→`pv_soft` (slot 17). Added **`pv_wmma`** dump of slot 10
-*before* that copy, plus compile-time slot trace (WMMA / MOV / SPILL / FILL with
-phys + scratch offsets).
+Dumps: `p_reg` (per wave, before LDS), `p_lds`, `v_lds`, `pv_wmma`.
 
 ```
 PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py \
-  --phase-only --phases pv_wmma,pv --replays 100
+  --phase-only --phases p_reg,p_lds --replays 100
 ```
 
-### GPU (gfx1100) — frozen instrumented ELF fail/pred
+### GPU fail/pred (frozen instrumented ELF)
 
-Instrumented out still fails (replay 1). Probe verdict:
+| Stage | fail vs pred |
+|-------|----------------|
+| `p_reg` **wave_n=0** | EXACT |
+| `p_reg` **wave_n=1** | **DIVERGES** |
+| `p_lds` wave_n=0 | EXACT |
+| `p_lds` wave_n=1 | diverges (matches p_reg) |
+| `v_lds` | EXACT |
+| pred: wave_n0 vs wave_n1 | EXACT (both waves agree within a launch) |
 
-| Probe | Result |
-|-------|--------|
-| `pv_wmma` before copy | **already wrong** |
-| post-copy `pv` | same coords + same values as `pv_wmma` |
-| Conclusion | **not** REG_STORE / soft spill primary; look at P/V LDS, WMMA inputs, ACC init, WMMA scheduling |
+**PROBE: `p_reg_wrong`** — softmax **P in REG for wave_n=1** is already nondeterministic
+across launches; LDS write is not the first fault. wave_n=0 is bit-stable.
 
-Earliest this run: **`pv_wmma` @ n_tile=1**, `(qrow=16, dcol=64)` →
-`wave_m=1, wave_n=1, lane=0, ri=0, rj=0` (still the **wave_n=1 / dcol=64** boundary;
-prior `pv`-only run had n_tile=3 / qrow=8 — tile index varies with launch, class does not).
+Earliest example: `p_reg` @ n_tile=2, coords `[wave_n=1, qrow=0, kcol=8]`.
+Same class as prior dcol=64 / wave_n=1 PV failures (second N-wave).
 
-Slot trace for that fragment: ACC pack `v142` lane `v142` → soft `v24`;
-`v24` SPILL/FILL scratch_off **156** (secondary once pre-copy is wrong).
+Prior `soft_m`/`soft_l` dumps only wrote **wave_n=0**, so they could not see this.
 
-Artifacts on gaming PC: `extra/rdna3_state_diag_pv_split/`.
+Artifacts: `extra/rdna3_state_diag_pre_wmma`, `extra/rdna3_state_diag_preg_waves`.
 
 ## Next
 
-1. Dig into **pre-WMMA** path for PV: P/V LDS contents, WMMA A/B packing, ACC cin init,
-   scheduling around wave_n=1.
-2. Do **not** chase slot-2 acc until both PV stages match.
-3. Keep DIRECT blocked; no merge / no “fixed” claim.
+1. Trace **wave_n=1** softmax / S_reg path: spills of slot 6/16, LDS QK aliasing with
+   wave_n=0, warp-local vs shared scratch.
+2. Dump `soft_m`/`soft_l` **per wave_n** (or confirm S_reg before softmax per wave).
+3. Do not chase PV copy / slot-2 acc until wave_n=1 `p_reg` is stable.
+4. Keep DIRECT blocked.
 
 ## Local gates
 
-- `map_pv_coord(8,64)` → wave_m=0,wave_n=1,lane=0,ri=4,rj=0
-- `pytest -k 'cluster_sload or batch_sload or in_order_emit'` → 8 + 2 subtests
 - Ruff clean on touched files
+- `pytest -k 'cluster_sload or batch_sload or in_order_emit'` → 8 + 2 subtests
