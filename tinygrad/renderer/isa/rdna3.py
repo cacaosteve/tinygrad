@@ -2440,6 +2440,8 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
         if u.dtype is not dtypes.float32: raise CompileError(f"no vec scratch load {u.dtype}")
         if slots == 4 and byte_off % 16 == 0 and byte_off + 12 <= 0xfff:
           return pre + [r3.scratch_load_b128(addr=addr, vdst=_reg_chunk(greg(u), 0, 4), offset=byte_off, sve=1)]
+        if slots == 2 and byte_off % 8 == 0 and byte_off + 4 <= 0xfff:
+          return pre + [r3.scratch_load_b64(addr=addr, vdst=_reg_chunk(greg(u), 0, 2), offset=byte_off, sve=1)]
         return pre + [r3.scratch_load_b32(addr=addr, vdst=_reg_lane(greg(u), i), offset=byte_off + i*4, sve=1) for i in range(slots)]
       if (scratch_load:=_scratch_load(u.dtype)) is None: raise CompileError(f"no scratch load {u.dtype}")
       return pre + [scratch_load(addr=addr, vdst=_dst(u), offset=byte_off, sve=1)]
@@ -3803,6 +3805,42 @@ def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAdd
   deps = set().union(*(_reg_idxs(x.src[1]) for x in loads))
   return 4, pre + [r3.scratch_load_b128(addr=addr, vdst=_reg_chunk(r0, 0, 4), offset=byte_off, sve=1)], deps
 
+def _fused_scratch_contig_load_b64(uops:list[UOp], i:int, store_addr_cache:_StoreAddrCache|None=None) -> tuple[int, list, set[int]]|None:
+  """Fold two contiguous scalar SLOAD into SCRATCH_LOAD_B64 (8-byte aligned)."""
+  if not getenv("AMD_SCRATCH_LOAD_B64", 1) or i + 1 >= len(uops): return None
+  loads = uops[i:i+2]
+  if not all(x.op is Ops.INS and _iop(x) is AMDOps.SLOAD for x in loads): return None
+  dt = loads[0].dtype
+  if dt not in (dtypes.float32, dtypes.uint32, dtypes.int32): return None
+  if not all(x.dtype is dt and _elem_count(x) == 1 and isinstance(greg(x), Register) for x in loads): return None
+  r0 = greg(loads[0])
+  if greg(loads[1]).index != r0.index + 1: return None
+  base = loads[0].src[0]
+  if loads[1].src[0] is not base: return None
+  offs = [_lds_byte_off(x) for x in loads]
+  idxs = [_const_int(x.src[1]) for x in loads]
+  byte_off = 0
+  idx = loads[0].src[1]
+  if loads[1].src[1] is idx and offs[0] % 8 == 0 and offs[1] == offs[0] + 4 and offs[0] + 4 <= 0xfff:
+    byte_off = offs[0]
+  elif (all(t is not None for t in idxs) and all(o == 0 for o in offs) and
+        int(idxs[0]) % 2 == 0 and int(idxs[1]) == int(idxs[0]) + 1 and  # type: ignore[arg-type]
+        (int(idxs[0]) + 1) * dt.itemsize <= 0xfff):  # type: ignore[arg-type]
+    byte_off = int(idxs[0]) * dt.itemsize  # type: ignore[arg-type]
+    idx = _tconst(0, dtypes.int32).rtag()
+  else:
+    return None
+  soff = _scratch_base_offset(base)
+  if store_addr_cache is not None:
+    pre, addr, byte_off = store_addr_cache.addr(idx, dt.itemsize, byte_off, base_key=(id(base), id(loads[0])))
+    if pre and soff: pre = pre + [r3.v_add_nc_u32_e64(addr, soff, addr)]
+  else:
+    pre, addr = _scaled_addr(TMP_VADDR, idx, dt.itemsize)
+    if soff: pre = pre + [r3.v_add_nc_u32_e64(TMP_VADDR, soff, addr)]
+    addr = TMP_VADDR
+  deps = set().union(*(_reg_idxs(x.src[1]) for x in loads))
+  return 2, pre + [r3.scratch_load_b64(addr=addr, vdst=_reg_chunk(r0, 0, 2), offset=byte_off, sve=1)], deps
+
 def _fused_lds_pack_load(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
   """Fold four contiguous f32 LLOAD (same base, offs +0..+12) into one DS_LOAD_B128."""
   if i + 3 >= len(uops): return None
@@ -4216,6 +4254,14 @@ def insts_from_linear(lin:UOp):
       note_vm(set().union(*(_reg_idxs(scheduled[k]) for k in range(oi, oi + count))), emitted)
       oi += count
       continue
+    # Contiguous SLOAD×2 → scratch_load_b64 when b128 cannot match.
+    if mask_depth == 0 and (fused_s64:=_fused_scratch_contig_load_b64(scheduled, oi, store_addr_cache)) is not None:
+      count, emitted, deps = fused_s64
+      if deps and _pending_src(deps): flush_regs(deps)
+      for inst in emitted: emit(inst)
+      note_vm(set().union(*(_reg_idxs(scheduled[k]) for k in range(oi, oi + count))), emitted)
+      oi += count
+      continue
     # Burst SLOAD streak: hoist addr ALU, then s_clause + scratch_load* (HIP/LLVM VMEM clause).
     # Only when scales are TMP-safe (shared CSE'd TMP_VADDR or ≤1 TMP scale).
     # Skip if any 4-window can b128-fuse (same greed trap as stores).
@@ -4225,7 +4271,9 @@ def insts_from_linear(lin:UOp):
             _iop(scheduled[j]) is AMDOps.SLOAD and j - oi < getenv("AMD_SCRATCH_SCLAUSE_MAX", 32):
         j += 1
       if j - oi >= 2 and not any(_fused_scratch_contig_load(scheduled, start, None) is not None
-                                  for start in range(oi, j - 3)):
+                                  for start in range(oi, j - 3)) and \
+         not any(_fused_scratch_contig_load_b64(scheduled, start, None) is not None
+                 for start in range(oi, j - 1)):
         cache_snap = (store_addr_cache.key, store_addr_cache.page)
         parts = [_emit_uop(scheduled[k], with_store_cache=True) for k in range(oi, j)]
         if all(_vm_load_count(p) >= 1 for p in parts):
