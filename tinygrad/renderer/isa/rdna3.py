@@ -3444,18 +3444,23 @@ def _pack_aligned_const_scratch_sloads(ops:list[UOp]) -> list[UOp]:
 
   Scalar dests often get non-consecutive VGPRs under pressure, blocking emit-time
   b128 fusion. A 4-slot SLOAD forces a contiguous chunk; prefer_phys aliases EXTRACTs.
-  Cap packs: >8 on flash slot-2 soft-copy currently corrupts (VGPR/liveness) — AMD_PACK_SLOAD_MAX.
+  Cap packs: AMD_PACK_SLOAD_MAX. Flash S=32: packs 1–8 are soft-copy on base A; the
+  9th pack is a *second* scratch base and corrupts — AMD_PACK_SLOAD_BASES (default 1)
+  limits how many distinct bases may be packed.
   """
   if not getenv("AMD_PACK_SLOAD_B128", 0): return ops
   max_packs = getenv("AMD_PACK_SLOAD_MAX", 8)
+  max_bases = getenv("AMD_PACK_SLOAD_BASES", 1)
   n = itertools.count()
   remap: dict[UOp, UOp] = {}
   out: list[UOp] = []
   i = 0
   packs = 0
+  packed_bases: list[UOp] = []
   while i < len(ops):
     u = ops[i]
-    if (packs < max_packs and u.op is Ops.INS and _iop(u) is AMDOps.SLOAD and _elem_count(u) == 1 and
+    base_ok = (u.src and (u.src[0] in packed_bases or len(packed_bases) < max_bases))
+    if (packs < max_packs and base_ok and u.op is Ops.INS and _iop(u) is AMDOps.SLOAD and _elem_count(u) == 1 and
         u.dtype in (dtypes.float32, dtypes.int32, dtypes.uint32) and
         _const_int(u.src[1]) is not None and _lds_byte_off(u) == 0 and i + 3 < len(ops)):
       g = ops[i:i + 4]
@@ -3464,6 +3469,7 @@ def _pack_aligned_const_scratch_sloads(ops:list[UOp]) -> list[UOp]:
               v.src[0] is u.src[0] and _lds_byte_off(v) == 0 for v in g) and
           all(t is not None for t in idxs) and int(idxs[0]) % 4 == 0 and  # type: ignore[arg-type]
           [int(t) for t in idxs] == [int(idxs[0]) + k for k in range(4)]):  # type: ignore[arg-type]
+        if u.src[0] not in packed_bases: packed_bases.append(u.src[0])
         wide = UOp(Ops.INS, src=(u.src[0], g[0].src[1], _load_count_src(4)),
                    arg=(AMDOps.SLOAD, u.dtype), tag=(Register(f"sload4_{next(n)}", 0, _cons=VGPR),))
         out.append(wide)
