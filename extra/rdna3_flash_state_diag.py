@@ -1051,14 +1051,16 @@ def main() -> None:
   print("\n======== SUMMARY ========")
   print(json.dumps(summary, indent=2, default=str))
   (art / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
-  # Phase capture expects failure (ok=False with launch_nondeterminism_instrumented is success-of-diag)
+  # Phase: either captured nondeterminism (pre-fix diag) or clean stability (post-fix).
   phase_ok = any(
-    r.get("config") == "phase" and r.get("verdict") == "launch_nondeterminism_instrumented"
+    r.get("config") == "phase" and r.get("verdict") in (
+      "launch_nondeterminism_instrumented", "instrumented_stable")
     for r in summary)
   other_fail = any(not r.get("ok", False) for r in summary if r.get("config") not in ("phase",))
   if args.phase_only:
     if phase_ok:
-      print(f"OK phase diag captured instrumented failure under {art}")
+      v = next(r.get("verdict") for r in summary if r.get("config") == "phase")
+      print(f"OK phase diag ({v}) under {art}")
       raise SystemExit(0)
     print(f"FAIL phase diag under {art}")
     raise SystemExit(1)
