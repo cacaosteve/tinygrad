@@ -919,10 +919,27 @@ def _reg_promote_slot(ctx:PreRegAllocContext, base:UOp, idx:UOp, byte_off:int=0,
   if (slot:=_const_int(idx)) is None or itemsize <= 0 or byte_off % itemsize: return None
   return buf, slot + byte_off // itemsize
 
-def _new_promoted_reg(ctx:PreRegAllocContext, val:UOp) -> UOp:
+def _new_promoted_reg(ctx:PreRegAllocContext, val:UOp, cons:tuple[Register, ...]|None=None) -> UOp:
   n = ctx.scratch["reg_n"]
   ctx.scratch["reg_n"] = n + 1
-  return UOp(Ops.INS, src=(val,), arg=(AMDOps.MOV, val.dtype), tag=(Register(f"reg{n}", 0, _cons=VGPR),))
+  return UOp(Ops.INS, src=(val,), arg=(AMDOps.MOV, val.dtype), tag=(Register(f"reg{n}", 0, _cons=cons or VGPR),))
+
+def _promote_reg_cons(ctx:PreRegAllocContext, buf:UOp) -> tuple[Register, ...]:
+  """Physical VGPR pool for a promoted REG buffer.
+
+  Long-lived REDUCE-carried buffers (flash output acc) must not share parked WMMA
+  ACC (v126+): under pressure linear-scan places them there and WMMA clobbers them.
+  Smaller tile-local soft/stats stay on full VGPR so they can sit above ACC when
+  the low range is full (restricting *all* promote to [:121] broke SKIP=2 soft).
+  """
+  if buf.max_numel() <= 16: return VGPR
+  uops = ctx.uops or []
+  if not any(u.op is Ops.WMMA or (u.op is Ops.INS and _iop(u) is AMDOps.WMMA) for u in uops):
+    return VGPR
+  packed_quant = bool(getenv("AMD_PACKED_WMMA_ACC", 1)) and any(
+    u.op is Ops.INS and _iop(u) in (AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16) for u in uops)
+  # Exclude WMMA_ACC_VGPR / WMMA_ACC_QUANT_VGPR prefixes.
+  return VGPR[:89] if packed_quant else VGPR[:121]
 
 def _peel_add_imm(idx:UOp, itemsize:int, max_byte:int=0xffff, deep:bool=False) -> tuple[UOp, int]:
   """Peel ADD+imm from an index into a byte offset. Keeps one address base live.
@@ -1904,7 +1921,8 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
     val = x.src[2]
     reg_values = ctx.scratch["reg_values"]
     if slot not in reg_values:
-      reg_values[slot] = acc = _new_promoted_reg(ctx, val)
+      buf, _ = slot
+      reg_values[slot] = acc = _new_promoted_reg(ctx, val, _promote_reg_cons(ctx, buf))
       return acc, [acc]
     acc = reg_values[slot]
     # Same vreg as the first promote MOV; tag makes this a defining redef for linear-scan
