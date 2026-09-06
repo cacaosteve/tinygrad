@@ -5,8 +5,8 @@ Preserves work-copy/layout knobs (SKIP slots, ACC_WORK, batch/cluster). Does NOT
 unrelated default SDPA kernel — both backends run `_amd_flash_attention`.
 
 Configs:
-  hip              DEV=AMD:HIP, same graph (reference backend)
-  direct           DEV=AMD:AMD AMD_FLASH_DIRECT=1 (shipping emit)
+  hip              DEV=AMD:HIP (HIPRenderer), same `_amd_flash_attention` graph
+  direct           DEV=AMD:AMD (AMDRenderer) + shipping emit
   inorder          direct + AMD_IN_ORDER_EMIT=1 (no optional post-alloc motion/fusions)
   inorder_instr    inorder + AMD_INSTR_WAIT=1 (hard wait after each mem burst)
 
@@ -31,7 +31,7 @@ import numpy as np
 from tinygrad import Device, Tensor, dtypes
 from tinygrad.codegen import to_program, to_program_cache
 from tinygrad.engine.realize import get_runtime, runtime_cache
-from tinygrad.helpers import Context, getenv
+from tinygrad.helpers import Context, getenv, DEV
 from tinygrad.llm.kernels.amd import _amd_flash_attention
 import tinygrad.llm.kernels.amd as amd
 from tinygrad.uop.ops import Ops, UOp
@@ -96,10 +96,24 @@ def apply_emit_env(name: str) -> dict:
 
 
 def device_for(cfg: str) -> str:
+  """Return DEV= target string (renderer select). Buffer device is always AMD."""
   return "AMD:HIP" if cfg == "hip" else "AMD:AMD"
 
 
-def compile_program(S: int, T: int, use_acc_work: bool, device: str):
+def set_dev(cfg: str) -> str:
+  """Select HIP vs direct-ISA renderer via DEV=AMD:HIP / DEV=AMD:AMD.
+
+  Device buffers stay on \"AMD\"; the colon suffix picks the renderer, not a device id.
+  Must update the DEV ContextVar — os.environ alone is not enough after import.
+  """
+  target = device_for(cfg)
+  os.environ["DEV"] = target
+  DEV.value = target
+  clear_caches()
+  return target
+
+
+def compile_program(S: int, T: int, use_acc_work: bool):
   out = UOp.placeholder((32, T, 128), dtypes.float32, 0)
   q = UOp.placeholder((32, T, 128), dtypes.float16, 1)
   kv = UOp.placeholder((2, 1, 8, S, 128), dtypes.float16, 2)
@@ -110,7 +124,7 @@ def compile_program(S: int, T: int, use_acc_work: bool, device: str):
     os.environ["AMD_FLASH_ACC_SMALL"] = "1"
     clear_caches()
     try:
-      prg = to_program(sink, Device[device].renderer)
+      prg = to_program(sink, Device["AMD"].renderer)
     finally:
       if prev is None: os.environ.pop("AMD_FLASH_ACC_SMALL", None)
       else: os.environ["AMD_FLASH_ACC_SMALL"] = prev
@@ -128,7 +142,8 @@ def program_elf(prg) -> bytes | None:
   return None
 
 
-def launch(prg, q_np, kv_np, T: int, device: str, *, sentinel: float = float("nan")) -> np.ndarray:
+def launch(prg, q_np, kv_np, T: int, *, sentinel: float = float("nan")) -> np.ndarray:
+  device = "AMD"
   q = Tensor(q_np.copy(), device=device, dtype=dtypes.float16).realize()
   kv = Tensor(kv_np.copy(), device=device, dtype=dtypes.float16).realize()
   out = Tensor.full((32, T, 128), sentinel, dtype=dtypes.float32, device=device).realize()
@@ -161,11 +176,14 @@ def first_divergent(a: np.ndarray, b: np.ndarray) -> dict | None:
 
 def run_cfg(cfg: str, S: int, T: int, replays: int, layout: dict, art: Path,
             ref: np.ndarray | None, ref_tol: float) -> dict:
-  device = device_for(cfg)
-  print(f"\n======== cfg={cfg} device={device} S={S} T={T} replays={replays} ========")
+  target = set_dev(cfg)
+  print(f"\n======== cfg={cfg} DEV={target} S={S} T={T} replays={replays} ========")
   layout_env = apply_layout_env(skip=layout["skip"], work=layout["work"],
                                 batch=layout["batch"], cluster=layout["cluster"])
+  # layout clear_caches may drop DEV; re-pin renderer then emit knobs
+  set_dev(cfg)
   emit = apply_emit_env(cfg)
+  set_dev(cfg)  # apply_emit_env clears caches again
   use_acc_work = bool(int(layout_env["_use_acc_work"]))
 
   cfg_art = art / cfg
@@ -176,25 +194,36 @@ def run_cfg(cfg: str, S: int, T: int, replays: int, layout: dict, art: Path,
   kv_np = patterned((2, 1, 8, S, 128), np.float16)
   np.save(cfg_art / "q.npy", q_np)
   np.save(cfg_art / "cache.npy", kv_np)
-  (cfg_art / "env.json").write_text(json.dumps({**layout, **emit, "device": device}, indent=2))
 
   try:
-    Device[device]
+    ren = Device["AMD"].renderer
+    ren_name = ren.__class__.__name__
   except Exception as e:
     row = {"config": cfg, "ok": False, "error": f"device unavailable: {e}"}
     print(f"SKIP: {row['error']}")
     (cfg_art / "summary.json").write_text(json.dumps(row, indent=2))
     return row
 
-  prg = compile_program(S, T, use_acc_work, device)
+  expect = "HIPRenderer" if cfg == "hip" else "AMDRenderer"
+  if ren_name != expect:
+    row = {"config": cfg, "ok": False, "error": f"expected {expect}, got {ren_name} under DEV={target}"}
+    print(f"FAIL: {row['error']}")
+    (cfg_art / "summary.json").write_text(json.dumps(row, indent=2))
+    return row
+
+  (cfg_art / "env.json").write_text(json.dumps(
+    {**layout, **emit, "DEV": target, "renderer": ren_name}, indent=2))
+
+  prg = compile_program(S, T, use_acc_work)
   elf = program_elf(prg)
   elf_sha = sha256(elf) if elf else None
-  print(f"  compiled name={prg.arg.function_name} elf={elf_sha[:16] + '…' if elf_sha else 'n/a'}")
+  print(f"  compiled name={prg.arg.function_name} renderer={ren_name} "
+        f"elf={elf_sha[:16] + '…' if elf_sha else 'n/a'}")
   if elf: (cfg_art / "frozen.elf").write_bytes(elf)
 
   outs = []
   for i in range(replays):
-    o = launch(prg, q_np, kv_np, T, device)
+    o = launch(prg, q_np, kv_np, T)
     outs.append(o)
     if i < 4 or i == replays - 1 or (i + 1) % 25 == 0:
       print(f"  replay[{i}] mean={float(o.mean()):.8g} finite={bool(np.isfinite(o).all())}")
@@ -226,7 +255,7 @@ def run_cfg(cfg: str, S: int, T: int, replays: int, layout: dict, art: Path,
     "ok"
   )
   row = {
-    "config": cfg, "device": device, "ok": ok, "verdict": verdict,
+    "config": cfg, "DEV": target, "renderer": ren_name, "ok": ok, "verdict": verdict,
     "replays": replays, "frozen_replay_exact": exact, "frozen_replay_maxdiff": maxdiff,
     "finite": finite, "elf_sha": elf_sha, "first_divergent_replay": div,
     "ref_ok": ref_ok, "ref_maxdiff": ref_max, "first_divergent_ref": ref_div,
