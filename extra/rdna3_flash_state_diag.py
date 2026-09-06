@@ -10,12 +10,13 @@ Stops scheduling experiments. Compares:
 
 Also saves the first failing replay and its predecessor (not only the first eight).
 
-Phase dumps (optional): compile with phase_dumps and compare QK / soft_m0 / soft_l0 /
-PV / pre-norm acc for one affected tile against HIP.
+Phase dumps: instrumented ELF is replayed until *output* fails; fail+pred dumps saved.
+Do not transfer an uninstrumented fail index onto a newly instrumented binary.
+If instrumentation suppresses the out failure, treat as inconclusive (not a pass).
 
 Example:
-  PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py --replays 100
-  PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py --modes fixed,recreate,scratch --phase
+  PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py --phase-only --phases qk --replays 100
+  PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py --modes fixed --phase --phases qk
 """
 from __future__ import annotations
 
@@ -24,7 +25,6 @@ import hashlib
 import json
 import os
 import shutil
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -33,12 +33,12 @@ from tinygrad import Device, Tensor, dtypes
 from tinygrad.codegen import to_program, to_program_cache
 from tinygrad.engine.realize import get_runtime, runtime_cache
 from tinygrad.helpers import Context, getenv, DEV
-from tinygrad.llm.kernels.amd import _amd_flash_attention, BLOCK_M, WAVES_M
+from tinygrad.llm.kernels.amd import (
+  _amd_flash_attention, BLOCK_M, BLOCK_N, WAVES_M, WAVES_N,
+  LANES_PER_WAVE_M, LANES_PER_WAVE_N, flash_tile_dims,
+)
 import tinygrad.llm.kernels.amd as amd
 from tinygrad.uop.ops import Ops, UOp
-
-
-TM, TN, TD = 4, 4, 4  # D=128 flash ACC_SMALL tile locals
 
 
 def patterned(shape, dtype=np.float32):
@@ -86,28 +86,35 @@ def use_acc_work(skip: str, work: int) -> bool:
   return bool(work and "2" in {s.strip() for s in skip.split(",")})
 
 
-def phase_shapes(BH: int, M: int, S: int) -> dict[str, tuple]:
+def phase_shapes(BH: int, M: int, S: int, D: int = 128,
+                 phases: tuple[str, ...] = ("qk",)) -> dict[str, tuple]:
+  """Logical dump shapes — must match `_amd_flash_attention` phase_dumps docstring."""
   nm = M // BLOCK_M
-  ntiles = (S + 31) // 32  # BLOCK_N=32
-  return {
-    "qk": (BH, nm, ntiles, WAVES_M, TM, TN),
-    "soft_m": (BH, nm, ntiles, WAVES_M, TM),
-    "soft_l": (BH, nm, ntiles, WAVES_M, TM),
-    "pv": (BH, nm, ntiles, WAVES_M, TM, TD),
-    "acc": (BH, nm, WAVES_M, TM, TD),
+  ntiles = (S + BLOCK_N - 1) // BLOCK_N
+  TM, TN, TD = flash_tile_dims(D)  # noqa: F841 — document dims; shapes use BLOCK_* / D
+  assert (TM, TN, TD) == (BLOCK_M // (WAVES_M * LANES_PER_WAVE_M),
+                          BLOCK_N // LANES_PER_WAVE_N,
+                          D // (WAVES_N * LANES_PER_WAVE_N))
+  all_shapes = {
+    "qk": (BH, nm, ntiles, BLOCK_M, BLOCK_N),
+    "soft_m": (BH, nm, ntiles, BLOCK_M),
+    "soft_l": (BH, nm, ntiles, BLOCK_M),
+    "pv": (BH, nm, ntiles, BLOCK_M, D),
+    "acc": (BH, nm, BLOCK_M, D),
   }
+  return {k: all_shapes[k] for k in phases}
 
 
-def compile_program(S: int, T: int, acc_work: bool, *, with_phases: bool = False):
+def compile_program(S: int, T: int, acc_work: bool, *, phases: tuple[str, ...] = ()):
   BH = 32
   out = UOp.placeholder((BH, T, 128), dtypes.float32, 0)
   q = UOp.placeholder((BH, T, 128), dtypes.float16, 1)
   kv = UOp.placeholder((2, 1, 8, S, 128), dtypes.float16, 2)
   dumps: list[tuple[str, UOp]] = []
   dump_bufs: dict[str, UOp] = {}
-  if with_phases:
+  if phases:
     slot = 3
-    for name, shape in phase_shapes(BH, T, S).items():
+    for name, shape in phase_shapes(BH, T, S, phases=phases).items():
       buf = UOp.placeholder(shape, dtypes.float32, slot)
       dump_bufs[name] = buf
       dumps.append((name, buf))
@@ -136,17 +143,42 @@ def program_elf(prg) -> bytes | None:
   return binary if isinstance(binary, bytes) and binary.startswith(b"\x7fELF") else None
 
 
+def arrays_close(a: np.ndarray, b: np.ndarray) -> bool:
+  """Bit-exact finites; matching ±inf equal; matching NaN masks equal with equal non-NaNs."""
+  a64, b64 = a.astype(np.float64), b.astype(np.float64)
+  a_nan, b_nan = np.isnan(a64), np.isnan(b64)
+  if not np.array_equal(a_nan, b_nan):
+    return False
+  nn = ~a_nan
+  aa, bb = a64[nn], b64[nn]
+  both_pos = np.isposinf(aa) & np.isposinf(bb)
+  both_neg = np.isneginf(aa) & np.isneginf(bb)
+  both_fin = np.isfinite(aa) & np.isfinite(bb)
+  return bool(np.all(both_pos | both_neg | (both_fin & (aa == bb))))
+
+
 def first_divergent(a: np.ndarray, b: np.ndarray) -> dict | None:
-  d = np.abs(a.astype(np.float64) - b.astype(np.float64))
-  if not np.any(d): return None
-  idx = int(np.argmax(d > 0))
+  """First mismatch. Matching ±inf equal; NaN mask/value issues → kind=nan (not via a-b)."""
+  a64, b64 = a.astype(np.float64), b.astype(np.float64)
+  a_nan, b_nan = np.isnan(a64), np.isnan(b64)
+  both_pos = np.isposinf(a64) & np.isposinf(b64)
+  both_neg = np.isneginf(a64) & np.isneginf(b64)
+  both_fin = np.isfinite(a64) & np.isfinite(b64)
+  both_nan = a_nan & b_nan
+  equal = both_pos | both_neg | both_nan | (both_fin & (a64 == b64))
+  if np.all(equal):
+    return None
+  idx = int(np.argmax(~equal))
   coords = [int(c) for c in np.unravel_index(idx, a.shape)]
+  av, bv = float(a.reshape(-1)[idx]), float(b.reshape(-1)[idx])
+  kind = "nan" if (a_nan.reshape(-1)[idx] or b_nan.reshape(-1)[idx]) else "value"
+  md = abs(av - bv) if np.isfinite(av) and np.isfinite(bv) else float("nan")
   return {
-    "flat_index": idx, "coords": coords, "maxdiff": float(d.max()),
-    "a": float(a.reshape(-1)[idx]), "b": float(b.reshape(-1)[idx]),
-    "head": coords[0] if len(coords) >= 1 else None,
-    "token": coords[1] if len(coords) >= 2 else None,
-    "query_tile": (coords[1] // BLOCK_M) if len(coords) >= 2 else None,
+    "flat_index": idx, "coords": coords, "maxdiff": md, "kind": kind,
+    "a": av, "b": bv,
+    "head": coords[0] if coords else None,
+    "token": coords[1] if len(coords) > 1 else None,
+    "query_tile": (coords[1] // BLOCK_M) if len(coords) > 1 else None,
   }
 
 
@@ -191,9 +223,9 @@ def make_fixed_state(prg, q_np, kv_np, T: int, S: int | None = None, *, sentinel
   out = Tensor.full((32, T, 128), sentinel, dtype=dtypes.float32, device=device).realize()
   dumps = {}
   if dump_names:
+    shapes = phase_shapes(32, T, S, phases=tuple(dump_names))
     for name in dump_names:
-      shape = phase_shapes(32, T, S)[name]
-      dumps[name] = Tensor.zeros(shape, dtype=dtypes.float32, device=device).realize()
+      dumps[name] = Tensor.zeros(shapes[name], dtype=dtypes.float32, device=device).realize()
   rt = get_runtime(device, prg, cache=True)
   gs, ls = prg.arg.launch_dims({})
   vals = prg.arg.vals({})
@@ -238,14 +270,14 @@ def save_fail_pair(art: Path, outs: list[np.ndarray], ref0: np.ndarray | None = 
   """Persist first failing replay and its predecessor."""
   meta = {"first_fail_i": None, "pred_i": None}
   for i in range(1, len(outs)):
-    if not np.array_equal(outs[0], outs[i]):
+    if not arrays_close(outs[0], outs[i]):
       meta["first_fail_i"] = i
       meta["pred_i"] = i - 1
       np.save(art / f"fail_{i}.npy", outs[i])
       np.save(art / f"pred_{i-1}.npy", outs[i - 1])
       np.save(art / "replay_0.npy", outs[0])
       meta["div_vs_0"] = first_divergent(outs[0], outs[i])
-      if i >= 2:
+      if i >= 1:
         meta["div_vs_pred"] = first_divergent(outs[i - 1], outs[i])
       if ref0 is not None:
         meta["fail_vs_ref"] = first_divergent(outs[i], ref0)
@@ -264,15 +296,24 @@ def save_fail_pair(art: Path, outs: list[np.ndarray], ref0: np.ndarray | None = 
 
 
 def summarize_outs(outs: list[np.ndarray], ref: np.ndarray | None, ref_tol: float) -> dict:
-  finite = all(np.isfinite(o).all() for o in outs)
-  exact = all(np.array_equal(outs[0], o) for o in outs[1:])
-  maxdiff = max((float(np.max(np.abs(outs[0] - o))) for o in outs[1:]), default=0.0)
-  div = None if exact else first_divergent(outs[0], next(o for o in outs[1:] if not np.array_equal(outs[0], o)))
+  finite = all(np.isfinite(o).all() for o in outs)  # outputs should be finite; -inf only in QK dumps
+  exact = all(arrays_close(outs[0], o) for o in outs[1:])
+  maxdiff = 0.0
+  for o in outs[1:]:
+    both = np.isfinite(outs[0]) & np.isfinite(o)
+    if np.any(both):
+      maxdiff = max(maxdiff, float(np.max(np.abs(outs[0][both].astype(np.float64) - o[both].astype(np.float64)))))
+  div = None if exact else first_divergent(outs[0], next(o for o in outs[1:] if not arrays_close(outs[0], o)))
   ref_ok, ref_max = True, 0.0
   if ref is not None:
-    ref_max = float(np.max(np.abs(outs[0].astype(np.float64) - ref.astype(np.float64))))
-    # Allow ulp noise when judging first-out vs HIP; bit-exact still preferred in meta.
-    ref_ok = bool(ref_max <= max(ref_tol, 1e-5)) and bool(np.isfinite(outs[0]).all())
+    d = first_divergent(outs[0], ref)
+    ref_max = 0.0 if d is None else float(d.get("maxdiff") or 0.0)
+    if d is None:
+      ref_ok = True
+    elif np.isfinite(ref_max):
+      ref_ok = bool(ref_max <= max(ref_tol, 1e-5))
+    else:
+      ref_ok = False
   verdict = (
     "launch_nondeterminism" if finite and not exact else
     "stable_wrong" if exact and finite and not ref_ok else
@@ -328,94 +369,179 @@ def run_mode(mode: str, prg, q_np, kv_np, T: int, replays: int, art: Path,
   return row
 
 
-def run_phase_compare(S: int, T: int, acc_work: bool, art: Path, q_np, kv_np,
-                      fail_meta: dict | None) -> dict:
-  """Compile with phase dumps; compare HIP vs DIRECT at first failing tile (or tile 0)."""
-  print("\n======== phase dump HIP vs DIRECT ========")
+def read_dumps(state) -> dict[str, np.ndarray]:
+  return {name: np.array(t.numpy(), dtype=np.float32, copy=True) for name, t in state["dumps"].items()}
+
+
+def zero_dumps_host(state):
+  """Zero dump buffers via allocator copyin — no compute helper kernel."""
+  for t in state["dumps"].values():
+    buf = t.uop.buffer.ensure_allocated()
+    raw = buf.get_buf("AMD")
+    nbytes = int(np.prod(t.shape)) * 4
+    Device["AMD"].allocator._copyin(raw, memoryview(bytearray(nbytes)))
+  Device["AMD"].synchronize()
+
+
+def run_phase_fail_capture(S: int, T: int, acc_work: bool, art: Path, q_np, kv_np,
+                           *, phases: tuple[str, ...] = ("qk",), replays: int = 100,
+                           focus_head: int | None = None, focus_bm: int | None = None) -> dict:
+  """Replay *instrumented* DIRECT ELF until out diverges; save fail+pred phase dumps.
+
+  Also runs one HIP instrumented launch as a phase reference (not a fail index transfer).
+  If instrumentation suppresses out failure within `replays`, report inconclusive.
+  """
+  print(f"\n======== phase fail-capture phases={phases} replays={replays} ========")
   phase_art = art / "phase"
   if phase_art.exists(): shutil.rmtree(phase_art)
   phase_art.mkdir(parents=True)
+  TM, TN, TD = flash_tile_dims(128)
+  print(f"  flash_tile_dims TM,TN,TD={TM},{TN},{TD} (expect 8,2,4)")
 
-  dump_names = ["qk", "soft_m", "soft_l", "pv", "acc"]
-  results = {}
-  for label, target in (("hip", "AMD:HIP"), ("direct", "AMD:AMD")):
-    set_dev(target)
-    apply_env(direct=(label == "direct"))
-    set_dev(target)
-    prg, _ = compile_program(S, T, acc_work, with_phases=True)
-    ren = Device["AMD"].renderer.__class__.__name__
-    expect = "HIPRenderer" if label == "hip" else "AMDRenderer"
-    if ren != expect:
-      results[label] = {"error": f"expected {expect}, got {ren}"}
-      print(f"  {label}: FAIL renderer {ren}")
-      continue
-    state = make_fixed_state(prg, q_np, kv_np, T, S, dump_names=dump_names)
-    # Zero dump buffers then launch once
-    for name, t in state["dumps"].items():
-      t.assign(Tensor.zeros(t.shape, dtype=dtypes.float32, device="AMD")).realize()
-    refill_out_sentinel(state)
-    out = launch_fixed(state)
-    dumps_np = {name: np.array(t.numpy(), dtype=np.float32, copy=True) for name, t in state["dumps"].items()}
-    for name, arr in dumps_np.items():
-      np.save(phase_art / f"{label}_{name}.npy", arr)
-    np.save(phase_art / f"{label}_out.npy", out)
-    results[label] = {"renderer": ren, "out_mean": float(out.mean()),
-                      "dumps": {k: {"mean": float(v.mean()), "finite": bool(np.isfinite(v).all())}
-                                for k, v in dumps_np.items()}}
-    print(f"  {label}: out_mean={results[label]['out_mean']:.8g}")
+  # --- HIP instrumented reference (single launch; HIP out is stable) ---
+  set_dev("AMD:HIP")
+  apply_env(direct=False)
+  set_dev("AMD:HIP")
+  hip_prg, _ = compile_program(S, T, acc_work, phases=phases)
+  assert Device["AMD"].renderer.__class__.__name__ == "HIPRenderer"
+  hip_state = make_fixed_state(hip_prg, q_np, kv_np, T, S, dump_names=list(phases))
+  zero_dumps_host(hip_state)
+  hip_out = launch_fixed(hip_state)
+  hip_dumps = read_dumps(hip_state)
+  np.save(phase_art / "hip_out.npy", hip_out)
+  for k, v in hip_dumps.items():
+    np.save(phase_art / f"hip_{k}.npy", v)
+  print(f"  HIP instrumented out_mean={float(hip_out.mean()):.8g}")
 
-  if "hip" in results and "direct" in results and "error" not in results["hip"] and "error" not in results["direct"]:
-    tile = None
-    if fail_meta and fail_meta.get("div_vs_0"):
-      d = fail_meta["div_vs_0"]
-      tile = {"head": d.get("head"), "query_tile": d.get("query_tile"), "token": d.get("token"), "n_tile": 0}
-    if tile is None:
-      tile = {"head": 0, "query_tile": 0, "token": 0, "n_tile": 0}
-    print(f"  focusing tile head={tile['head']} query_tile={tile['query_tile']} n_tile={tile['n_tile']}")
-    cmp = {"tile": tile, "phases": {}}
-    for name in dump_names:
-      ha = np.load(phase_art / f"hip_{name}.npy")
-      da = np.load(phase_art / f"direct_{name}.npy")
-      h, bm, nt = int(tile["head"]), int(tile["query_tile"]), int(tile["n_tile"])
-      try:
-        if name == "acc":
-          ht, dt = ha[h, bm], da[h, bm]
-        else:
-          ht, dt = ha[h, bm, nt], da[h, bm, nt]
-      except Exception:
-        ht, dt = ha, da
-      div = first_divergent(ht, dt)
-      md = float(np.max(np.abs(ht.astype(np.float64) - dt.astype(np.float64))))
-      cmp["phases"][name] = {"maxdiff": md, "exact": div is None, "first_divergent": div}
-      print(f"  phase[{name}] tile maxdiff={md:.6g} exact={div is None} div={div}")
-    for name in dump_names:
-      ha = np.load(phase_art / f"hip_{name}.npy")
-      da = np.load(phase_art / f"direct_{name}.npy")
-      full = first_divergent(ha, da)
-      cmp["phases"][name]["full_first_divergent"] = full
-      if full:
-        print(f"  phase[{name}] FULL first_divergent={full}")
-    results["compare"] = cmp
-    (phase_art / "compare.json").write_text(json.dumps(cmp, indent=2, default=str))
-  (phase_art / "summary.json").write_text(json.dumps(results, indent=2, default=str))
-  return results
+  # --- DIRECT instrumented: same ELF until output fails ---
+  set_dev("AMD:AMD")
+  apply_env(direct=True)
+  set_dev("AMD:AMD")
+  dir_prg, _ = compile_program(S, T, acc_work, phases=phases)
+  assert Device["AMD"].renderer.__class__.__name__ == "AMDRenderer"
+  elf = program_elf(dir_prg)
+  if elf:
+    (phase_art / "direct_instrumented.elf").write_bytes(elf)
+    print(f"  DIRECT instrumented elf={sha256(elf)[:16]}…")
+
+  state = make_fixed_state(dir_prg, q_np, kv_np, T, S, dump_names=list(phases))
+  outs: list[np.ndarray] = []
+  dump_hist: list[dict[str, np.ndarray]] = []
+  fail_i = None
+  for i in range(replays):
+    zero_dumps_host(state)
+    o = launch_fixed(state)
+    d = read_dumps(state)
+    outs.append(o)
+    dump_hist.append(d)
+    if i < 4 or (i + 1) % 25 == 0 or i + 1 == replays:
+      print(f"  direct_instr replay[{i}] mean={float(o.mean()):.8g}")
+    if i > 0 and not arrays_close(outs[0], o):
+      fail_i = i
+      print(f"  instrumented output FAILED at replay {i} (still reproduces)")
+      break
+  else:
+    print("  INCONCLUSIVE: instrumentation suppressed output failure within replay budget")
+    row = {
+      "ok": False, "verdict": "instrumentation_suppressed_or_unlucky",
+      "replays": replays, "phases": list(phases),
+      "out_exact": True, "note": "no out divergence observed on instrumented ELF",
+    }
+    (phase_art / "summary.json").write_text(json.dumps(row, indent=2, default=str))
+    return row
+
+  pred_i = fail_i - 1
+  np.save(phase_art / "replay_0_out.npy", outs[0])
+  np.save(phase_art / f"pred_{pred_i}_out.npy", outs[pred_i])
+  np.save(phase_art / f"fail_{fail_i}_out.npy", outs[fail_i])
+  for k in phases:
+    np.save(phase_art / f"pred_{pred_i}_{k}.npy", dump_hist[pred_i][k])
+    np.save(phase_art / f"fail_{fail_i}_{k}.npy", dump_hist[fail_i][k])
+    np.save(phase_art / f"replay0_{k}.npy", dump_hist[0][k])
+
+  out_div = first_divergent(outs[pred_i], outs[fail_i])
+  print(f"  out fail_vs_pred={out_div}")
+
+  # Focus tile: from out divergence, or CLI override
+  if focus_head is None or focus_bm is None:
+    focus_head = int(out_div["head"]) if out_div and out_div.get("head") is not None else 0
+    focus_bm = int(out_div["query_tile"]) if out_div and out_div.get("query_tile") is not None else 0
+  print(f"  focus head={focus_head} query_tile={focus_bm}; inspecting ALL n_tiles")
+
+  cmp: dict = {
+    "fail_i": fail_i, "pred_i": pred_i, "out_div": out_div,
+    "focus": {"head": focus_head, "query_tile": focus_bm},
+    "phases": {}, "earliest": None,
+  }
+  earliest = None
+  for name in phases:
+    pred, fail = dump_hist[pred_i][name], dump_hist[fail_i][name]
+    hip = hip_dumps[name]
+    # Full fail vs pred
+    full_div = first_divergent(pred, fail)
+    # Per n_tile for this query tile (acc has no n_tile dim)
+    per_ntile = []
+    if name == "acc":
+      pt, ft = pred[focus_head, focus_bm], fail[focus_head, focus_bm]
+      div = first_divergent(pt, ft)
+      per_ntile.append({"n_tile": None, "div": div, "vs_hip_pred": first_divergent(pt, hip[focus_head, focus_bm])})
+      if div is not None and earliest is None:
+        earliest = {"phase": name, "n_tile": None, "div": div}
+    else:
+      ntiles = pred.shape[2]
+      for nt in range(ntiles):
+        pt, ft = pred[focus_head, focus_bm, nt], fail[focus_head, focus_bm, nt]
+        div = first_divergent(pt, ft)
+        per_ntile.append({"n_tile": nt, "div": div,
+                          "vs_hip_pred": first_divergent(pt, hip[focus_head, focus_bm, nt]),
+                          "vs_hip_fail": first_divergent(ft, hip[focus_head, focus_bm, nt])})
+        if div is not None and earliest is None:
+          earliest = {"phase": name, "n_tile": nt, "div": div}
+        print(f"  phase[{name}] head={focus_head} bm={focus_bm} n_tile={nt} "
+              f"fail_vs_pred={'EXACT' if div is None else div}")
+    cmp["phases"][name] = {"full_fail_vs_pred": full_div, "per_ntile": per_ntile}
+    if full_div:
+      print(f"  phase[{name}] FULL fail_vs_pred={full_div}")
+
+  cmp["earliest"] = earliest
+  if earliest:
+    print(f"  EARLIEST divergence: phase={earliest['phase']} n_tile={earliest['n_tile']} {earliest['div']}")
+  else:
+    print("  WARNING: out diverged but selected phase dumps match — try more phases")
+
+  row = {
+    "ok": False, "verdict": "launch_nondeterminism_instrumented",
+    "replays_until_fail": fail_i + 1, "phases": list(phases),
+    "compare": cmp, "tile_dims": {"TM": TM, "TN": TN, "TD": TD},
+  }
+  (phase_art / "compare.json").write_text(json.dumps(cmp, indent=2, default=str))
+  (phase_art / "summary.json").write_text(json.dumps(row, indent=2, default=str))
+  return row
 
 
 def main() -> None:
   p = argparse.ArgumentParser()
   p.add_argument("--modes", default="recreate,fixed,scratch",
-                 help="comma: recreate,fixed,scratch")
+                 help="comma: recreate,fixed,scratch (ignored with --phase-only)")
   p.add_argument("--S", type=int, default=128)
   p.add_argument("--T", type=int, default=128)
   p.add_argument("--replays", type=int, default=100)
   p.add_argument("--skip", default="2")
   p.add_argument("--work", type=int, default=1)
   p.add_argument("--ref-tol", type=float, default=0.0)
-  p.add_argument("--phase", action="store_true", help="also run HIP vs DIRECT phase dumps")
+  p.add_argument("--phase", action="store_true",
+                 help="after modes: instrumented fail/pred phase capture")
+  p.add_argument("--phase-only", action="store_true",
+                 help="skip recreate/fixed/scratch; only instrumented fail capture")
+  p.add_argument("--phases", default="qk",
+                 help="comma phase dumps: qk,soft_m,soft_l,pv,acc (start with qk)")
+  p.add_argument("--focus-head", type=int, default=None)
+  p.add_argument("--focus-bm", type=int, default=None)
   p.add_argument("--artifacts", default="extra/rdna3_state_diag")
   args = p.parse_args()
   T = min(args.T, args.S)
   modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+  phases = tuple(x.strip() for x in args.phases.split(",") if x.strip())
   art = Path(args.artifacts)
   if art.exists(): shutil.rmtree(art)
   art.mkdir(parents=True)
@@ -426,66 +552,61 @@ def main() -> None:
   np.save(art / "q.npy", q_np)
   np.save(art / "cache.npy", kv_np)
 
-  # HIP reference (fixed, 8 replays enough if previously stable; still do 100 if requested)
-  print("======== HIP reference ========")
-  set_dev("AMD:HIP")
-  apply_env(skip=args.skip, work=args.work, direct=False)
-  set_dev("AMD:HIP")
-  hip_prg, _ = compile_program(args.S, T, acc_work, with_phases=False)
-  assert Device["AMD"].renderer.__class__.__name__ == "HIPRenderer"
-  hip_outs = []
-  hip_state = make_fixed_state(hip_prg, q_np, kv_np, T)
-  for i in range(args.replays):
-    # No out-refill helper kernel between HIP launches either.
-    hip_outs.append(launch_fixed(hip_state))
-  hip_row = summarize_outs(hip_outs, None, args.ref_tol)
-  hip_art = art / "hip_fixed"
-  hip_art.mkdir(parents=True)
-  save_fail_pair(hip_art, hip_outs, None)
-  (hip_art / "summary.json").write_text(json.dumps(hip_row, indent=2, default=str))
-  ref = hip_outs[0]
-  print(f"  HIP verdict={hip_row['verdict']} exact={hip_row['exact']}")
-  if not hip_row["exact"]:
-    print("WARN: HIP fixed replay not exact — reference itself is unstable")
+  # Self-check: matching -inf must not look divergent
+  _a = np.array([1.0, float("-inf")], np.float32)
+  assert first_divergent(_a, _a.copy()) is None, "inf-aware compare broken"
+  assert arrays_close(_a, _a.copy())
 
-  # DIRECT program
-  set_dev("AMD:AMD")
-  apply_env(skip=args.skip, work=args.work, direct=True)
-  set_dev("AMD:AMD")
-  prg, _ = compile_program(args.S, T, acc_work, with_phases=False)
-  assert Device["AMD"].renderer.__class__.__name__ == "AMDRenderer"
-  elf = program_elf(prg)
-  if elf:
-    (art / "direct.elf").write_bytes(elf)
-    print(f"DIRECT elf={sha256(elf)[:16]}…")
+  summary: list = []
+  if not args.phase_only:
+    print("======== HIP reference ========")
+    set_dev("AMD:HIP")
+    apply_env(skip=args.skip, work=args.work, direct=False)
+    set_dev("AMD:HIP")
+    hip_prg, _ = compile_program(args.S, T, acc_work, phases=())
+    assert Device["AMD"].renderer.__class__.__name__ == "HIPRenderer"
+    hip_outs = []
+    hip_state = make_fixed_state(hip_prg, q_np, kv_np, T)
+    for i in range(args.replays):
+      hip_outs.append(launch_fixed(hip_state))
+    hip_row = summarize_outs(hip_outs, None, args.ref_tol)
+    hip_art = art / "hip_fixed"
+    hip_art.mkdir(parents=True)
+    save_fail_pair(hip_art, hip_outs, None)
+    (hip_art / "summary.json").write_text(json.dumps(hip_row, indent=2, default=str))
+    ref = hip_outs[0]
+    print(f"  HIP verdict={hip_row['verdict']} exact={hip_row['exact']}")
+    summary.append({"config": "hip_fixed", **hip_row})
 
-  summary = [{"config": "hip_fixed", **hip_row}]
-  fail_meta = None
-  for mode in modes:
-    if mode == "scratch":
-      for sm in ("untouched", "zero", "nonzero"):
-        # Fresh process-equivalent: re-apply env, same prg, fixed buffers + scratch fill
+    set_dev("AMD:AMD")
+    apply_env(skip=args.skip, work=args.work, direct=True)
+    set_dev("AMD:AMD")
+    prg, _ = compile_program(args.S, T, acc_work, phases=())
+    assert Device["AMD"].renderer.__class__.__name__ == "AMDRenderer"
+    elf = program_elf(prg)
+    if elf:
+      (art / "direct.elf").write_bytes(elf)
+      print(f"DIRECT elf={sha256(elf)[:16]}…")
+
+    for mode in modes:
+      if mode == "scratch":
+        for sm in ("untouched", "zero", "nonzero"):
+          set_dev("AMD:AMD")
+          apply_env(skip=args.skip, work=args.work, direct=True)
+          set_dev("AMD:AMD")
+          summary.append(run_mode("fixed", prg, q_np, kv_np, T, args.replays, art, ref, args.ref_tol, scratch_mode=sm))
+      else:
         set_dev("AMD:AMD")
         apply_env(skip=args.skip, work=args.work, direct=True)
         set_dev("AMD:AMD")
-        row = run_mode("fixed", prg, q_np, kv_np, T, args.replays, art, ref, args.ref_tol, scratch_mode=sm)
-        summary.append(row)
-        if fail_meta is None and row.get("fail_meta", {}).get("first_fail_i") is not None:
-          fail_meta = row["fail_meta"]
-    else:
-      set_dev("AMD:AMD")
-      apply_env(skip=args.skip, work=args.work, direct=True)
-      set_dev("AMD:AMD")
-      row = run_mode(mode, prg, q_np, kv_np, T, args.replays, art, ref, args.ref_tol)
-      summary.append(row)
-      if fail_meta is None and row.get("fail_meta", {}).get("first_fail_i") is not None:
-        fail_meta = row["fail_meta"]
+        summary.append(run_mode(mode, prg, q_np, kv_np, T, args.replays, art, ref, args.ref_tol))
 
-  phase_results = None
-  if args.phase:
+  if args.phase or args.phase_only:
     try:
-      phase_results = run_phase_compare(args.S, T, acc_work, art, q_np, kv_np, fail_meta)
-      summary.append({"config": "phase", "ok": True, "phase": phase_results.get("compare")})
+      phase_row = run_phase_fail_capture(
+        args.S, T, acc_work, art, q_np, kv_np, phases=phases, replays=args.replays,
+        focus_head=args.focus_head, focus_bm=args.focus_bm)
+      summary.append({"config": "phase", **phase_row})
     except Exception as e:
       import traceback
       traceback.print_exc()
@@ -494,13 +615,22 @@ def main() -> None:
   print("\n======== SUMMARY ========")
   print(json.dumps(summary, indent=2, default=str))
   (art / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
-  failed = any(not r.get("ok", False) for r in summary if r.get("config") != "phase")
-  # Phase compare is informational; don't require HIP==DIRECT bit-exact on dumps for exit
-  if failed:
+  # Phase capture expects failure (ok=False with launch_nondeterminism_instrumented is success-of-diag)
+  phase_ok = any(
+    r.get("config") == "phase" and r.get("verdict") == "launch_nondeterminism_instrumented"
+    for r in summary)
+  other_fail = any(not r.get("ok", False) for r in summary if r.get("config") not in ("phase",))
+  if args.phase_only:
+    if phase_ok:
+      print(f"OK phase diag captured instrumented failure under {art}")
+      raise SystemExit(0)
+    print(f"FAIL phase diag under {art}")
+    raise SystemExit(1)
+  if other_fail and not (args.phase and phase_ok):
     print(f"FAIL artifacts under {art}")
     raise SystemExit(1)
-  print(f"OK artifacts under {art}")
-  raise SystemExit(0)
+  print(f"done artifacts under {art}")
+  raise SystemExit(0 if not other_fail else 1)
 
 
 if __name__ == "__main__":

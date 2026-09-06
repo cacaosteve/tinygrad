@@ -12,6 +12,13 @@ WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
 WAVES_M, WAVES_N, LANES_PER_WAVE_M, LANES_PER_WAVE_N = 2, 2, 2, 16
 WMMA_ACC, THREADS_PER_BLOCK = WMMA_M // LANES_PER_WAVE_M, WARP_SIZE * WAVES_M * WAVES_N
 LDS_PAD, WMMA_ARG, LOG2E = 4, ((WMMA_M, WMMA_N, WMMA_K), 'AMD', 32), math.log2(math.e)
+
+def flash_tile_dims(D:int=128) -> tuple[int, int, int]:
+  """Per-thread tile locals for flash prefill: (TM, TN, TD). D=128 → (8, 2, 4)."""
+  return (BLOCK_M // (WAVES_M * LANES_PER_WAVE_M),
+          BLOCK_N // LANES_PER_WAVE_N,
+          D // (WAVES_N * LANES_PER_WAVE_N))
+
 Q4_K, Q5_K, Q6_K, IQ4_XS, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS = 12, 13, 14, 23, 256, 32, 36, 44, 210, 34
 Q6_PADDED, Q6_WORDS = 212, 53  # the 210-byte Q6 blocks are padded to 212 bytes so they are word-addressable
 QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4}  # bytes per 256-weight block
@@ -711,14 +718,15 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
 def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None,
                          acc_small:bool=False, k_unroll:int=0, use_acc_work:bool=False,
                          phase_dumps: tuple[tuple[str, UOp], ...]=()) -> UOp:
-  """Hand flash-attn. Optional phase_dumps=(("qk", buf), ("soft_m", buf), ...) for diagnostics.
+  """Hand flash-attn. Optional phase_dumps=(("qk", buf), ...) for diagnostics.
 
-  Dump buffer shapes (D=128, TM=4, TN=4, TD=4, WAVES_M=2). Ntiles = ceil(S/BLOCK_N) when int:
-    qk:     (BH, M//BLOCK_M, Ntiles, WAVES_M, TM, TN) — scaled+masked S per n_tile
-    soft_m: (BH, M//BLOCK_M, Ntiles, WAVES_M, TM) — tile softmax max per n_tile
-    soft_l: (BH, M//BLOCK_M, Ntiles, WAVES_M, TM) — tile softmax sum per n_tile
-    pv:     (BH, M//BLOCK_M, Ntiles, WAVES_M, TM, TD) — PV fragment per n_tile
-    acc:    (BH, M//BLOCK_M, WAVES_M, TM, TD) — pre-normalize accumulator after all n_tiles
+  Dump buffers use *logical* tile coords so each slot has one writer:
+    qk:     (BH, M//BLOCK_M, Ntiles, BLOCK_M, BLOCK_N) — scaled+masked S; writer wave_n==0
+    soft_m: (BH, M//BLOCK_M, Ntiles, BLOCK_M) — softmax max; writer wave_n==0 & lane_n==0
+    soft_l: (BH, M//BLOCK_M, Ntiles, BLOCK_M) — softmax sum; writer wave_n==0 & lane_n==0
+    pv:     (BH, M//BLOCK_M, Ntiles, BLOCK_M, D) — PV fragment; all threads unique (qrow,dcol)
+    acc:    (BH, M//BLOCK_M, BLOCK_M, D) — pre-norm acc; all threads unique (qrow,dcol)
+  Ntiles = ceil(S/BLOCK_N) when S is int. Start with one phase (qk) when debugging.
   """
   dumps = dict(phase_dumps)
   valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start) if q_start is not None else None
@@ -874,12 +882,17 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         S_reg = S_reg.after(UOp.group(*sm_stores))
   else:
     S_reg = S_masked
-  # Diagnostic: capture scaled+masked QK scores before softmax overwrites S_reg.
+  # Diagnostic: scaled+masked QK → logical (BLOCK_M, BLOCK_N). wave_n duplicates S; one writer.
   if dumps and "qk" in dumps:
-    dq = dumps["qk"]  # (BH, Nm, Ntiles, WAVES_M, TM, TN)
-    qk_store = UOp.group(*[dq[block_bh, block_m, n_tile, wave_m, ri, rj].store(S_reg[ri, rj])
-                           for ri in range(TM) for rj in range(TN)])
-    S_reg = S_reg.after(qk_store)
+    dq = dumps["qk"]  # (BH, Nm, Ntiles, BLOCK_M, BLOCK_N)
+    qk_stores = []
+    for ri in range(TM):
+      for rj in range(TN):
+        qrow = wave_m * WMMA_M + ri * LANES_PER_WAVE_M + lane_m
+        kcol = rj * LANES_PER_WAVE_N + lane_n
+        # Gate on an index axis (not INDEX.valid) so STORE stays INDEX+value.
+        qk_stores.append(dq[block_bh, block_m, n_tile, qrow, kcol.valid(wave_n.eq(0))].store(S_reg[ri, rj]))
+    S_reg = S_reg.after(UOp.group(*qk_stores))
   if _fu & 2:
     m_ij = _reg((TM,), 7, -math.inf, n_tile)
     for rn_i in range(TN):
@@ -899,15 +912,16 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     S_reg = S_reg.after(S_reg.store(((S_reg - tile_max) * LOG2E).exp2()))
     p_local, ri_ws = _reg((TM,), 8, 0, n_tile), UOp.range(TM, 295)
     p_sum = p_local.after(p_local[ri_ws].store(sum((warp_reduce(S_reg[ri_ws, rn]) for rn in range(TN)), S_reg.const_like(0))).end(ri_ws))
-  # Diagnostic: softmax max/sum per n_tile.
+  # Diagnostic: softmax max/sum → logical BLOCK_M rows. One writer per row (wave_n=0, lane_n=0).
   if dumps and any(k in dumps for k in ("soft_m", "soft_l")):
     soft_stores: list[UOp] = []
-    if "soft_m" in dumps:
-      dm = dumps["soft_m"]  # (BH, Nm, Ntiles, WAVES_M, TM)
-      soft_stores.append(UOp.group(*[dm[block_bh, block_m, n_tile, wave_m, ri].store(m_ij[ri]) for ri in range(TM)]))
-    if "soft_l" in dumps:
-      dl = dumps["soft_l"]
-      soft_stores.append(UOp.group(*[dl[block_bh, block_m, n_tile, wave_m, ri].store(p_sum[ri]) for ri in range(TM)]))
+    writer = wave_n.eq(0) & lane_n.eq(0)
+    for ri in range(TM):
+      qrow = wave_m * WMMA_M + ri * LANES_PER_WAVE_M + lane_m
+      if "soft_m" in dumps:
+        soft_stores.append(dumps["soft_m"][block_bh, block_m, n_tile, qrow.valid(writer)].store(m_ij[ri]))
+      if "soft_l" in dumps:
+        soft_stores.append(dumps["soft_l"][block_bh, block_m, n_tile, qrow.valid(writer)].store(p_sum[ri]))
     gate = UOp.group(*soft_stores)
     S_reg, m_ij, p_sum = S_reg.after(gate), m_ij.after(gate), p_sum.after(gate)
   P_lds = QP_lds.flatten()[:WAVES_N * BLOCK_M * BLOCK_N].reshape(WAVES_N, BLOCK_M, BLOCK_N)
@@ -1019,10 +1033,14 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
       else:
         pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
   if dumps and "pv" in dumps:
-    dp = dumps["pv"]  # (BH, Nm, Ntiles, WAVES_M, TM, TD)
-    pv_dump = UOp.group(*[dp[block_bh, block_m, n_tile, wave_m, ri, rj].store(pv_acc[ri, rj])
-                          for ri in range(TM) for rj in range(TD)])
-    pv_acc = pv_acc.after(pv_dump)
+    dp = dumps["pv"]  # (BH, Nm, Ntiles, BLOCK_M, D) — each thread owns unique (qrow, dcol)
+    pv_stores = []
+    for ri in range(TM):
+      for rj in range(TD):
+        qrow = wave_m * WMMA_M + ri * LANES_PER_WAVE_M + lane_m
+        dcol = wave_n * (TD * LANES_PER_WAVE_N) + rj * LANES_PER_WAVE_N + lane_n
+        pv_stores.append(dp[block_bh, block_m, n_tile, qrow, dcol].store(pv_acc[ri, rj]))
+    pv_acc = pv_acc.after(UOp.group(*pv_stores))
   ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
   if _fu & 4 and getenv("AMD_FLASH_ACC_UNROLL", 1):
     # Const-index acc update. Slot 2 stays unpromoted (REDUCE-carried); soft/stats promote.
@@ -1045,12 +1063,16 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   else:
     n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
   acc, l_i, m_i = acc.after(n_tile_end), l_i.after(n_tile_end), m_i.after(n_tile_end)
-  # Diagnostic: pre-normalize accumulator after all KV tiles.
+  # Diagnostic: pre-normalize accumulator → logical (BLOCK_M, D).
   if dumps and "acc" in dumps:
-    da = dumps["acc"]  # (BH, Nm, WAVES_M, TM, TD)
-    acc_dump = UOp.group(*[da[block_bh, block_m, wave_m, ri, rj].store(acc[ri, rj])
-                           for ri in range(TM) for rj in range(TD)])
-    acc = acc.after(acc_dump)
+    da = dumps["acc"]  # (BH, Nm, BLOCK_M, D)
+    acc_stores = []
+    for ri in range(TM):
+      for rj in range(TD):
+        qrow = wave_m * WMMA_M + ri * LANES_PER_WAVE_M + lane_m
+        dcol = wave_n * (TD * LANES_PER_WAVE_N) + rj * LANES_PER_WAVE_N + lane_n
+        acc_stores.append(da[block_bh, block_m, qrow, dcol].store(acc[ri, rj]))
+    acc = acc.after(UOp.group(*acc_stores))
   # Fuse normalize into the global store — avoid writing scaled acc back through slot-2 scratch.
   inv_l = (1 / l_i).reshape(TM, 1).expand(TM, TD)
   o = o.reshape(WAVES_M, TM, LANES_PER_WAVE_M, 1, WAVES_N, TD, LANES_PER_WAVE_N, 1) \
