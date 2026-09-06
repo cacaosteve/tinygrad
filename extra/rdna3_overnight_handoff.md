@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`29144c446`**.
+Tip: **`677550428`**.
 
 ## Headline
 
@@ -20,18 +20,19 @@ FMA_MIX / K-unroll / perf stay off.
 | Test | Result |
 |------|--------|
 | Uninstrumented fixed ×1000 | **exact=True maxdiff=0 ref_ok** |
-| Uninstrumented recreate ×200 | **exact=True maxdiff=0 ref_ok** |
-| Instrumented `qk_wmma` ×300 | stable (HIP mean); no out divergence |
-| Instrumented `pv_wmma` / `pv` ×100 | no out divergence (harness “inconclusive”) |
+| Uninstrumented recreate ×500 | **exact=True maxdiff=0 ref_ok** |
+| Instrumented `qk_wmma` ×300 | **instrumented_stable**; vs HIP ~1e-7 |
+| Instrumented `pv_wmma` / `pv` ×100 | no out divergence |
 
 Pre-fix: fail by replay ~1–10; wave_n=1 QK wrong; fail wn0≠wn1; shared Q/K LDS exact.
 
 ## Next
 
-1. Phase harness: “no fail in N replays” → stability pass (not FAIL).
-2. Keep DIRECT opt-in; more soak / real prefill before flipping defaults.
-3. Perf leftovers only after more soak confidence.
+1. Keep DIRECT opt-in; real prefill soak before flipping defaults.
+2. Perf leftovers only after more confidence.
+3. Optional: rename QP_lds → Q_lds now that P has its own slot.
 
 ```
 PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py --modes fixed --replays 1000
+PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py --phase-only --phases qk_wmma --replays 100
 ```
