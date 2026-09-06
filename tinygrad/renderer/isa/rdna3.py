@@ -1,4 +1,5 @@
 from __future__ import annotations
+import itertools
 import struct
 
 from tinygrad.device import CompileError
@@ -3414,6 +3415,62 @@ def _cluster_const_scratch_loads(ops:list[UOp]) -> list[UOp]:
     i += 1
   return out
 
+def _pack_aligned_const_scratch_sloads(ops:list[UOp]) -> list[UOp]:
+  """SLOAD×4 at const idx i..i+3 (i%4==0) → one SLOAD×4 + EXTRACT×4.
+
+  Scalar dests often get non-consecutive VGPRs under pressure, blocking emit-time
+  b128 fusion. A 4-slot SLOAD forces a contiguous chunk; prefer_phys aliases EXTRACTs.
+  Cap packs: >8 on flash slot-2 soft-copy currently corrupts (VGPR/liveness) — AMD_PACK_SLOAD_MAX.
+  """
+  if not getenv("AMD_PACK_SLOAD_B128", 0): return ops
+  max_packs = getenv("AMD_PACK_SLOAD_MAX", 8)
+  n = itertools.count()
+  remap: dict[UOp, UOp] = {}
+  out: list[UOp] = []
+  i = 0
+  packs = 0
+  while i < len(ops):
+    u = ops[i]
+    if (packs < max_packs and u.op is Ops.INS and _iop(u) is AMDOps.SLOAD and _elem_count(u) == 1 and
+        u.dtype in (dtypes.float32, dtypes.int32, dtypes.uint32) and
+        _const_int(u.src[1]) is not None and _lds_byte_off(u) == 0 and i + 3 < len(ops)):
+      g = ops[i:i + 4]
+      idxs = [_const_int(v.src[1]) if (v.op is Ops.INS and _iop(v) is AMDOps.SLOAD) else None for v in g]
+      if (all(v.op is Ops.INS and _iop(v) is AMDOps.SLOAD and _elem_count(v) == 1 and v.dtype is u.dtype and
+              v.src[0] is u.src[0] and _lds_byte_off(v) == 0 for v in g) and
+          all(t is not None for t in idxs) and int(idxs[0]) % 4 == 0 and  # type: ignore[arg-type]
+          [int(t) for t in idxs] == [int(idxs[0]) + k for k in range(4)]):  # type: ignore[arg-type]
+        wide = UOp(Ops.INS, src=(u.src[0], g[0].src[1], _load_count_src(4)),
+                   arg=(AMDOps.SLOAD, u.dtype), tag=(Register(f"sload4_{next(n)}", 0, _cons=VGPR),))
+        out.append(wide)
+        for lane, old in enumerate(g):
+          ext = UOp(Ops.INS, src=(wide, _tconst(lane, dtypes.int32).rtag()),
+                    arg=(AMDOps.EXTRACT, u.dtype), tag=(Register(f"sload4e{lane}_{next(n)}", 0, _cons=VGPR),))
+          remap[old] = ext
+          out.append(ext)
+        packs += 1
+        i += 4
+        continue
+    if u in remap:
+      i += 1
+      continue
+    out.append(u)
+    i += 1
+  if not remap: return out
+  # Deep remap: soft-copy often wraps SLOAD in AFTER before SSTORE/use.
+  cache: dict[UOp, UOp] = {}
+  def deep(u:UOp) -> UOp:
+    if u in remap: return remap[u]
+    if u in cache: return cache[u]
+    if not u.src:
+      cache[u] = u
+      return u
+    nsrc = tuple(deep(s) for s in u.src)
+    nu = u.replace(src=nsrc) if nsrc != u.src else u
+    cache[u] = nu
+    return nu
+  return [deep(u) for u in out]
+
 def _vm_load_count(insts:list) -> int:
   return sum(1 for i in insts if (n:=getattr(i, "op_name", "")) and
              (n.startswith("GLOBAL_LOAD") or n.startswith("SCRATCH_LOAD") or
@@ -4844,6 +4901,7 @@ class AMDRenderer(ISARenderer):
     lst = _cluster_const_scratch_stores(lst)
     lst = _batch_scratch_load_uses(lst)
     lst = _cluster_const_scratch_loads(lst)
+    lst = _pack_aligned_const_scratch_sloads(lst)
     return _schedule_loop_cmps(lst)
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True
