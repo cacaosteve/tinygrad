@@ -45,6 +45,7 @@ class LinearScanRegallocContext:
     self.remat: set[Register] = set()
     self.reals: dict[int, dict[Register, Register]] = {} # mapping from virtual to real at each program point
     self.insert_before: dict[int, list[tuple[Register, Register]]] = {} # fills to be inserted at each program point
+    self.spill_on_evict: dict[int, list[tuple[Register, Register]]] = {}  # (vreg, phys) to spill before insn
     if self.wide:
       real_idxs = [i for i,u in enumerate(uops) if u.op not in PSEUDO_OPS and u.op is not Ops.SINK]
       self.first_real_idx, self.last_real_idx = (real_idxs[0], real_idxs[-1]) if real_idxs else (-1, -1)
@@ -61,7 +62,21 @@ class LinearScanRegallocContext:
     def alloc(cons:tuple[Register, ...], i:int, v:Register|None=None, *, pin:bool=True) -> Register:
       if self.wide:
         assert v is not None
-        return wide_alloc(cons, i, slots(v), v.cons, live, lr, len(uops), slots, pinned if pin else frozenset())
+        victims: list[tuple[Register, Register]] = []
+        reg = wide_alloc(cons, i, slots(v), v.cons, live, lr, len(uops), slots, pinned if pin else frozenset(),
+                         spill_victims=victims if getenv("AMD_SPILL_ON_EVICT", 1) else None, remat=self.remat)
+        # Spill-on-evict: store victim phys before this insn overwrites it. Without this,
+        # loop-carried promoted REG (flash slot-2) loses values under pressure (pn>=64).
+        for vr, phys in victims:
+          if vr not in self.spills:
+            vd = self.vdef(vr)
+            sz = ren.spill_size(vd, vr)
+            if sz <= 0: sz = 4
+            offset = self.stack_size + (sz - self.stack_size % sz) % sz
+            self.spills[vr] = UOp.cconst(offset, dtypes.int32)
+            self.stack_size = offset + sz
+          self.spill_on_evict.setdefault(i, []).append((vr, phys))
+        return reg
       live_inv = {rv:k for k,rv in live.items()}
       reg,vreg = max(((r,live_inv.get(r)) for r in cons),
                     key=lambda rv: next((j-i for j in ([] if rv[1] is None else lr[rv[1]]) if j >= i), len(uops)))
@@ -164,7 +179,8 @@ class LinearScanRegallocContext:
         for v,r in live_ins.pop().items():
           if v not in live or live[v] != r: live[v] = fill(v, i, (r,), pin=False)
 
-def wide_alloc(cons, i, nslots, allowed, live, lr, uops_len, slots_fn, pinned=frozenset()):
+def wide_alloc(cons, i, nslots, allowed, live, lr, uops_len, slots_fn, pinned=frozenset(),
+               spill_victims:list|None=None, remat:set|None=None):
   # Candidates can describe an aligned multi-slot physical class (for example an
   # even 64-bit SGPR pair). Include covered sub-registers when validating width,
   # while still using only the listed candidates as legal starting positions.
@@ -178,6 +194,11 @@ def wide_alloc(cons, i, nslots, allowed, live, lr, uops_len, slots_fn, pinned=fr
     uses = lr[vr]
     pos = bisect_left(uses, i)
     return uses[pos] - i if pos < len(uses) else uops_len
+  def evict(vregs):
+    for vr in vregs:
+      if spill_victims is not None and vr in live and (remat is None or vr not in remat) and next_use(vr) < uops_len:
+        spill_victims.append((vr, live[vr]))
+      live.pop(vr, None)
   def get_candidates(check_pinned:bool):
     candidates = []
     for r in cons:
@@ -194,17 +215,17 @@ def wide_alloc(cons, i, nslots, allowed, live, lr, uops_len, slots_fn, pinned=fr
   free, candidates = get_candidates(True)
   if free is not None:
     reg, vregs = free
-    for vr in vregs: live.pop(vr, None)
+    evict(vregs)
     return reg
   if not candidates:  # no unpinned window (wide nslots / fill) — steal via blockers
     free, candidates = get_candidates(False)
     if free is not None:
       reg, vregs = free
-      for vr in vregs: live.pop(vr, None)
+      evict(vregs)
       return reg
   if not candidates: raise CompileError(f"wide_alloc: no free regs ({nslots} slots)")
   reg,vregs,_ = max(candidates, key=lambda rv: rv[2])
-  for vr in vregs: live.pop(vr, None)
+  evict(vregs)
   return reg
 
 def wide_restore(ctx, v, r, i):
@@ -241,7 +262,10 @@ def wide_regalloc_rewrite(ctx, x:UOp):
     if x in ctx.reg_promotable and x not in ctx.locals: nx = ctx.ren.isel_matcher.rewrite(x.replace(tag=ndefs))
     else: nx = ctx.ren.isel_matcher.rewrite(ctx.ren.stack_pointer().index(ctx.locals[x], tag=ndefs))
   else: nx = x.replace(src=tuple(nsrc), tag=ndefs)
-  before = [wide_restore(ctx, vr, r, i) for vr,r in ctx.insert_before.get(i, [])]
+  # Spill victims before this insn clobbers their phys regs (spill-on-evict), then fills.
+  before = [ctx.ren.spill(ctx.spills[vr], ctx.ren.bind(ctx.vdef(vr).dtype, phys))
+            for vr, phys in ctx.spill_on_evict.get(i, [])]
+  before += [wide_restore(ctx, vr, r, i) for vr,r in ctx.insert_before.get(i, [])]
   after = [ctx.ren.spill(ctx.spills[vr], nx) for vr in x.tag if vr in ctx.spills] if isinstance(x.tag, tuple) else []
   if ctx.stack_size > 0:
     sp, offset = ctx.ren.stack_pointer(), UOp.cconst(ctx.stack_size, ctx.ren.stack_pointer().dtype)
