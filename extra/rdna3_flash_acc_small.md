@@ -1,12 +1,12 @@
 # Flash ACC_SMALL (DIRECT ISA)
 
-**Status (7900, tip `4d1547216`):** `AMD_FLASH_DIRECT=1` defaults ACC_SMALL on
+**Status (7900, tip `6c0bb21c1`):** `AMD_FLASH_DIRECT=1` defaults ACC_SMALL on
 (python-unroll QK+PV WMMA; `flash_attention` realizes under `AMD_FLASH_ACC_SMALL=1` briefly;
 tile-local VGPR work copy + float4 copies + normalize fused into store).
 
 | Path | median µs | err | notes |
 |------|-----------|-----|-------|
-| DIRECT + ACC_SMALL | ~672 | ~1e-4 | 214 VGPR, priv 212, 21 SPILL, 64 SLOAD/SSTORE |
+| DIRECT + ACC_SMALL | ~675 | ~1e-4 | 214 VGPR, priv 212, 21 SPILL, 64 SLOAD/SSTORE |
 | DIRECT (pre work-copy) | ~702 | ~1e-4 | 189 VGPR, 128 SLOAD/SSTORE |
 | DIRECT + ACC_SMALL=0 | ~1315 | ~1e-4 | 149 VGPR, priv 384, 16 SPILL, 192 SLOAD/SSTORE |
 | HIP flash | ~278 | ~1e-4 | 0 scratch path |
@@ -25,8 +25,11 @@ tile-local VGPR work copy + float4 copies + normalize fused into store).
 **Corrected takeaway:** the old “128 soft-copy” count was mostly **slot-2 acc**, not S_soft/pv_soft
 (those already promote). Tile-local slot-19 work copy cuts mid-tile scratch while keeping
 `alpha*acc` before V load (latency hiding). Fusing `acc=alpha*acc+beta*pv` cut traffic but
-**regressed to ~820µs** — lost overlap with V loads; do not revive. Promoting REDUCE-carried
-acc (slot 2 or 19) → err~135 + spill thrash; leave skipped.
+**regressed to ~820µs** — lost overlap with V loads; do not revive.
+
+**Loop-carried promote (2026-09-05):** `REG_STORE` is now a tagged two-address redef +
+env-keyed `to_program_cache`. Minimal REDUCE-carried promote is correct; **flash still
+nans if slot 2 is promoted** (`SKIP_SLOTS=`). Leave slot 2 skipped. See overnight handoff.
 
 ## How it works
 
@@ -42,7 +45,7 @@ acc (slot 2 or 19) → err~135 + spill thrash; leave skipped.
 
 - HIP fully unrolls more WMMA (24 vs 6) and keeps 0 scratch.
 - Direct still spills (~21) under ACC VGPR pressure; slot-2 still scratch-backed across tiles.
-- Promoting slot 2 (`AMD_REG_PROMOTE_SKIP_SLOTS=`) → err~135 — leave skipped.
+- Promoting slot 2 (`AMD_REG_PROMOTE_SKIP_SLOTS=`) → **nan** — leave skipped.
 - QK-only unroll regresses (~833µs); keep full QK+PV unroll.
 - `AMD_FLASH_K_UNROLL=1` full K chain **MMU-faults**; `=2` nan; `=4` err~1.17 — leave 0.
 
