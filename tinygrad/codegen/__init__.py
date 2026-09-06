@@ -640,7 +640,14 @@ def to_program_disk_key(ast:UOp, renderer:Renderer) -> str|None:
   key = (to_program_key(ast, renderer), _program_source_fingerprint(), env, sys.version_info[:2])
   return hashlib.sha256(pickle.dumps(key, protocol=pickle.HIGHEST_PROTOCOL)).hexdigest()
 
+def to_program_mem_key(ast:UOp, renderer:Renderer) -> tuple:
+  # In-memory key must include getenv-driven compiler env (same idea as disk cache).
+  # Without this, toggling AMD_REG_PROMOTE_SKIP_SLOTS (etc.) silently returns a stale program.
+  env = tuple((name, os.environ[name]) for name in _program_cache_env_names() if name in os.environ)
+  return (to_program_key(ast, renderer), env)
+
 to_program_cache: dict[tuple, UOp] = {}
 def to_program(ast:UOp, renderer:Renderer) -> UOp:
-  if (prg:=to_program_cache.get(key:=to_program_key(ast, renderer))) is None: to_program_cache[key] = prg = do_to_program(ast, renderer)
+  if (prg:=to_program_cache.get(key:=to_program_mem_key(ast, renderer))) is None:
+    to_program_cache[key] = prg = do_to_program(ast, renderer)
   return prg

@@ -1805,9 +1805,11 @@ def _lower_reg_store(x:UOp) -> tuple[UOp, list[UOp]]:
     # spilled acc: write update back to scratch slot
     sp = UOp(Ops.INS, src=(acc.src[0], val), arg=(AMDOps.SPILL, dtypes.void))
     return sp, [sp]
-  if not isinstance(greg(acc), Register) or greg(acc).index < 256:
-    raise CompileError(f"bad reg store acc {acc}")
-  st = UOp(Ops.INS, src=(val,), arg=(AMDOps.MOV, val.dtype), tag=(greg(acc),))
+  # Prefer the (post-regalloc) dest tag when present; src[0] may be a bind/fill alias.
+  dest = x.tag[0] if isinstance(x.tag, tuple) and x.tag else greg(acc)
+  if not isinstance(dest, Register) or dest.index < 256:
+    raise CompileError(f"bad reg store dest {dest} acc {acc}")
+  st = UOp(Ops.INS, src=(val,), arg=(AMDOps.MOV, val.dtype), tag=(dest,))
   return st, [st]
 
 post_regalloc_matcher = PatternMatcher([
@@ -1894,7 +1896,9 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
       if (got:=_wmma_acc_lane(ctx, buf, idx)) is None: return None
       init, lane = got
       ext = _wmma_acc_extract(ctx, init, lane)
-      st = UOp(Ops.INS, src=(ext, x.src[2]), arg=(AMDOps.REG_STORE, dtypes.void))
+      # Tag REG_STORE as a redef of the ACC lane so spills write the new value (KGEN-style
+      # loop-carried promote). Untagged REG_STORE was only a use → stale spill restores.
+      st = UOp(Ops.INS, src=(ext, x.src[2]), arg=(AMDOps.REG_STORE, dtypes.void), tag=(greg(ext),))
       return ext, [ext, st]
     if (slot:=_reg_promote_slot(ctx, x.src[0], x.src[1], _lds_byte_off(x), x.src[2].dtype.itemsize)) is None: return None
     val = x.src[2]
@@ -1903,7 +1907,9 @@ def _promote_reg_access(ctx:PreRegAllocContext, x:UOp) -> tuple[UOp, list[UOp]]|
       reg_values[slot] = acc = _new_promoted_reg(ctx, val)
       return acc, [acc]
     acc = reg_values[slot]
-    st = UOp(Ops.INS, src=(acc, val), arg=(AMDOps.REG_STORE, dtypes.void))
+    # Same vreg as the first promote MOV; tag makes this a defining redef for linear-scan
+    # live ranges and spill-after-write (REDUCE-carried flash acc / m_i / soft).
+    st = UOp(Ops.INS, src=(acc, val), arg=(AMDOps.REG_STORE, dtypes.void), tag=(greg(acc),))
     return acc, [st]
   if _iop(x) is AMDOps.SLOAD:
     if (buf:=_reg_buffer_base(x.src[0])) is not None and buf in _wmma_acc_buffers(ctx):
@@ -4672,9 +4678,14 @@ class AMDRenderer(ISARenderer):
 
   def is_two_address(self, x:UOp) -> bool:
     if x.op is not Ops.INS: return False
-    if _iop(x) in (AMDOps.WMMA, AMDOps.FMAC, AMDOps.FMA_MIX_F32): return True
+    # REG_STORE redefines the promoted REG vreg in place (loop-carried / RMW).
+    if _iop(x) in (AMDOps.WMMA, AMDOps.FMAC, AMDOps.FMA_MIX_F32, AMDOps.REG_STORE): return True
     # PACK_F16(half×16 LOAD) — coalesce onto the load (hand FA/FB).
     return _iop(x) is AMDOps.PACK_F16 and _pack_f16_is_vec_load(x) and len(x.src) == 1
+  def spill(self, disp:UOp, x:UOp) -> UOp:
+    # REG_STORE is void; spill the written value, not the void node.
+    if x.op is Ops.INS and _iop(x) is AMDOps.REG_STORE: x = x.src[1]
+    return UOp(Ops.INS, src=(disp, x), arg=(AMDOps.SPILL, dtypes.void))
   def loop_end(self, x:UOp) -> UOp|None:
     if x.op is Ops.INS and _iop(x) is AMDOps.LOOP_CMP: return x.src[2] if len(x.src) == 3 else x.src[3]
     return super().loop_end(x)
@@ -4792,8 +4803,6 @@ class AMDRenderer(ISARenderer):
     # Scalar scratch transport uses B32 even for bool/int8/int16 SGPR values.
     return max(4, x.dtype.itemsize) if all(c.index < 256 for c in vreg.cons) else super().spill_size(x, vreg)
   def copy(self, x:UOp, reg): return UOp(Ops.INS, src=(x,), arg=(AMDOps.MOV, x.dtype), tag=(reg,))
-  def spill(self, disp:UOp, x:UOp) -> UOp:
-    return UOp(Ops.INS, src=(disp, x), arg=(AMDOps.SPILL, dtypes.void))
   def fill(self, disp:UOp, x:UOp, reg) -> UOp:
     return UOp(Ops.INS, src=(disp, _tconst(_reg_slots(x), dtypes.int32).rtag()), arg=(AMDOps.FILL, x.dtype), tag=(reg,))
 

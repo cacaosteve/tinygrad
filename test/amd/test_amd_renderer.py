@@ -2475,6 +2475,19 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertIs(out.src[1], val)
     self.assertEqual(lst, [out])
 
+  def test_reg_store_redef_is_two_address(self):
+    # Loop-carried promote: REG_STORE must redefine the same vreg (spill-after-write).
+    acc = _uop(Ops.INS, dtypes.float32, (UOp.const(0.0, dtypes.float32).rtag(),), AMDOps.MOV,
+              (Register("reg0", 0, _cons=amd_lib.VGPR),))
+    val = _uop(Ops.INS, dtypes.float32, (), AMDOps.MOV, (Register("val", 1, _cons=amd_lib.VGPR),))
+    st = _uop(Ops.INS, dtypes.void, (acc, val), AMDOps.REG_STORE, (greg(acc),))
+    self.assertTrue(_REN.is_two_address(st))
+    self.assertIs(greg(st), greg(acc))
+    # spill() must write the new value, not the void REG_STORE node
+    sp = _REN.spill(UOp.const(0, dtypes.int32), st)
+    self.assertIs(_iop(sp), AMDOps.SPILL)
+    self.assertIs(sp.src[1], val)
+
   def test_regalloc_rewrites_surviving_shrink(self):
     renderer = _REN
     src = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32).rtag(),), AMDOps.MOV,

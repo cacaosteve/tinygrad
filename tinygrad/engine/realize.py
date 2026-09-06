@@ -8,7 +8,7 @@ from tinygrad.helpers import BEAM, size_to_str, time_to_str, VALIDATE_WITH_CPU, 
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, AxisType, sym_infer, graph_rewrite, ProgramInfo
 from tinygrad.device import Device, Buffer, MultiBuffer, ProfileGraphEntry
 from tinygrad.renderer import Estimates, Renderer
-from tinygrad.codegen import to_program, to_program_cache, to_program_key, to_program_disk_key, to_program_context
+from tinygrad.codegen import to_program, to_program_cache, to_program_mem_key, to_program_disk_key, to_program_context
 from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
 
 # **************** Helpers ****************
@@ -243,7 +243,7 @@ def lower_and_compile(linear:UOp) -> UOp:
   if not len(ar:={c: a for c in linear.toposort() if c.op is Ops.CALL and (a:=_get_call_to_compile(c)) is not None}): return linear
 
   # lower and compile what's not cached, in parallel if there's a worker pool
-  keys = {c: to_program_key(*a) for c, a in ar.items()}
+  keys = {c: to_program_mem_key(*a) for c, a in ar.items()}
   uncached = {keys[c]: a for c, a in ar.items() if keys[c] not in to_program_cache}
   disk_keys: dict[tuple, str] = {}
   todo = []
