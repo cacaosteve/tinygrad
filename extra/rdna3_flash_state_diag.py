@@ -963,6 +963,8 @@ def main() -> None:
                  help="comma: recreate,fixed,scratch (ignored with --phase-only)")
   p.add_argument("--S", type=int, default=128)
   p.add_argument("--T", type=int, default=128)
+  p.add_argument("--shapes", default=None,
+                 help="comma S:T pairs (e.g. 128:128,256:64,512:32,2048:32); overrides --S/--T")
   p.add_argument("--replays", type=int, default=100)
   p.add_argument("--skip", default="2")
   p.add_argument("--work", type=int, default=1)
@@ -978,18 +980,19 @@ def main() -> None:
   p.add_argument("--focus-bm", type=int, default=None)
   p.add_argument("--artifacts", default="extra/rdna3_state_diag")
   args = p.parse_args()
-  T = min(args.T, args.S)
+  if args.shapes:
+    shapes: list[tuple[int, int]] = []
+    for part in args.shapes.split(","):
+      s_str, t_str = part.strip().split(":")
+      S_i, T_i = int(s_str), int(t_str)
+      shapes.append((S_i, min(T_i, S_i)))
+  else:
+    shapes = [(args.S, min(args.T, args.S))]
   modes = [m.strip() for m in args.modes.split(",") if m.strip()]
   phases = tuple(x.strip() for x in args.phases.split(",") if x.strip())
   art = Path(args.artifacts)
   if art.exists(): shutil.rmtree(art)
   art.mkdir(parents=True)
-
-  acc_work = use_acc_work(args.skip, args.work)
-  q_np = patterned((32, T, 128), np.float16)
-  kv_np = patterned((2, 1, 8, args.S, 128), np.float16)
-  np.save(art / "q.npy", q_np)
-  np.save(art / "cache.npy", kv_np)
 
   # Self-check: matching -inf must not look divergent
   _a = np.array([1.0, float("-inf")], np.float32)
@@ -997,59 +1000,72 @@ def main() -> None:
   assert arrays_close(_a, _a.copy())
 
   summary: list = []
-  if not args.phase_only:
-    print("======== HIP reference ========")
-    set_dev("AMD:HIP")
-    apply_env(skip=args.skip, work=args.work, direct=False)
-    set_dev("AMD:HIP")
-    hip_prg, _ = compile_program(args.S, T, acc_work, phases=())
-    assert Device["AMD"].renderer.__class__.__name__ == "HIPRenderer"
-    hip_outs = []
-    hip_state = make_fixed_state(hip_prg, q_np, kv_np, T)
-    for i in range(args.replays):
-      hip_outs.append(launch_fixed(hip_state))
-    hip_row = summarize_outs(hip_outs, None, args.ref_tol)
-    hip_art = art / "hip_fixed"
-    hip_art.mkdir(parents=True)
-    save_fail_pair(hip_art, hip_outs, None)
-    (hip_art / "summary.json").write_text(json.dumps(hip_row, indent=2, default=str))
-    ref = hip_outs[0]
-    print(f"  HIP verdict={hip_row['verdict']} exact={hip_row['exact']}")
-    summary.append({"config": "hip_fixed", **hip_row})
+  for S, T in shapes:
+    shape_tag = f"S{S}_T{T}"
+    shape_art = art / shape_tag if len(shapes) > 1 else art
+    shape_art.mkdir(parents=True, exist_ok=True)
+    print(f"\n######## shape {shape_tag} ########")
+    acc_work = use_acc_work(args.skip, args.work)
+    q_np = patterned((32, T, 128), np.float16)
+    kv_np = patterned((2, 1, 8, S, 128), np.float16)
+    np.save(shape_art / "q.npy", q_np)
+    np.save(shape_art / "cache.npy", kv_np)
 
-    set_dev("AMD:AMD")
-    apply_env(skip=args.skip, work=args.work, direct=True)
-    set_dev("AMD:AMD")
-    prg, _ = compile_program(args.S, T, acc_work, phases=())
-    assert Device["AMD"].renderer.__class__.__name__ == "AMDRenderer"
-    elf = program_elf(prg)
-    if elf:
-      (art / "direct.elf").write_bytes(elf)
-      print(f"DIRECT elf={sha256(elf)[:16]}…")
+    if not args.phase_only:
+      print("======== HIP reference ========")
+      set_dev("AMD:HIP")
+      apply_env(skip=args.skip, work=args.work, direct=False)
+      set_dev("AMD:HIP")
+      hip_prg, _ = compile_program(S, T, acc_work, phases=())
+      assert Device["AMD"].renderer.__class__.__name__ == "HIPRenderer"
+      hip_outs = []
+      hip_state = make_fixed_state(hip_prg, q_np, kv_np, T)
+      for i in range(args.replays):
+        hip_outs.append(launch_fixed(hip_state))
+      hip_row = summarize_outs(hip_outs, None, args.ref_tol)
+      hip_art = shape_art / "hip_fixed"
+      hip_art.mkdir(parents=True)
+      save_fail_pair(hip_art, hip_outs, None)
+      (hip_art / "summary.json").write_text(json.dumps(hip_row, indent=2, default=str))
+      ref = hip_outs[0]
+      print(f"  HIP verdict={hip_row['verdict']} exact={hip_row['exact']}")
+      summary.append({"config": "hip_fixed", "shape": shape_tag, **hip_row})
 
-    for mode in modes:
-      if mode == "scratch":
-        for sm in ("untouched", "zero", "nonzero"):
+      set_dev("AMD:AMD")
+      apply_env(skip=args.skip, work=args.work, direct=True)
+      set_dev("AMD:AMD")
+      prg, _ = compile_program(S, T, acc_work, phases=())
+      assert Device["AMD"].renderer.__class__.__name__ == "AMDRenderer"
+      elf = program_elf(prg)
+      if elf:
+        (shape_art / "direct.elf").write_bytes(elf)
+        print(f"DIRECT elf={sha256(elf)[:16]}…")
+
+      for mode in modes:
+        if mode == "scratch":
+          for sm in ("untouched", "zero", "nonzero"):
+            set_dev("AMD:AMD")
+            apply_env(skip=args.skip, work=args.work, direct=True)
+            set_dev("AMD:AMD")
+            row = run_mode("fixed", prg, q_np, kv_np, T, args.replays, shape_art, ref, args.ref_tol, scratch_mode=sm)
+            summary.append({"shape": shape_tag, **row})
+        else:
           set_dev("AMD:AMD")
           apply_env(skip=args.skip, work=args.work, direct=True)
           set_dev("AMD:AMD")
-          summary.append(run_mode("fixed", prg, q_np, kv_np, T, args.replays, art, ref, args.ref_tol, scratch_mode=sm))
-      else:
-        set_dev("AMD:AMD")
-        apply_env(skip=args.skip, work=args.work, direct=True)
-        set_dev("AMD:AMD")
-        summary.append(run_mode(mode, prg, q_np, kv_np, T, args.replays, art, ref, args.ref_tol))
+          row = run_mode(mode, prg, q_np, kv_np, T, args.replays, shape_art, ref, args.ref_tol)
+          summary.append({"shape": shape_tag, **row})
 
-  if args.phase or args.phase_only:
-    try:
-      phase_row = run_phase_fail_capture(
-        args.S, T, acc_work, art, q_np, kv_np, phases=phases, replays=args.replays,
-        focus_head=args.focus_head, focus_bm=args.focus_bm)
-      summary.append({"config": "phase", **phase_row})
-    except Exception as e:
-      import traceback
-      traceback.print_exc()
-      summary.append({"config": "phase", "ok": False, "error": str(e)})
+    if args.phase or args.phase_only:
+      try:
+        phase_row = run_phase_fail_capture(
+          S, T, acc_work, shape_art, q_np, kv_np, phases=phases, replays=args.replays,
+          focus_head=args.focus_head, focus_bm=args.focus_bm)
+        summary.append({"config": "phase", "shape": shape_tag, **phase_row})
+      except Exception as e:
+        import traceback
+        traceback.print_exc()
+        summary.append({"config": "phase", "shape": shape_tag, "ok": False, "error": str(e)})
 
   print("\n======== SUMMARY ========")
   print(json.dumps(summary, indent=2, default=str))
@@ -1061,9 +1077,9 @@ def main() -> None:
     for r in summary)
   other_fail = any(not r.get("ok", False) for r in summary if r.get("config") not in ("phase",))
   if args.phase_only:
-    if phase_ok:
-      v = next(r.get("verdict") for r in summary if r.get("config") == "phase")
-      print(f"OK phase diag ({v}) under {art}")
+    if phase_ok and not any(r.get("config") == "phase" and not r.get("ok", False) for r in summary):
+      vs = sorted({r.get("verdict") for r in summary if r.get("config") == "phase"})
+      print(f"OK phase diag ({','.join(vs)}) under {art}")
       raise SystemExit(0)
     print(f"FAIL phase diag under {art}")
     raise SystemExit(1)
