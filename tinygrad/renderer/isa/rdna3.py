@@ -2428,7 +2428,10 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
         if (scratch_load:=_scratch_load(u.dtype)) is None: raise CompileError(f"no scratch load {u.dtype}")
         return pre + [scratch_load(addr=addr, vdst=dst, offset=byte_off, sve=1)]
       if store_addr_cache is not None and not masked:
-        pre, addr, byte_off = store_addr_cache.addr(u.src[1], itemsize, byte_off, base_key=id(u.src[0]))
+        # Key by this SLOAD identity — const-index soft-copy phases reuse (base, idx=0)
+        # after intervening TMP_VADDR clobbers; value-only CSE then loads the wrong slot.
+        pre, addr, byte_off = store_addr_cache.addr(u.src[1], itemsize, byte_off,
+                                                    base_key=(id(u.src[0]), id(u)))
         if pre and soff: pre = pre + [r3.v_add_nc_u32_e64(addr, soff, addr)]
       else:
         pre, addr = _scratch_addr(u.src[0], u.src[1], itemsize)
@@ -3791,7 +3794,7 @@ def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAdd
     return None
   soff = _scratch_base_offset(base)
   if store_addr_cache is not None:
-    pre, addr, byte_off = store_addr_cache.addr(idx, dt.itemsize, byte_off, base_key=id(base))
+    pre, addr, byte_off = store_addr_cache.addr(idx, dt.itemsize, byte_off, base_key=(id(base), id(loads[0])))
     if pre and soff: pre = pre + [r3.v_add_nc_u32_e64(addr, soff, addr)]
   else:
     pre, addr = _scaled_addr(TMP_VADDR, idx, dt.itemsize)
