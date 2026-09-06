@@ -4847,10 +4847,21 @@ class AMDRenderer(ISARenderer):
     return _schedule_loop_cmps(lst)
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True
+    # SPECIAL(uint)→MOV→CAST(int)→SHL/ADD. Without CAST, AMD_REMAT_ADDR never sees pure addr.
+    # Deep remat of nested ADD trees still MMUs on flash (gfx1100); leaf-only via AMD_REMAT_ADDR
+    # (default off outside TC_LDS). AMD_REMAT_ADDR_DEEP=1 is unsafe until remat src binding is fixed.
+    if x.op is Ops.CAST and x.dtype in dtypes.ints and x.src:
+      return self._pure_addr(x.src[0])
     if x.op is not Ops.INS or x.dtype not in (dtypes.int32, dtypes.uint32): return False
     if _iop(x) is AMDOps.MOV and x.src: return self._pure_addr(x.src[0])
     if _iop(x) in (AMDOps.ADD, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR):
       return all(self._pure_addr(s) for s in x.src)
+    return False
+  def _addr_leaf(self, x:UOp) -> bool:
+    if x.op in (Ops.CONST, Ops.SPECIAL): return True
+    if x.op is Ops.CAST and x.dtype in dtypes.ints and x.src: return self._addr_leaf(x.src[0])
+    if x.op is Ops.INS and x.dtype in (dtypes.int32, dtypes.uint32) and _iop(x) is AMDOps.MOV and x.src:
+      return self._addr_leaf(x.src[0])
     return False
   def rematerialize(self, x:UOp) -> bool:
     if x.op is not Ops.INS: return False
@@ -4865,7 +4876,10 @@ class AMDRenderer(ISARenderer):
         return True
     if not getenv("AMD_REMAT_ADDR", 1 if getenv("TC_LDS_AB", 0) else 0): return False
     if x.dtype not in (dtypes.int32, dtypes.uint32): return False
-    return _iop(x) is not AMDOps.MOV and self._pure_addr(x)
+    if _iop(x) is AMDOps.MOV or not self._pure_addr(x): return False
+    # Leaf-only by default: SHL(lidx,C)/AND/ADD(lidx,C). Nested ADD remat → MMU on flash.
+    if getenv("AMD_REMAT_ADDR_DEEP", 0): return True
+    return all(self._addr_leaf(s) for s in x.src)
   def keep_remat(self, x:UOp) -> bool:
     # Pure-addr remats under TC_LDS: without sticky, SHR/AND remat ~60× and SHL/ADD flood the loop.
     return x.op is Ops.INS and _iop(x) in (AMDOps.SHR, AMDOps.AND, AMDOps.SHL, AMDOps.ADD)
