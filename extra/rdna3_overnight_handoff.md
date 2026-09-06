@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`398a0af32`**.
+Tip: **`f78d19ed3`**.
 
 ## Headline
 
