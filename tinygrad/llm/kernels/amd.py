@@ -756,11 +756,10 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   wave_m, wave_n, lane = UOp.range(WAVES_M, 2, AxisType.LOCAL), UOp.range(WAVES_N, 3, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
   tid, lane_m, lane_n = (wave_m * WAVES_N + wave_n) * WARP_SIZE + lane, lane // LANES_PER_WAVE_N, lane % LANES_PER_WAVE_N
   Q_ELEMS_PER_THREAD, KV_ELEMS_PER_THREAD = BLOCK_M * D // THREADS_PER_BLOCK, BLOCK_N * D // THREADS_PER_BLOCK
-  QP_lds = UOp.placeholder((BLOCK_M, D + LDS_PAD), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)
+  Q_lds = UOp.placeholder((BLOCK_M, D + LDS_PAD), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)[:, :D]
   KV_lds = UOp.placeholder((BLOCK_N, D + LDS_PAD), dtypes.half, slot=1, addrspace=AddrSpace.LOCAL)[:, :D]
   acc, m_i, l_i = _reg((TM, TD), 2, 0), _reg((TM,), 3, -math.inf), _reg((TM,), 4, 0)
   n_tile = UOp.range((q_base + (block_m + 1) * BLOCK_M + BLOCK_N - 1) // BLOCK_N, 100, AxisType.REDUCE)
-  Q_lds = QP_lds[:, :D]
   Q_store = Q_lds.after(n_tile).reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid].store(q.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid])
   load_k = UOp.range(KV_ELEMS_PER_THREAD, 90)
   kval = k.reshape(physical_n*D)[n_tile*BLOCK_N*D + tid*KV_ELEMS_PER_THREAD + load_k].float()
@@ -980,10 +979,10 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         kcol = rj * LANES_PER_WAVE_N + lane_n
         p_reg_stores.append(dp[block_bh, block_m, n_tile, wave_n, qrow, kcol].store(S_reg[ri, rj]))
     S_reg = S_reg.after(UOp.group(*p_reg_stores))
-  # QK reads Q from QP_lds and K from KV_lds. P used to reuse QP_lds and V reuses KV_lds
-  # (slot 1). after(qk_done) on V was per-wave only — early waves could V-store over K while
-  # peers were still in the K-loop. Dedicated P removes Q/P aliasing; workgroup barrier on
-  # qk_done gates V until every wave finishes QK.
+  # QK reads Q from Q_lds and K from KV_lds. P used to reuse Q's LDS buffer and V reuses
+  # KV_lds (slot 1). after(qk_done) on V was per-wave only — early waves could V-store over K
+  # while peers were still in the K-loop. Dedicated P removes Q/P aliasing; workgroup
+  # barrier on qk_done gates V until every wave finishes QK.
   lds_reuse_barrier = UOp.barrier(qk_done)
   P_lds = UOp.placeholder((WAVES_N, BLOCK_M, BLOCK_N), dtypes.half, slot=5, addrspace=AddrSpace.LOCAL)
   P_write = P_lds.reshape(WAVES_N, WAVES_M, TM, LANES_PER_WAVE_M, 1, TN, LANES_PER_WAVE_N, 1).permute((1, 0, 3, 6, 2, 4, 5, 7)) \

@@ -775,17 +775,20 @@ def run_phase_fail_capture(S: int, T: int, acc_work: bool, art: Path, q_np, kv_n
     # Post-fix: no divergence is a stability pass (pre-fix always failed early).
     print(f"  STABLE: no out divergence across {replays} instrumented replays")
     hip_match = arrays_close(outs[0], hip_out)
+    hip_max = float(np.max(np.abs(outs[0].astype(np.float64) - hip_out.astype(np.float64))))
+    hip_near = bool(hip_max <= 1e-5)
     row = {
       "ok": True, "verdict": "instrumented_stable",
       "replays": replays, "phases": list(phases),
       "out_exact": True, "hip_out_exact": hip_match,
+      "hip_out_near": hip_near, "hip_maxdiff": hip_max,
       "note": "no out divergence on instrumented ELF (stability pass)",
     }
     if outs:
       row["out_mean"] = float(outs[0].mean())
       row["hip_out_mean"] = float(hip_out.mean())
     (phase_art / "summary.json").write_text(json.dumps(row, indent=2, default=str))
-    print(f"  hip_out_exact={hip_match}")
+    print(f"  hip_out_exact={hip_match} hip_out_near={hip_near} hip_maxdiff={hip_max:.6g}")
     return row
 
   pred_i = fail_i - 1

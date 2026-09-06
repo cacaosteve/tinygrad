@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`677550428`**.
+Tip: **pending push** (rename Q_lds + hip_near).
 
 ## Headline
 
@@ -11,28 +11,32 @@ FMA_MIX / K-unroll / perf stay off.
 
 ## Fix (`478c23b49`)
 
-1. **Dedicated P LDS** (`slot=5`) — P no longer aliases `QP_lds` / Q.
+1. **Dedicated P LDS** (`slot=5`) — P no longer aliases Q's LDS.
 2. **`UOp.barrier(qk_done)` before V_store** — prior `V_lds.after(qk_done)` was
    per-wave only; early waves could overwrite K (KV slot 1) during peer QK.
 
-## Validation (gaming PC)
+## Validation (gaming PC, tip `cbd9f1da2`)
 
 | Test | Result |
 |------|--------|
-| Uninstrumented fixed ×1000 | **exact=True maxdiff=0 ref_ok** |
-| Uninstrumented recreate ×500 | **exact=True maxdiff=0 ref_ok** |
-| Instrumented `qk_wmma` ×300 | **instrumented_stable**; vs HIP ~1e-7 |
-| Instrumented `pv_wmma` / `pv` ×100 | no out divergence |
+| Uninstrumented fixed ×2000 | **exact=True maxdiff=0 ref_ok** |
+| Instrumented `qk_wmma` ×200 | **instrumented_stable**; means match HIP |
+| Instrumented `p_lds,pv_wmma,pv,acc` ×100 | **instrumented_stable** |
 
 Pre-fix: fail by replay ~1–10; wave_n=1 QK wrong; fail wn0≠wn1; shared Q/K LDS exact.
 
+## Cleanup
+
+- Renamed `QP_lds` → `Q_lds` (P has its own slot).
+- Phase stability reports `hip_out_near` / `hip_maxdiff` (atol 1e-5) alongside bit-exact.
+
 ## Next
 
-1. Keep DIRECT opt-in; real prefill soak before flipping defaults.
-2. Perf leftovers only after more confidence.
-3. Optional: rename QP_lds → Q_lds now that P has its own slot.
+1. Serial prefill correctness soak (`extra/rdna3_serial_correctness.py`).
+2. Keep DIRECT opt-in; more soak before flipping defaults.
+3. Perf leftovers only after more confidence.
 
 ```
 PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py --modes fixed --replays 1000
-PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py --phase-only --phases qk_wmma --replays 100
+AMD_FLASH_DIRECT=1 PYTHONPATH=.:extra python extra/rdna3_serial_correctness.py
 ```
