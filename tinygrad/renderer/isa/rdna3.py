@@ -2480,7 +2480,8 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
                          r3.v_readfirstlane_b32_e32(_reg_lane(greg(u), i), TMP_VDATA)]
         return sgpr_loads
       if slots > 1:
-        # raw VGPR lanes (f32 packs or half2 LDS loads)
+        # raw VGPR lanes (f32 packs or half2 LDS loads). Page in TMP_VDATA so TMP_VADDR
+        # store-addr CSE survives spill-on-evict between global/LDS ops.
         loads: list[Inst] = []
         fill_page: int|None = None
         for i in range(slots):
@@ -2488,12 +2489,12 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
           # SCRATCH's 13-bit immediate is signed, so page before its sign bit (0x1000).
           if (new_page:=scratch_addr & ~0xfff) != fill_page:
             fill_page = new_page
-            loads.append(r3.v_mov_b32_e32(TMP_VADDR, new_page))
-          loads.append(r3.scratch_load_b32(addr=TMP_VADDR, vdst=_reg_lane(greg(u), i), offset=scratch_addr & 0xfff, sve=1))
+            loads.append(r3.v_mov_b32_e32(TMP_VDATA, new_page))
+          loads.append(r3.scratch_load_b32(addr=TMP_VDATA, vdst=_reg_lane(greg(u), i), offset=scratch_addr & 0xfff, sve=1))
         return loads
       if (scratch_load:=_scratch_load(u.dtype)) is None: raise CompileError(f"no scratch fill {u.dtype}")
-      return [r3.v_mov_b32_e32(TMP_VADDR, disp & ~0xfff),
-              scratch_load(addr=TMP_VADDR, vdst=_dst(u), offset=disp & 0xfff, sve=1)]
+      return [r3.v_mov_b32_e32(TMP_VDATA, disp & ~0xfff),
+              scratch_load(addr=TMP_VDATA, vdst=_dst(u), offset=disp & 0xfff, sve=1)]
     case AMDOps.SPILL:
       # Prefer explicit slot count (spill-on-evict) over _reg_slots(bind) which is often 1.
       if len(u.src) > 2 and (n:=_unwrap_const(u.src[2])) is not None: slots = int(n)
@@ -2513,7 +2514,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
                           r3.scratch_store_b32(addr=TMP_VADDR, data=TMP_VDATA, offset=scratch_addr & 0xfff, sve=1)]
         return sgpr_stores + [r3.s_waitcnt_vscnt(sdst=NULL, simm16=0)]
       if slots > 1:
-        # raw VGPR lanes (f32 packs or half2 LDS loads)
+        # raw VGPR lanes — page in TMP_VDATA to preserve TMP_VADDR for mem CSE.
         stores: list[Inst] = []
         spill_page: int|None = None
         for i in range(slots):
@@ -2521,13 +2522,15 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
           # SCRATCH's 13-bit immediate is signed, so page before its sign bit (0x1000).
           if (new_page:=scratch_addr & ~0xfff) != spill_page:
             spill_page = new_page
-            stores.append(r3.v_mov_b32_e32(TMP_VADDR, new_page))
-          stores.append(r3.scratch_store_b32(addr=TMP_VADDR, data=_reg_lane(greg(u.src[1]), i), offset=scratch_addr & 0xfff, sve=1))
+            stores.append(r3.v_mov_b32_e32(TMP_VDATA, new_page))
+          stores.append(r3.scratch_store_b32(addr=TMP_VDATA, data=_reg_lane(greg(u.src[1]), i), offset=scratch_addr & 0xfff, sve=1))
         return stores + [r3.s_waitcnt_vscnt(sdst=NULL, simm16=0)]
       if (scratch_store:=_scratch_store(u.src[1].dtype)) is None:
         raise CompileError(f"no scratch spill {u.src[1].dtype}")
-      return [r3.v_mov_b32_e32(TMP_VADDR, disp & ~0xfff),
-              scratch_store(addr=TMP_VADDR, data=_src(u.src[1]), offset=disp & 0xfff, sve=1),
+      # VGPR spill: scratch page in TMP_VDATA (not TMP_VADDR) so spill-on-evict before
+      # LLOAD/STORE does not invalidate a live store-addr CSE in TMP_VADDR.
+      return [r3.v_mov_b32_e32(TMP_VDATA, disp & ~0xfff),
+              scratch_store(addr=TMP_VDATA, data=_src(u.src[1]), offset=disp & 0xfff, sve=1),
               r3.s_waitcnt_vscnt(sdst=NULL, simm16=0)]
     case AMDOps.CMP_GE:
       pre0, a = _sgpr_data(TMP_SDATA0, u.src[0])
