@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`ec88ab5b0`**.
+Tip: **pending**.
 
 ## Headline
 
@@ -15,24 +15,23 @@ FMA_MIX / K-unroll / perf stay off.
 2. **`UOp.barrier(qk_done)` before V_store** — prior `V_lds.after(qk_done)` was
    per-wave only; early waves could overwrite K (KV slot 1) during peer QK.
 
-## Validation (gaming PC, tip `cbd9f1da2`)
+## Validation (gaming PC)
 
-| Test | Result |
-|------|--------|
-| Uninstrumented fixed ×2000 | **exact=True maxdiff=0 ref_ok** |
-| Instrumented `qk_wmma` ×200 | **instrumented_stable**; means match HIP |
-| Instrumented `p_lds,pv_wmma,pv,acc` ×100 | **instrumented_stable** |
-
-Pre-fix: fail by replay ~1–10; wave_n=1 QK wrong; fail wn0≠wn1; shared Q/K LDS exact.
+| Test | Tip | Result |
+|------|-----|--------|
+| fixed ×3000 | `d16a29e77` | **exact=True maxdiff=0 ref_ok** |
+| recreate ×1000 | `d16a29e77` | **exact=True maxdiff=0 ref_ok** |
+| `qk_wmma` ×100 | `d16a29e77` | **instrumented_stable**; hip_near=True maxdiff≈1.8e-7 |
 
 ## Cleanup
 
-- Renamed `QP_lds` → `Q_lds` (P has its own slot).
-- Phase stability reports `hip_out_near` / `hip_maxdiff` (atol 1e-5) alongside bit-exact.
+- Renamed `QP_lds` → `Q_lds` (`ec88ab5b0`).
+- Phase stability reports `hip_out_near` / `hip_maxdiff` (atol 1e-5).
+- `rdna3_serial_correctness.py` selects `AMD:AMD` vs `AMD:HIP` from `AMD_FLASH_DIRECT`.
 
 ## Next
 
-1. Serial prefill correctness soak (`extra/rdna3_serial_correctness.py`).
+1. Run serial prefill/decode correctness under DIRECT + HIP.
 2. Keep DIRECT opt-in; more soak before flipping defaults.
 3. Perf leftovers only after more confidence.
 

@@ -9,7 +9,7 @@ import time
 import numpy as np
 
 from tinygrad import Device, Tensor, TinyJit, dtypes
-from tinygrad.helpers import Context, getenv
+from tinygrad.helpers import Context, DEV, getenv
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported, flash_attention
 
@@ -41,19 +41,37 @@ def status(ok: bool) -> str:
   return "OK" if ok else "FAIL"
 
 
+def set_dev(target: str) -> str:
+  """Match rdna3_flash_state_diag: switch AMD↔HIP before any Tensor work."""
+  os.environ["DEV"] = target
+  DEV.value = target
+  getenv.cache_clear()
+  return target
+
+
 def main() -> None:
-  print("renderer", Device[Device.DEFAULT].renderer.__class__.__name__,
-        "arch", getattr(Device[Device.DEFAULT], "arch", "?"))
+  # DIRECT needs AMDRenderer (AMD:AMD). Default DEV=AMD often resolves to HIP.
+  want_direct = bool(getenv("AMD_FLASH_DIRECT", 0))
+  target = "AMD:AMD" if want_direct else "AMD:HIP"
+  set_dev(target)
+  # Touch device after switch (same double-call pattern as state_diag).
+  _ = Device["AMD"].renderer
+  set_dev(target)
+  rname = Device["AMD"].renderer.__class__.__name__
+  print("DEV", target, "renderer", rname, "arch", getattr(Device["AMD"], "arch", "?"))
   print("FLASH_DIRECT", getenv("AMD_FLASH_DIRECT"),
         "ACC_SMALL_env", os.environ.get("AMD_FLASH_ACC_SMALL"),
-        "custom", amd_custom_kernels_supported(Device.DEFAULT))
-  assert "AMDRenderer" in Device[Device.DEFAULT].renderer.__class__.__name__
+        "custom", amd_custom_kernels_supported("AMD"))
+  if want_direct:
+    assert "AMDRenderer" in rname, f"AMD_FLASH_DIRECT=1 needs AMDRenderer, got {rname}"
+  else:
+    assert "HIPRenderer" in rname, f"HIP path needs HIPRenderer, got {rname}"
 
   results: list[tuple[str, bool, float | None]] = []
 
   # Peer GEMM must stay healthy even with AMD_FLASH_DIRECT=1 in the process env.
-  a = Tensor.randn(64, 64, dtype=dtypes.half, device=Device.DEFAULT).realize()
-  b = Tensor.randn(64, 64, dtype=dtypes.half, device=Device.DEFAULT).realize()
+  a = Tensor.randn(64, 64, dtype=dtypes.half, device="AMD").realize()
+  b = Tensor.randn(64, 64, dtype=dtypes.half, device="AMD").realize()
   c = (a @ b).realize().numpy().astype(np.float32)
   ref = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32)
   err = float(np.max(np.abs(c - ref)))
@@ -72,8 +90,8 @@ def main() -> None:
     q_np = patterned((batch, heads, tokens, dim))
     cache_np = patterned((2, batch, kv_heads, physical_n, dim), np.float16)
     ref = ref_attn(q_np, cache_np)
-    q = Tensor(q_np, device=Device.DEFAULT).realize()
-    cache = Tensor(cache_np, device=Device.DEFAULT).realize()
+    q = Tensor(q_np, device="AMD").realize()
+    cache = Tensor(cache_np, device="AMD").realize()
     out = flash_attention(q, cache, physical_n).realize().numpy().astype(np.float32)
     err = float(np.max(np.abs(out - ref)))
     nz = float(np.mean(np.abs(out) > 1e-6))
@@ -82,8 +100,8 @@ def main() -> None:
     print(f"FLASH {name}: err={err:.3e} nonzero_frac={nz:.3f} {status(ok)}")
 
   # Flash ACC_SMALL realize must not leave peer kernels broken.
-  a = Tensor.randn(64, 64, dtype=dtypes.half, device=Device.DEFAULT).realize()
-  b = Tensor.randn(64, 64, dtype=dtypes.half, device=Device.DEFAULT).realize()
+  a = Tensor.randn(64, 64, dtype=dtypes.half, device="AMD").realize()
+  b = Tensor.randn(64, 64, dtype=dtypes.half, device="AMD").realize()
   c = (a @ b).realize().numpy().astype(np.float32)
   ref = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32)
   err = float(np.max(np.abs(c - ref)))
@@ -94,9 +112,9 @@ def main() -> None:
   os.environ["TC_LDS_AB"] = "1"
   getenv.cache_clear()
   with Context(BEAM=0):
-    eye = Tensor.eye(256, dtype=dtypes.half).to(Device.DEFAULT).realize()
+    eye = Tensor.eye(256, dtype=dtypes.half).to("AMD").realize()
     b_np = patterned((256, 256), np.float16)
-    b = Tensor(b_np, device=Device.DEFAULT).realize()
+    b = Tensor(b_np, device="AMD").realize()
     c = (eye @ b).realize().numpy().astype(np.float32)
     err = float(np.max(np.abs(c - b_np.astype(np.float32))))
     ok = err < 1e-2 and bool(np.isfinite(c).all())
@@ -104,7 +122,7 @@ def main() -> None:
     print(f"EYE eye@B: err={err:.3e} {status(ok)}")
 
     a_np = patterned((256, 256), np.float16)
-    a = Tensor(a_np, device=Device.DEFAULT).realize()
+    a = Tensor(a_np, device="AMD").realize()
     c2 = (a @ eye).realize().numpy().astype(np.float32)
     err2 = float(np.max(np.abs(c2 - a_np.astype(np.float32))))
     ok2 = err2 < 1e-2 and bool(np.isfinite(c2).all())
@@ -116,7 +134,7 @@ def main() -> None:
   rng = np.random.default_rng(0)
   w = (rng.standard_normal((256, 256)) * 0.1).astype(np.float32)
   x = rng.standard_normal((256,)).astype(np.float32)
-  y = (Tensor(w, device=Device.DEFAULT).half() @ Tensor(x, device=Device.DEFAULT).half()).realize().numpy().astype(np.float32)
+  y = (Tensor(w, device="AMD").half() @ Tensor(x, device="AMD").half()).realize().numpy().astype(np.float32)
   ref = w.astype(np.float16).astype(np.float32) @ x.astype(np.float16).astype(np.float32)
   err = float(np.max(np.abs(y - ref)))
   ok = err < 2e-2 and bool(np.isfinite(y).all())
@@ -134,8 +152,8 @@ def main() -> None:
     rows, cols = 1024, 2048
     nblocks = rows * cols // 256
     qdata_np = (np.arange(nblocks * bpb, dtype=np.uint8) * 37 + 13).astype(np.uint8)
-    y_amd = (ggml_data_to_tensor(Tensor(qdata_np, device=Device.DEFAULT), rows * cols, ftype).reshape(rows, cols)
-             @ Tensor(x_np, device=Device.DEFAULT)).realize().numpy().astype(np.float32)
+    y_amd = (ggml_data_to_tensor(Tensor(qdata_np, device="AMD"), rows * cols, ftype).reshape(rows, cols)
+             @ Tensor(x_np, device="AMD")).realize().numpy().astype(np.float32)
     finite_amd = bool(np.isfinite(y_amd).all())
     print(f"QUANT {name} AMD: finite={finite_amd}")
     np.save("/tmp/rdna3_qdata.npy", qdata_np)
@@ -146,8 +164,8 @@ def main() -> None:
       from tinygrad.llm.gguf import ggml_data_to_tensor
       qdata_np = np.load("/tmp/rdna3_qdata.npy")
       x_np = np.load("/tmp/rdna3_x.npy")
-      y = (ggml_data_to_tensor(Tensor(qdata_np, device=Device.DEFAULT), {rows}*{cols}, {ftype}).reshape({rows}, {cols})
-           @ Tensor(x_np, device=Device.DEFAULT)).realize().numpy().astype(np.float32)
+      y = (ggml_data_to_tensor(Tensor(qdata_np, device="AMD"), {rows}*{cols}, {ftype}).reshape({rows}, {cols})
+           @ Tensor(x_np, device="AMD")).realize().numpy().astype(np.float32)
       np.save("/tmp/rdna3_hip_y.npy", y)
       print("finite", bool(np.isfinite(y).all()))
     """)
@@ -168,18 +186,18 @@ def main() -> None:
       print(f"QUANT {name} vs HIP: finite_match={ok} amd={finite_amd} hip={finite_hip} {status(ok)}")
 
   batch, heads, kv_heads, dim, physical_n, tokens = 1, 32, 8, 128, 2048, 32
-  q = Tensor(patterned((batch, heads, tokens, dim)), device=Device.DEFAULT).realize()
-  cache = Tensor(patterned((2, batch, kv_heads, physical_n, dim), np.float16), device=Device.DEFAULT).realize()
+  q = Tensor(patterned((batch, heads, tokens, dim)), device="AMD").realize()
+  cache = Tensor(patterned((2, batch, kv_heads, physical_n, dim), np.float16), device="AMD").realize()
   runner = TinyJit(lambda qu: flash_attention(qu, cache, physical_n).realize())
   for _ in range(3):
     runner(q)
-    Device[Device.DEFAULT].synchronize()
+    Device["AMD"].synchronize()
   samples = []
   for _ in range(5):
     t0 = time.perf_counter_ns()
     for _ in range(10):
       runner(q)
-    Device[Device.DEFAULT].synchronize()
+    Device["AMD"].synchronize()
     samples.append((time.perf_counter_ns() - t0) / 10 / 1e3)
   print(f"PERF prefill DIRECT median_us={statistics.median(samples):.1f} best={min(samples):.1f}")
 
