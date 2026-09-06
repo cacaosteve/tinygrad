@@ -721,16 +721,18 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   """Hand flash-attn. Optional phase_dumps=(("qk", buf), ...) for diagnostics.
 
   Dump buffers use *logical* tile coords so each slot has one writer:
-    qk:      (BH, M//BLOCK_M, Ntiles, BLOCK_M, BLOCK_N) — scaled+masked S; writer wave_n==0
+    qk_wmma:(BH, M//BLOCK_M, Ntiles, WAVES_N, BLOCK_M, BLOCK_N) — raw QK after qk_done (slot 6 / per wave)
+    s_soft:  (BH, M//BLOCK_M, Ntiles, WAVES_N, BLOCK_M, BLOCK_N) — after ACC→S_soft (+scale/mask); before exp
+    qk:      (BH, M//BLOCK_M, Ntiles, BLOCK_M, BLOCK_N) — scaled+masked S; writer wave_n==0 (legacy)
     soft_m:  (BH, M//BLOCK_M, Ntiles, BLOCK_M) — softmax max; writer wave_n==0 & lane_n==0
     soft_l:  (BH, M//BLOCK_M, Ntiles, BLOCK_M) — softmax sum; writer wave_n==0 & lane_n==0
-    p_reg:   (BH, M//BLOCK_M, Ntiles, WAVES_N, BLOCK_M, BLOCK_N) — softmax P in REG before LDS (per wave)
+    p_reg:   (BH, M//BLOCK_M, Ntiles, WAVES_N, BLOCK_M, BLOCK_N) — after softmax exp (per wave)
     p_lds:   (BH, M//BLOCK_M, Ntiles, WAVES_N, BLOCK_M, BLOCK_N) — P after pv_barrier (per wave_n slice)
     v_lds:   (BH, M//BLOCK_M, Ntiles, D, BLOCK_N) — V after pv_barrier; unique (d,n) writers
     pv_wmma: (BH, M//BLOCK_M, Ntiles, BLOCK_M, D) — PV *before* ACC→pv_soft copy (slot 10)
     pv:      (BH, M//BLOCK_M, Ntiles, BLOCK_M, D) — PV *after* copy (slot 17 / current reader)
     acc:     (BH, M//BLOCK_M, BLOCK_M, D) — pre-norm acc; all threads unique (qrow,dcol)
-  Ntiles = ceil(S/BLOCK_N) when S is int. Start with one phase (qk) when debugging.
+  Ntiles = ceil(S/BLOCK_N) when S is int. Probe wave_n=1 with qk_wmma → s_soft → p_reg.
   """
   dumps = dict(phase_dumps)
   valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start) if q_start is not None else None
@@ -845,6 +847,16 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
       S_masked = S_reg.after(S_reg[rm, rn].store((k_idx <= q_idx).where(S_reg[rm, rn], S_reg[rm, rn].const_like(-math.inf))).end(rm, rn))
   else:
     S_masked = S_reg.after(qk_done)
+  # Diagnostic: raw QK WMMA C (slot 6) per wave_n, immediately after qk_done (before ACC→soft).
+  if dumps and "qk_wmma" in dumps:
+    dq = dumps["qk_wmma"]  # (BH, Nm, Ntiles, WAVES_N, BLOCK_M, BLOCK_N)
+    qk_wmma_stores = []
+    for ri in range(TM):
+      for rj in range(TN):
+        qrow = wave_m * WMMA_M + ri * LANES_PER_WAVE_M + lane_m
+        kcol = rj * LANES_PER_WAVE_N + lane_n
+        qk_wmma_stores.append(dq[block_bh, block_m, n_tile, wave_n, qrow, kcol].store(S_masked[ri, rj]))
+    S_masked = S_masked.after(UOp.group(*qk_wmma_stores))
   if _acc_sep:
     # Copy into a const-index soft buffer (REG-promotable) for softmax.
     # Skip zero-init: every slot is overwritten by the copy before any read.
@@ -886,7 +898,17 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         S_reg = S_reg.after(UOp.group(*sm_stores))
   else:
     S_reg = S_masked
-  # Diagnostic: scaled+masked QK → logical (BLOCK_M, BLOCK_N). wave_n duplicates S; one writer.
+  # Diagnostic: S_soft (slot 16) after ACC→soft (+scale/mask); before max/sum/exp. Per wave_n.
+  if dumps and "s_soft" in dumps:
+    ds = dumps["s_soft"]  # (BH, Nm, Ntiles, WAVES_N, BLOCK_M, BLOCK_N)
+    s_soft_stores = []
+    for ri in range(TM):
+      for rj in range(TN):
+        qrow = wave_m * WMMA_M + ri * LANES_PER_WAVE_M + lane_m
+        kcol = rj * LANES_PER_WAVE_N + lane_n
+        s_soft_stores.append(ds[block_bh, block_m, n_tile, wave_n, qrow, kcol].store(S_reg[ri, rj]))
+    S_reg = S_reg.after(UOp.group(*s_soft_stores))
+  # Legacy: scaled+masked QK, wave_n==0 only (does not prove wave_n=1).
   if dumps and "qk" in dumps:
     dq = dumps["qk"]  # (BH, Nm, Ntiles, BLOCK_M, BLOCK_N)
     qk_stores = []

@@ -97,6 +97,8 @@ def phase_shapes(BH: int, M: int, S: int, D: int = 128,
                           D // (WAVES_N * LANES_PER_WAVE_N))
   all_shapes = {
     "qk": (BH, nm, ntiles, BLOCK_M, BLOCK_N),
+    "qk_wmma": (BH, nm, ntiles, WAVES_N, BLOCK_M, BLOCK_N),
+    "s_soft": (BH, nm, ntiles, WAVES_N, BLOCK_M, BLOCK_N),
     "soft_m": (BH, nm, ntiles, BLOCK_M),
     "soft_l": (BH, nm, ntiles, BLOCK_M),
     "p_reg": (BH, nm, ntiles, WAVES_N, BLOCK_M, BLOCK_N),
@@ -373,6 +375,22 @@ def run_mode(mode: str, prg, q_np, kv_np, T: int, replays: int, art: Path,
   return row
 
 
+def map_s_coord(wave_n: int, qrow: int, kcol: int) -> dict:
+  """Map dump (wave_n,qrow,kcol) → wave_m/lane/ri/rj for S/QK fragments."""
+  wave_m = qrow // WMMA_M
+  rem_m = qrow % WMMA_M
+  lane_m = rem_m % LANES_PER_WAVE_M
+  ri = rem_m // LANES_PER_WAVE_M
+  rj = kcol // LANES_PER_WAVE_N
+  lane_n = kcol % LANES_PER_WAVE_N
+  lane = lane_m * LANES_PER_WAVE_N + lane_n
+  return {
+    "wave_n": wave_n, "qrow": qrow, "kcol": kcol,
+    "wave_m": wave_m, "lane": lane, "lane_m": lane_m, "lane_n": lane_n,
+    "ri": ri, "rj": rj,
+  }
+
+
 def map_pv_coord(qrow: int, dcol: int, D: int = 128) -> dict:
   """Map logical (qrow,dcol) → wave/lane/fragment indices for PV dumps."""
   TM, TN, TD = flash_tile_dims(D)  # noqa: F841
@@ -390,6 +408,134 @@ def map_pv_coord(qrow: int, dcol: int, D: int = 128) -> dict:
     "wave_m": wave_m, "wave_n": wave_n, "lane": lane,
     "lane_m": lane_m, "lane_n": lane_n, "ri": ri, "rj": rj,
     "td_i": rj,  # with ACC_SMALL one WMMA pack per TD column
+  }
+
+
+def trace_s_slots(prg, *, focus: dict | None = None) -> dict:
+  """Trace slot-6 (S_reg/QK WMMA ACC) and slot-16 (S_soft) through lin IR.
+
+  QK WMMAs are the first TN packs; soft copy is ACC→low VGPR MOV after those.
+  Reports EXTRACT/MOV/REG_STORE/SPILL/FILL with phys names and scratch offsets.
+  """
+  from tinygrad.renderer.isa import greg
+  from tinygrad.renderer.isa.rdna3 import AMDOps, _iop, _unwrap_const, _reg_slots
+
+  lin = prg.src[1]
+  TM, TN, TD = flash_tile_dims(128)  # noqa: F841
+  events: list[dict] = []
+  wmma_ops = [(i, u) for i, u in enumerate(lin.src) if u.op is Ops.INS and _iop(u) is AMDOps.WMMA]
+  # First TN packs are QK (S); last TD are PV.
+  qk_wmmas = wmma_ops[:TN] if len(wmma_ops) >= TN + TD else wmma_ops[:TN]
+  s_accs = [str(greg(u)) for _, u in qk_wmmas]
+  for i, u in qk_wmmas:
+    events.append({
+      "i": i, "op": "WMMA", "slot_hint": 6,
+      "dst": str(greg(u)), "srcs": [str(greg(s)) for s in u.src],
+      "note": "S_reg / QK WMMA C",
+    })
+
+  acc_bases = []
+  for a in s_accs:
+    try: acc_bases.append(int(a[1:]))
+    except ValueError: pass
+  # QK ACC packs: TN columns × WMMA_ACC(=8) lanes each when ACC_SMALL.
+  acc_lane_names = {f"v{b + k}" for b in acc_bases for k in range(8)}
+  soft_dsts: list[str] = []
+  soft_src_of: dict[str, str] = {}
+  if qk_wmmas:
+    start = qk_wmmas[-1][0] + 1
+    # Stop before PV WMMAs (next WMMA after QK block).
+    stop = wmma_ops[TN][0] if len(wmma_ops) > TN else len(lin.src)
+    for j in range(start, stop):
+      u = lin.src[j]
+      if u.op is not Ops.INS: continue
+      op = _iop(u)
+      if op.name == "EXTRACT":
+        src, dst = (str(greg(u.src[0])) if u.src else None), str(greg(u))
+        if src in acc_lane_names or (src and any(src == a for a in s_accs)):
+          events.append({
+            "i": j, "op": "EXTRACT", "slot_hint": 6,
+            "dst": dst, "srcs": [src], "note": "ACC extract toward S_soft",
+          })
+      if op.name != "MOV" or not u.src: continue
+      sreg, dreg = greg(u.src[0]), greg(u)
+      if sreg is None or dreg is None: continue
+      src_n, dst_n = str(sreg), str(dreg)
+      if src_n == dst_n: continue
+      if src_n in acc_lane_names and dst_n not in acc_lane_names:
+        if dst_n not in soft_dsts:
+          soft_dsts.append(dst_n)
+          soft_src_of[dst_n] = src_n
+          events.append({
+            "i": j, "op": "MOV", "slot_hint": 16,
+            "dst": dst_n, "srcs": [src_n],
+            "note": "ACC→S_soft copy (REG_STORE lowered)",
+            "dst_phys_index": dreg.index, "src_phys_index": sreg.index,
+          })
+        if len(soft_dsts) >= TM * TN:
+          break
+
+  soft_set = set(soft_dsts)
+  watch = set(s_accs) | soft_set | acc_lane_names
+  for i, u in enumerate(lin.src):
+    if u.op is not Ops.INS: continue
+    op = _iop(u)
+    if op is AMDOps.SPILL:
+      src_reg = greg(u.src[1]) if len(u.src) > 1 else None
+      if src_reg is None or str(src_reg) not in watch: continue
+      disp = _unwrap_const(u.src[0])
+      events.append({
+        "i": i, "op": "SPILL",
+        "slot_hint": 16 if str(src_reg) in soft_set else 6,
+        "phys": str(src_reg),
+        "scratch_off": int(disp.val) if disp is not None else None,
+        "slots": int(_reg_slots(u.src[1])) if len(u.src) > 1 else None,
+      })
+    elif op is AMDOps.FILL:
+      dst = greg(u)
+      if dst is None or str(dst) not in watch: continue
+      disp = _unwrap_const(u.src[0])
+      events.append({
+        "i": i, "op": "FILL",
+        "slot_hint": 16 if str(dst) in soft_set else 6,
+        "phys": str(dst),
+        "scratch_off": int(disp.val) if disp is not None else None,
+        "slots": int(_reg_slots(u)),
+      })
+    elif op is AMDOps.REG_STORE:
+      dst = greg(u.src[0]) if u.src else None
+      dn = str(dst) if dst is not None else None
+      if dn is not None and dn not in watch: continue
+      events.append({
+        "i": i, "op": "REG_STORE",
+        "slot_hint": 16 if dn in soft_set else 6,
+        "phys": dn, "srcs": [str(greg(s)) for s in u.src],
+      })
+
+  focus_map = None
+  if focus and focus.get("qrow") is not None and focus.get("kcol") is not None:
+    wn = int(focus.get("wave_n", 1))
+    focus_map = map_s_coord(wn, int(focus["qrow"]), int(focus["kcol"]))
+    # QK ACC pack index = rj (TN columns); lane within pack = ri
+    if focus_map["rj"] < len(s_accs):
+      focus_map["qk_wmma_acc_phys"] = s_accs[focus_map["rj"]]
+      if focus_map["rj"] < len(acc_bases):
+        acc_lane = f"v{acc_bases[focus_map['rj']] + focus_map['ri']}"
+        focus_map["qk_wmma_acc_lane"] = acc_lane
+        soft_phys = next((d for d, s in soft_src_of.items() if s == acc_lane), None)
+        focus_map["s_soft_phys"] = soft_phys
+        if soft_phys:
+          focus_map["s_soft_spill_fill"] = [
+            e for e in events if e.get("op") in ("SPILL", "FILL") and e.get("phys") == soft_phys
+          ]
+
+  return {
+    "qk_wmma_count": len(qk_wmmas),
+    "qk_wmma_acc_phys": s_accs,
+    "s_soft_phys": soft_dsts,
+    "focus": focus_map,
+    "events": events,
+    "spill_fill_watched": [e for e in events if e.get("op") in ("SPILL", "FILL")],
   }
 
 
@@ -659,41 +805,47 @@ def run_phase_fail_capture(S: int, T: int, acc_work: bool, art: Path, q_np, kv_n
     print(f"  EARLIEST divergence: phase={earliest['phase']} n_tile={earliest['n_tile']} {earliest['div']}")
     div = earliest.get("div") or {}
     coords = div.get("coords") or []
-    # PV dumps: tile slice is (BLOCK_M, D) → coords [qrow, dcol]
-    if earliest["phase"] in ("pv_wmma", "pv", "acc") and len(coords) >= 2:
-      qrow, dcol = int(coords[0]), int(coords[1])
-      cmap = map_pv_coord(qrow, dcol)
+    if earliest["phase"] in ("qk_wmma", "s_soft", "p_reg", "p_lds") and len(coords) >= 3:
+      cmap = map_s_coord(int(coords[0]), int(coords[1]), int(coords[2]))
+      cmp["earliest_coord_map"] = cmap
+      print(f"  coord map: {cmap}")
+    elif earliest["phase"] in ("pv_wmma", "pv", "acc") and len(coords) >= 2:
+      cmap = map_pv_coord(int(coords[0]), int(coords[1]))
       cmp["earliest_coord_map"] = cmap
       print(f"  coord map: {cmap}")
   else:
     print("  WARNING: out diverged but selected phase dumps match — try more phases")
 
-  # Probe table: pre-WMMA inputs → WMMA → post-copy
+  # Probe: QK → S_soft → p_reg → LDS → PV (leave PV/acc alone until wave_n=1 S is stable)
   probe = None
-  if any(p in cmp["phases"] for p in ("p_reg", "p_lds", "v_lds", "pv_wmma", "pv", "acc")):
+  s_phases = ("qk_wmma", "s_soft", "p_reg", "p_lds", "v_lds", "pv_wmma", "pv", "acc")
+  if any(p in cmp["phases"] for p in s_phases):
     def _phase_has_div(name: str) -> bool:
       p = cmp["phases"].get(name)
       if not p: return False
       return p.get("full_fail_vs_pred") is not None or any(x.get("div") for x in p.get("per_ntile", []))
-    flags = {n: _phase_has_div(n) for n in ("p_reg", "p_lds", "v_lds", "pv_wmma", "pv", "acc")}
-    if flags.get("p_reg"):
-      probe, note = "p_reg_wrong", "softmax P in REG already diverges (before LDS; check per-wave)"
-    elif flags.get("p_lds") and not flags.get("p_reg"):
-      probe, note = "p_lds_wrong", "P REG ok but P LDS after barrier diverges (write/barrier/wave_n slice)"
+    flags = {n: _phase_has_div(n) for n in s_phases}
+    if flags.get("qk_wmma"):
+      probe, note = "qk_wmma_wrong", "per-wave QK already wrong → Q/K WMMA or ACC extract/init"
+    elif flags.get("s_soft"):
+      probe, note = "s_soft_wrong", "QK ok but S_soft wrong → ACC→soft copy or slot-16 promote/spill"
+    elif flags.get("p_reg"):
+      probe, note = "p_reg_wrong", "S_soft ok (or undumped) but p_reg wrong → softmax exp/reduce or slot-16 reload"
+    elif flags.get("p_lds"):
+      probe, note = "p_lds_wrong", "register phases ok but P LDS diverges (store/barrier)"
     elif flags.get("v_lds"):
-      probe, note = "v_lds_wrong", "V LDS after barrier diverges (global→LDS or layout)"
+      probe, note = "v_lds_wrong", "V LDS after barrier diverges"
     elif flags.get("pv_wmma"):
-      probe, note = "pv_wmma_before_copy_wrong", "P/V LDS ok (or not dumped); WMMA/ACC cin/scheduling"
+      probe, note = "pv_wmma_before_copy_wrong", "pre-WMMA S ok; PV WMMA path"
     elif flags.get("pv"):
-      probe, note = "pv_wmma_ok_post_copy_wrong", "REG_STORE/MOV copy, phys overlap, or spill/reload of slot 17"
+      probe, note = "pv_wmma_ok_post_copy_wrong", "PV copy/spill path"
     elif flags.get("acc"):
-      probe, note = "both_pv_ok_acc_diverges", "loop-carried slot-2 accumulator path"
+      probe, note = "both_pv_ok_acc_diverges", "slot-2 accumulator"
     else:
       probe, note = "selected_phases_match", "selected dumps match fail vs pred"
     cmp["probe"] = {"verdict": probe, "note": note, **{f"{k}_div": v for k, v in flags.items()}}
     print(f"  PROBE: {probe} — {note}")
-    # Cross-check: wave_n=0 vs wave_n=1 on pred for p_reg / p_lds
-    for pname in ("p_reg", "p_lds"):
+    for pname in ("qk_wmma", "s_soft", "p_reg", "p_lds"):
       if pname not in dump_hist[pred_i]: continue
       pl = dump_hist[pred_i][pname]
       if pl.ndim >= 4 and pl.shape[3] >= 2:
@@ -708,27 +860,37 @@ def run_phase_fail_capture(S: int, T: int, acc_work: bool, art: Path, q_np, kv_n
                                 dump_hist[fail_i][pname][focus_head, focus_bm, nt, wn])
             print(f"  {pname} n_tile={nt} wave_n={wn} fail_vs_pred={'EXACT' if d is None else d}")
 
-  # Compile-time slot 10/17 trace (same ELF for all launches)
   slot_trace = None
+  s_slot_trace = None
+  if any(p in phases for p in ("qk_wmma", "s_soft", "p_reg")):
+    focus_coord = cmp.get("earliest_coord_map") or {"wave_n": 1, "qrow": 0, "kcol": 8}
+    try:
+      s_slot_trace = trace_s_slots(dir_prg, focus=focus_coord)
+      (phase_art / "s_slot_trace.json").write_text(json.dumps(s_slot_trace, indent=2, default=str))
+      print(f"  S slot trace: qk_acc={s_slot_trace['qk_wmma_acc_phys']} "
+            f"soft={s_slot_trace['s_soft_phys'][:8]}{'…' if len(s_slot_trace['s_soft_phys'])>8 else ''} "
+            f"spill/fill={len(s_slot_trace['spill_fill_watched'])}")
+      if s_slot_trace.get("focus"):
+        print(f"  S slot focus: {s_slot_trace['focus']}")
+    except Exception as e:
+      s_slot_trace = {"error": str(e)}
+      print(f"  S slot trace FAILED: {e}")
   if any(p in phases for p in ("pv_wmma", "pv")):
     focus_coord = (cmp.get("earliest_coord_map") or {})
     try:
       slot_trace = trace_pv_slots(dir_prg, focus=focus_coord or None)
       (phase_art / "pv_slot_trace.json").write_text(json.dumps(slot_trace, indent=2, default=str))
-      print(f"  slot trace: pv_wmma_acc={slot_trace['pv_wmma_acc_phys']} "
-            f"soft={slot_trace['pv_soft_phys'][:8]}{'…' if len(slot_trace['pv_soft_phys'])>8 else ''} "
-            f"spill/fill_watched={len(slot_trace['spill_fill_watched'])}")
-      if slot_trace.get("focus"):
-        print(f"  slot focus: {slot_trace['focus']}")
+      print(f"  PV slot trace: acc={slot_trace['pv_wmma_acc_phys']} "
+            f"spill/fill={len(slot_trace['spill_fill_watched'])}")
     except Exception as e:
       slot_trace = {"error": str(e)}
-      print(f"  slot trace FAILED: {e}")
+      print(f"  PV slot trace FAILED: {e}")
 
   row = {
     "ok": False, "verdict": "launch_nondeterminism_instrumented",
     "replays_until_fail": fail_i + 1, "phases": list(phases),
     "compare": cmp, "tile_dims": {"TM": TM, "TN": TN, "TD": TD},
-    "probe": cmp.get("probe"), "pv_slot_trace": slot_trace,
+    "probe": cmp.get("probe"), "pv_slot_trace": slot_trace, "s_slot_trace": s_slot_trace,
   }
   (phase_art / "compare.json").write_text(json.dumps(cmp, indent=2, default=str))
   (phase_art / "summary.json").write_text(json.dumps(row, indent=2, default=str))
@@ -749,8 +911,9 @@ def main() -> None:
                  help="after modes: instrumented fail/pred phase capture")
   p.add_argument("--phase-only", action="store_true",
                  help="skip recreate/fixed/scratch; only instrumented fail capture")
-  p.add_argument("--phases", default="qk",
-                 help="comma dumps: qk,soft_m,soft_l,p_reg,p_lds,v_lds,pv_wmma,pv,acc")
+  p.add_argument("--phases", default="qk_wmma",
+                 help="comma dumps: qk_wmma,s_soft,p_reg,p_lds,v_lds,pv_wmma,pv,acc "
+                      "(one probe at a time for wave_n=1)")
   p.add_argument("--focus-head", type=int, default=None)
   p.add_argument("--focus-bm", type=int, default=None)
   p.add_argument("--artifacts", default="extra/rdna3_state_diag")
