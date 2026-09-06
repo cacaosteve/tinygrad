@@ -2636,20 +2636,45 @@ class TestAMDRenderer(unittest.TestCase):
     os.environ["AMD_BATCH_SLOAD_USE"] = "1"
     getenv.cache_clear()
     base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
-    def sload(i):
+    def sload(i, v):
       return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
-                 tag=(Register(f"l{i}", 0, _cons=amd_lib.VGPR),))
-    loads = [sload(i) for i in range(2)]
+                 tag=(Register(f"l{i}", v, _cons=amd_lib.VGPR),))
+    loads = [sload(0, 10), sload(1, 11)]  # distinct phys dests (pre-regalloc-safe)
     uses = [
       UOp(Ops.INS, src=(loads[0], UOp.cconst(1.0, dtypes.float32)), arg=(AMDOps.MUL, dtypes.float32),
-          tag=(Register("u0", 0, _cons=amd_lib.VGPR),)),
+          tag=(Register("u0", 20, _cons=amd_lib.VGPR),)),
       UOp(Ops.INS, src=(loads[1], UOp.cconst(2.0, dtypes.float32)), arg=(AMDOps.MUL, dtypes.float32),
-          tag=(Register("u1", 0, _cons=amd_lib.VGPR),)),
+          tag=(Register("u1", 21, _cons=amd_lib.VGPR),)),
     ]
     ops = [loads[0], uses[0], loads[1], uses[1]]
     out = _batch_scratch_load_uses(ops)
     self.assertEqual(out[:2], loads)
     self.assertEqual(out[2:], uses)
+    os.environ.pop("AMD_BATCH_SLOAD_USE", None)
+    getenv.cache_clear()
+
+  def test_batch_sload_use_refuses_phys_reg_reuse(self):
+    """Post-regalloc VGPR reuse: UOp-independent pairs must not batch (clobber).
+
+    Before: v5=load A; v6=v5; v5=load B; v7=v5
+    Unsafe batch: v5=load A; v5=load B; v6=v5; v7=v5  → both uses see B.
+    """
+    from tinygrad.renderer.isa.rdna3 import _batch_scratch_load_uses, _scratch_batch_phys_conflict
+    os.environ["AMD_BATCH_SLOAD_USE"] = "1"
+    getenv.cache_clear()
+    base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
+    load_a = UOp(Ops.INS, src=(base, UOp.cconst(0, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
+                 tag=(Register("la", 5, _cons=amd_lib.VGPR),))
+    use_a = UOp(Ops.INS, src=(load_a,), arg=(AMDOps.MOV, dtypes.float32),
+                tag=(Register("ua", 6, _cons=amd_lib.VGPR),))
+    load_b = UOp(Ops.INS, src=(base, UOp.cconst(1, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
+                 tag=(Register("lb", 5, _cons=amd_lib.VGPR),))  # reuses v5
+    use_b = UOp(Ops.INS, src=(load_b,), arg=(AMDOps.MOV, dtypes.float32),
+                tag=(Register("ub", 7, _cons=amd_lib.VGPR),))
+    ops = [load_a, use_a, load_b, use_b]
+    self.assertTrue(_scratch_batch_phys_conflict([load_a], [use_a], load_b, use_b))
+    out = _batch_scratch_load_uses(ops)
+    self.assertEqual(out, ops, "must not batch when load dests share a physical VGPR")
     os.environ.pop("AMD_BATCH_SLOAD_USE", None)
     getenv.cache_clear()
 

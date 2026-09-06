@@ -127,10 +127,16 @@ def make_inputs(S: int, T: int):
   return q, kv, q_np, kv_np
 
 
-def launch(prg, q: Tensor, kv: Tensor, T: int) -> np.ndarray:
-  """Launch frozen program with a brand-new output buffer; return host f32 [32,T,128]."""
+def launch(prg, q: Tensor, kv: Tensor, T: int, *, sentinel: float = float("nan")) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+  """Launch frozen program with a sentinel-filled output buffer.
+
+  Returns (out, q_after, kv_after) host copies — q/kv after are device readbacks.
+  """
   device = Device.DEFAULT
-  out = Tensor.empty(32, T, 128, dtype=dtypes.float32, device=device).realize()
+  # Prefill output with a sentinel so unwritten lanes are visible.
+  out = Tensor.full((32, T, 128), sentinel, dtype=dtypes.float32, device=device).realize()
+  q_before = np.array(q.numpy(), copy=True)
+  kv_before = np.array(kv.numpy(), copy=True)
   rt = get_runtime(device, prg, cache=True)
   gs, ls = prg.arg.launch_dims({})
   vals = prg.arg.vals({})
@@ -142,7 +148,10 @@ def launch(prg, q: Tensor, kv: Tensor, T: int) -> np.ndarray:
   ordered = [bufs[i] for i in prg.arg.globals]
   rt(*ordered, global_size=gs, local_size=ls, vals=vals, wait=True)
   Device[device].synchronize()
-  return np.array(out.numpy(), dtype=np.float32, copy=True)
+  out_np = np.array(out.numpy(), dtype=np.float32, copy=True)
+  q_after = np.array(q.numpy(), copy=True)
+  kv_after = np.array(kv.numpy(), copy=True)
+  return out_np, q_after, kv_after
 
 
 def first_divergent(a: np.ndarray, b: np.ndarray, block_m: int = 32) -> dict | None:
@@ -213,7 +222,14 @@ def run_config(cfg: str, S: int, T: int, replays: int, recompiles: int, art_root
     """New device copies of q/kv each launch (rules out host-visible input clobber)."""
     qq = Tensor(q_np.copy(), device=Device.DEFAULT, dtype=dtypes.float16).realize()
     kk = Tensor(kv_np.copy(), device=Device.DEFAULT, dtype=dtypes.float16).realize()
-    return launch(prg, qq, kk, T)
+    out, q_after, kv_after = launch(prg, qq, kk, T)
+    if not np.array_equal(q_after, q_np):
+      raise RuntimeError("device q buffer corrupted after launch")
+    if not np.array_equal(kv_after, kv_np):
+      raise RuntimeError("device kv buffer corrupted after launch")
+    if np.isnan(out).all():
+      raise RuntimeError("output still all-NaN sentinel — kernel wrote nothing?")
+    return out
 
   # --- fresh recompiles ---
   print("-- recompiles --")
@@ -274,7 +290,12 @@ def run_config(cfg: str, S: int, T: int, replays: int, recompiles: int, art_root
   replay_outs = [launch_fresh_inputs(prg0) for _ in range(replays)]
   q_reuse = Tensor(q_np.copy(), device=Device.DEFAULT, dtype=dtypes.float16).realize()
   kv_reuse = Tensor(kv_np.copy(), device=Device.DEFAULT, dtype=dtypes.float16).realize()
-  reuse_outs = [launch(prg0, q_reuse, kv_reuse, T) for _ in range(min(replays, 6))]
+  reuse_outs = []
+  for _ in range(min(replays, 6)):
+    o, qa, ka = launch(prg0, q_reuse, kv_reuse, T)
+    if not np.array_equal(qa, q_np) or not np.array_equal(ka, kv_np):
+      print("  WARN: device input changed under reuse launches")
+    reuse_outs.append(o)
   rep_finite = all(np.isfinite(o).all() for o in replay_outs)
   rep_exact = all(np.array_equal(replay_outs[0], o) for o in replay_outs[1:])
   rep_max = max((float(np.max(np.abs(replay_outs[0] - o))) for o in replay_outs[1:]), default=0.0)

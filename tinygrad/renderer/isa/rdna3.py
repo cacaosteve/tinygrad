@@ -3416,6 +3416,22 @@ def _scratch_batch_use_safe(u:UOp) -> bool:
   if iop in _SCRATCH_BATCH_UNSAFE_USE or iop in _SCRATCH_CLUSTER_CF: return False
   return True
 
+def _scratch_batch_phys_conflict(loads:list[UOp], uses:list[UOp], new_load:UOp, new_use:UOp) -> bool:
+  """True if appending new_load/new_use would clobber a live physical dest under load×N,use×N.
+
+  After batching, all loads run before any use. An earlier load's dest must stay intact until
+  its use — a later load that reuses the same VGPR (legal post-regalloc) would overwrite it.
+  """
+  cand_loads, cand_uses = loads + [new_load], uses + [new_use]
+  for i, ld in enumerate(cand_loads):
+    live = _reg_idxs(ld)
+    if not live: continue
+    for later in cand_loads[i + 1:]:
+      if _reg_idxs(later) & live: return True
+      # Later load may also clobber other phys regs the earlier use still reads.
+      if _reg_idxs(later) & set().union(*(_reg_idxs(s) for s in cand_uses[i].src)): return True
+  return False
+
 def _schedule_scratch_load_passes(ops:list[UOp]) -> list[UOp]:
   """Composed scratch scheduling: store cluster → load/use batch → load cluster."""
   ops = _cluster_const_scratch_stores(ops)
@@ -3432,6 +3448,10 @@ def _batch_scratch_load_uses(ops:list[UOp]) -> list[UOp]:
 
   USE must be register-only: an SSTORE/STORE/SPILL use must not be batched, or a
   later load can move before that write (same-base alias via memory, not SSA).
+
+  Must not run after physical regalloc without phys checks: regalloc reuses VGPRs, so
+  UOp-independent pairs can still conflict (v5=load A; v6=v5; v5=load B → batch clobbers).
+  Emit path therefore skips this pass; after_pre_regalloc is the intended call site.
   """
   if not getenv("AMD_BATCH_SLOAD_USE", 1): return ops
   out: list[UOp] = []
@@ -3445,7 +3465,8 @@ def _batch_scratch_load_uses(ops:list[UOp]) -> list[UOp]:
       while j + 1 < len(ops) and len(loads) < getenv("AMD_BATCH_SLOAD_MAX", 32) and \
             ops[j].op is Ops.INS and _iop(ops[j]) is AMDOps.SLOAD and \
             ops[j] in ops[j + 1].src and _scratch_batch_use_safe(ops[j + 1]) and \
-            not any(prev in ops[j].src or prev in ops[j + 1].src for prev in loads + uses):
+            not any(prev in ops[j].src or prev in ops[j + 1].src for prev in loads + uses) and \
+            not _scratch_batch_phys_conflict(loads, uses, ops[j], ops[j + 1]):
         loads.append(ops[j]); uses.append(ops[j + 1]); j += 2
       if len(loads) >= 2:
         # Index order matters for b128 fusion; USE order follows its load.
@@ -4065,11 +4086,16 @@ def insts_from_linear(lin:UOp):
         emit(_wait_for_domain(domain))
         pending[domain].clear()
   def flush_regs(regs:set[int]):
+    if getenv("AMD_CONSERVATIVE_WAIT", 0):
+      flush("vm", "lgkm", "vs")
+      return
     need_i = next((i for i in range(len(pending_vm) - 1, -1, -1) if pending_vm[i][0] & regs), -1)
     if need_i >= 0: wait_vm(sum(n for _, n in pending_vm[need_i + 1:]))
     if pending["lgkm"] & regs: flush("lgkm")
   def note_vm(regs:set[int], insts:list):
     if (n:=_vm_load_count(insts)) and regs: pending_vm.append((regs, n))
+    # Opt-in: drain VMEM after every tracked load burst (isolates missing-wait bugs).
+    if getenv("AMD_CONSERVATIVE_WAIT", 0): flush("vm")
   def _pending_src(regs:set[int]) -> bool:
     return any(pr & regs for pr, _ in pending_vm) or bool(pending["lgkm"] & regs)
   last_vcc_key: tuple|None = None
@@ -4088,11 +4114,11 @@ def insts_from_linear(lin:UOp):
     return list(insts_for_uop(u, skip, masked, store_addr_cache if with_store_cache else None,
                               d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst))
   scheduled = _order_d16_lo_before_hi(
-    _hoist_loads_before_wmma(_sink_wmma_past_loads(_hoist_lloads_before_extracts(ops))), d16_hi_lo)
-  scheduled = _schedule_swizzle_mov_batches(scheduled)
-  scheduled = _gap_fill_after_loads(scheduled)
+    _hoist_loads_before_wmma(_sink_wmma_past_loads(ops)), d16_hi_lo)
+  # Post-regalloc UOp-only reordering is unsound: regalloc reuses VGPRs, so SSA-independent
+  # ops can still conflict in phys regs (load A→use; load B both in v5 → batch clobbers A).
+  # Swizzle/SLOAD batch, LLOAD hoist, and load gap-fill run in after_pre_regalloc instead.
   scheduled = _cluster_const_scratch_stores(scheduled)
-  scheduled = _batch_scratch_load_uses(scheduled)
   fma_pair_dst = _fma_pair_pack_dsts(scheduled, fma_hi_lo)
   early_emitted: set[int] = set()
   perm_selects_ready = False
@@ -5040,6 +5066,8 @@ class AMDRenderer(ISARenderer):
     if getenv("AMD_SCHEDULE_VMEM", 1): lst = _schedule_scalar_vmem(lst, d16_hi_lo)
     # After scalar VMEM (it otherwise reopens the weight→A gap). Default on; AMD_PREFETCH_Q6_A=0 opts out.
     lst = _prefetch_a_before_dequant_mix(lst) if getenv("AMD_PREFETCH_Q6_A", 1) else lst
+    # LLOAD hoist before phys assignment (emit-time hoist hits the same VGPR-reuse hazard as SLOAD batch).
+    lst = _hoist_lloads_before_extracts(lst)
     lst = _schedule_swizzle_mov_batches(lst)
     lst = _gap_fill_after_loads(lst)
     lst = _schedule_scratch_load_passes(lst)

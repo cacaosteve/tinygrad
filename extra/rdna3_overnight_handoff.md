@@ -1,33 +1,39 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`4c81f952b`**.
+Tip: refresh after next commit.
 
-## Headline
+## Headline — correctness first
 
-**Flash DIRECT ACC_SMALL** ~**685µs** (err~1e-4) on 7900/`gfx1100`.
-HIP ~278; SDPA ~360. **`SKIP_SLOTS=2`** + work-copy. **`SPILL_ON_EVICT=0`**.
+**Do not treat ~685µs Flash DIRECT ACC_SMALL as validated-correct.** Frozen-ELF
+replay still shows **launch nondeterminism** under shipping SKIP=2 (fails under
+12–16 replays). Normal DIRECT prefill still defaults to **SDPA** unless
+`AMD_FLASH_DIRECT=1`. Packing / FMA_MIX / eviction stay **off**.
 
-## Correctness status (freeze/replay)
+## Post-regalloc hazard (landed)
 
-`extra/rdna3_flash_kernel_freeze_replay.py` on S=T=128:
+Emit-time `_batch_scratch_load_uses` was UOp-only after phys regalloc — VGPR reuse
+makes SSA-independent pairs unsafe. **Removed post-alloc batching**, emit-time
+swizzle batch / gap-fill / LLOAD hoist (moved LLOAD hoist to `after_pre_regalloc`).
+Added phys-overlap guard + regression test.
 
-| config | unique ELF | verdict |
-|--------|------------|---------|
-| prom | 1 | **launch nondeterminism** (frozen ELF, varying outs) |
-| skip2_nobatch | 1 | **launch nondeterminism** |
-| skip2 (defaults) | 1 | **launch nondeterminism** on frozen replay |
+`AMD_CONSERVATIVE_WAIT=1` (full vm/lgkm/vs drain on `flush_regs` / after `note_vm`)
+**does not** stabilize freeze replay — not a trivial soft-wait miss on that path.
 
-Compile is **deterministic** (same sha256). Host q/kv are **not** mutated. Same binary + synchronized launches still diverge — investigate missing waits / uninit scratch/VGPR / overlap. First divergent samples often at query tile ~2 (token≈80), head ~27–30, dim 64.
+## Freeze/replay (after post-alloc batch removal)
 
-Stability probe (`extra/rdna3_flash_promote_stability.py`) now **exits non-zero** and **keeps artifacts**.
+| config | unique ELF | 12+ replay |
+|--------|------------|------------|
+| skip2 (defaults) | 1 | still **diverges** (earlier 8-replay pass was luck) |
+| skip2_nobatch | 1 (same ELF as skip2 now) | diverges |
+| prom | 1 | diverges |
 
-## Defaults / keep off
-
-- **FMA_MIX**, **PACK_SLOAD_B128**, second-base packing, eviction
+Device q/kv readbacks match; outs are not all-sentinel. First-mismatch coords are
+**flattened output order**, not first workgroup.
 
 ## Next leftovers
 
-1. Root-cause **launch** nondeterminism on frozen flash ELF (waits / uninit / overlap)
-2. Decode partial 34→28 + e2e (after flash deterministic)
+1. Remaining launch nondeterminism: uninit VGPR/scratch, other emit reorders
+   (WMMA hoist/sink, d16, store cluster, `AMD_SINK_VMEM_SWIZZLE`), or algo race
+2. Decode only after `AMD_FLASH_DIRECT=1` freeze replay is bit-exact
 3. eye/GEMM TC_LDS_AB
