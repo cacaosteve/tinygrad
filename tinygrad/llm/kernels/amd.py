@@ -721,11 +721,12 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   """Hand flash-attn. Optional phase_dumps=(("qk", buf), ...) for diagnostics.
 
   Dump buffers use *logical* tile coords so each slot has one writer:
-    qk:     (BH, M//BLOCK_M, Ntiles, BLOCK_M, BLOCK_N) — scaled+masked S; writer wave_n==0
-    soft_m: (BH, M//BLOCK_M, Ntiles, BLOCK_M) — softmax max; writer wave_n==0 & lane_n==0
-    soft_l: (BH, M//BLOCK_M, Ntiles, BLOCK_M) — softmax sum; writer wave_n==0 & lane_n==0
-    pv:     (BH, M//BLOCK_M, Ntiles, BLOCK_M, D) — PV fragment; all threads unique (qrow,dcol)
-    acc:    (BH, M//BLOCK_M, BLOCK_M, D) — pre-norm acc; all threads unique (qrow,dcol)
+    qk:      (BH, M//BLOCK_M, Ntiles, BLOCK_M, BLOCK_N) — scaled+masked S; writer wave_n==0
+    soft_m:  (BH, M//BLOCK_M, Ntiles, BLOCK_M) — softmax max; writer wave_n==0 & lane_n==0
+    soft_l:  (BH, M//BLOCK_M, Ntiles, BLOCK_M) — softmax sum; writer wave_n==0 & lane_n==0
+    pv_wmma: (BH, M//BLOCK_M, Ntiles, BLOCK_M, D) — PV *before* ACC→pv_soft copy (slot 10)
+    pv:      (BH, M//BLOCK_M, Ntiles, BLOCK_M, D) — PV *after* copy (slot 17 / current reader)
+    acc:     (BH, M//BLOCK_M, BLOCK_M, D) — pre-norm acc; all threads unique (qrow,dcol)
   Ntiles = ceil(S/BLOCK_N) when S is int. Start with one phase (qk) when debugging.
   """
   dumps = dict(phase_dumps)
@@ -1021,6 +1022,18 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     v_frag = V_view[wave_n, tn2, lane_n, k_pv]
     pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
   pv_acc = pv_acc.after(pv_done)
+  def _pv_logical_stores(dp: UOp, src: UOp) -> list[UOp]:
+    # Each thread owns unique (qrow, dcol); same layout for pre- and post-copy dumps.
+    stores = []
+    for ri in range(TM):
+      for rj in range(TD):
+        qrow = wave_m * WMMA_M + ri * LANES_PER_WAVE_M + lane_m
+        dcol = wave_n * (TD * LANES_PER_WAVE_N) + rj * LANES_PER_WAVE_N + lane_n
+        stores.append(dp[block_bh, block_m, n_tile, qrow, dcol].store(src[ri, rj]))
+    return stores
+  # Pre-copy dump: slot-10 WMMA C / parked ACC result (before ACC→pv_soft).
+  if dumps and "pv_wmma" in dumps:
+    pv_acc = pv_acc.after(UOp.group(*_pv_logical_stores(dumps["pv_wmma"], pv_acc)))
   if _acc_sep:
     # Fully overwritten before read — skip REG zero-fill (same as S_soft).
     # Keep soft copy even under ACC_SMALL: PV ACC→soft is faster than EXTRACT-at-use
@@ -1032,15 +1045,9 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         pv_acc = pv_soft.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)]))
       else:
         pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
+  # Post-copy dump: slot-17 soft buffer (or still slot-10 if PV_ACC_DIRECT).
   if dumps and "pv" in dumps:
-    dp = dumps["pv"]  # (BH, Nm, Ntiles, BLOCK_M, D) — each thread owns unique (qrow, dcol)
-    pv_stores = []
-    for ri in range(TM):
-      for rj in range(TD):
-        qrow = wave_m * WMMA_M + ri * LANES_PER_WAVE_M + lane_m
-        dcol = wave_n * (TD * LANES_PER_WAVE_N) + rj * LANES_PER_WAVE_N + lane_n
-        pv_stores.append(dp[block_bh, block_m, n_tile, qrow, dcol].store(pv_acc[ri, rj]))
-    pv_acc = pv_acc.after(UOp.group(*pv_stores))
+    pv_acc = pv_acc.after(UOp.group(*_pv_logical_stores(dumps["pv"], pv_acc)))
   ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
   if _fu & 4 and getenv("AMD_FLASH_ACC_UNROLL", 1):
     # Const-index acc update. Slot 2 stays unpromoted (REDUCE-carried); soft/stats promote.

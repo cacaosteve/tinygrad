@@ -1,60 +1,53 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`134a2ca35`**.
+Tip: **(pending)**.
 
 ## Headline — correctness first
 
 **Flash DIRECT remains experimental and correctness-blocked.** Prefill defaults to
-SDPA unless `AMD_FLASH_DIRECT=1`. Packing / FMA_MIX / eviction stay **off**.
+SDPA unless `AMD_FLASH_DIRECT=1`. Packing / FMA_MIX / K-unroll / eviction / scratch
+zeroing / perf tuning stay **off**.
 
-## Phase recorder fixes (trustworthy dumps)
+## PV split probe (pre-copy vs post-copy)
 
-Four diagnostic defects in `1420dca2c` are fixed (not explanations of the original bug):
-
-1. **Unique writers** — QK/soft use gated index axes (`kcol.valid(wave_n.eq(0))`,
-   `qrow.valid(wave_n.eq(0)&lane_n.eq(0))`); PV/acc include `wave_n` in `dcol`.
-2. **Tile dims** — `flash_tile_dims(D) → (8,2,4)` for D=128; harness derives shapes
-   from `BLOCK_*` / that helper (no hardcoded `(4,4,4)`).
-3. **Inf-aware compare** — matching ±inf equal; NaN mismatches → `kind=nan`
-   (no `a-b` NaN false divergence on `[1,-inf]`).
-4. **Fail/pred on instrumented ELF** — `--phase-only --phases qk` replays the *same*
-   instrumented binary until **out** fails; saves fail+pred dumps. Old uninstrumented
-   fail indices are not transferred.
-
-Harness: `extra/rdna3_flash_state_diag.py`
+`pv` dump was after ACC→`pv_soft` (slot 17). Added **`pv_wmma`** dump of slot 10
+*before* that copy, plus compile-time slot trace (WMMA / MOV / SPILL / FILL with
+phys + scratch offsets).
 
 ```
 PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py \
-  --phase-only --phases qk --replays 100
+  --phase-only --phases pv_wmma,pv --replays 100
 ```
 
-## GPU evidence (gfx1100)
+### GPU (gfx1100) — frozen instrumented ELF fail/pred
 
-Instrumented DIRECT still **reproduces** out nondeterminism (fail at replay 1).
+Instrumented out still fails (replay 1). Probe verdict:
 
-| phase | focus tile all n_tiles fail_vs_pred |
-|-------|-------------------------------------|
-| qk | EXACT (all n_tiles; also vs HIP) |
-| soft_m / soft_l | EXACT |
-| **pv** | EXACT n_tile 0..2; **diverges at n_tile=3** |
-| acc | diverges (downstream of pv) |
+| Probe | Result |
+|-------|--------|
+| `pv_wmma` before copy | **already wrong** |
+| post-copy `pv` | same coords + same values as `pv_wmma` |
+| Conclusion | **not** REG_STORE / soft spill primary; look at P/V LDS, WMMA inputs, ACC init, WMMA scheduling |
 
-Earliest dump divergence: **`pv` @ n_tile=3**, logical `(qrow=8, dcol=64)` on the
-failing query tile. Artifacts: `extra/rdna3_state_diag_phase_qk`,
-`extra/rdna3_state_diag_phase_later` on the gaming PC checkout.
+Earliest this run: **`pv_wmma` @ n_tile=1**, `(qrow=16, dcol=64)` →
+`wave_m=1, wave_n=1, lane=0, ri=0, rj=0` (still the **wave_n=1 / dcol=64** boundary;
+prior `pv`-only run had n_tile=3 / qrow=8 — tile index varies with launch, class does not).
 
-If instrumentation ever suppresses out failure within the replay budget →
-**inconclusive**, not a pass.
+Slot trace for that fragment: ACC pack `v142` lane `v142` → soft `v24`;
+`v24` SPILL/FILL scratch_off **156** (secondary once pre-copy is wrong).
+
+Artifacts on gaming PC: `extra/rdna3_state_diag_pv_split/`.
 
 ## Next
 
-1. Trace earliest PV divergence through **def → spill → reload** (last KV tile).
-2. Do not ship scratch zeroing; uninstrumented fixed/scratch still nondeterministic.
-3. Decode only after DIRECT is bit-exact vs HIP.
+1. Dig into **pre-WMMA** path for PV: P/V LDS contents, WMMA A/B packing, ACC cin init,
+   scheduling around wave_n=1.
+2. Do **not** chase slot-2 acc until both PV stages match.
+3. Keep DIRECT blocked; no merge / no “fixed” claim.
 
 ## Local gates
 
-- Inf/tile unit checks on harness helpers
-- `pytest -k 'cluster_sload or batch_sload or in_order_emit'` → 8 passed + 2 subtests
-- Ruff clean on touched files; mypy baseline noise unchanged
+- `map_pv_coord(8,64)` → wave_m=0,wave_n=1,lane=0,ri=4,rj=0
+- `pytest -k 'cluster_sload or batch_sload or in_order_emit'` → 8 + 2 subtests
+- Ruff clean on touched files
