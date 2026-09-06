@@ -2541,6 +2541,68 @@ class TestAMDRenderer(unittest.TestCase):
     os.environ.pop("AMD_SPILL_ON_EVICT", None)
     getenv.cache_clear()
 
+  def test_cluster_sload_does_not_cross_same_base_store(self):
+    """Window scan must not hoist loads past a same-base SSTORE (stale read)."""
+    from tinygrad.renderer.isa.rdna3 import _cluster_const_scratch_loads
+    os.environ["AMD_CLUSTER_SLOAD"] = "1"
+    getenv.cache_clear()
+    base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
+    def sload(i):
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
+                 tag=(Register(f"l{i}", 0, _cons=amd_lib.VGPR),))
+    def sstore(i, val):
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag(), val), arg=(AMDOps.SSTORE, dtypes.void))
+    nine = UOp(Ops.INS, src=(UOp.cconst(9.0, dtypes.float32),), arg=(AMDOps.MOV, dtypes.float32),
+               tag=(Register("nine", 0, _cons=amd_lib.VGPR),))
+    loads = [sload(i) for i in range(4)]
+    # load0, store[1]=9, load1, load2, load3 — must keep the store before load1..3
+    ops = [loads[0], nine, sstore(1, nine), loads[1], loads[2], loads[3]]
+    out = _cluster_const_scratch_loads(ops)
+    store_i = next(i for i, u in enumerate(out) if u.op is Ops.INS and _iop(u) is AMDOps.SSTORE)
+    for ld in loads[1:]:
+      self.assertLess(store_i, out.index(ld), "SLOAD must not move before same-base SSTORE")
+    os.environ.pop("AMD_CLUSTER_SLOAD", None)
+    getenv.cache_clear()
+
+  def test_cluster_sload_does_not_cross_label(self):
+    """Clustering must stop at control-flow boundaries."""
+    from tinygrad.renderer.isa.rdna3 import _cluster_const_scratch_loads
+    os.environ["AMD_CLUSTER_SLOAD"] = "1"
+    getenv.cache_clear()
+    base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
+    def sload(i):
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
+                 tag=(Register(f"l{i}", 0, _cons=amd_lib.VGPR),))
+    loads = [sload(i) for i in range(4)]
+    label = UOp(Ops.INS, arg=(AMDOps.LABEL, dtypes.void), tag=".L")
+    ops = [loads[0], label, loads[1], loads[2], loads[3]]
+    out = _cluster_const_scratch_loads(ops)
+    # With a CF edge after load0, remaining loads stay after the label (no hoist across).
+    self.assertIs(out[0], loads[0])
+    self.assertIs(out[1], label)
+    self.assertEqual(out[2:], loads[1:])
+    os.environ.pop("AMD_CLUSTER_SLOAD", None)
+    getenv.cache_clear()
+
+  def test_cluster_sload_still_merges_across_alu(self):
+    """Independent ALU between same-base loads may be skipped; loads can still cluster."""
+    from tinygrad.renderer.isa.rdna3 import _cluster_const_scratch_loads
+    os.environ["AMD_CLUSTER_SLOAD"] = "1"
+    getenv.cache_clear()
+    base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
+    def sload(i):
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
+                 tag=(Register(f"l{i}", 0, _cons=amd_lib.VGPR),))
+    loads = [sload(i) for i in range(4)]
+    alu = UOp(Ops.INS, src=(UOp.cconst(1, dtypes.int32), UOp.cconst(2, dtypes.int32)), arg=(AMDOps.ADD, dtypes.int32),
+              tag=(Register("a", 0, _cons=amd_lib.VGPR),))
+    ops = [loads[0], alu, loads[1], loads[2], loads[3]]
+    out = _cluster_const_scratch_loads(ops)
+    self.assertEqual(out[:4], loads)  # sorted 0..3 first
+    self.assertIs(out[4], alu)
+    os.environ.pop("AMD_CLUSTER_SLOAD", None)
+    getenv.cache_clear()
+
   def test_regalloc_rewrites_surviving_shrink(self):
     renderer = _REN
     src = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32).rtag(),), AMDOps.MOV,

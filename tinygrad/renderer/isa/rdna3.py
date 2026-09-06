@@ -3348,6 +3348,63 @@ def _cluster_const_scratch_stores(ops:list[UOp]) -> list[UOp]:
     i += 1
   return out
 
+# Control-flow / sync ops that must not be crossed when clustering scratch traffic.
+_SCRATCH_CLUSTER_CF = (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ,
+                       AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER, AMDOps.LOOP_CMP)
+
+def _scratch_cluster_blocks_load(u:UOp, base:UOp) -> bool:
+  """True if clustering must not pull later SLOADs across `u` for `base`."""
+  if u.op is not Ops.INS: return True
+  iop = _iop(u)
+  if iop in _SCRATCH_CLUSTER_CF: return True
+  # Private spill/fill and same-base stores can invalidate const-index scratch values.
+  if iop in (AMDOps.SPILL, AMDOps.FILL): return True
+  if iop is AMDOps.SSTORE and u.src and u.src[0] is base: return True
+  return False
+
+def _cluster_const_scratch_loads(ops:list[UOp]) -> list[UOp]:
+  """Pull independent const-index SLOADs to the same base together (sorted) for b128 fusion.
+
+  Flash work-copy emits 32 scalar SLOADs that scheduling often splits; contiguous-only
+  clustering left half unfused (16→4×b128, 16 still B32).
+
+  Must not hoist a load across a same-base SSTORE / spill / control-flow edge — that
+  reorders a store-before-load into a stale read (CPU-repro: load,store,load* → wrong).
+  """
+  if not getenv("AMD_CLUSTER_SLOAD", 1): return ops
+  out: list[UOp] = []
+  i = 0
+  while i < len(ops):
+    u = ops[i]
+    if u.op is Ops.INS and _iop(u) is AMDOps.SLOAD and _const_int(u.src[1]) is not None and _lds_byte_off(u) == 0:
+      base = u.src[0]
+      group = [u]
+      taken = {i}
+      # Scan a window for more independent same-base const SLOADs (not only adjacent).
+      j = i + 1
+      max_scan = i + 1 + getenv("AMD_CLUSTER_SLOAD_SCAN", 64)
+      while j < len(ops) and j < max_scan and len(group) < 32:
+        v = ops[j]
+        if _scratch_cluster_blocks_load(v, base):
+          break
+        if v.op is Ops.INS and _iop(v) is AMDOps.SLOAD and v.src[0] is base and \
+           _const_int(v.src[1]) is not None and _lds_byte_off(v) == 0 and \
+           not any(g in v.src or v in g.src for g in group):
+          group.append(v)
+          taken.add(j)
+        j += 1
+      if len(group) >= 4:
+        group.sort(key=lambda x: int(_const_int(x.src[1])))  # type: ignore[arg-type]
+        out.extend(group)
+        # Keep relative order of non-loads that were skipped inside the scan window.
+        for k in range(i + 1, j):
+          if k not in taken: out.append(ops[k])
+        i = j
+        continue
+    out.append(u)
+    i += 1
+  return out
+
 def _batch_scratch_load_uses(ops:list[UOp]) -> list[UOp]:
   """Rewrite SLOAD,USE,SLOAD,USE → SLOAD×N,USE×N so waitcnt can cover a load burst.
 
@@ -3378,46 +3435,8 @@ def _batch_scratch_load_uses(ops:list[UOp]) -> list[UOp]:
         out.extend(uses)
         i = j
         continue
+      # fall through
     out.append(u); i += 1
-  return out
-
-def _cluster_const_scratch_loads(ops:list[UOp]) -> list[UOp]:
-  """Pull independent const-index SLOADs to the same base together (sorted) for b128 fusion.
-
-  Flash work-copy emits 32 scalar SLOADs that scheduling often splits; contiguous-only
-  clustering left half unfused (16→4×b128, 16 still B32).
-  """
-  if not getenv("AMD_CLUSTER_SLOAD", 1): return ops
-  out: list[UOp] = []
-  i = 0
-  while i < len(ops):
-    u = ops[i]
-    if u.op is Ops.INS and _iop(u) is AMDOps.SLOAD and _const_int(u.src[1]) is not None and _lds_byte_off(u) == 0:
-      base = u.src[0]
-      group = [u]
-      taken = {i}
-      # Scan a window for more independent same-base const SLOADs (not only adjacent).
-      j = i + 1
-      max_scan = i + 1 + getenv("AMD_CLUSTER_SLOAD_SCAN", 64)
-      while j < len(ops) and j < max_scan and len(group) < 32:
-        v = ops[j]
-        if v.op is Ops.INS and _iop(v) is AMDOps.SLOAD and v.src[0] is base and \
-           _const_int(v.src[1]) is not None and _lds_byte_off(v) == 0 and \
-           not any(g in v.src or v in g.src for g in group):
-          group.append(v)
-          taken.add(j)
-        j += 1
-      if len(group) >= 4:
-        group.sort(key=lambda x: int(_const_int(x.src[1])))  # type: ignore[arg-type]
-        out.extend(group)
-        # Emit skipped non-taken ops in original order after the cluster? No — keep
-        # relative order of non-loads: rebuild the window with loads extracted.
-        for k in range(i + 1, j):
-          if k not in taken: out.append(ops[k])
-        i = j
-        continue
-    out.append(u)
-    i += 1
   return out
 
 def _pack_aligned_const_scratch_sloads(ops:list[UOp]) -> list[UOp]:

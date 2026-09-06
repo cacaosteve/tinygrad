@@ -53,21 +53,32 @@ def main() -> None:
   p = argparse.ArgumentParser()
   p.add_argument("--S", type=int, default=256, help="KV length (tiles = ceil(S/32))")
   p.add_argument("--T", type=int, default=128)
+  p.add_argument("--tol", type=float, default=2e-4, help="maxdiff vs SDPA (fail the run if exceeded)")
   args = p.parse_args()
   T = min(args.T, args.S)
   print("device", Device.DEFAULT, Device[Device.DEFAULT].renderer.__class__.__name__)
   skip2 = run(skip="2", work=1, S=args.S, T=T, direct=1)
   prom = run(skip="", work=0, S=args.S, T=T, direct=1)
   sdpa = run(skip="2", work=1, S=args.S, T=T, direct=0)
+  results: dict[str, tuple[float, float, bool]] = {}
   for name, a, b in (
     ("prom_vs_skip2", prom, skip2),
     ("skip2_vs_sdpa", skip2, sdpa),
     ("prom_vs_sdpa", prom, sdpa),
   ):
     mx, mn, ok = maxdiff(a, b)
+    results[name] = (mx, mn, ok)
     print(f"{name}: ok={ok} maxdiff={mx:.6g} mean={mn:.6g}")
-  ok = np.isfinite(prom).all() and maxdiff(prom, skip2)[0] == 0.0
-  raise SystemExit(0 if ok else 1)
+  prom_ok = np.isfinite(prom).all() and results["prom_vs_skip2"][2] and results["prom_vs_skip2"][0] == 0.0
+  sdpa_ok = (
+    results["skip2_vs_sdpa"][2] and results["skip2_vs_sdpa"][0] <= args.tol and
+    results["prom_vs_sdpa"][2] and results["prom_vs_sdpa"][0] <= args.tol
+  )
+  if not prom_ok:
+    print("FAIL: promote must match SKIP=2 exactly (and stay finite)")
+  if not sdpa_ok:
+    print(f"FAIL: vs SDPA maxdiff must be <= {args.tol:g}")
+  raise SystemExit(0 if prom_ok and sdpa_ok else 1)
 
 
 if __name__ == "__main__":
