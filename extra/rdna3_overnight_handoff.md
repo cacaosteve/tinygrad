@@ -1,39 +1,37 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **pending** — QP_lds Q/P reuse barrier.
+Tip: **`478c23b49`**.
 
-## Headline — correctness first
+## Headline
 
-**Flash DIRECT remains experimental and correctness-blocked.** Prefill defaults to
-SDPA unless `AMD_FLASH_DIRECT=1`.
+**QK wave race fixed.** Prefill Flash DIRECT still experimental (not default) until
+longer soak + PV path confidence. Packing / FMA_MIX / K-unroll / perf stay off.
 
-## Root cause (candidate fix)
+## Fix
 
-`QP_lds` holds **Q during QK**, then **P reuses the same buffer**. There was **no barrier**
-between QK reads and P writes. Faster waves (often wave_n=0) finish soft and overwrite
-Q while slower waves are still in the K-loop → wave_n=1-only QK nondeterminism.
-
-**Fix:** `S_reg = S_reg.after(UOp.barrier(S_reg))` immediately before `P_store`.
+1. **Dedicated P LDS** (`slot=5`) — stop P from aliasing `QP_lds` / Q.
+2. **`UOp.barrier(qk_done)` before V_store** — `V_lds.after(qk_done)` was per-wave
+   only; early waves could overwrite K (KV slot 1) while peers were still in QK.
 
 ## Evidence
 
-| Probe | Result |
-|-------|--------|
-| `q_lds` / `k_lds` alone | EXACT on fail vs pred |
-| Same ELF `q_lds,k_lds,qk_wmma` | LDS **EXACT**, `qk_wmma` **diverges** |
-| fail wn0 vs wn1 | **DIFF** (same launch; must match) |
-| HIP wn0 vs wn1 | always EXACT |
-| K-loop `v28@128` spill | **not causal** — `TC_LDS_AB=1` removes spill, bug remains |
-| INSTR_WAIT / IN_ORDER / K_UNROLL=2 | still diverge |
+| Test | Result |
+|------|--------|
+| Pre-fix `qk_wmma` | fail ~replay 1–10; wn1-only; fail wn0≠wn1 |
+| Same-ELF `q_lds`/`k_lds` | EXACT while `qk_wmma` diverged |
+| Post-fix `qk_wmma` ×300 | stable mean=HIP; no out divergence |
+| Uninstrumented recreate×200 | **exact=True maxdiff=0 ref_ok** |
+| Uninstrumented fixed×200 | **exact=True maxdiff=0 ref_ok** |
+
+`v28` K-loop spill was a red herring (`TC_LDS_AB` removed it; bug remained).
 
 ## Next
 
-1. GPU: confirm `qk_wmma` + out stable after Q/P barrier (100+ replays).
-2. If stable: leave PV/perf blocked until a few clean overnight runs.
-3. Do not ship DIRECT as default yet.
+1. Longer soak (1k+ fixed launches) if time.
+2. Phase-dump `p_lds`/`pv_wmma`/`pv` once — expect match now that QK is stable.
+3. Keep DIRECT opt-in; do not enable by default yet.
 
 ```
-PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py \
-  --phase-only --phases qk_wmma --replays 100
+PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py --modes recreate,fixed --replays 200
 ```
