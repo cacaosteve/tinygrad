@@ -96,6 +96,8 @@ def phase_shapes(BH: int, M: int, S: int, D: int = 128,
                           BLOCK_N // LANES_PER_WAVE_N,
                           D // (WAVES_N * LANES_PER_WAVE_N))
   all_shapes = {
+    "q_lds": (BH, nm, ntiles, BLOCK_M, D),
+    "k_lds": (BH, nm, ntiles, BLOCK_N, D),
     "qk": (BH, nm, ntiles, BLOCK_M, BLOCK_N),
     "qk_wmma": (BH, nm, ntiles, WAVES_N, BLOCK_M, BLOCK_N),
     "s_soft": (BH, nm, ntiles, WAVES_N, BLOCK_M, BLOCK_N),
@@ -416,6 +418,8 @@ def trace_s_slots(prg, *, focus: dict | None = None) -> dict:
 
   QK WMMAs are the first TN packs; soft copy is ACC→low VGPR MOV after those.
   Reports EXTRACT/MOV/REG_STORE/SPILL/FILL with phys names and scratch offsets.
+  Also lists SPILL/FILL in the QK window (barrier→after QK WMMAs) — address bases
+  like v28@scratch+128 are often outside ACC watch sets but clobbered by LLOAD.
   """
   from tinygrad.renderer.isa import greg
   from tinygrad.renderer.isa.rdna3 import AMDOps, _iop, _unwrap_const, _reg_slots
@@ -434,6 +438,10 @@ def trace_s_slots(prg, *, focus: dict | None = None) -> dict:
       "note": "S_reg / QK WMMA C",
     })
 
+  barriers = [i for i, u in enumerate(lin.src) if u.op is Ops.INS and _iop(u) is AMDOps.BARRIER]
+  qk_window = (barriers[0] if barriers else 0,
+               (qk_wmmas[-1][0] + 80) if qk_wmmas else len(lin.src))
+
   acc_bases = []
   for a in s_accs:
     try: acc_bases.append(int(a[1:]))
@@ -442,6 +450,7 @@ def trace_s_slots(prg, *, focus: dict | None = None) -> dict:
   acc_lane_names = {f"v{b + k}" for b in acc_bases for k in range(8)}
   soft_dsts: list[str] = []
   soft_src_of: dict[str, str] = {}
+  acc_zero_movs: list[dict] = []
   if qk_wmmas:
     start = qk_wmmas[-1][0] + 1
     # Stop before PV WMMAs (next WMMA after QK block).
@@ -475,33 +484,55 @@ def trace_s_slots(prg, *, focus: dict | None = None) -> dict:
         if len(soft_dsts) >= TM * TN:
           break
 
+  # ACC cin zeroing before first QK WMMA (MOV into ACC lanes).
+  if qk_wmmas:
+    for j in range(qk_window[0], qk_wmmas[0][0]):
+      u = lin.src[j]
+      if u.op is not Ops.INS or _iop(u).name != "MOV" or not u.src: continue
+      dreg, sreg = greg(u), greg(u.src[0])
+      if dreg is None: continue
+      dn = str(dreg)
+      if dn in acc_lane_names or dn in s_accs:
+        acc_zero_movs.append({"i": j, "dst": dn, "src": str(sreg) if sreg is not None else None})
+        events.append({"i": j, "op": "MOV", "slot_hint": 6, "dst": dn,
+                       "srcs": [str(sreg) if sreg is not None else None], "note": "ACC cin zero/init"})
+
   soft_set = set(soft_dsts)
   watch = set(s_accs) | soft_set | acc_lane_names
+  qk_window_spill_fill: list[dict] = []
   for i, u in enumerate(lin.src):
     if u.op is not Ops.INS: continue
     op = _iop(u)
     if op is AMDOps.SPILL:
       src_reg = greg(u.src[1]) if len(u.src) > 1 else None
-      if src_reg is None or str(src_reg) not in watch: continue
+      if src_reg is None: continue
       disp = _unwrap_const(u.src[0])
-      events.append({
+      rec = {
         "i": i, "op": "SPILL",
-        "slot_hint": 16 if str(src_reg) in soft_set else 6,
+        "slot_hint": 16 if str(src_reg) in soft_set else (6 if str(src_reg) in watch else None),
         "phys": str(src_reg),
         "scratch_off": int(disp.val) if disp is not None else None,
         "slots": int(_reg_slots(u.src[1])) if len(u.src) > 1 else None,
-      })
+      }
+      if str(src_reg) in watch:
+        events.append(rec)
+      if qk_window[0] <= i <= qk_window[1]:
+        qk_window_spill_fill.append(rec)
     elif op is AMDOps.FILL:
       dst = greg(u)
-      if dst is None or str(dst) not in watch: continue
+      if dst is None: continue
       disp = _unwrap_const(u.src[0])
-      events.append({
+      rec = {
         "i": i, "op": "FILL",
-        "slot_hint": 16 if str(dst) in soft_set else 6,
+        "slot_hint": 16 if str(dst) in soft_set else (6 if str(dst) in watch else None),
         "phys": str(dst),
         "scratch_off": int(disp.val) if disp is not None else None,
         "slots": int(_reg_slots(u)),
-      })
+      }
+      if str(dst) in watch:
+        events.append(rec)
+      if qk_window[0] <= i <= qk_window[1]:
+        qk_window_spill_fill.append(rec)
     elif op is AMDOps.REG_STORE:
       dst = greg(u.src[0]) if u.src else None
       dn = str(dst) if dst is not None else None
@@ -533,6 +564,9 @@ def trace_s_slots(prg, *, focus: dict | None = None) -> dict:
     "qk_wmma_count": len(qk_wmmas),
     "qk_wmma_acc_phys": s_accs,
     "s_soft_phys": soft_dsts,
+    "acc_zero_movs": acc_zero_movs,
+    "qk_window": {"start": qk_window[0], "end": qk_window[1]},
+    "qk_window_spill_fill": qk_window_spill_fill,
     "focus": focus_map,
     "events": events,
     "spill_fill_watched": [e for e in events if e.get("op") in ("SPILL", "FILL")],
@@ -816,17 +850,20 @@ def run_phase_fail_capture(S: int, T: int, acc_work: bool, art: Path, q_np, kv_n
   else:
     print("  WARNING: out diverged but selected phase dumps match — try more phases")
 
-  # Probe: QK → S_soft → p_reg → LDS → PV (leave PV/acc alone until wave_n=1 S is stable)
+  # Probe: shared Q/K LDS → QK → S_soft → p_reg → LDS → PV (leave PV/acc alone until wave_n=1 S is stable)
   probe = None
-  s_phases = ("qk_wmma", "s_soft", "p_reg", "p_lds", "v_lds", "pv_wmma", "pv", "acc")
+  s_phases = ("q_lds", "k_lds", "qk_wmma", "s_soft", "p_reg", "p_lds", "v_lds", "pv_wmma", "pv", "acc")
   if any(p in cmp["phases"] for p in s_phases):
     def _phase_has_div(name: str) -> bool:
       p = cmp["phases"].get(name)
       if not p: return False
       return p.get("full_fail_vs_pred") is not None or any(x.get("div") for x in p.get("per_ntile", []))
     flags = {n: _phase_has_div(n) for n in s_phases}
-    if flags.get("qk_wmma"):
-      probe, note = "qk_wmma_wrong", "per-wave QK already wrong → Q/K WMMA or ACC extract/init"
+    if flags.get("q_lds") or flags.get("k_lds"):
+      bad = "q_lds" if flags.get("q_lds") else "k_lds"
+      probe, note = f"{bad}_wrong", "shared Q/K LDS already diverges → store/barrier/tile load"
+    elif flags.get("qk_wmma"):
+      probe, note = "qk_wmma_wrong", "LDS ok (or undumped); per-wave QK wrong → WMMA/ACC/VGPR/spill"
     elif flags.get("s_soft"):
       probe, note = "s_soft_wrong", "QK ok but S_soft wrong → ACC→soft copy or slot-16 promote/spill"
     elif flags.get("p_reg"):
@@ -852,6 +889,10 @@ def run_phase_fail_capture(S: int, T: int, acc_work: bool, art: Path, q_np, kv_n
         p_wn = first_divergent(pl[focus_head, focus_bm, :, 0], pl[focus_head, focus_bm, :, 1])
         print(f"  {pname} wave_n0 vs wave_n1 (pred focus): {'EXACT' if p_wn is None else p_wn}")
         cmp["probe"][f"{pname}_wave_n_mismatch_pred"] = p_wn
+        f_wn = first_divergent(dump_hist[fail_i][pname][focus_head, focus_bm, :, 0],
+                               dump_hist[fail_i][pname][focus_head, focus_bm, :, 1])
+        print(f"  {pname} wave_n0 vs wave_n1 (fail focus): {'EXACT' if f_wn is None else f_wn}")
+        cmp["probe"][f"{pname}_wave_n_mismatch_fail"] = f_wn
         for nt_info in cmp["phases"].get(pname, {}).get("per_ntile", []):
           if nt_info.get("div") is None: continue
           nt = nt_info["n_tile"]
@@ -859,6 +900,11 @@ def run_phase_fail_capture(S: int, T: int, acc_work: bool, art: Path, q_np, kv_n
             d = first_divergent(dump_hist[pred_i][pname][focus_head, focus_bm, nt, wn],
                                 dump_hist[fail_i][pname][focus_head, focus_bm, nt, wn])
             print(f"  {pname} n_tile={nt} wave_n={wn} fail_vs_pred={'EXACT' if d is None else d}")
+          # Same-launch wave disagreement on the failing tile is the smoking gun.
+          wn_fail = first_divergent(dump_hist[fail_i][pname][focus_head, focus_bm, nt, 0],
+                                    dump_hist[fail_i][pname][focus_head, focus_bm, nt, 1])
+          print(f"  {pname} n_tile={nt} fail wn0 vs wn1={'EXACT' if wn_fail is None else wn_fail}")
+          cmp["probe"][f"{pname}_nt{nt}_fail_wn_mismatch"] = wn_fail
 
   slot_trace = None
   s_slot_trace = None
@@ -869,9 +915,13 @@ def run_phase_fail_capture(S: int, T: int, acc_work: bool, art: Path, q_np, kv_n
       (phase_art / "s_slot_trace.json").write_text(json.dumps(s_slot_trace, indent=2, default=str))
       print(f"  S slot trace: qk_acc={s_slot_trace['qk_wmma_acc_phys']} "
             f"soft={s_slot_trace['s_soft_phys'][:8]}{'…' if len(s_slot_trace['s_soft_phys'])>8 else ''} "
-            f"spill/fill={len(s_slot_trace['spill_fill_watched'])}")
+            f"spill/fill={len(s_slot_trace['spill_fill_watched'])} "
+            f"qk_window_sf={len(s_slot_trace.get('qk_window_spill_fill') or [])} "
+            f"acc_zero={len(s_slot_trace.get('acc_zero_movs') or [])}")
       if s_slot_trace.get("focus"):
         print(f"  S slot focus: {s_slot_trace['focus']}")
+      for e in (s_slot_trace.get("qk_window_spill_fill") or [])[:12]:
+        print(f"    qk_window {e.get('op')} {e.get('phys')} off={e.get('scratch_off')}")
     except Exception as e:
       s_slot_trace = {"error": str(e)}
       print(f"  S slot trace FAILED: {e}")
@@ -912,8 +962,8 @@ def main() -> None:
   p.add_argument("--phase-only", action="store_true",
                  help="skip recreate/fixed/scratch; only instrumented fail capture")
   p.add_argument("--phases", default="qk_wmma",
-                 help="comma dumps: qk_wmma,s_soft,p_reg,p_lds,v_lds,pv_wmma,pv,acc "
-                      "(one probe at a time for wave_n=1)")
+                 help="comma dumps: q_lds,k_lds,qk_wmma,s_soft,p_reg,p_lds,v_lds,pv_wmma,pv,acc "
+                      "(one phase per ELF when localizing; q_lds/k_lds are shared)")
   p.add_argument("--focus-head", type=int, default=None)
   p.add_argument("--focus-bm", type=int, default=None)
   p.add_argument("--artifacts", default="extra/rdna3_state_diag")

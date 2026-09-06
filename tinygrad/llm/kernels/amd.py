@@ -721,6 +721,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   """Hand flash-attn. Optional phase_dumps=(("qk", buf), ...) for diagnostics.
 
   Dump buffers use *logical* tile coords so each slot has one writer:
+    q_lds:   (BH, M//BLOCK_M, Ntiles, BLOCK_M, D) — Q LDS after qk_load_barrier; unique (qrow,d) writers
+    k_lds:   (BH, M//BLOCK_M, Ntiles, BLOCK_N, D) — K LDS after qk_load_barrier; unique (krow,d) writers
     qk_wmma:(BH, M//BLOCK_M, Ntiles, WAVES_N, BLOCK_M, BLOCK_N) — raw QK after qk_done (slot 6 / per wave)
     s_soft:  (BH, M//BLOCK_M, Ntiles, WAVES_N, BLOCK_M, BLOCK_N) — after ACC→S_soft (+scale/mask); before exp
     qk:      (BH, M//BLOCK_M, Ntiles, BLOCK_M, BLOCK_N) — scaled+masked S; writer wave_n==0 (legacy)
@@ -733,6 +735,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     pv:      (BH, M//BLOCK_M, Ntiles, BLOCK_M, D) — PV *after* copy (slot 17 / current reader)
     acc:     (BH, M//BLOCK_M, BLOCK_M, D) — pre-norm acc; all threads unique (qrow,dcol)
   Ntiles = ceil(S/BLOCK_N) when S is int. Probe wave_n=1 with qk_wmma → s_soft → p_reg.
+  Shared Q/K LDS dumps rule out tile data before blaming wave-local ACC/VGPR/spill.
   """
   dumps = dict(phase_dumps)
   valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start) if q_start is not None else None
@@ -764,6 +767,23 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   K_store = KV_lds.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_k].store(kval).end(load_k)
   qk_load_barrier = UOp.barrier(UOp.group(Q_store, K_store))
   Q_lds, KV_lds_k = Q_lds.after(qk_load_barrier), KV_lds.after(qk_load_barrier)
+  # Diagnostic: shared Q/K LDS after barrier (pre-WMMA inputs; expect exact across launches).
+  if dumps and "q_lds" in dumps:
+    dq = dumps["q_lds"]  # (BH, Nm, Ntiles, BLOCK_M, D) — unique (qrow, dcol) per thread
+    q_lds_stores = []
+    for ei in range(Q_ELEMS_PER_THREAD):
+      flat = tid * Q_ELEMS_PER_THREAD + ei
+      qrow, dcol = flat // D, flat % D
+      q_lds_stores.append(dq[block_bh, block_m, n_tile, qrow, dcol].store(Q_lds[qrow, dcol].float()))
+    Q_lds = Q_lds.after(UOp.group(*q_lds_stores))
+  if dumps and "k_lds" in dumps:
+    dk = dumps["k_lds"]  # (BH, Nm, Ntiles, BLOCK_N, D) — unique (krow, dcol) per thread
+    k_lds_stores = []
+    for ei in range(KV_ELEMS_PER_THREAD):
+      flat = tid * KV_ELEMS_PER_THREAD + ei
+      krow, dcol = flat // D, flat % D
+      k_lds_stores.append(dk[block_bh, block_m, n_tile, krow, dcol].store(KV_lds_k[krow, dcol].float()))
+    KV_lds_k = KV_lds_k.after(UOp.group(*k_lds_stores))
   S_reg = _reg((TM, TN), 6, 0, n_tile)
   # AMD_FLASH_UNROLL: 0=off; 1 or 6=soft+corr python-unroll (const REG slots). WMMA stays ranged —
   # frag.after(store) cin was wrong; const_like(0) chains break direct-ISA emit (half2 LDS).
