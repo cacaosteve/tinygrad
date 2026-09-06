@@ -2414,9 +2414,9 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       itemsize, byte_off = u.dtype.itemsize, _lds_byte_off(u)
       soff = _scratch_base_offset(u.src[0])
       # Dest-as-addr scalar: each load scales into its own VGPR so SLOAD streaks can
-      # s_clause (TMP_VADDR CSE blocks multi-index clauses). Off by default — without
-      # AMD_SCRATCH_SCLAUSE it regresses flash ~1.05→1.38ms and blocks b128 fusion.
-      if getenv("AMD_SCRATCH_DEST_ADDR", 0) and not masked and slots == 1 and isinstance(greg(u), Register) and \
+      # s_clause (TMP_VADDR CSE blocks multi-index clauses). Default on with
+      # AMD_SCRATCH_SCLAUSE — HW flash ~2µs faster; AMD_SCRATCH_DEST_ADDR=0 opts out.
+      if getenv("AMD_SCRATCH_DEST_ADDR", 1) and not masked and slots == 1 and isinstance(greg(u), Register) and \
          itemsize in (1, 2, 4) and byte_off <= 0xfff:
         dst = _dst(u)
         pre, addr = _scaled_addr(dst, u.src[1], itemsize)
@@ -3347,6 +3347,7 @@ def _batch_scratch_load_uses(ops:list[UOp]) -> list[UOp]:
 
   Flash tip still pairs each scratch_load with an immediate wait0; batching independent
   scalar SLOADs before their first uses mirrors HIP vmem overlap.
+  Sort batched loads by const index so SCRATCH_LOAD_B128 fusion can match (0,1,2,3).
   """
   if not getenv("AMD_BATCH_SLOAD_USE", 1): return ops
   out: list[UOp] = []
@@ -3362,11 +3363,55 @@ def _batch_scratch_load_uses(ops:list[UOp]) -> list[UOp]:
             not any(prev in ops[j].src or prev in ops[j + 1].src for prev in loads + uses):
         loads.append(ops[j]); uses.append(ops[j + 1]); j += 2
       if len(loads) >= 2:
+        # Index order matters for b128 fusion; USE order follows its load.
+        pairs = sorted(zip(loads, uses), key=lambda lu: (
+          id(lu[0].src[0]), int(c) if (c:=_const_int(lu[0].src[1])) is not None else 1 << 30))
+        loads = [p[0] for p in pairs]
+        uses = [p[1] for p in pairs]
         out.extend(loads)
         out.extend(uses)
         i = j
         continue
     out.append(u); i += 1
+  return out
+
+def _cluster_const_scratch_loads(ops:list[UOp]) -> list[UOp]:
+  """Pull independent const-index SLOADs to the same base together (sorted) for b128 fusion.
+
+  Flash work-copy emits 32 scalar SLOADs that scheduling often splits; contiguous-only
+  clustering left half unfused (16→4×b128, 16 still B32).
+  """
+  if not getenv("AMD_CLUSTER_SLOAD", 1): return ops
+  out: list[UOp] = []
+  i = 0
+  while i < len(ops):
+    u = ops[i]
+    if u.op is Ops.INS and _iop(u) is AMDOps.SLOAD and _const_int(u.src[1]) is not None and _lds_byte_off(u) == 0:
+      base = u.src[0]
+      group = [u]
+      taken = {i}
+      # Scan a window for more independent same-base const SLOADs (not only adjacent).
+      j = i + 1
+      max_scan = i + 1 + getenv("AMD_CLUSTER_SLOAD_SCAN", 64)
+      while j < len(ops) and j < max_scan and len(group) < 32:
+        v = ops[j]
+        if v.op is Ops.INS and _iop(v) is AMDOps.SLOAD and v.src[0] is base and \
+           _const_int(v.src[1]) is not None and _lds_byte_off(v) == 0 and \
+           not any(g in v.src or v in g.src for g in group):
+          group.append(v)
+          taken.add(j)
+        j += 1
+      if len(group) >= 4:
+        group.sort(key=lambda x: int(_const_int(x.src[1])))  # type: ignore[arg-type]
+        out.extend(group)
+        # Emit skipped non-taken ops in original order after the cluster? No — keep
+        # relative order of non-loads: rebuild the window with loads extracted.
+        for k in range(i + 1, j):
+          if k not in taken: out.append(ops[k])
+        i = j
+        continue
+    out.append(u)
+    i += 1
   return out
 
 def _vm_load_count(insts:list) -> int:
@@ -4798,6 +4843,7 @@ class AMDRenderer(ISARenderer):
     lst = _gap_fill_after_loads(lst)
     lst = _cluster_const_scratch_stores(lst)
     lst = _batch_scratch_load_uses(lst)
+    lst = _cluster_const_scratch_loads(lst)
     return _schedule_loop_cmps(lst)
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True
