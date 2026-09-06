@@ -222,13 +222,21 @@ def run_cfg(cfg: str, S: int, T: int, replays: int, layout: dict, art: Path,
   if elf: (cfg_art / "frozen.elf").write_bytes(elf)
 
   outs = []
+  first_fail_i = None
   for i in range(replays):
     o = launch(prg, q_np, kv_np, T)
     outs.append(o)
     if i < 4 or i == replays - 1 or (i + 1) % 25 == 0:
       print(f"  replay[{i}] mean={float(o.mean()):.8g} finite={bool(np.isfinite(o).all())}")
+    if first_fail_i is None and i > 0 and not np.array_equal(outs[0], o):
+      first_fail_i = i
+  # Always keep first eight; also preserve first failing replay + predecessor.
   for i, o in enumerate(outs[:8]):
     np.save(cfg_art / f"replay_{i}.npy", o)
+  if first_fail_i is not None:
+    np.save(cfg_art / f"fail_{first_fail_i}.npy", outs[first_fail_i])
+    np.save(cfg_art / f"pred_{first_fail_i - 1}.npy", outs[first_fail_i - 1])
+    print(f"  saved first_fail={first_fail_i} and pred={first_fail_i - 1}")
 
   finite = all(np.isfinite(o).all() for o in outs)
   exact = all(np.array_equal(outs[0], o) for o in outs[1:])
