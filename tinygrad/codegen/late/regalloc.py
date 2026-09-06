@@ -3,22 +3,23 @@ from bisect import bisect_left
 from tinygrad.device import CompileError
 from tinygrad.helpers import dedup, getenv
 from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat
-from tinygrad.renderer.isa import ISARenderer, Register, greg
+from tinygrad.renderer.isa import ISARenderer, Register, greg, rdef, LinearContext
 from tinygrad.dtype import dtypes, AddrSpace
+from typing import Any
 
 PSEUDO_OPS = {Ops.CONST, Ops.CAST, Ops.BITCAST, Ops.NOOP, Ops.AFTER, Ops.BARRIER, Ops.GROUP, Ops.STACK}
 
 class LinearScanRegallocContext:
   # returns the uop that defines the virtual register
   def vdef(self, v:Register) -> UOp: return self.uops[self.live_range[v][0]]
-  def __init__(self, uops:list[UOp], ren:ISARenderer):
+  def __init__(self, ctx:LinearContext, uops:list[UOp], ren:ISARenderer):
     self.uops = uops
     self.ren = ren
     self.wide = ren.wide_regalloc
     self.idx = itertools.count()
     self.regalloc_i = 0
     self.reg_promotable: set[UOp] = set()
-    if ren.pre_regalloc_matcher is not None:
+    if self.wide:
       from tinygrad.renderer.isa import PreRegAllocContext
       from tinygrad.renderer.isa.rdna3 import _reg_promotable_buffers
       self.reg_promotable = _reg_promotable_buffers(PreRegAllocContext(uops))
@@ -28,21 +29,21 @@ class LinearScanRegallocContext:
     # compute live ranges
     self.live_range: dict[Register, list[int]] = {}
     lr = self.live_range
-    ranges: list[Register] = []
-    for i,u in enumerate(reversed(uops)):
+    loops: dict[int, int] = {} # the interval of each loop, from its RANGE to the last uop that reads that RANGE
+    for idx,u in reversed(list(enumerate(uops))):
       if u.op in PSEUDO_OPS: continue
       defs = u.tag if isinstance(u.tag, tuple) else ()
-      for v in defs + tuple(greg(s) for s in dedup(u.src)):
-        if isinstance(v, Register): lr.setdefault(v, []).insert(0, len(uops) - 1 - i)
+      for v in defs + tuple(rdef(s) for s in dedup(u.src)):
+        if isinstance(v, Register): lr.setdefault(v, []).insert(0, idx)
       for v in defs:
-        if v in lr and (n:=max((lr[rng][-1] for rng in ranges if lr[rng][0] <= lr[v][-1] < lr[rng][-1]), default=None)): lr[v].append(n)
-      if u.op is Ops.RANGE: ranges.append(greg(u))
+        if v in lr and (n:=max((e for s,e in loops.items() if s <= lr[v][-1] < e), default=None)): lr[v].append(n)
+      if u.op is Ops.RANGE: loops[idx] = max(j for j,x in enumerate(uops) if u in x.src)
 
     # allocate registers
-    self.stack_size: int = 0
     self.locals: dict[UOp, UOp] = {}
-    self.spills: dict[Register, UOp] = {} # mapping from virtual to stack slot
+    self.spills: dict[Register, Any] = {} # mapping from virtual to architecture-specific spill slot
     self.remat: set[Register] = set()
+    self.stack_size = 0
     self.reals: dict[int, dict[Register, Register]] = {} # mapping from virtual to real at each program point
     self.insert_before: dict[int, list[tuple[Register, Register]]] = {} # fills to be inserted at each program point
     self.spill_on_evict: dict[int, list[tuple[Register, Register]]] = {}  # (vreg, phys) to spill before insn
@@ -87,7 +88,7 @@ class LinearScanRegallocContext:
 
     def fill(v:Register, i:int, cons:tuple[Register, ...]|None=None, *, pin:bool=True) -> Register:
       vd = self.vdef(v)
-      if ren.rematerialize(vd):
+      if self.wide and ren.rematerialize(vd):
         self.remat.add(v)
         for s in vd.src:
           if s.op is Ops.CONST: continue
@@ -96,11 +97,14 @@ class LinearScanRegallocContext:
             self.reals.setdefault(i, {})[sv] = live[sv]
             if pin: pinned.update(range(live[sv].index, live[sv].index + slots(sv)))
       elif v not in self.spills:
-        sz = ren.spill_size(vd, v)
-        if sz <= 0: sz = 4  # void/empty cons under ACC promote must not ZeroDivisionError
-        offset = self.stack_size + (sz - self.stack_size % sz) % sz
-        self.spills[v] = UOp.cconst(offset, dtypes.int32)
-        self.stack_size = offset + sz
+        if self.wide:
+          sz = ren.spill_size(vd, v)
+          if sz <= 0: sz = 4  # void/empty cons under ACC promote must not ZeroDivisionError
+          offset = self.stack_size + (sz - self.stack_size % sz) % sz
+          self.spills[v] = UOp.cconst(offset, dtypes.int32)
+          self.stack_size = offset + sz
+        else:
+          self.spills[v] = ctx.assign_spill_slot(v, vd)
       r = alloc(cons if cons is not None else v.cons, i, v, pin=pin)
       self.insert_before.setdefault(i, []).append((v, r))
       return r
@@ -113,7 +117,7 @@ class LinearScanRegallocContext:
         if loop_end is not None: continue
         if not isinstance(v:=greg(s), Register): continue
         # Remat usually rebuilds at every use; keep_remat ops reuse the phys reg.
-        if v in self.remat and not ren.keep_remat(self.vdef(v)): live.pop(v, None)
+        if self.wide and v in self.remat and not ren.keep_remat(self.vdef(v)): live.pop(v, None)
         if v not in live: live[v] = fill(v, i)
         self.reals.setdefault(i, {})[v] = live[v]
         pinned.update(range(live[v].index, live[v].index + slots(v)))
@@ -160,15 +164,17 @@ class LinearScanRegallocContext:
           live[v] = alloc(cons, i+1 if u.op is not Ops.RANGE else i, v, spill_at=i)
           self.reals.setdefault(i, {})[v] = live[v]
 
-      for rv in [rv for rv in live if rv in self.remat and not ren.keep_remat(self.vdef(rv))]: live.pop(rv, None)
+      if self.wide:
+        for rv in [rv for rv in live if rv in self.remat and not ren.keep_remat(self.vdef(rv))]: live.pop(rv, None)
 
-      if u.op is Ops.BUFFER:
+      if self.wide and u.op is Ops.BUFFER:
         if u.addrspace is AddrSpace.REG and u in self.reg_promotable: continue
         self.locals[u] = UOp.cconst(self.stack_size, dtypes.int32)
         self.stack_size += u.max_numel() * u.dtype.itemsize
 
       if u.op is Ops.RANGE:
-        used_in_loop = [v for v in live.keys() | self.spills.keys() if any(i <= l < lr[greg(u)][-1] for l in lr[v])]
+        # we move to registers vars used in the loop sorted by next use, vars not used in the loop will not be reloaded in the epilogue
+        used_in_loop = [v for v in live.keys() | self.spills.keys() if any(i <= l < loops[i] for l in lr[v])]
         sorted_uses = sorted(used_in_loop, key=lambda k: (next(l-i for l in lr[k] if l >= i), lr[k][0], k.name, k.index))
         live_in: dict[Register, Register] = {}
         for v in sorted_uses:
@@ -297,22 +303,14 @@ def regalloc_rewrite(ctx:LinearScanRegallocContext, x:UOp):
 
   nsrc = []
   for j,s in enumerate(x.src):
-    if i in ctx.reals and (v:=greg(ctx.uops[i].src[j])) in ctx.spills: nsrc.append(ctx.ren.fill(ctx.spills[v], ctx.vdef(v), ctx.reals[i][v]))
+    # v here is the virtual defined by the original s as s is the rewritten version
+    if i in ctx.reals and (v:=rdef(ctx.uops[i].src[j])) in ctx.spills: nsrc.append(ctx.ren.fill(ctx.spills[v], ctx.vdef(v), ctx.reals[i][v]))
     else: nsrc.append(s)
   ndefs = tuple(ctx.reals[i][v] for v in x.tag) if isinstance(x.tag, tuple) else x.tag
-  if x.op is Ops.BUFFER:
-    if x in ctx.reg_promotable and x not in ctx.locals: nx = ctx.ren.isel_matcher.rewrite(x.replace(tag=ndefs))
-    else: nx = ctx.ren.isel_matcher.rewrite(ctx.ren.stack_pointer().index(ctx.locals[x], tag=ndefs))
-  else: nx = x.replace(src=tuple(nsrc), tag=ndefs)
+  nx = x.replace(src=tuple(nsrc), tag=ndefs)
 
   before = [ctx.ren.fill(ctx.spills[v], ctx.vdef(v), r) for v,r in ctx.insert_before.get(i, [])]
   after = [ctx.ren.spill(ctx.spills[v], nx) for v in x.tag if v in ctx.spills] if isinstance(x.tag, tuple) else []
-
-  if ctx.stack_size > 0:
-    sp = ctx.ren.stack_pointer()
-    offset = UOp.cconst(ctx.stack_size, sp.dtype)
-    if i == 0: before = [ctx.ren.isel_matcher.rewrite(UOp(Ops.SUB, src=(sp, offset), tag=sp.tag))] + before
-    elif i == len(ctx.uops) - 2: before += [ctx.ren.isel_matcher.rewrite(UOp(Ops.ADD, src=(sp, offset), tag=sp.tag))]
 
   return nx, before + [nx] + after
 

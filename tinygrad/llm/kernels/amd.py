@@ -584,56 +584,58 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   _, B, H_KV, N, D = cast(tuple[int, int, int, int, int], cache_kv.shape)
   _, H, M, _ = cast(tuple[int, int, int, int], q.shape)
   assert M == 1 and H % H_KV == 0 and D % WARP_SIZE == 0 and max_kv_len <= N and max_kv_len % block_n == 0
-  G, CHUNK, DPL, WAVES = H // H_KV, block_n, D // WARP_SIZE, waves
+  G, CHUNK, DPL, WAVES, PARTIALS = H // H_KV, block_n, D // WARP_SIZE, waves, out.shape[2]
   assert CHUNK % WAVES == 0
   SEC = CHUNK // WAVES  # keys each wave scans independently
-  live_chunks = (valid_kv_len+CHUNK-1)//CHUNK
-  live_chunks = min(live_chunks, out.shape[2]) if isinstance(live_chunks, int) else live_chunks.minimum(out.shape[2])
+  total_chunks = (valid_kv_len+CHUNK-1)//CHUNK
+  live_chunks = min(total_chunks, PARTIALS) if isinstance(total_chunks, int) else total_chunks.minimum(PARTIALS)
   block_bhkv, block_chunk = UOp.range(B*H_KV, 0, AxisType.GLOBAL), UOp.range(live_chunks, 1, AxisType.GLOBAL)
   lane, wave = UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(WAVES, 3, axis_type=AxisType.LOCAL)
   b, kv_head = block_bhkv // H_KV, block_bhkv % H_KV
   # per-lane query fragments for every GQA head, kept packed in registers; unpacked at use
   qf = tuple(_vec_load(q[b, kv_head*G+h, 0, lane*DPL], DPL) for h in range(G))
   zerof = UOp.const(0, dtypes.float)
+  # Each block scans every PARTIALS-th chunk, keeping an online softmax across rounds.
+  chunk_round = UOp.range((total_chunks-1-block_chunk)//PARTIALS+1, 4, AxisType.REDUCE)
+  chunk_id = block_chunk + chunk_round*PARTIALS
   valids: list[UOp] = []
   scores: list[list[UOp]] = [[zerof]*G for _ in range(SEC)]
   vfrags: list[tuple[UOp, ...]] = [()]*SEC
-  # Batch keys into one warp_reduce_many so swizzle/permlane stages share lgkm waits.
-  # Default 8 = full SEC at waves=8 (one reduce for the wave's keys). Smaller batches
-  # were for VGPR headroom; measured same vgpr with better wait sharing at 8.
-  score_batch = getenv("AMD_FLASH_SCORE_BATCH", 16)
-  for j0 in range(0, SEC, score_batch):
-    js = range(j0, min(j0 + score_batch, SEC))
-    dots: list[UOp] = []
-    for j in js:
-      key = block_chunk*CHUNK + wave*SEC + j
-      valid = key < valid_kv_len
-      valids.append(valid)
-      kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
-      # V is prefetched in the score pass so both streams are in flight together
-      vfrags[j] = _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL)
-      dots.extend([sum((qf[h][i]*kfrag[i] for i in range(DPL)), zerof) for h in range(G)])
-    for t, s in enumerate(warp_reduce_many(dots, full_wave=True)):
-      j, h = j0 + t // G, t % G
-      scores[j][h] = valids[j].where(s * (1/math.sqrt(D)), UOp.const(-math.inf, dtypes.float))
-  ninf = UOp.const(-math.inf, dtypes.float)
-  row_max = [functools.reduce(UOp.maximum, (scores[j][h] for j in range(SEC)), ninf) for h in range(G)]
-  accs:list[list[UOp]] = [[UOp.const(0, dtypes.float)] * DPL for _ in range(G)]
-  row_sums:list[UOp] = [UOp.const(0, dtypes.float) for _ in range(G)]
+  for j in range(SEC):
+    key = chunk_id*CHUNK + wave*SEC + j
+    valid = key < valid_kv_len
+    valids.append(valid)
+    kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
+    # V is prefetched in the score pass so both streams are in flight together
+    vfrags[j] = tuple(valid.where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
+    for h in range(G):
+      s = warp_reduce(sum((qf[h][i]*kfrag[i] for i in range(DPL)), UOp.const(0, dtypes.float)), full_wave=True) * (1/math.sqrt(D))
+      scores[j][h] = valid.where(s, UOp.const(-1e30, dtypes.float))
+  # A finite initial max keeps fully masked waves from computing exp(-inf - -inf).
+  acc_reg, max_reg, sum_reg = _reg((G, DPL), 2, 0), _reg((G,), 3, -1e30), _reg((G,), 4, 0)
+  prev_acc, prev_max, prev_sum = acc_reg.after(chunk_round), max_reg.after(chunk_round), sum_reg.after(chunk_round)
+  row_max = [functools.reduce(UOp.maximum, (scores[j][h] for j in range(SEC)), prev_max[h].load()) for h in range(G)]
+  # Rescale the previous rounds to the new max, then accumulate this round's keys.
+  alpha = [((prev_max[h].load()-row_max[h])*LOG2E).exp2() for h in range(G)]
+  accs = [[alpha[h]*prev_acc[h, i].load() for i in range(DPL)] for h in range(G)]
+  row_sums = [alpha[h]*prev_sum[h].load() for h in range(G)]
   for j in range(SEC):
     for h in range(G):
-      beta = valids[j].where(((scores[j][h]-row_max[h])*LOG2E).exp2(), UOp.const(0, dtypes.float))
-      # Invalid physical-cache rows are still speculatively loaded. Mask before the multiply so an
-      # uninitialized NaN cannot leak through 0*NaN into the partial accumulator.
-      accs[h] = [a + beta*valids[j].where(v, UOp.const(0, dtypes.float)) for a, v in zip(accs[h], vfrags[j])]
+      beta = valids[j].where(((scores[j][h]-row_max[h])*LOG2E).exp2(), zerof)
+      accs[h] = [a + beta*v for a, v in zip(accs[h], vfrags[j])]
       row_sums[h] = row_sums[h] + beta
+  update = UOp.group(acc_reg.store(UOp.stack(*(x for acc in accs for x in acc)).reshape(G, DPL)),
+                     max_reg.store(UOp.stack(*row_max)), sum_reg.store(UOp.stack(*row_sums))).end(chunk_round)
+  acc_reg, max_reg, sum_reg = acc_reg.after(update), max_reg.after(update), sum_reg.after(update)
   # exchange across the block's waves through LDS (fp16 halves LDS so more blocks fit per CU)
-  acc_lds = UOp.placeholder((WAVES, G, D), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)
+  # Matching cache/LDS strides can reuse a loop-local cache index outside the loop. Pad that layout.
+  acc_lds = UOp.placeholder((WAVES, G, D + (LDS_PAD if G == SEC else 0)), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)[:, :, :D]
   ml_lds = UOp.placeholder((WAVES, G, 2), dtypes.float, slot=1, addrspace=AddrSpace.LOCAL)
   lds_acc = acc_lds.reshape(WAVES, G, WARP_SIZE, DPL)
-  stores = [lds_acc[wave, h, lane].store(UOp.stack(*accs[h]).cast(dtypes.half)) for h in range(G)]
+  # Normalize before fp16 to avoid overflow. Nonempty waves have sum >= 1; empty waves keep their zero accumulator.
+  stores = [lds_acc[wave, h, lane].store((acc_reg[h].load() / sum_reg[h].load().maximum(1)).cast(dtypes.half)) for h in range(G)]
   # NOTE: duplicate stores of the same value from every lane are harmless here
-  stores += [ml_lds[wave, h, i].store(x) for h in range(G) for i, x in enumerate((row_max[h], row_sums[h]))]
+  stores += [ml_lds[wave, h, i].store(x) for h in range(G) for i, x in enumerate((max_reg[h].load(), sum_reg[h].load()))]
   barrier = UOp.barrier(UOp.group(*stores))
   acc_lds, ml_lds = acc_lds.after(barrier), ml_lds.after(barrier)
   tid = wave*WARP_SIZE + lane
@@ -641,14 +643,16 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   for i in range(-(-G*D//(WAVES*WARP_SIZE))):
     flat = tid + i*WAVES*WARP_SIZE
     h, d = flat // D, flat % D
-    M = functools.reduce(UOp.maximum, (ml_lds[w, h, 0].load() for w in range(WAVES)), ninf)
-    val = sum((((ml_lds[w, h, 0].load()-M)*LOG2E).exp2() * acc_lds[w, h, d].load().float() for w in range(WAVES)), UOp.const(0, dtypes.float))
+    M = functools.reduce(UOp.maximum, (ml_lds[w, h, 0].load() for w in range(WAVES)))
+    # LDS holds normalized values; restore each wave's sum before combining.
+    val = sum((((ml_lds[w, h, 0].load()-M)*LOG2E).exp2() * ml_lds[w, h, 1].load() * acc_lds[w, h, d].load().float()
+               for w in range(WAVES)), zerof)
     oidx = out[b, kv_head*G + h, block_chunk, d]
     if G*D % (WAVES*WARP_SIZE): oidx = out[b, (kv_head*G + h).valid(flat < G*D), block_chunk, d]
     final_stores.append(oidx.store(val))
   hstat = tid
-  M = functools.reduce(UOp.maximum, (ml_lds[w, hstat, 0].load() for w in range(WAVES)), ninf)
-  L = sum((((ml_lds[w, hstat, 0].load()-M)*LOG2E).exp2() * ml_lds[w, hstat, 1].load() for w in range(WAVES)), UOp.const(0, dtypes.float))
+  M = functools.reduce(UOp.maximum, (ml_lds[w, hstat, 0].load() for w in range(WAVES)))
+  L = sum((((ml_lds[w, hstat, 0].load()-M)*LOG2E).exp2() * ml_lds[w, hstat, 1].load() for w in range(WAVES)), zerof)
   q_head = (kv_head*G + hstat).valid(hstat < G) if WAVES*WARP_SIZE > G else kv_head*G + hstat
   final_stores += [stats[b, q_head, block_chunk, 0].store(M), stats[b, q_head, block_chunk, 1].store(L)]
   return UOp.group(*final_stores).end(lane, wave, block_chunk, block_bhkv).sink(arg=KernelInfo(name="flash_decode_partial", opts_to_apply=()))
@@ -699,13 +703,12 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
 
 def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, max_kv_len:int) -> Tensor:
   B, H, D = cache_kv.shape[1], q.shape[1], cache_kv.shape[4]
-  chunks = min(256, max_kv_len // 64)
+  chunks = min(48, max_kv_len // 64)
   partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
-  # Eight waves keeps the LDS exchange mapping correct for both direct ISA and HIP.
-  # AMD_FLASH_WAVES overrides (must divide block_n=64).
-  waves = getenv("AMD_FLASH_WAVES", 8)
-  assert 64 % waves == 0, f"AMD_FLASH_WAVES={waves} must divide block_n=64"
+  waves, group = 16, H // cache_kv.shape[2]
+  while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
+  assert waves > 0, "attention head group exceeds shared memory capacity"
   fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=64, waves=waves)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len+63)//64
@@ -1032,7 +1035,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # after(qk_done) is per-wave only; lds_reuse_barrier syncs the workgroup so K is not
   # overwritten by V while another wave is still in QK.
   V_copy, load_v = V_lds.after(lds_reuse_barrier).permute(1, 0), UOp.range(KV_ELEMS_PER_THREAD, 390)
-  vval = v.reshape(physical_n*D)[n_tile*BLOCK_N*D + tid*KV_ELEMS_PER_THREAD + load_v].float()
+  v_pos = n_tile*BLOCK_N + (tid*KV_ELEMS_PER_THREAD + load_v)//D
+  vval = (v_pos < valid_kv_len).where(v.reshape(physical_n*D)[n_tile*BLOCK_N*D + tid*KV_ELEMS_PER_THREAD + load_v].float(), 0)
   V_store = V_copy.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_v].store(vval).end(load_v)
   pv_barrier = UOp.barrier(UOp.group(P_store, V_store))
   P_lds, V_lds = P_lds.after(pv_barrier), V_lds.after(pv_barrier)
@@ -1169,7 +1173,16 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
 def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
   T_real, q_start = q.shape[2], None
-  if resolve(T_real == 1): return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, assigned_kv.shape[3]))
+  D, N, group = q.shape[3], assigned_kv.shape[3], q.shape[1] // assigned_kv.shape[2]
+  decode = resolve(T_real == 1, False)
+  # Shape/LDS gates from upstream master; fall back to SDPA when hand kernels cannot run.
+  supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and group*((D+LDS_PAD)*2+8) <= 65536 if decode else
+    D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and q.max_shape[2] % BLOCK_M == 0)
+  if not supported:
+    k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
+    mask = None if decode else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
+    return q.float().scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
+  if decode: return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N))
   # Direct ISA can render the hand WMMA prefill correctly, but still trails HIP and
   # often SDPA. With AMD_FLASH_ACC_SMALL (default on for DIRECT): ~670µs vs ~1030µs
   # scratch ACC; HIP ~268µs. SDPA fallback ~306µs remains the non-DIRECT default.
@@ -1259,6 +1272,8 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
   assert alpha.shape[:3] == (batch, heads, tokens) and (len(alpha.shape) == 3 or alpha.shape[-1] in (1, value_dim))
   assert (key_dim <= 32 or key_dim % 32 == 0) and value_dim % 4 == 0
+  assert q.dtype == k.dtype == dtypes.float32, "recurrent Q/K must be float32"
+  assert state.uop.contiguous_view_offset() is not None, "recurrent state must be contiguous"
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
   if start_pos is None: return Tensor.custom_kernel(*srcs, fxn=_gated_delta_prefill_kernel)[0]

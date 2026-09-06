@@ -459,6 +459,8 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
 
   @functools.cached_property
   def ended_ranges(self) -> tuple[UOp, ...]:
+    if self.op is Ops.CALL and self.src[0].op is Ops.CUSTOM_FUNCTION and self.src[0].src: return ()
+    if self.op is Ops.END: return tuple(r for r in self.src[1:] if r.op is Ops.RANGE)
     if self.op in range_start: return self.src[range_start[self.op]:]
     if self.op is Ops.AFTER: return tuple(flatten([x.ended_ranges for x in self.src[1:]]))
     # UNSHARD ends the DEVICE range: its src is per-device index math, the device axis is carried by the axis metadata
@@ -1094,7 +1096,9 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
       trunc = truncate.get(self.dtype) if dtypes.is_float(self.dtype) else math.trunc if dtypes.is_int(self.dtype) else None
       if trunc is not None and all(math.isfinite(v) for v in (smin, smax)): smin, smax = trunc(smin), trunc(smax)
       if dtypes.is_unsigned(self.dtype) and 0 <= smin and smax <= self.dtype.max: return smin, smax
-      if self.dtype in dtypes.floats+dtypes.sints+(dtypes.weakint,): return max(self.dtype.min, smin), min(smax, self.dtype.max)
+      # a signed or float destination holds the part of the source that overlaps it: overflow is undefined, a nan bound overlaps nothing
+      if self.dtype in dtypes.floats+dtypes.sints+dtypes.weaks and smin <= self.dtype.max and self.dtype.min <= smax:
+        return max(self.dtype.min, smin), min(smax, self.dtype.max)
     return self.dtype.min, self.dtype.max
 
   @functools.cached_property
@@ -1249,8 +1253,10 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
 
   def _program_signature(self) -> tuple[tuple[str|None, int, DType, tuple], ...]:
     assert self.op is Ops.PROGRAM and isinstance(self.arg, ProgramInfo), "to_elf should only be called on a PROGRAM ast"
-    return tuple((u.arg.name, u.arg.slot, u.dtype, u._shape)
-                 for u in tuple(filter(lambda u: u.op is Ops.PARAM and u.addrspace != AddrSpace.ALU, self.src[1].src)) + self.arg.vars)
+    params = tuple(u for u in self.src[1].src if u.op is Ops.PARAM and u.addrspace != AddrSpace.ALU)
+    gmap = {s:j for j, s in enumerate(self.arg.globals)}
+    return tuple((u.arg.name, gmap[u.arg.slot], u.dtype, u._shape) for u in params) + \
+           tuple((v.arg.name, len(self.arg.globals)+j, v.dtype, v._shape) for j, v in enumerate(self.arg.vars))
 
   @functools.cached_property
   def program_key(self) -> bytes:
@@ -1424,6 +1430,7 @@ class UPat(RandMixin):
   @staticmethod
   def any(*src): return UPat(src=src, is_any=True)
   def or_casted(self, name:str|None=None): return UPat.any(self if name is None else self.named(name), UPat(Ops.CAST, name=name, src=(self,)))
+  def or_bitcasted(self, name:str|None=None): return UPat.any(self if name is None else self.named(name), UPat(Ops.BITCAST, name=name, src=(self,)))
   def or_after(self, name:str|None=None):
     return UPat.any(self if name is None else self.named(name), UPat(Ops.AFTER, name=name, src=(self,), allow_any_len=True))
   @staticmethod

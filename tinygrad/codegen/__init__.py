@@ -499,7 +499,8 @@ def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:
   _print_compile_stage(prg, "linearize", stage_st, len(lst))
   # isa renderers need to allocate registers
   if isinstance(ctx, ISARenderer):
-    if ctx.pre_regalloc_matcher is not None:
+    lin_ctx = ctx.linear_ctx_type(ctx)
+    if ctx.wide_regalloc:
       stage_st = time.perf_counter_ns()
       lst, scratch = ctx.prepare_pre_regalloc(lst)
       pa_ctx = PreRegAllocContext(lst)
@@ -507,16 +508,18 @@ def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:
       lst = line_rewrite(lst, ctx.pre_regalloc_matcher, pa_ctx)
       if (after:=getattr(ctx, "after_pre_regalloc", None)) is not None: lst = after(lst)
       _print_compile_stage(prg, "pre_regalloc", stage_st, len(lst))
+    else:
+      lst = line_rewrite(lst, ctx.pre_regalloc_matcher, lin_ctx)
     # register definitions (INS without srcs) move to the top so regalloc sees their live ranges span the whole program (callee saved regs)
     stage_st = time.perf_counter_ns()
     lst = sorted(lst, key=lambda u: u.op is not Ops.INS or bool(u.src))
-    regalloc_ctx = LinearScanRegallocContext(lst, ctx)
+    regalloc_ctx = LinearScanRegallocContext(lin_ctx, lst, ctx)
     _print_compile_stage(prg, "regalloc_init", stage_st, len(lst))
     stage_st = time.perf_counter_ns()
     lst = line_rewrite(lst, pm_regalloc_rewrite, regalloc_ctx)
     _print_compile_stage(prg, "regalloc", stage_st, len(lst))
     stage_st = time.perf_counter_ns()
-    lst = line_rewrite(lst, ctx.post_regalloc_matcher, regalloc_ctx)
+    lst = line_rewrite(lst, ctx.post_regalloc_matcher, regalloc_ctx if ctx.wide_regalloc else lin_ctx)
     _print_compile_stage(prg, "post_regalloc", stage_st, len(lst))
     if DEBUG >= 4: print(ctx.asm_str(lst, sink.arg.function_name))
   return prg.replace(src=prg.src + (UOp(Ops.LINEAR, src=tuple(lst)),))

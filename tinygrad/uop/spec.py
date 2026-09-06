@@ -21,13 +21,6 @@ def validate_index(uidx:UOp, gate:UOp|None=None):
   # We can use UOp min/max to do a faster check, but it can give false positive since its not an exact bound and doesn't consider the mask
   if 0<=idx.vmin and idx.vmax<sz: return True
 
-  # TODO: validate these
-  # WEBGPU has a BITCAST in the index, PTX casts pointer to long
-  # VECTORIZE can't be properly modeled in z3 since it doesn't support vectors
-  # don't descend into PARAM shape metadata; only the PARAM value participates in index arithmetic
-  for x in idx.toposort(gate=lambda x: x.op is not Ops.PARAM) | gate.toposort(gate=lambda x: x.op is not Ops.PARAM):
-    if x.op in {Ops.BITCAST, Ops.STACK}: return True
-
   # if all is good and CHECK_OOB=1, validate with z3
   from tinygrad.uop.validate import validate_index_with_z3
   return validate_index_with_z3(sz, idx, gate)
@@ -198,8 +191,8 @@ spec_program = PatternMatcher([
   (UPat(GroupOp.All, name="x"), lambda x: False if x.op is not Ops.CAST and any(s.op is Ops.CONST for s in x.src) else None),
   (UPat(GroupOp.All-{Ops.CONST}, dtypes.weaks), lambda: False),
 
-  # allow special SHRINK
-  (UPat(Ops.SHRINK, src=(UPat((Ops.PARAM, Ops.BUFFER, Ops.AFTER)), UPat(), UPat(Ops.CONST).or_casted())), lambda: True),
+  # allow special SHRINK of a buffer or its bitcast
+  (UPat(Ops.SHRINK, src=(UPat((Ops.PARAM, Ops.BUFFER, Ops.AFTER)).or_bitcasted(), UPat(), UPat.cvar().or_casted())), lambda: True),
 
   # movement ops are not allowed in programs
   (UPat(GroupOp.Movement), lambda: False),

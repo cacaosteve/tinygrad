@@ -187,7 +187,7 @@ class Buffer:
     # zero copy with as_memoryview (disabled by default due to use after free)
     if (force_zero_copy or allow_zero_copy) and hasattr(self.allocator, '_as_buffer'):
       if not no_sync: self.allocator.dev.synchronize()
-      return self.allocator._as_buffer(self._buf)
+      if (mv:=self.allocator._as_buffer(self._buf)) is not None: return mv
     assert not force_zero_copy, "force zero copy was passed, but copy is required"
     Buffer("PYTHON", self.size, self.dtype, opaque=(mv:=memoryview(bytearray(self.nbytes)))).copy_from(self)
     return mv
@@ -280,9 +280,13 @@ class DepsTracker:
       if i in write:
         for dmap in [self.w_dependency_map, self.r_dependency_map]:
           kept = []
-          for st,en,dep in dmap[key]:
-            if st < min(s, en): kept.append((st, min(s, en), dep))
-            if max(e, st) < en: kept.append((max(e, st), en, dep))
+          for entry in dmap[key]:
+            st, en, dep = entry
+            if st == en: continue
+            if en <= s or e <= st: kept.append(entry)
+            else:
+              if st < s: kept.append((st, s, dep))
+              if e < en: kept.append((e, en, dep))
           dmap[key] = kept
         self.w_dependency_map[key].append((s, e, new_dependency))
       else: self.r_dependency_map[key].append((s, e, new_dependency))
@@ -337,8 +341,9 @@ class Compiled:
 
   has_copy_queue:bool = True
 
-  pm_encode:Any = None # per queue kind: queue ops -> flat command words
-  pm_lower:Any = None # per queue kind: custom_function(submit, cmdbuf) -> the queue push
+  pm_batch:Any = None
+  pm_encode:Any = None
+  pm_lower:Any = None
   pm_bufferize:Any = None
 
   def __init__(self, device:str, allocator:Allocator, renderers:list[type[Renderer]], runtime:type[Program[Self]]|None, graph=None, arch=None):
