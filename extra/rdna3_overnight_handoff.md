@@ -1,12 +1,12 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`575e5481e`**.
+Tip: **`4b80a18e8`**.
 
 ## Headline
 
-**QK LDS reuse race fixed and validated.** Continuous multi-shape + serial soak
-running on gaming PC (10+ clean rounds so far). Flash DIRECT still **opt-in**
+**QK LDS reuse race fixed and validated.** Continuous multi-shape + serial soak:
+**50+ clean rounds** on gaming PC (~1h+). Flash DIRECT still **opt-in**
 (`AMD_FLASH_DIRECT=1`); do not flip the prefill default. Packing / FMA_MIX /
 K-unroll / perf stay off. (HIP prefill ~3× faster today.)
 
@@ -21,7 +21,7 @@ K-unroll / perf stay off. (HIP prefill ~3× faster today.)
 | Test | Result |
 |------|--------|
 | fixed ×5000 | **exact=True maxdiff=0 ref_ok** |
-| continuous soak | multi-shape fixed ×500 (128/128,256/64,512/32,2048/32) + serial DIRECT + recreate ×300 per round — **10+ rounds clean** |
+| continuous soak | multi-shape fixed ×500 (128/128,256/64,512/32,2048/32) + serial DIRECT + recreate ×300 — **50+ rounds clean** |
 | all phases ×50 | **instrumented_stable**; hip_near ≈1.8e-7 |
 | serial DIRECT+HIP | **13/13** each |
 
