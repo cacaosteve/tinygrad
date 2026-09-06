@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`4276c17b2`**.
+Tip: **`adf2d1174`**.
 
 ## Headline
 
@@ -12,21 +12,32 @@ Decode: partial ~**34** (HIP ~28.6); e2e ~50–75 noisy; combine ~9.4 (beats HIP
 
 ## Landed
 
-- Safe SLOAD **clustering** (store/CF) + tests
-- Safe SLOAD **batching**: refuse SSTORE/STORE/SPILL as USE (hoist-past-write); composed `_schedule_scratch_load_passes` + tests
+- Safe SLOAD **clustering** (store/CF)
+- Safe SLOAD **batching**: refuse SSTORE/STORE/SPILL as USE; composed schedule tests
 - Promote A/B fails on SDPA maxdiff > tol
-- Pack: second-base trigger identified; `PACK_SLOAD_BASES=1`; pack stays **off** (loses ~10µs)
+- Pack second-base trigger; pack/FMA_MIX stay **off**
 
-## Promote / larger-S (not “noise”)
+## Promote / larger-S (classified — not tolerance)
 
-Fresh-process A/B is **not** stable: S=128 can be exact one run and fail the next (prom≠skip2 and/or skip2≠SDPA beyond tol). Treat as a real multi-tile / path divergence bug to isolate — not FP tolerance.
+Fresh-process bit-exact dumps at **S=128** (4 runs/config):
+
+| path | cross-run exact? | notes |
+|------|------------------|-------|
+| SDPA | yes | reference stable |
+| SKIP=2 + work-copy (defaults) | yes | shipping path |
+| SKIP=2 + `BATCH=0` (cluster on) | **no** | maxΔ~1.5e-3 |
+| promote (`SKIP=""`, work=0) | **no** | fails with batch/cluster on **or** off (maxΔ~few e-3) |
+
+So promote vs SKIP=2 / SDPA failures are **path nondeterminism / incorrect promote codegen**, not FP rounding. Shipping SKIP=2 defaults stay bit-stable in this matrix. Do not call these “noise.”
 
 ## Defaults / keep off
 
-- **FMA_MIX**, **PACK_SLOAD_B128**, second-base packing, eviction experiments
+- **FMA_MIX**, **PACK_SLOAD_B128**, second-base packing, eviction
 
 ## Next leftovers
 
-1. Isolate larger-S / cross-run promote vs SKIP=2 vs SDPA failures (bit-exact dumps)
-2. Decode partial 34→28 + e2e
+1. Root-cause promote-path cross-run instability (independent of batch/cluster)
+2. Decode partial 34→28 + e2e (after promote path trustworthy or explicitly deferred)
 3. eye/GEMM TC_LDS_AB
+
+Branch still has pre-existing Ruff/mypy debt (not introduced by these commits).
