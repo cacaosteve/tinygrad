@@ -980,13 +980,13 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         kcol = rj * LANES_PER_WAVE_N + lane_n
         p_reg_stores.append(dp[block_bh, block_m, n_tile, wave_n, qrow, kcol].store(S_reg[ri, rj]))
     S_reg = S_reg.after(UOp.group(*p_reg_stores))
-  P_lds = QP_lds.flatten()[:WAVES_N * BLOCK_M * BLOCK_N].reshape(WAVES_N, BLOCK_M, BLOCK_N)
-  P_write = P_lds.reshape(WAVES_N, WAVES_M, TM, LANES_PER_WAVE_M, 1, TN, LANES_PER_WAVE_N, 1).permute((1, 0, 3, 6, 2, 4, 5, 7)) \
-    .reshape(THREADS_PER_BLOCK, TM, TN)
   # QP_lds holds Q during QK WMMA; P reuses the same buffer. Without a barrier, a wave
   # that finishes softmax early can overwrite Q while peers are still in the K-loop —
   # matches wave_n=1-only QK nondeterminism with exact shared LDS dumps.
-  S_reg = S_reg.after(UOp.barrier(S_reg))
+  QP_for_p = QP_lds.after(UOp.barrier(S_reg))
+  P_lds = QP_for_p.flatten()[:WAVES_N * BLOCK_M * BLOCK_N].reshape(WAVES_N, BLOCK_M, BLOCK_N)
+  P_write = P_lds.reshape(WAVES_N, WAVES_M, TM, LANES_PER_WAVE_M, 1, TN, LANES_PER_WAVE_N, 1).permute((1, 0, 3, 6, 2, 4, 5, 7)) \
+    .reshape(THREADS_PER_BLOCK, TM, TN)
   P_store = P_write[tid].store(S_reg.cast(dtypes.half))
   beta_i = UOp.placeholder((TM,), dtypes.float, slot=9, addrspace=AddrSpace.REG)
   # Tile-local promotable working copy of REDUCE-carried acc when slot 2 stays scratch.
