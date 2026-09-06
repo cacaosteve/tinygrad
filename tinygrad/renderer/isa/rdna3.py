@@ -15,6 +15,7 @@ from tinygrad.uop import Ops, GroupOp
 from tinygrad.uop.divandmod import affine_int_bounds
 from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
 from tinygrad.renderer.isa.rdna3_defs import (AMDOps, KERNARG_REG, WGID, LID, SGPR, SGPR32, VGPR, WMMA_ACC_VGPR, WMMA_ACC_QUANT_VGPR,
+  PROMOTE_VGPR, PROMOTE_VGPR_QUANT,
   LLOAD_VGPR, PACK_F16_VGPR, PACK_F16_VGPR_UP16, LLOAD_VGPR_UP16, TMP_VDATA, TMP_VADDR, TMP_BRANCH, TMP_SDATA0, TMP_SDATA1,
   allow_upcast16, unwrap_const as _unwrap_const, const_value as _const_value, tconst as _tconst)
 from tinygrad.renderer.isa.rdna3_tc import expand_wmma_lds_tiles, pm_stage_wmma_ab
@@ -922,7 +923,18 @@ def _reg_promote_slot(ctx:PreRegAllocContext, base:UOp, idx:UOp, byte_off:int=0,
 def _new_promoted_reg(ctx:PreRegAllocContext, val:UOp) -> UOp:
   n = ctx.scratch["reg_n"]
   ctx.scratch["reg_n"] = n + 1
-  return UOp(Ops.INS, src=(val,), arg=(AMDOps.MOV, val.dtype), tag=(Register(f"reg{n}", 0, _cons=VGPR),))
+  if (cons:=ctx.scratch.get("promote_vgpr")) is None:
+    uops = ctx.uops or []
+    has_wmma = any(u.op is Ops.WMMA or (u.op is Ops.INS and _iop(u) is AMDOps.WMMA) for u in uops)
+    if not has_wmma:
+      cons = VGPR
+    else:
+      # Match parked ACC pool: quant packs reserve from VGPR[89:].
+      packed_quant = bool(getenv("AMD_PACKED_WMMA_ACC", 1)) and any(
+        u.op is Ops.INS and _iop(u) in (AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16) for u in uops)
+      cons = PROMOTE_VGPR_QUANT if packed_quant else PROMOTE_VGPR
+    ctx.scratch["promote_vgpr"] = cons
+  return UOp(Ops.INS, src=(val,), arg=(AMDOps.MOV, val.dtype), tag=(Register(f"reg{n}", 0, _cons=cons),))
 
 def _peel_add_imm(idx:UOp, itemsize:int, max_byte:int=0xffff, deep:bool=False) -> tuple[UOp, int]:
   """Peel ADD+imm from an index into a byte offset. Keeps one address base live.

@@ -23,6 +23,10 @@ VGPR = tuple(Register(f"v{i}", 256+i, size=4) for i in range(5, 254))
 
 WMMA_ACC_VGPR = VGPR[121:]
 WMMA_ACC_QUANT_VGPR = VGPR[89:]
+# Promoted REG temps must stay out of parked WMMA ACC — otherwise ACC_SMALL /
+# two-address WMMA clobbers loop-carried soft/acc VGPRs (flash SKIP_SLOTS='' nan).
+PROMOTE_VGPR = VGPR[:121]
+PROMOTE_VGPR_QUANT = VGPR[:89]
 LLOAD_VGPR = VGPR[:118]
 PACK_F16_VGPR = VGPR[185:244]
 PACK_F16_VGPR_UP16 = VGPR[59:121]
