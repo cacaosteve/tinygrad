@@ -980,11 +980,12 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         kcol = rj * LANES_PER_WAVE_N + lane_n
         p_reg_stores.append(dp[block_bh, block_m, n_tile, wave_n, qrow, kcol].store(S_reg[ri, rj]))
     S_reg = S_reg.after(UOp.group(*p_reg_stores))
-  # QP_lds holds Q during QK WMMA; P reuses the same buffer. Without a barrier, a wave
-  # that finishes softmax early can overwrite Q while peers are still in the K-loop —
-  # matches wave_n=1-only QK nondeterminism with exact shared LDS dumps.
-  QP_for_p = QP_lds.after(UOp.barrier(S_reg))
-  P_lds = QP_for_p.flatten()[:WAVES_N * BLOCK_M * BLOCK_N].reshape(WAVES_N, BLOCK_M, BLOCK_N)
+  # QK reads Q from QP_lds and K from KV_lds. P used to reuse QP_lds and V reuses KV_lds
+  # (slot 1). Without a sync, early waves overwrite Q/K while peers are still in the K-loop
+  # → wave_n=1-only QK nondeterminism with exact post-load LDS dumps. Dedicated P buffer
+  # removes Q/P aliasing; barrier before V_store protects K until all waves finish QK.
+  lds_reuse_barrier = UOp.barrier(S_reg)
+  P_lds = UOp.placeholder((WAVES_N, BLOCK_M, BLOCK_N), dtypes.half, slot=5, addrspace=AddrSpace.LOCAL)
   P_write = P_lds.reshape(WAVES_N, WAVES_M, TM, LANES_PER_WAVE_M, 1, TN, LANES_PER_WAVE_N, 1).permute((1, 0, 3, 6, 2, 4, 5, 7)) \
     .reshape(THREADS_PER_BLOCK, TM, TN)
   P_store = P_write[tid].store(S_reg.cast(dtypes.half))
@@ -1029,7 +1030,9 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
                            m_i[ri4].store(m_new), beta_i[ri4].store(beta_val)).end(ri4)
     acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
   V_lds = UOp.placeholder((D, BLOCK_N + LDS_PAD), dtypes.half, slot=1, addrspace=AddrSpace.LOCAL)[:, :BLOCK_N]
-  V_copy, load_v = V_lds.after(qk_done).permute(1, 0), UOp.range(KV_ELEMS_PER_THREAD, 390)
+  # after(qk_done) is per-wave only; lds_reuse_barrier syncs the workgroup so K is not
+  # overwritten by V while another wave is still in QK.
+  V_copy, load_v = V_lds.after(lds_reuse_barrier).permute(1, 0), UOp.range(KV_ELEMS_PER_THREAD, 390)
   vval = v.reshape(physical_n*D)[n_tile*BLOCK_N*D + tid*KV_ELEMS_PER_THREAD + load_v].float()
   V_store = V_copy.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_v].store(vval).end(load_v)
   pv_barrier = UOp.barrier(UOp.group(P_store, V_store))
