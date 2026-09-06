@@ -1,4 +1,4 @@
-# Overnight RDNA3 — tip `643005df2`
+# Overnight RDNA3 — tip `515c21a11`
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
 
@@ -52,7 +52,8 @@ Do **not** ship `SKIP_SLOTS=` (also parks slot 2 in peer GEMMs).
 
 ## Next leftovers
 
-1. **Spill-on-evict** (or pin slot-2 promote) so multi-tile promote matches — then revisit SKIP
+1. **Spill-on-evict** landed gated `AMD_SPILL_ON_EVICT=0` (default off) — `=1` MMU-faults on
+   multi-tile promote; needs a safer emit path before enabling
 2. Cut 21 allocator spills / slot-2 tile copies on baseline (~675→HIP)
 3. Decode partial 34→29
 4. eye/GEMM serial fails exist since before this tip (TC_LDS_AB) — separate track

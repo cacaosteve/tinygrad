@@ -64,7 +64,7 @@ class LinearScanRegallocContext:
         assert v is not None
         victims: list[tuple[Register, Register]] = []
         reg = wide_alloc(cons, i, slots(v), v.cons, live, lr, len(uops), slots, pinned if pin else frozenset(),
-                         spill_victims=victims if getenv("AMD_SPILL_ON_EVICT", 1) else None, remat=self.remat)
+                         spill_victims=victims if getenv("AMD_SPILL_ON_EVICT", 0) else None, remat=self.remat)
         # Spill-on-evict: store victim phys before this insn overwrites it. Without this,
         # loop-carried promoted REG (flash slot-2) loses values under pressure (pn>=64).
         for vr, phys in victims:
