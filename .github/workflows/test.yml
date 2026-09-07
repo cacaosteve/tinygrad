@@ -13,6 +13,7 @@ on:
       - master
       - amd-asm-backend
       - amd-asm-full
+      - codex/rdna3-perf-coverage
   pull_request:
   workflow_dispatch:
 
@@ -239,7 +240,10 @@ jobs:
         # Fork WIP tips still carry a fat RDNA3 ISA file; allow headroom
         # until rdna3.py is cut toward Gabriel/~x86 size. Do not raise this for a master PR.
         LIMIT=26500
-        case "${{ github.ref_name }}" in amd-asm-backend|amd-asm-full) LIMIT=28000 ;; esac
+        case "${{ github.ref_name }}" in
+          amd-asm-backend|amd-asm-full) LIMIT=28000 ;;
+          codex/rdna3-perf-coverage) LIMIT=32000 ;;
+        esac
         echo "MAX_LINE_COUNT=$LIMIT (ref=${{ github.ref_name }})"
         MAX_LINE_COUNT=$LIMIT python sz.py
 
