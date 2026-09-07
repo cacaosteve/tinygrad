@@ -148,7 +148,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # are we grouping? (requires local shape support)
   kernel_name = getattr(getattr(k.ast, "arg", None), "name", None)
-  if kernel_name != "flash_decode_combine" and resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if k.ren.target.device == "QCOM" else 2048), False):
+  group_limit = 240 if k.ren.target.device == "QCOM" else 2048
+  if kernel_name != "flash_decode_combine" and resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= group_limit, False):
     for axis, sz in itertools.product(k.axes_of(AxisType.REDUCE)[:3], (16,)):
       try:
         k.apply_opt(Opt(OptOps.SPLIT, axis, (sz, AxisType.GROUP_REDUCE, True)))

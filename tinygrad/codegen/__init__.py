@@ -367,7 +367,8 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
 
   # ** expander (expand_rewrite) **
   # reduce_unparented: a REDUCE whose src folded to a CONST (e.g. x*0) has no parented ranges, collapse it before the expander
-  sink = graph_rewrite(sink, sym+pm_move_where_on_load+pm_flatten_range+pm_index_mops+pm_reduce_unparented+pm_reduce_identity, name="postopt symbolic")
+  sink = graph_rewrite(sink, sym+pm_move_where_on_load+pm_flatten_range+pm_index_mops+pm_reduce_unparented+pm_reduce_identity,
+                       name="postopt symbolic")
 
   # expand
   sink = graph_rewrite(sink, expander2, ctx=build_range_map(sink), name="expander")
