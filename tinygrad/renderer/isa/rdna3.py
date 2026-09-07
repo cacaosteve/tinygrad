@@ -1283,7 +1283,8 @@ AMD_PACKED_F16_MUL_TO_F16 = "__builtin_amdgcn_fma_mixlo_f16_packed({}, {}, {})"
 AMD_MBCNT_LO = "__builtin_amdgcn_mbcnt_lo(-1, 0)"
 AMD_SWIZZLE_PREFIX = "__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {0}), "
 # Identity cross-16 gather: lane i reads lane i^16. Select nibbles 0..15 across src1|src2.
-AMD_PERMLANEX16 = "__builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__builtin_bit_cast(int, {0}), __builtin_bit_cast(int, {0}), 0x76543210, 0xfedcba98, true, false))"
+AMD_PERMLANEX16 = ("__builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__builtin_bit_cast(int, {0}), "
+                   "__builtin_bit_cast(int, {0}), 0x76543210, 0xfedcba98, true, false))")
 
 def _warp_group_reduce(x:UOp) -> UOp|None:
   """Use a wave32 butterfly for an isolated f32 ADD group reduction."""
@@ -1850,7 +1851,8 @@ post_regalloc_matcher = PatternMatcher([
   # STRUCTURAL: INDEX/SHRINK/CAST/CONST etc. must not become LINEAR statements. Regalloc returns
   # None for SHRINK/LOAD/STORE → line_rewrite's `or (nu,[nu])` would otherwise re-emit them and
   # break do_assemble's all-INS match (flash_decode_partial ELF regression after master merge).
-  (UPat((Ops.CONST, Ops.CAST, Ops.BITCAST, Ops.NOOP, Ops.AFTER, Ops.SPECIAL, Ops.SINK, Ops.GROUP, Ops.SHRINK, Ops.INDEX, Ops.LOAD, Ops.STORE), name="x"),
+  (UPat((Ops.CONST, Ops.CAST, Ops.BITCAST, Ops.NOOP, Ops.AFTER, Ops.SPECIAL, Ops.SINK, Ops.GROUP,
+         Ops.SHRINK, Ops.INDEX, Ops.LOAD, Ops.STORE), name="x"),
    lambda x: (x, [])),
 ])
 
