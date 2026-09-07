@@ -315,10 +315,13 @@ class RandMixin(OpMixin):
       key = key.repeat_interleave(int(self.shape[-3] // key.shape[-3]), dim=-3)
       value = value.repeat_interleave(int(self.shape[-3] // value.shape[-3]), dim=-3)
       # AMD direct-ISA TC matmul is wrong on the strided expanded K/V view for even
-      # query-head counts (odd heads diverge). Contiguous only when shapes are static —
-      # forcing it on symbolic KV lengths can hit "compact B needs VGPR idx".
+      # query-head counts (odd heads diverge). Contiguous only on AMDRenderer with static
+      # shapes — applying it everywhere adds two kernels and breaks test_gemm_qkv fusion.
+      # Forcing it on symbolic KV lengths can hit "compact B needs VGPR idx".
       if all(isinstance(s, int) for s in (*key.shape, *value.shape)):
-        key, value = key.contiguous(), value.contiguous()
+        from tinygrad.device import Device
+        if Device[key.device].renderer.__class__.__name__ == "AMDRenderer":
+          key, value = key.contiguous(), value.contiguous()
 
     q = self
     qk = q.matmul(key.transpose(-2,-1), dtype=least_upper_dtype(q.dtype, key.dtype, dtypes.float32)) / math.sqrt(q.shape[-1])

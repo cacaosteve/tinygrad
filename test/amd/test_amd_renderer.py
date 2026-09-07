@@ -21,6 +21,10 @@ from tinygrad.renderer.isa.amd import AMDRenderer, AMDOps
 _GFX11 = Target("AMD", arch="gfx1100")
 _REN = AMDRenderer(_GFX11)
 
+def _regalloc_ctx(uops, renderer=_REN):
+  """Match codegen.do_linearize: LinearScanRegallocContext(lin_ctx, uops, ren)."""
+  return LinearScanRegallocContext(renderer.linear_ctx_type(renderer), list(uops), renderer)
+
 def _uop(op, dtype=None, src=(), arg=None, tag=None):
   """Build the low-level test fixtures using the current dtype-less UOp API."""
   if op is Ops.INS: return UOp(op, src=src, arg=(arg, dtypes.void if dtype is None else dtype), tag=tag)
@@ -786,7 +790,7 @@ def _late_gated_store_linear(materialized_gate=False):
   uops = [u for u in (out, inp, idx, val, one, gate, addr, mif, st, mend) if u is not None]
   lst = line_rewrite(uops, renderer.pre_regalloc_matcher, PreRegAllocContext())
   lst = sorted(lst, key=lambda u: u.op is not Ops.INS or bool(u.src))
-  regalloc_ctx = LinearScanRegallocContext(lst, renderer)
+  regalloc_ctx = _regalloc_ctx(lst, renderer)
   lst = line_rewrite(lst, pm_regalloc_rewrite, regalloc_ctx)
   lst = line_rewrite(lst, renderer.post_regalloc_matcher, regalloc_ctx)
   return _uop(Ops.LINEAR, src=tuple(lst))
@@ -2513,7 +2517,7 @@ class TestAMDRenderer(unittest.TestCase):
         store = UOp(Ops.INS, src=(acc, new), arg=(AMDOps.REG_STORE, dtypes.void), tag=(greg(acc),))
         ops += [new, store]
       ops += [observe(acc)]
-      ctx = LinearScanRegallocContext(ops, _REN)
+      ctx = _regalloc_ctx(ops, _REN)
       allocated = line_rewrite(ops, pm_regalloc_rewrite, ctx)
       lowered = line_rewrite(allocated, _REN.post_regalloc_matcher)
       registers, scratch, observed = {}, {}, []
@@ -2725,7 +2729,7 @@ class TestAMDRenderer(unittest.TestCase):
     shrink = _uop(Ops.SHRINK, dtypes.float32, (src, UOp.const(0, dtypes.int32), UOp.const(1, dtypes.int32)), tag=(
       Register("shrunk", 1, _cons=amd_lib.VGPR),))
     dst = _uop(Ops.INS, dtypes.float32, (shrink,), AMDOps.MOV, (Register("dst", 2, _cons=amd_lib.VGPR),))
-    out = line_rewrite([src, shrink, dst], pm_regalloc_rewrite, LinearScanRegallocContext([src, shrink, dst], renderer))
+    out = line_rewrite([src, shrink, dst], pm_regalloc_rewrite, _regalloc_ctx([src, shrink, dst], renderer))
     self.assertEqual([u.op for u in out], [Ops.INS, Ops.SHRINK, Ops.INS])
     self.assertIsInstance(greg(out[1]), Register)
     self.assertIs(out[2].src[0], out[1])
@@ -2739,7 +2743,7 @@ class TestAMDRenderer(unittest.TestCase):
     vec = _uop(Ops.INS, dtypes.float32, pack_src, AMDOps.PACK, (vvec,))
     scalar = _uop(Ops.INS, dtypes.float32, arg=AMDOps.DEFINE, tag=(vscalar,))
     use = _uop(Ops.INS, dtypes.float32, (vec,), AMDOps.MOV, (vuse,))
-    out = line_rewrite([vec, scalar, use], pm_regalloc_rewrite, LinearScanRegallocContext([vec, scalar, use], renderer))
+    out = line_rewrite([vec, scalar, use], pm_regalloc_rewrite, _regalloc_ctx([vec, scalar, use], renderer))
     self.assertNotIn(greg(out[1]).index, range(greg(out[0]).index, greg(out[0]).index + 4))
 
   def test_regalloc_vector_group_can_evict_live_scalars(self):
@@ -2751,7 +2755,7 @@ class TestAMDRenderer(unittest.TestCase):
     vec = _uop(Ops.INS, dtypes.float32, pack_src, AMDOps.PACK, (vvec,))
     uses = [_uop(Ops.INS, dtypes.float32, (s,), AMDOps.MOV, (Register(f"use{i}", 5+i, _cons=amd_lib.VGPR[:4]),))
             for i,s in enumerate(scalars)]
-    ctx = LinearScanRegallocContext(scalars + [vec] + uses, renderer)
+    ctx = _regalloc_ctx(scalars + [vec] + uses, renderer)
     self.assertEqual(ctx.reals[len(scalars)][vvec].index, amd_lib.VGPR[0].index)
 
   def test_parallel_vmov_preserves_overlapping_vector_pack_sources(self):
@@ -3546,6 +3550,7 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertNotIn("V_CVT_F32_U32_E32", names)
 
   def test_vgpr_spill_uses_explicit_zero_scratch_addr(self):
+    # VGPR spill/fill park scratch page in TMP_VDATA so TMP_VADDR mem CSE stays live.
     prg = _spill_program()
     renderer = TinyVGPRAMDRenderer(_GFX11)
     for u in _prg_lin(prg).src:
@@ -3553,10 +3558,10 @@ class TestAMDRenderer(unittest.TestCase):
         with self.subTest(op=_iop(u).name):
           insts = renderer._insts_for_uop(u)
           self.assertEqual(insts[0].op_name, "V_MOV_B32_E32")
-          self.assertEqual(insts[0].vdst, amd_lib.TMP_VADDR)
+          self.assertEqual(insts[0].vdst, amd_lib.TMP_VDATA)
           self.assertEqual(str(insts[0].src0), "0")
           scratch = next(i for i in insts if type(i).__name__ == "SCRATCH")
-          self.assertEqual(scratch.addr, amd_lib.TMP_VADDR)
+          self.assertEqual(scratch.addr, amd_lib.TMP_VDATA)
 
   def test_vgpr_spill_pages_at_signed_scratch_offset_boundary(self):
     renderer = TinyVGPRAMDRenderer(_GFX11)
