@@ -642,7 +642,7 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[
   allow_hh = getenv("AMD_FMA_MIX_HH", 0)
   uses: dict[UOp, list[UOp]] = {}
   for u in uops:
-    for s in u.src: uses.setdefault(s, []).append(u)
+    for src in u.src: uses.setdefault(src, []).append(u)
   # Optional: only fold when the f32 sibling is EXP2-derived (softmax@V). Avoids SDPA
   # correctness hits when AMD_FMA_MIX=1 with larger cast caps.
   exp_only = bool(getenv("AMD_FMA_MIX_EXP", 0))
@@ -657,14 +657,17 @@ def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[
     for u in consumers:
       half_i = next((i for i in (1, 2) if u.src[i] is cast), None)
       if half_i is None:
-        ok = False; break
+        ok = False
+        break
       f32_i = 2 if half_i == 1 else 1
       f32 = u.src[f32_i]
       # Skip QK-style half×half; both casts would still need a cvt or a second mix.
       if not allow_hh and _is_f16_to_f32_cast(f32):
-        ok = False; break
+        ok = False
+        break
       if exp_only and not (f32.op is Ops.INS and _iop(f32) is AMDOps.EXP2):
-        ok = False; break
+        ok = False
+        break
       folds[u] = (hbase, f32)
     if ok: skip.add(cast)
     else:
@@ -2889,8 +2892,8 @@ def _prefetch_a_before_dequant_mix(ops:list[UOp]) -> list[UOp]:
       i = pos.get(u)
       if i is None or i < insert_at: continue
       move_idx.add(i)
-      for s in u.src:
-        if s in pos and pos[s] >= insert_at: stack.append(s)
+      for src in u.src:
+        if src in pos and pos[src] >= insert_at: stack.append(src)
   # Never drag weight EXTRACTs / dequant / packs into the A burst.
   weight_set = {out[i] for i in weights}
   for i in move_idx:
@@ -3247,7 +3250,9 @@ def _schedule_swizzle_mov_batches(ops:list[UOp]) -> list[UOp]:
         # Same-stage keys only: next SW must not depend on an earlier use in this batch
         # (no-park SW,ADD,SW,ADD crosses stages otherwise → use-before-def).
         if any(prev in ops[j].toposort() for prev in uses): break
-        sws.append(ops[j]); uses.append(ops[j + 1]); j += 2
+        sws.append(ops[j])
+        uses.append(ops[j + 1])
+        j += 2
       if len(sws) >= 2:
         gap: list[UOp] = []
         if pull_valu:
@@ -3268,7 +3273,8 @@ def _schedule_swizzle_mov_batches(ops:list[UOp]) -> list[UOp]:
         out.extend(uses)
         i = j + len(gap)
         continue
-    out.append(u); i += 1
+    out.append(u)
+    i += 1
   return out
 
 def _gap_fill_after_loads(ops:list[UOp]) -> list[UOp]:
@@ -3478,7 +3484,9 @@ def _batch_scratch_load_uses(ops:list[UOp], *, check_phys:bool=False) -> list[UO
             ops[j] in ops[j + 1].src and _scratch_batch_use_safe(ops[j + 1]) and \
             not any(prev in ops[j].src or prev in ops[j + 1].src for prev in loads + uses) and \
             not (check_phys and _scratch_batch_phys_conflict(loads, uses, ops[j], ops[j + 1])):
-        loads.append(ops[j]); uses.append(ops[j + 1]); j += 2
+        loads.append(ops[j])
+        uses.append(ops[j + 1])
+        j += 2
       if len(loads) >= 2:
         # Index order matters for b128 fusion; USE order follows its load.
         pairs = sorted(zip(loads, uses), key=lambda lu: (
@@ -3490,7 +3498,8 @@ def _batch_scratch_load_uses(ops:list[UOp], *, check_phys:bool=False) -> list[UO
         i = j
         continue
       # fall through
-    out.append(u); i += 1
+    out.append(u)
+    i += 1
   return out
 
 def _pack_aligned_const_scratch_sloads(ops:list[UOp]) -> list[UOp]:
@@ -3707,7 +3716,7 @@ def _fma_pair_pack_dsts(uops:list[UOp], fma_hi_lo:dict[UOp, UOp]) -> dict[UOp, R
   pos = {u:i for i,u in enumerate(uops)}
   last_use: dict[UOp, int] = {}
   for i,u in enumerate(uops):
-    for s in u.src: last_use[s] = i
+    for src in u.src: last_use[src] = i
   ret: dict[UOp, Reg] = {}
   for pack in uops:
     if pack.op is not Ops.INS or _iop(pack) is not AMDOps.PACK_F16 or not isinstance(greg(pack), Register): continue
