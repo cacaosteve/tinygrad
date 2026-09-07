@@ -2244,8 +2244,8 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       return pre + [inst(_dst(u), a, b)]
     case AMDOps.FMA_MIX_F32:
       # srcs: (acc, half, f32) — half is always mix src0 (opsel_hi=1). VOP3 accepts VGPR/SGPR.
-      acc = _dst(u)
-      return [r3.v_fma_mix_f32(acc, _src(u.src[1]), _src(u.src[2]), acc, opsel=0, opsel_hi=1, opsel_hi2=0)]
+      acc_reg = _dst(u)
+      return [r3.v_fma_mix_f32(acc_reg, _src(u.src[1]), _src(u.src[2]), acc_reg, opsel=0, opsel_hi=1, opsel_hi2=0)]
     case AMDOps.CAST:
       cast_src = _src(u.src[0])
       if greg(u).index < 256:
@@ -3835,11 +3835,14 @@ def _fused_scratch_contig_store(uops:list[UOp], i:int, store_addr_cache:_StoreAd
   if all(x.src[1] is idx for x in stores) and offs[0] % 16 == 0 and \
      all(offs[n] == offs[0] + 4 * n for n in range(4)) and offs[0] + 12 <= 0xfff:
     byte_off = offs[0]
-  elif (all(i is not None for i in idxs) and all(o == 0 for o in offs) and
-        idxs[0] % 4 == 0 and all(idxs[n] == idxs[0] + n for n in range(4)) and
-        (idxs[0] + 3) * dt.itemsize <= 0xfff):  # type: ignore[operator]
-    byte_off = int(idxs[0]) * dt.itemsize  # type: ignore[arg-type]
-    idx = _tconst(0, dtypes.int32).rtag()
+  elif all(i is not None for i in idxs) and all(o == 0 for o in offs):
+    i0 = idxs[0]
+    assert i0 is not None
+    if i0 % 4 == 0 and all(idxs[n] == i0 + n for n in range(4)) and (i0 + 3) * dt.itemsize <= 0xfff:
+      byte_off = i0 * dt.itemsize
+      idx = _tconst(0, dtypes.int32).rtag()
+    else:
+      return None
   else:
     return None
   soff = _scratch_base_offset(base)
@@ -3913,12 +3916,15 @@ def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAdd
   if all(x.src[1] is idx for x in loads) and offs[0] % 16 == 0 and \
      all(offs[n] == offs[0] + 4 * n for n in range(4)) and offs[0] + 12 <= 0xfff:
     byte_off = offs[0]
-  elif (all(i is not None for i in idxs) and all(o == 0 for o in offs) and
-        idxs[0] % 4 == 0 and all(idxs[n] == idxs[0] + n for n in range(4)) and
-        (idxs[0] + 3) * dt.itemsize <= 0xfff):  # type: ignore[operator]
-    # Const element indices → encode as byte offset from a zero index.
-    byte_off = int(idxs[0]) * dt.itemsize  # type: ignore[arg-type]
-    idx = _tconst(0, dtypes.int32).rtag()
+  elif all(i is not None for i in idxs) and all(o == 0 for o in offs):
+    i0 = idxs[0]
+    assert i0 is not None
+    if i0 % 4 == 0 and all(idxs[n] == i0 + n for n in range(4)) and (i0 + 3) * dt.itemsize <= 0xfff:
+      # Const element indices → encode as byte offset from a zero index.
+      byte_off = i0 * dt.itemsize
+      idx = _tconst(0, dtypes.int32).rtag()
+    else:
+      return None
   else:
     return None
   soff = _scratch_base_offset(base)
@@ -4551,9 +4557,9 @@ def insts_from_linear(lin:UOp):
         emit(r3.s_clause(simm16=len(group) - 1))
         for su, off in group:
           kw = {"offset": off} if off else {}
-          ld = r3.global_load_b128(_dst(su), addr, saddr=_src(saddr0), **kw)
-          emit(ld)
-          note_vm(_reg_idxs(su), [ld])
+          gld = r3.global_load_b128(_dst(su), addr, saddr=_src(saddr0), **kw)
+          emit(gld)
+          note_vm(_reg_idxs(su), [gld])
         oi = j
         continue
     # Cluster scalar half loads: dest-as-addr scales, then s_clause + tight VMEM (LLVM-style B).
@@ -4779,6 +4785,7 @@ def merge_adjacent_half_loads(sink:UOp) -> UOp:
     buf, idx_u = u.src[0].src[0], u.src[0]
     if buf.addrspace is not AddrSpace.GLOBAL: continue
     idx, valid = idx_u.get_idx(), idx_u.get_valid()
+    root_src: UOp | str
     if idx.op is Ops.ADD and idx.src[1].op is Ops.CONST and isinstance((c:=idx.src[1].val), int):
       root_src, arg = idx.src[0], c
     elif idx.op is Ops.ADD and idx.src[0].op is Ops.CONST and isinstance((c:=idx.src[0].val), int):
@@ -4816,6 +4823,7 @@ def merge_adjacent_uint32_loads(sink:UOp) -> UOp:
     buf, idx_u = u.src[0].src[0], u.src[0]
     if buf.addrspace is not AddrSpace.GLOBAL: continue
     idx, valid = idx_u.get_idx(), idx_u.get_valid()
+    root_src: UOp | str
     if idx.op is Ops.ADD and idx.src[1].op is Ops.CONST and isinstance((c:=idx.src[1].val), int):
       root_src, arg = idx.src[0], c
     elif idx.op is Ops.ADD and idx.src[0].op is Ops.CONST and isinstance((c:=idx.src[0].val), int):

@@ -355,13 +355,13 @@ def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_wa
   lds = UOp.placeholder((output_waves, 32, len(flat_accs)*8), dtypes.float32, slot=33, addrspace=AddrSpace.LOCAL)
   stores = [lds[wave, lane, a*8+i].store(acc.after(update)[i].load()) for a,acc in enumerate(flat_accs) for i in range(8)]
   lds = lds.after(UOp.barrier(UOp.group(*stores)))
-  def values(ai:int) -> tuple[UOp, ...]:
+  def lds_values(ai:int) -> tuple[UOp, ...]:
     own = tuple(lds[wave, lane, ai*8+i].load() for i in range(8))
     peer = tuple(lds[wave, lane ^ 16, ai*8+i].load() for i in range(8))
     low = half.eq(0)
     return tuple(low.where(own[i], peer[i+4]) if j == 0 else low.where(peer[i], own[i+4]) for i in range(4) for j in range(2))
   return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
-          for tile,(tile_tokens,_acc) in enumerate(zip(tokens, output_accs)) for token,value in zip(tile_tokens, values(ot*tt+tile))]
+          for tile,(tile_tokens,_acc) in enumerate(zip(tokens, output_accs)) for token,value in zip(tile_tokens, lds_values(ot*tt+tile))]
 
 def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, dequant, name, swizzle_stores:bool=False,
                        dequant_halves:Callable[[UOp, UOp], tuple[tuple[UOp, ...], tuple[UOp, ...]]]|None=None):
@@ -425,7 +425,7 @@ def _q6_byte_f32(word:UOp, byte:int) -> UOp:
   # Pre-isel folds CAST(AND(SHR(word, shift), 255)) → V_CVT_F32_UBYTEn
   return ((word >> UOp.const(byte*8, dtypes.uint32)) & 255).cast(dtypes.float32)
 
-def _q6_wmma_words(ql4:tuple[UOp, ...], qh4:tuple[UOp, ...], subgroup:UOp, half:int) -> tuple[UOp, ...]:
+def _q6_wmma_words(ql4:UOp, qh4:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
   # All four words in a half share lo/hi shifts (within steps by 4 do not cross 64/32 boundaries).
   within0 = (subgroup*32 + half*16) % 128
   lo_shift, hi_shift = (within0//64)*4, (within0//32)*2
@@ -477,7 +477,7 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
   tid, lut_items = wave*32+lane, 256//(32*output_waves)
   # Packed global→LDS fill (HIP ds_store_b128): load u32×4 then scalar stores; emit folds to B128.
   if direct_isa and lut_items >= 4 and lut_items % 4 == 0:
-    stores = []
+    stores: list[UOp] = []
     for i in range(0, lut_items, 4):
       packed = _amd_load(lut[tid*lut_items+i], 4, packed_u32=True)
       stores.extend(local_lut[tid*lut_items+i+j].store(packed[j]) for j in range(4))
@@ -1001,6 +1001,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   if _fu & 4:
     acc_c, l_c, m_c = acc.after(n_tile), l_i.after(n_tile), m_i.after(n_tile)
     if _acc_work:
+      assert acc_work is not None
       # float4 copy: fewer scratch ops than 32 scalar SLOAD/SSTORE (promoted dst still VGPR).
       if (TM * TD) % 4 == 0:
         src, dst = acc_c.reshape(TM * TD), acc_work.reshape(TM * TD)
@@ -1137,6 +1138,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     # Const-index acc update. Slot 2 stays unpromoted (REDUCE-carried); soft/stats promote.
     acc_c = acc.after(n_tile)
     if _acc_work:
+      assert acc_work is not None
       work = acc_work
       acc_up = UOp.group(*[work[ri, rj].store(work[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
                            for ri in range(TM) for rj in range(TD)])
@@ -1216,13 +1218,13 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # Compile under ACC_SMALL env so renderer parks flash tiles without poisoning peers.
   prev = os.environ.get("AMD_FLASH_ACC_SMALL")
   os.environ["AMD_FLASH_ACC_SMALL"] = "1"
-  getenv.cache_clear()
+  getenv.cache_clear()  # type: ignore[attr-defined]
   try:
     return out.realize()
   finally:
     if prev is None: os.environ.pop("AMD_FLASH_ACC_SMALL", None)
     else: os.environ["AMD_FLASH_ACC_SMALL"] = prev
-    getenv.cache_clear()
+    getenv.cache_clear()  # type: ignore[attr-defined]
 
 # ******** gated delta net: fused recurrent scan ********
 
