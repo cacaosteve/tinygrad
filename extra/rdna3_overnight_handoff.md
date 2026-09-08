@@ -1,50 +1,43 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`b9f1f1578`** (merged `origin/master`).
+Tip: **`7c7cdcae1`** (DIRECT decode: legacy partial @ 8 waves).
 
 ## Headline
 
-**QK LDS reuse race fixed and validated.** Continuous soak ran until gaming PC
-disconnect: **61 clean rounds** (~69 min), zero failures. Flash DIRECT still
-**opt-in** (`AMD_FLASH_DIRECT=1`); do not flip the prefill default. Packing /
-FMA_MIX / K-unroll / perf stay off. (HIP prefill ~3× faster today.)
+**QK LDS reuse race fixed** (prefill). Flash DIRECT still **opt-in**
+(`AMD_FLASH_DIRECT=1`). Prefill packing / FMA_MIX / K-unroll stay off.
+HIP prefill still ~2.4–3× faster (~278 µs vs DIRECT ~675–910 µs).
 
-Merged upstream master (65 commits): decode>16k online-softmax fix, V-load
-masking, shape/LDS SDPA fallback gates, plus CALLIFY/x86/validate cleanups.
-Kept dedicated P LDS + workgroup barrier before V.
+## Decode DIRECT (2026-09-07)
 
-## Fix (`478c23b49`)
+After merging `#18010` (online-softmax past 16k), **DIRECT decode_gqa failed**
+(err~1.18). HIP OK. Root cause:
 
-1. **Dedicated P LDS** (`slot=5`) — P no longer aliases Q's LDS.
-2. **`UOp.barrier(qk_done)` before V_store** — prior `V_lds.after(qk_done)` was
-   per-wave only; early waves could overwrite K (KV slot 1) during peer QK.
+1. `#18010` REG `sum_reg` undercounts on AMDRenderer (partials cancel via
+   normalize; stats L wrong → combine scales).
+2. **waves=16** breaks DIRECT LDS exchange even on pre-#18010 partial;
+   **waves=8** is correct.
 
-## Validation (gaming PC) — ended on disconnect
+**Fix:** DIRECT uses pre-#18010 partial + default 8 waves; SDPA if
+`max_kv_len > chunks*64`. HIP keeps `#18010` / 16-wave path.
 
-| Test | Result |
-|------|--------|
-| fixed ×5000 | **exact=True maxdiff=0 ref_ok** |
-| continuous soak | multi-shape fixed ×500 (128/128,256/64,512/32,2048/32) + serial DIRECT + recreate ×300 — **61 rounds clean** then SSH timed out / network unreachable |
-| all phases ×50 | **instrumented_stable**; hip_near ≈1.8e-7 |
-| serial DIRECT+HIP | **13/13** each |
+Serial on 7900: **13/13 OK** after fix.
 
-Disconnect mid-round 61 during `S=2048 T=32` (prior shapes in that round already OK).
+## Prefill validation (earlier)
 
-## Cleanup this session
+61 clean multi-shape soak rounds then SSH disconnect. Re-soak on tip after
+decode fix.
 
-- Renamed `QP_lds` → `Q_lds`.
-- Phase stability: `hip_out_near` / `hip_maxdiff`.
-- Serial harness selects `AMD:AMD` vs `AMD:HIP`.
-- State diag `--shapes S:T,...`.
+## Next
 
-## Next (when GPU returns)
+1. Continuous soak on tip (prefill + serial).
+2. Re-bench prefill/decode vs HIP.
+3. Perf leftovers only after soak confidence.
+4. Do not flip DIRECT default yet.
 
-1. Keep DIRECT opt-in; optional more soak before flipping defaults.
-2. Perf leftovers (packing / FMA_MIX / K-unroll) only after more confidence.
-
-```
+```bash
+AMD_FLASH_DIRECT=1 PYTHONPATH=.:extra python extra/rdna3_serial_correctness.py
 PYTHONPATH=.:extra python extra/rdna3_flash_state_diag.py --modes fixed \
   --shapes 128:128,256:64,512:32,2048:32 --replays 500
-AMD_FLASH_DIRECT=1 PYTHONPATH=.:extra python extra/rdna3_serial_correctness.py
 ```
