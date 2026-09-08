@@ -1260,6 +1260,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   if not use_acc_small: return out
   # Compile under ACC_SMALL env so renderer parks flash tiles without poisoning peers.
   # Remat one nested addr level: base flash spills are ADD/SHL trees; full deep (2) MMUs.
+  # AMD_REMAT_ADDR_SHALLOW=1 (opt-in): SPILL 14→5; enable here only after clean latency win.
   prev = os.environ.get("AMD_FLASH_ACC_SMALL")
   prev_remat = os.environ.get("AMD_REMAT_ADDR")
   prev_deep = os.environ.get("AMD_REMAT_ADDR_DEEP")
