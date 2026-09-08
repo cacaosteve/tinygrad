@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`e5f7d9943`**.
+Tip: **`1938c4ee0`**.
 
 ## Headline
 
@@ -38,6 +38,7 @@ Soak: continuous on tip (serial+fixed multi-shape).
 - `CMPLT(ADD(x,c),y)` fold: SPILL 14→25 (more pressure)
 - `K_UNROLL=4` pv: tied with baseline; `all`/`qk` nan
 - Slot-2 promote (`SKIP_SLOTS=`): correct, still slightly slower
+- SSTORE byte_off clustering: sorts offs but values are same VGPR (redef/init) — no b128 win
 
 ## Next
 
