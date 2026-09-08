@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`5ecac324c`** / remat SHALLOW **`40e16ec0a`**; decode waves **`e1fea66f8`**.
+Tip: **`bdbc7cbbd`** (NO_STICKY_CONST_ADD opt-in); SHALLOW **`40e16ec0a`**; decode waves **`e1fea66f8`**.
 
 ## Headline
 
@@ -53,7 +53,7 @@ Of **14** SPILLs, **7** are `ADD(ADD(SHL,MOV), CAST(C2016..2028))` — causal `q
 
 ## In flight
 
-- `AMD_REMAT_ADDR_SHALLOW=1`: treats SHL/ADD-of-leaves as leaf-equivalent under DEEP=1 → **SPILL 14→5**, TinyJit looked ~651 vs ~663, but one serial run showed ~910 (dirty GPU?). Needs clean re-validate then enable on flash realize. Gaming PC unreachable mid-test after NO_STICKY hang.
+- Gaming PC unreachable after `AMD_REMAT_NO_STICKY_ADD` hang (likely MMU/host down). Tip **`bdbc7cbbd`**. Reboot/recover then: clean SHALLOW rebench; try `SHALLOW=1` + `NO_STICKY_CONST_ADD=1`.
 
 ## Next
 
