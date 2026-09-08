@@ -5144,6 +5144,8 @@ class AMDRenderer(ISARenderer):
     # SPECIAL(uint)→MOV→CAST(int)→SHL/ADD. Without CAST, AMD_REMAT_ADDR never sees pure addr.
     # Deep remat of nested ADD trees still MMUs on flash (gfx1100); leaf-only via AMD_REMAT_ADDR
     # (default off outside TC_LDS). AMD_REMAT_ADDR_DEEP=1 is unsafe until remat src binding is fixed.
+    # Do NOT treat MUL as pure-addr: depth-1 remat of stride MULs wrongs flash numerics;
+    # depth-2 remat hangs (MMU) on gfx1100.
     if x.op is Ops.CAST and x.dtype in dtypes.ints and x.src:
       return self._pure_addr(x.src[0])
     if x.op is not Ops.INS or x.dtype not in (dtypes.int32, dtypes.uint32): return False
@@ -5169,10 +5171,16 @@ class AMDRenderer(ISARenderer):
       if getenv("ALLOW_UPCAST16", 0) and _iop(x) is AMDOps.LLOAD and x.dtype is dtypes.half:
         return True
     if not getenv("AMD_REMAT_ADDR", 1 if getenv("TC_LDS_AB", 0) else 0): return False
+    # MOV of a const (any dtype) or int leaf is cheaper to remat than spill — flash spills
+    # softmax constants (-1e30, 1/sqrt(D)) and several `MOV True` gates.
+    if _iop(x) is AMDOps.MOV and x.src:
+      s0 = x.src[0]
+      if s0.op is Ops.CONST or (s0.op is Ops.CAST and s0.src and s0.src[0].op is Ops.CONST):
+        return True
+      if x.dtype in (dtypes.int32, dtypes.uint32, dtypes.bool, dtypes.uint) and self._addr_leaf(s0):
+        return True
+      return False
     if x.dtype not in (dtypes.int32, dtypes.uint32, dtypes.bool, dtypes.uint): return False
-    # MOV of a leaf/const is cheaper to remat than spill (flash spills several `MOV True`).
-    if _iop(x) is AMDOps.MOV:
-      return bool(x.src) and self._addr_leaf(x.src[0])
     if not self._pure_addr(x): return False
     # Depth via AMD_REMAT_ADDR_DEEP: 0=leaf srcs; 1=one nested pure-addr (safe on flash);
     # >=2 full deep (historically MMU on flash — leave off).
