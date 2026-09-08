@@ -21,11 +21,21 @@ SGPR = tuple(Register(f"s{i}", i, size=8) for i in range(6, 104, 2) if i not in 
 SGPR32 = tuple(Register(f"s{i}", i, size=4) for i in range(6, 102) if i not in (14, 15, 16, 17, 20, 21, 22, 23))
 VGPR = tuple(Register(f"v{i}", 256+i, size=4) for i in range(5, 254))
 
-WMMA_ACC_VGPR = VGPR[121:]
-WMMA_ACC_QUANT_VGPR = VGPR[89:]
-LLOAD_VGPR = VGPR[:118]
-PACK_F16_VGPR = VGPR[185:244]
-PACK_F16_VGPR_UP16 = VGPR[59:121]
+# Soft partition: ACC packs live in a high VGPR band so LinearScan does not spill them.
+# Flash only parks 6×8=48 ACC lanes (v126..); default base 121 wastes ~80 regs that then
+# force low-VGPR SPILL. AMD_WMMA_ACC_BASE raises the band (tuple index into VGPR).
+# Base 201 → ACC v206..v253 (48 regs) and a much larger general pool.
+_acc_base = int(getenv("AMD_WMMA_ACC_BASE", 121))
+_acc_base = max(89, min(_acc_base, len(VGPR) - 48))
+WMMA_ACC_VGPR = VGPR[_acc_base:]
+WMMA_ACC_QUANT_VGPR = VGPR[min(89, _acc_base):]
+LLOAD_VGPR = VGPR[:min(118, _acc_base)]
+# Keep f16 pack band below ACC when ACC_BASE is raised (default pack stays 185:244).
+if _acc_base >= 201:
+  PACK_F16_VGPR = VGPR[max(121, _acc_base - 60):_acc_base]
+else:
+  PACK_F16_VGPR = VGPR[185:244]
+PACK_F16_VGPR_UP16 = VGPR[59:min(121, _acc_base)]
 LLOAD_VGPR_UP16 = VGPR[:59]
 
 # v3/v4: per-instruction VGPR scratch; s20/s21: SALU/permlane; s22:23: long branch.

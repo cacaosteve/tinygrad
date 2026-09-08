@@ -723,6 +723,7 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
 @functools.cache
 def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None,
                          acc_small:bool=False, k_unroll:int=0, use_acc_work:bool=False,
+                         k_hip_scope:str="all",
                          phase_dumps: tuple[tuple[str, UOp], ...]=()) -> UOp:
   """Hand flash-attn. Optional phase_dumps=(("qk", buf), ...) for diagnostics.
 
@@ -804,12 +805,29 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   S_view = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)
   Q_view = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)
   K_view = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)
-  # AMD_FLASH_K_UNROLL: 0=ranged K; N>=2=outer range of K/N with N chained WMMA;
-  # 1=full python K chain (MMU-faults on gfx1100 — keep off).
+  # AMD_FLASH_K_UNROLL: 0=ranged; N>=2 chained; 1=full chain (MMU); -1=HIP-style store-each-K
+  # (needs AMD_SPILL_DRAIN_LGKM≥1 on DIRECT or MMU-faults). Scope via k_hip_scope / AMD_FLASH_K_HIP_SCOPE.
   _k_factor = int(k_unroll) if _acc_small else 0
+  _k_hip = _k_factor == -1
+  _hip_scope = (k_hip_scope or getenv("AMD_FLASH_K_HIP_SCOPE", "all")).lower() if _k_hip else ""
+  _k_hip_qk = _k_hip and _hip_scope in ("all", "qk", "q")
+  _k_hip_pv = _k_hip and _hip_scope in ("all", "pv", "v")
   _k_unroll_full = _k_factor == 1
   _k_unroll_factor = _k_factor if _k_factor >= 2 and (D // WMMA_K) % _k_factor == 0 else 0
-  if _acc_small and _k_unroll_full:
+  if _acc_small and _k_hip_qk:
+    # HIP-style: chain all K in ACC, one store per (tm,tn) — not store-reload each K.
+    qk_stores = []
+    for tn_i in range(TN):
+      for tm_i in range(TM // WMMA_ACC):
+        S_frag = S_view[tm_i, tn_i]
+        wmma_c = S_frag
+        for k_i in range(D // WMMA_K):
+          q_frag = Q_view[wave_m, tm_i, lane_n, k_i]
+          k_frag = K_view[tn_i, lane_n, k_i]
+          wmma_c = UOp.wmma(q_frag, k_frag, wmma_c, *WMMA_ARG)
+        qk_stores.append(S_frag.store(wmma_c))
+    qk_done = UOp.group(*qk_stores)
+  elif _acc_small and _k_unroll_full:
     qk_stores = []
     for tn_i in range(TN):
       for tm_i in range(TM // WMMA_ACC):
@@ -1067,7 +1085,19 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   pv_view = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)
   P_view = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)
   V_view = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)
-  if _acc_small and _k_unroll_full:
+  if _acc_small and _k_hip_pv:
+    pv_stores = []
+    for td_i in range(TD):
+      for tm_i in range(TM // WMMA_ACC):
+        pv_frag = pv_view[tm_i, td_i]
+        wmma_c = pv_frag
+        for k_i in range(BLOCK_N // WMMA_K):
+          p_frag = P_view[wave_m, tm_i, lane_n, k_i]
+          v_frag = V_view[wave_n, td_i, lane_n, k_i]
+          wmma_c = UOp.wmma(p_frag, v_frag, wmma_c, *WMMA_ARG)
+        pv_stores.append(pv_frag.store(wmma_c))
+    pv_done = UOp.group(*pv_stores)
+  elif _acc_small and _k_unroll_full:
     pv_stores = []
     for td_i in range(TD):
       for tm_i in range(TM // WMMA_ACC):
@@ -1202,6 +1232,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # AMD_FLASH_ACC_SMALL=0 disables; AMD_WMMA_ACC_SMALL=1 forces (unsafe for quant).
   use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
   use_k_unroll = getenv("AMD_FLASH_K_UNROLL", 0) if use_acc_small else 0
+  use_k_hip_scope = getenv("AMD_FLASH_K_HIP_SCOPE", "all") if use_k_unroll == -1 else "all"
   # Work-copy (slot 19) only while slot 2 is in SKIP_SLOTS. Promoting slot 2 with the
   # work-copy active nans; promoting slot 2 alone is the alternate path (see handoff).
   _skip_reg = {int(s) for s in getenv("AMD_REG_PROMOTE_SKIP_SLOTS", "2").split(",") if s.strip()}
@@ -1214,19 +1245,29 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   B, H, T, D = q.shape
   out = Tensor.empty(B*H, T, D, dtype="float32", device=q.device)
   fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start,
-                          acc_small=use_acc_small, k_unroll=use_k_unroll, use_acc_work=use_acc_work)
+                          acc_small=use_acc_small, k_unroll=use_k_unroll, use_acc_work=use_acc_work,
+                          k_hip_scope=use_k_hip_scope)
   out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
   if q_start is not None: out = out[:, :, :T_real]
   if not use_acc_small: return out
   # Compile under ACC_SMALL env so renderer parks flash tiles without poisoning peers.
+  # Remat one nested addr level: base flash spills are ADD/SHL trees; full deep (2) MMUs.
   prev = os.environ.get("AMD_FLASH_ACC_SMALL")
+  prev_remat = os.environ.get("AMD_REMAT_ADDR")
+  prev_deep = os.environ.get("AMD_REMAT_ADDR_DEEP")
   os.environ["AMD_FLASH_ACC_SMALL"] = "1"
+  if prev_remat is None: os.environ["AMD_REMAT_ADDR"] = "1"
+  if prev_deep is None: os.environ["AMD_REMAT_ADDR_DEEP"] = "1"
   getenv.cache_clear()  # type: ignore[attr-defined]
   try:
     return out.realize()
   finally:
     if prev is None: os.environ.pop("AMD_FLASH_ACC_SMALL", None)
     else: os.environ["AMD_FLASH_ACC_SMALL"] = prev
+    if prev_remat is None: os.environ.pop("AMD_REMAT_ADDR", None)
+    else: os.environ["AMD_REMAT_ADDR"] = prev_remat
+    if prev_deep is None: os.environ.pop("AMD_REMAT_ADDR_DEEP", None)
+    else: os.environ["AMD_REMAT_ADDR_DEEP"] = prev_deep
     getenv.cache_clear()  # type: ignore[attr-defined]
 
 # ******** gated delta net: fused recurrent scan ********

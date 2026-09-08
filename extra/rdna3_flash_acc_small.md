@@ -41,13 +41,18 @@ nans if slot 2 is promoted** (`SKIP_SLOTS=`). Leave slot 2 skipped. See overnigh
 4. Tile-local `acc` work copy (slot 19) for ACC_SMALL + unroll correction path.
 5. **Do not** set `AMD_WMMA_ACC_SMALL=1` globally — parks ≤64 quant tiles and breaks Q4/Q6.
 
-## Remaining gap vs HIP
+## Remaining gap vs HIP (re-measured 2026-09-08)
 
-- HIP fully unrolls more WMMA (24 vs 6) and keeps 0 scratch.
-- Direct still spills (~21) under ACC VGPR pressure; slot-2 still scratch-backed across tiles.
-- Promoting slot 2 (`AMD_REG_PROMOTE_SKIP_SLOTS=`) → **nan** — leave skipped.
-- QK-only unroll regresses (~833µs); keep full QK+PV unroll.
-- `AMD_FLASH_K_UNROLL=1` full K chain **MMU-faults**; `=2` nan; `=4` err~1.17 — leave 0.
+- Fair fresh-process: DIRECT **~730 µs** vs HIP **~596 µs** (~1.2×), not the older ~2×.
+- HIP fully unrolls K → **24 WMMA**, **0** private, **~126** `s_delay_alu`, **~28** `v_mov`.
+- DIRECT ACC_SMALL: **6 WMMA**, priv **212**, **0** `s_delay_alu`, **~385** `v_mov`.
+- Only 6 ACC packs parked; 21 allocator SPILLs hit low VGPRs (`v23..v52`); slot-2 still scratch.
+- Promoting slot 2 (`AMD_REG_PROMOTE_SKIP_SLOTS=`) is **correct now** (was nan) but **slower** — leave skipped.
+- `AMD_FLASH_K_UNROLL=2` is **correct** but SPILL 87 / priv 492 → **much slower**.
+- Full K chain / QK-only expand **hangs** even with `AMD_INSTR_WAIT=1` — not soft waitcnt alone.
+- PV-only chained expand (`K_UNROLL=-1 HIP_SCOPE=pv`) is **correct** but slower (SPILL 65).
+- `AMD_WMMA_ACC_BASE=201` moves ACC to `v206..` but does **not** remove the 21 SPILLs.
+- Codegen UNROLL of K axes fails (WMMA shrink); n_tile UNROLL is incorrect (carried softmax).
 
 ## Toggles
 

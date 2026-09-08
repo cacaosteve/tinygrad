@@ -4264,6 +4264,15 @@ def insts_from_linear(lin:UOp):
       else:
         regs = set().union(*(_reg_idxs(s) for s in u.src), _reg_idxs(u))
         flush_regs(regs)
+    # Spill while LDS/scratch is still in flight can capture incomplete values when soft
+    # flush_regs misses a related dest (flash full-K expand → MMU). Opt-in:
+    #   AMD_SPILL_DRAIN_LGKM=1 → drain pending lgkm (+ vs) before SPILL
+    #   AMD_SPILL_DRAIN_LGKM=2 → full vm+lgkm+vs drain before SPILL
+    if u.op is Ops.INS and _iop(u) is AMDOps.SPILL and (drain:=getenv("AMD_SPILL_DRAIN_LGKM", 0)):
+      if drain >= 2: flush("vm", "lgkm", "vs")
+      else:
+        if pending["lgkm"]: flush("lgkm")
+        if pending["vs"]: flush("vs")
     if u.op is Ops.INS and _iop(u) is AMDOps.IF_MASK:
       store_addr_cache.clear()
       emitted = _emit_uop(u)
@@ -4283,6 +4292,9 @@ def insts_from_linear(lin:UOp):
     # Scratch stores must complete before SLOAD / FILL (soft vscnt — was per-store wait storm).
     elif u.op is Ops.INS and _iop(u) in (AMDOps.SLOAD, AMDOps.FILL) and -1 in pending["vs"]:
       flush("vs")
+    # Opt-in: also drain LDS before FILL — SPILL→FILL across in-flight DS can MMU on expand.
+    if u.op is Ops.INS and _iop(u) is AMDOps.FILL and getenv("AMD_SPILL_DRAIN_LGKM", 0) and pending["lgkm"]:
+      flush("lgkm")
     masked = mask_depth > 0 and u.op is Ops.INS and _iop(u) in _MASKED_MEM
     if u in skip:
       if u.op is Ops.INS and _iop(u) is AMDOps.END_MASK: mask_depth -= 1
@@ -5157,11 +5169,20 @@ class AMDRenderer(ISARenderer):
       if getenv("ALLOW_UPCAST16", 0) and _iop(x) is AMDOps.LLOAD and x.dtype is dtypes.half:
         return True
     if not getenv("AMD_REMAT_ADDR", 1 if getenv("TC_LDS_AB", 0) else 0): return False
-    if x.dtype not in (dtypes.int32, dtypes.uint32): return False
-    if _iop(x) is AMDOps.MOV or not self._pure_addr(x): return False
-    # Leaf-only by default: SHL(lidx,C)/AND/ADD(lidx,C). Nested ADD remat → MMU on flash.
-    if getenv("AMD_REMAT_ADDR_DEEP", 0): return True
-    return all(self._addr_leaf(s) for s in x.src)
+    if x.dtype not in (dtypes.int32, dtypes.uint32, dtypes.bool, dtypes.uint): return False
+    # MOV of a leaf/const is cheaper to remat than spill (flash spills several `MOV True`).
+    if _iop(x) is AMDOps.MOV:
+      return bool(x.src) and self._addr_leaf(x.src[0])
+    if not self._pure_addr(x): return False
+    # Depth via AMD_REMAT_ADDR_DEEP: 0=leaf srcs; 1=one nested pure-addr (safe on flash);
+    # >=2 full deep (historically MMU on flash — leave off).
+    depth = getenv("AMD_REMAT_ADDR_DEEP", 0)
+    if depth >= 2: return True
+    def ok(s:UOp, d:int) -> bool:
+      if self._addr_leaf(s): return True
+      if d <= 0 or s.op is not Ops.INS or not self._pure_addr(s) or _iop(s) is AMDOps.MOV: return False
+      return all(ok(t, d - 1) for t in s.src)
+    return all(ok(s, depth) for s in x.src)
   def keep_remat(self, x:UOp) -> bool:
     # Pure-addr remats under TC_LDS: without sticky, SHR/AND remat ~60× and SHL/ADD flood the loop.
     return x.op is Ops.INS and _iop(x) in (AMDOps.SHR, AMDOps.AND, AMDOps.SHL, AMDOps.ADD)
