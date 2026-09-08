@@ -1,11 +1,11 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`48d647604`** (docs; code tip **`cfa1a2407`** deep LDS peel).
+Tip: **(pending WAVES=8)**; code base **`cfa1a2407`** deep LDS peel + decode waves default 8.
 
 ## Headline
 
-Flash DIRECT **opt-in**. Fair fresh-process gap (7900, 2026-09-08):
+Flash DIRECT **opt-in**. Fair fresh-process gap (7900, 2026-09-08; decode rebench post-WAVES=8):
 
 | | DIRECT | HIP |
 |--|--:|--:|
@@ -13,13 +13,13 @@ Flash DIRECT **opt-in**. Fair fresh-process gap (7900, 2026-09-08):
 | WMMA | **6** | **24** |
 | private | **184 B** | **0** |
 | SPILL | **14** | **0** |
-| decode | ~57 µs | ~48 µs |
+| decode (TinyJit 32h/2k) | **~135 µs** @WAVES=8 | ~107 µs (remeasure) |
 
 Soak: continuous on tip (serial+fixed multi-shape). Restart after MMU/dirty GPU with a fresh process + `nohup /tmp/rdna3_soak/run_continuous.sh`.
 
 ## Landed
 
-- Decode ml_lds `(WAVES,2,G)` — 16-wave + 32k
+- Decode ml_lds `(WAVES,2,G)` — 16-wave + 32k safe; **default `AMD_FLASH_WAVES=8`** (~135 vs ~152 µs @16; serial+fixed OK). WAVES=4 fails decode_gqa.
 - Addr remat depth-1 on flash realize
 - Const MOV remat — SPILL 16→14, priv 192→184
 - Factor K_UNROLL scope via `AMD_FLASH_K_HIP_SCOPE`
@@ -57,6 +57,7 @@ Remaining 7: MUL/FILL/nested addr (not CMP-only).
 - Insert-new-ADD fold in `prepare_pre_regalloc`: CompileError (new INS never tagged)
 - Single-use `MOV(MOV(x))` fold: 0 hits on flash (inner MOVs are fan-out; from_MOV=80)
 - `MUL(x,132|1056|2112)` → SHL+ADD isel expand: correct, SPILL 14→16 (more pressure)
+- Decode `AMD_FLASH_WAVES=4`: faster (~143) but **decode_gqa FAIL** (err ~676) — leave ≥8
 
 ## Next
 

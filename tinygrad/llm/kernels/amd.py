@@ -707,8 +707,9 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   chunks = min(48, max_kv_len // 64)
   partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
-  # ml_lds is (WAVES, 2, G) so G==SEC (16-wave GQA) does not alias stats L on AMDRenderer.
-  waves, group = getenv("AMD_FLASH_WAVES", 16), H // cache_kv.shape[2]
+  # ml_lds is (WAVES, 2, G) so G==SEC (e.g. 16-wave GQA) does not alias stats L on AMDRenderer.
+  # Default 8: ~135µs vs ~152µs @16 on 32h/2k decode; WAVES=4 fails decode_gqa (huge err).
+  waves, group = getenv("AMD_FLASH_WAVES", 8), H // cache_kv.shape[2]
   assert 64 % waves == 0, f"AMD_FLASH_WAVES={waves} must divide block_n=64"
   while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
