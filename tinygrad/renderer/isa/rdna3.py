@@ -996,7 +996,8 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
   if _is_lds_ref(a.src[0]):
     if _local_load(x.dtype, n) is None and not (x.dtype is dtypes.half and n == 16):
       raise CompileError(f"no lds load {x.dtype} x{n}")
-    idx, off = _peel_add_imm(a.src[1], _mem_itemsize(x.dtype))
+    # deep=True: flash LDS uses ADD(ADD(base,tid),imm) — fold const chain into ds offset0/1.
+    idx, off = _peel_add_imm(a.src[1], _mem_itemsize(x.dtype), max_byte=0xffff, deep=True)
     src = (a.src[0], idx, count) if off == 0 else (a.src[0], idx, count, _tconst(off, dtypes.int32).rtag())
     return x.ins(AMDOps.LLOAD, dtype=x.dtype, src=src)
   if _is_scratch_ref(a.src[0]):
@@ -1057,7 +1058,7 @@ def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
       src = (a.src[0], idx, val) if off == 0 else (a.src[0], idx, val, _tconst(off, dtypes.int32).rtag())
       return x.ins(op, src=src)
     return x.ins(op, src=(a.src[0], a.src[1], val))
-  if _is_lds_ref(a.src[0]): return try_store(_local_store, AMDOps.LSTORE, peel=True, allow_half16=True)
+  if _is_lds_ref(a.src[0]): return try_store(_local_store, AMDOps.LSTORE, peel=True, deep=True, allow_half16=True)
   # Peel scratch REG stores to shared base + imm offset (flash init: 200× lshl+add → few bases).
   if _is_scratch_ref(a.src[0]): return try_store(_scratch_store, AMDOps.SSTORE, peel=True, max_byte=0xfff)
   # Soft-peel any ADD+imm (incl. nested). Emit uses GLOBAL offset when ≤4095 else v_lshl_add.
