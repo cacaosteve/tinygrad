@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`e1fea66f8`** (decode `AMD_FLASH_WAVES=8`); pending remat SHALLOW infra.
+Tip: **`5ecac324c`** / remat SHALLOW **`40e16ec0a`**; decode waves **`e1fea66f8`**.
 
 ## Headline
 
