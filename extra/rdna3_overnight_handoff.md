@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`e71b93a38`** (docs; code tip **`cfa1a2407`** deep LDS peel).
+Tip: **`37300f9bf`** (docs; code tip **`cfa1a2407`** deep LDS peel).
 
 ## Headline
 
