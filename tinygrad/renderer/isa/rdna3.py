@@ -5170,6 +5170,17 @@ class AMDRenderer(ISARenderer):
     if x.op is Ops.INS and x.dtype in (dtypes.int32, dtypes.uint32) and _iop(x) is AMDOps.MOV and x.src:
       return self._addr_leaf(x.src[0])
     return False
+  def _addr_shallow(self, x:UOp) -> bool:
+    # One ALU of leaves (e.g. SHL(MOV,C)) — free under AMD_REMAT_ADDR_SHALLOW so DEEP=1
+    # can remat flash causal q_idx ADD(ADD(SHL,MOV),C) without full DEEP=2 (MMU).
+    if self._addr_leaf(x): return True
+    if x.op is Ops.CAST and x.dtype in dtypes.ints and x.src: return self._addr_shallow(x.src[0])
+    if x.op is Ops.INS and x.dtype in (dtypes.int32, dtypes.uint32) and _iop(x) is AMDOps.MOV and x.src:
+      return self._addr_shallow(x.src[0])
+    if x.op is Ops.INS and x.dtype in (dtypes.int32, dtypes.uint32) and \
+       _iop(x) in (AMDOps.ADD, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR):
+      return all(self._addr_leaf(s) for s in x.src)
+    return False
   def rematerialize(self, x:UOp) -> bool:
     if x.op is not Ops.INS: return False
     # Under TC_LDS_AB: remat LDS half EXTRACTs (and LLOAD bases if ALLOW_UPCAST16).
@@ -5197,13 +5208,18 @@ class AMDRenderer(ISARenderer):
     # >=2 full deep (historically MMU on flash — leave off).
     depth = getenv("AMD_REMAT_ADDR_DEEP", 0)
     if depth >= 2: return True
+    shallow = bool(getenv("AMD_REMAT_ADDR_SHALLOW", 0))
     def ok(s:UOp, d:int) -> bool:
+      if shallow and self._addr_shallow(s): return True
       if self._addr_leaf(s): return True
       if d <= 0 or s.op is not Ops.INS or not self._pure_addr(s) or _iop(s) is AMDOps.MOV: return False
       return all(ok(t, d - 1) for t in s.src)
     return all(ok(s, depth) for s in x.src)
   def keep_remat(self, x:UOp) -> bool:
     # Pure-addr remats under TC_LDS: without sticky, SHR/AND remat ~60× and SHL/ADD flood the loop.
+    # AMD_REMAT_NO_STICKY_ADD=1: remat ADD at every use (SHALLOW q_idx experiment — fewer spills
+    # but sticky ADD kept pressure high / slower).
+    if getenv("AMD_REMAT_NO_STICKY_ADD", 0) and x.op is Ops.INS and _iop(x) is AMDOps.ADD: return False
     return x.op is Ops.INS and _iop(x) in (AMDOps.SHR, AMDOps.AND, AMDOps.SHL, AMDOps.ADD)
   def remat(self, x:UOp, reg:Register, src_regs:list[Register|None]) -> UOp:
     nsrc = [s if r is None else UOp(Ops.INS, arg=(AMDOps.MOV, s.dtype), tag=(r,)) for s, r in zip(x.src, src_regs)]
