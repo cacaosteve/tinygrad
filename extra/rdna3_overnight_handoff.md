@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`37300f9bf`** (docs; code tip **`cfa1a2407`** deep LDS peel).
+Tip: **`48d647604`** (docs; code tip **`cfa1a2407`** deep LDS peel).
 
 ## Headline
 
@@ -56,6 +56,7 @@ Remaining 7: MUL/FILL/nested addr (not CMP-only).
 - Same + `AMD_SPILL_ON_EVICT=1`: SPILL→42 and **MMU fault** — do not combine
 - Insert-new-ADD fold in `prepare_pre_regalloc`: CompileError (new INS never tagged)
 - Single-use `MOV(MOV(x))` fold: 0 hits on flash (inner MOVs are fan-out; from_MOV=80)
+- `MUL(x,132|1056|2112)` → SHL+ADD isel expand: correct, SPILL 14→16 (more pressure)
 
 ## Next
 
