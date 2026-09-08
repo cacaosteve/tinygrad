@@ -5217,9 +5217,12 @@ class AMDRenderer(ISARenderer):
     return all(ok(s, depth) for s in x.src)
   def keep_remat(self, x:UOp) -> bool:
     # Pure-addr remats under TC_LDS: without sticky, SHR/AND remat ~60× and SHL/ADD flood the loop.
-    # AMD_REMAT_NO_STICKY_ADD=1: remat ADD at every use (SHALLOW q_idx experiment — fewer spills
-    # but sticky ADD kept pressure high / slower).
-    if getenv("AMD_REMAT_NO_STICKY_ADD", 0) and x.op is Ops.INS and _iop(x) is AMDOps.ADD: return False
+    # AMD_REMAT_NO_STICKY_ADD=1: remat every ADD (hung/MMU on flash — leave off).
+    # AMD_REMAT_NO_STICKY_CONST_ADD=1: only non-sticky for ADD(..., const) — causal q_idx pattern.
+    if x.op is Ops.INS and _iop(x) is AMDOps.ADD:
+      if getenv("AMD_REMAT_NO_STICKY_ADD", 0): return False
+      if getenv("AMD_REMAT_NO_STICKY_CONST_ADD", 0):
+        if any(_const_int(s) is not None for s in x.src): return False
     return x.op is Ops.INS and _iop(x) in (AMDOps.SHR, AMDOps.AND, AMDOps.SHL, AMDOps.ADD)
   def remat(self, x:UOp, reg:Register, src_regs:list[Register|None]) -> UOp:
     nsrc = [s if r is None else UOp(Ops.INS, arg=(AMDOps.MOV, s.dtype), tag=(r,)) for s, r in zip(x.src, src_regs)]
