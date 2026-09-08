@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`cfa1a2407`**.
+Tip: **`e5f7d9943`**.
 
 ## Headline
 
@@ -32,6 +32,7 @@ Soak: continuous on tip (serial+fixed multi-shape).
 - Sparse MUL→SHL+ADD expand: correct, slower (~913→~932)
 - Power-of-2 LDS stride (132→256): SPILL 14→45
 - Full-K / `K_UNROLL=-1` QK: hang; PV-only correct but slower
+- `K_UNROLL=1` full chain: **MMU fault** on tip (do not enable)
 - `_addr_leaf` SHL+ sticky remat: SPILL 14→5 but ~725→~950 µs
 - `_addr_leaf` SHL + `keep_remat=False` on const-offset ADD: SPILL 14→5, ~neutral/slightly slower
 - `CMPLT(ADD(x,c),y)` fold: SPILL 14→25 (more pressure)
@@ -42,5 +43,5 @@ Soak: continuous on tip (serial+fixed multi-shape).
 
 1. Keep soak running.
 2. Cut remaining non-cmp spills (MUL/FILL addr) or shrink slot-2 scratch without promoting slot 2.
-3. Path to more WMMA only with spill plan (K_UNROLL=1 → 24 WMMA / 138 SPILL).
+3. Path to more WMMA only with spill plan (`K_UNROLL=1` now MMU — needs new approach).
 4. Do not flip DIRECT default.
