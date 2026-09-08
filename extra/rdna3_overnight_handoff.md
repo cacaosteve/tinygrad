@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`e571b4776`**.
+Tip: **`91d75e0f4`**.
 
 ## Headline
 
@@ -40,6 +40,7 @@ Soak: continuous on tip (serial+fixed multi-shape).
 - Slot-2 promote (`SKIP_SLOTS=`): correct, still slightly slower
 - SSTORE byte_off clustering: sorts offs but values are same VGPR (redef/init) — no b128 win
 - `s_delay_alu` after WMMA/swizzle: ~neutral (not default)
+- MOV-chain fold: inner MOVs are fan-out (32–96 uses), not single-use chains
 
 ## Next
 
