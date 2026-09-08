@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`6093b8a86`**.
+Tip: **`45961f595`**.
 
 ## Headline
 
@@ -41,6 +41,7 @@ Soak: continuous on tip (serial+fixed multi-shape).
 - SSTORE byte_off clustering: sorts offs but values are same VGPR (redef/init) — no b128 win
 - `s_delay_alu` after WMMA/swizzle: ~neutral (not default)
 - MOV-chain fold: inner MOVs are fan-out (32–96 uses), not single-use chains
+- `AMD_WMMA_ACC_BASE` default 201: same SPILL 14 / k2 SPILL 79 as 121 — leave 121
 
 ## Next
 
