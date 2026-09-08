@@ -1,40 +1,40 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`a688c7b9f`** (const-MOV remat).
+Tip: pending push.
 
 ## Headline
 
-Flash DIRECT **opt-in**. Decode fixed (`ml_lds (WAVES,2,G)`). Prefill gap ~**2.4×**
-vs HIP hand kernel on fresh processes (2026-09-08 night):
+Flash DIRECT **opt-in**. Prefill gap ~**2.4×** vs HIP (fresh processes):
 
 | | DIRECT | HIP |
 |--|--:|--:|
-| prefill median | **~670 µs** | **~280 µs** |
-| machine WMMA | **6** | **24** |
-| private_segment | **184 B** (was 192) | **0** |
-| allocator SPILL | **14** (was 16→21) | **0** |
-| decode median | ~57 µs | ~48 µs |
+| prefill median | **~660–670 µs** | **~280 µs** |
+| WMMA | **6** | **24** |
+| private | **184 B** | **0** |
+| SPILL | **14** | **0** |
+| decode | ~57 µs | ~48 µs |
 
-Soak: **58+** clean rounds on prior tip; continue on tip.
+Soak: continuous on tip (serial+fixed multi-shape).
 
-## Landed this loop
+## Landed
 
-- Decode ml_lds G==SEC fix (16-wave + 32k)
-- Addr remat depth-1 on flash realize (21→16 SPILL)
-- Factor `K_UNROLL` scope via `AMD_FLASH_K_HIP_SCOPE`
-- Remat **float/int const MOV** (softmax constants): SPILL **16→14**, priv **192→184**
+- Decode ml_lds `(WAVES,2,G)` — 16-wave + 32k
+- Addr remat depth-1 on flash realize
+- Const MOV remat — SPILL 16→14, priv 192→184
+- Factor K_UNROLL scope via `AMD_FLASH_K_HIP_SCOPE`
+- half×16 LSTORE → two B128 (isel parity with LLOAD)
 
-## Remat dead ends (do not revive)
+## Dead ends this loop
 
-- `MUL` in `_pure_addr` + depth-1 → **wrong numerics** (err~0.79)
-- `AMD_REMAT_ADDR_DEEP=2` → **0 spills locally**, **hangs/MMU** on 7900
+- `MUL` in pure-addr remat: wrong @depth1, MMU @depth2
+- Power-of-2 LDS stride (132→256): compiles with half×16 store, but
+  **SPILL 14→45** — more pressure, not a win
+- Full-K / `K_UNROLL=-1` QK: hang; PV-only correct but slower
 
-## Next leftovers
+## Next
 
-1. Continuous soak on tip.
-2. Remaining 14 SPILLs are nested ADD/MUL LDS bases — need safer remat binding
-   or fewer live addrs (not depth-2).
-3. Slot-2 scratch still 96 SLOAD/SSTORE; promote still nans.
-4. 24 WMMA / full-K still hangs; PV-only expand correct but slower.
-5. Do not flip DIRECT default yet.
+1. Keep soak running.
+2. Cut remaining 14 nested-ADD addr spills without depth-2 remat.
+3. Slot-2 96 SLOAD/SSTORE / 24 WMMA only with spill plan.
+4. Do not flip DIRECT default.
