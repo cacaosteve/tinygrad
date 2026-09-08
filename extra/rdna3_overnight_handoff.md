@@ -55,6 +55,7 @@ Remaining 7: MUL/FILL/nested addr (not CMP-only).
 - Remat deepen for CMP-only addr (`AMD_REMAT_CMP_DEEP`): SPILL 14→7, ~neutral latency, but **prefill_gqa_32 err ~2.6e-2** (threshold 5e-3). Likely silent remat-eviction with stale MOV binder srcs
 - Same + `AMD_SPILL_ON_EVICT=1`: SPILL→42 and **MMU fault** — do not combine
 - Insert-new-ADD fold in `prepare_pre_regalloc`: CompileError (new INS never tagged)
+- Single-use `MOV(MOV(x))` fold: 0 hits on flash (inner MOVs are fan-out; from_MOV=80)
 
 ## Next
 
