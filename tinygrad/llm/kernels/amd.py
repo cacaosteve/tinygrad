@@ -579,73 +579,6 @@ def _vec_load(ptr:UOp, lanes:int) -> tuple[UOp, ...]:
   return tuple(vec[i].float() for i in range(lanes))
 
 @functools.cache
-def _amd_flash_attention_decode_partial_direct(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4):
-  """Pre-#18010 single-pass decode partial for AMDRenderer.
-
-  Upstream online-softmax REG (`acc/max/sum` after REDUCE) undercounts wave sums on
-  direct ISA: partials cancel via normalize, but stats L is wrong and combine scales.
-  HIP keeps the #18010 path. DIRECT falls back to SDPA when kv_len > chunks*64.
-  """
-  valid_kv_len = _unbind(valid_kv_len)
-  _, B, H_KV, N, D = cast(tuple[int, int, int, int, int], cache_kv.shape)
-  _, H, M, _ = cast(tuple[int, int, int, int], q.shape)
-  assert M == 1 and H % H_KV == 0 and D % WARP_SIZE == 0 and max_kv_len <= N and max_kv_len % block_n == 0
-  G, CHUNK, DPL, WAVES = H // H_KV, block_n, D // WARP_SIZE, waves
-  assert CHUNK % WAVES == 0
-  SEC = CHUNK // WAVES  # keys each wave scans independently
-  live_chunks = (valid_kv_len+CHUNK-1)//CHUNK
-  live_chunks = min(live_chunks, out.shape[2]) if isinstance(live_chunks, int) else live_chunks.minimum(out.shape[2])
-  block_bhkv, block_chunk = UOp.range(B*H_KV, 0, AxisType.GLOBAL), UOp.range(live_chunks, 1, AxisType.GLOBAL)
-  lane, wave = UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(WAVES, 3, axis_type=AxisType.LOCAL)
-  b, kv_head = block_bhkv // H_KV, block_bhkv % H_KV
-  qf = tuple(_vec_load(q[b, kv_head*G+h, 0, lane*DPL], DPL) for h in range(G))
-  zerof = UOp.const(0, dtypes.float)
-  valids: list[UOp] = []
-  scores: list[list[UOp]] = [[zerof]*G for _ in range(SEC)]
-  vfrags: list[tuple[UOp, ...]] = [()]*SEC
-  for j in range(SEC):
-    key = block_chunk*CHUNK + wave*SEC + j
-    valid = key < valid_kv_len
-    valids.append(valid)
-    kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
-    vfrags[j] = tuple(valid.where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
-    for h in range(G):
-      s = warp_reduce(sum((qf[h][i]*kfrag[i] for i in range(DPL)), UOp.const(0, dtypes.float)), full_wave=True) * (1/math.sqrt(D))
-      scores[j][h] = valid.where(s, UOp.const(-math.inf, dtypes.float))
-  ninf = UOp.const(-math.inf, dtypes.float)
-  row_max = [functools.reduce(UOp.maximum, (scores[j][h] for j in range(SEC)), ninf) for h in range(G)]
-  accs:list[list[UOp]] = [[UOp.const(0, dtypes.float)] * DPL for _ in range(G)]
-  row_sums:list[UOp] = [UOp.const(0, dtypes.float) for _ in range(G)]
-  for j in range(SEC):
-    for h in range(G):
-      beta = valids[j].where(((scores[j][h]-row_max[h])*LOG2E).exp2(), UOp.const(0, dtypes.float))
-      accs[h] = [a + beta*v for a, v in zip(accs[h], vfrags[j])]
-      row_sums[h] = row_sums[h] + beta
-  acc_lds = UOp.placeholder((WAVES, G, D), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)
-  ml_lds = UOp.placeholder((WAVES, G, 2), dtypes.float, slot=1, addrspace=AddrSpace.LOCAL)
-  lds_acc = acc_lds.reshape(WAVES, G, WARP_SIZE, DPL)
-  stores = [lds_acc[wave, h, lane].store(UOp.stack(*accs[h]).cast(dtypes.half)) for h in range(G)]
-  stores += [ml_lds[wave, h, i].store(x) for h in range(G) for i, x in enumerate((row_max[h], row_sums[h]))]
-  barrier = UOp.barrier(UOp.group(*stores))
-  acc_lds, ml_lds = acc_lds.after(barrier), ml_lds.after(barrier)
-  tid = wave*WARP_SIZE + lane
-  final_stores:list[UOp] = []
-  for i in range(-(-G*D//(WAVES*WARP_SIZE))):
-    flat = tid + i*WAVES*WARP_SIZE
-    h, d = flat // D, flat % D
-    M = functools.reduce(UOp.maximum, (ml_lds[w, h, 0].load() for w in range(WAVES)), ninf)
-    val = sum((((ml_lds[w, h, 0].load()-M)*LOG2E).exp2() * acc_lds[w, h, d].load().float() for w in range(WAVES)), UOp.const(0, dtypes.float))
-    oidx = out[b, kv_head*G + h, block_chunk, d]
-    if G*D % (WAVES*WARP_SIZE): oidx = out[b, (kv_head*G + h).valid(flat < G*D), block_chunk, d]
-    final_stores.append(oidx.store(val))
-  hstat = tid
-  M = functools.reduce(UOp.maximum, (ml_lds[w, hstat, 0].load() for w in range(WAVES)), ninf)
-  L = sum((((ml_lds[w, hstat, 0].load()-M)*LOG2E).exp2() * ml_lds[w, hstat, 1].load() for w in range(WAVES)), UOp.const(0, dtypes.float))
-  q_head = (kv_head*G + hstat).valid(hstat < G) if WAVES*WARP_SIZE > G else kv_head*G + hstat
-  final_stores += [stats[b, q_head, block_chunk, 0].store(M), stats[b, q_head, block_chunk, 1].store(L)]
-  return UOp.group(*final_stores).end(lane, wave, block_chunk, block_bhkv).sink(arg=KernelInfo(name="flash_decode_partial", opts_to_apply=()))
-
-@functools.cache
 def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4):
   valid_kv_len = _unbind(valid_kv_len)
   _, B, H_KV, N, D = cast(tuple[int, int, int, int, int], cache_kv.shape)
@@ -697,12 +630,13 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   # exchange across the block's waves through LDS (fp16 halves LDS so more blocks fit per CU)
   # Matching cache/LDS strides can reuse a loop-local cache index outside the loop. Pad that layout.
   acc_lds = UOp.placeholder((WAVES, G, D + (LDS_PAD if G == SEC else 0)), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)[:, :, :D]
-  ml_lds = UOp.placeholder((WAVES, G, 2), dtypes.float, slot=1, addrspace=AddrSpace.LOCAL)
+  # (WAVES, 2, G): avoid G==SEC stride alias that corrupts stats L on AMDRenderer.
+  ml_lds = UOp.placeholder((WAVES, 2, G), dtypes.float, slot=1, addrspace=AddrSpace.LOCAL)
   lds_acc = acc_lds.reshape(WAVES, G, WARP_SIZE, DPL)
   # Normalize before fp16 to avoid overflow. Nonempty waves have sum >= 1; empty waves keep their zero accumulator.
   stores = [lds_acc[wave, h, lane].store((acc_reg[h].load() / sum_reg[h].load().maximum(1)).cast(dtypes.half)) for h in range(G)]
   # NOTE: duplicate stores of the same value from every lane are harmless here
-  stores += [ml_lds[wave, h, i].store(x) for h in range(G) for i, x in enumerate((max_reg[h].load(), sum_reg[h].load()))]
+  stores += [ml_lds[wave, i, h].store(x) for h in range(G) for i, x in enumerate((max_reg[h].load(), sum_reg[h].load()))]
   barrier = UOp.barrier(UOp.group(*stores))
   acc_lds, ml_lds = acc_lds.after(barrier), ml_lds.after(barrier)
   tid = wave*WARP_SIZE + lane
@@ -710,16 +644,16 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   for i in range(-(-G*D//(WAVES*WARP_SIZE))):
     flat = tid + i*WAVES*WARP_SIZE
     h, d = flat // D, flat % D
-    M = functools.reduce(UOp.maximum, (ml_lds[w, h, 0].load() for w in range(WAVES)))
+    M = functools.reduce(UOp.maximum, (ml_lds[w, 0, h].load() for w in range(WAVES)))
     # LDS holds normalized values; restore each wave's sum before combining.
-    val = sum((((ml_lds[w, h, 0].load()-M)*LOG2E).exp2() * ml_lds[w, h, 1].load() * acc_lds[w, h, d].load().float()
+    val = sum((((ml_lds[w, 0, h].load()-M)*LOG2E).exp2() * ml_lds[w, 1, h].load() * acc_lds[w, h, d].load().float()
                for w in range(WAVES)), zerof)
     oidx = out[b, kv_head*G + h, block_chunk, d]
     if G*D % (WAVES*WARP_SIZE): oidx = out[b, (kv_head*G + h).valid(flat < G*D), block_chunk, d]
     final_stores.append(oidx.store(val))
   hstat = tid
-  M = functools.reduce(UOp.maximum, (ml_lds[w, hstat, 0].load() for w in range(WAVES)))
-  L = sum((((ml_lds[w, hstat, 0].load()-M)*LOG2E).exp2() * ml_lds[w, hstat, 1].load() for w in range(WAVES)), zerof)
+  M = functools.reduce(UOp.maximum, (ml_lds[w, 0, hstat].load() for w in range(WAVES)))
+  L = sum((((ml_lds[w, 0, hstat].load()-M)*LOG2E).exp2() * ml_lds[w, 1, hstat].load() for w in range(WAVES)), zerof)
   q_head = (kv_head*G + hstat).valid(hstat < G) if WAVES*WARP_SIZE > G else kv_head*G + hstat
   final_stores += [stats[b, q_head, block_chunk, 0].store(M), stats[b, q_head, block_chunk, 1].store(L)]
   return UOp.group(*final_stores).end(lane, wave, block_chunk, block_bhkv).sink(arg=KernelInfo(name="flash_decode_partial", opts_to_apply=()))
@@ -771,22 +705,14 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
 def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, max_kv_len:int) -> Tensor:
   B, H, D = cache_kv.shape[1], q.shape[1], cache_kv.shape[4]
   chunks = min(48, max_kv_len // 64)
-  # DIRECT: #18010 REG online-softmax undercounts stats L; use pre-#18010 partial.
-  # That path only covers chunks*64 keys — longer contexts fall back to SDPA.
-  direct = amd_direct_isa(q.device)
-  if direct and max_kv_len > chunks * 64:
-    k, v = (cache_kv[i, :, :, :valid_kv_len].float() for i in range(2))
-    return q.float().scaled_dot_product_attention(k, v, enable_gqa=True)
   partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
-  # HIP uses up to 16 waves. DIRECT LDS exchange is wrong above 8 waves (stats L /
-  # combine scale); keep the proven 8-wave mapping unless AMD_FLASH_WAVES overrides.
-  waves, group = (getenv("AMD_FLASH_WAVES", 8) if direct else 16), H // cache_kv.shape[2]
-  if direct: assert 64 % waves == 0, f"AMD_FLASH_WAVES={waves} must divide block_n=64"
+  # ml_lds is (WAVES, 2, G) so G==SEC (16-wave GQA) does not alias stats L on AMDRenderer.
+  waves, group = getenv("AMD_FLASH_WAVES", 16), H // cache_kv.shape[2]
+  assert 64 % waves == 0, f"AMD_FLASH_WAVES={waves} must divide block_n=64"
   while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
-  partial_kernel = _amd_flash_attention_decode_partial_direct if direct else _amd_flash_attention_decode_partial
-  fxn = functools.partial(partial_kernel, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=64, waves=waves)
+  fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=64, waves=waves)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len+63)//64
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)

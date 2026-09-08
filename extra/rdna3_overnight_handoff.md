@@ -1,39 +1,41 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`7c7cdcae1`** (DIRECT decode: legacy partial @ 8 waves).
+Tip: see latest push (ml_lds G==SEC fix).
 
 ## Headline
 
-**QK LDS reuse race fixed** (prefill). Flash DIRECT still **opt-in**
-(`AMD_FLASH_DIRECT=1`). Prefill packing / FMA_MIX / K-unroll stay off.
-HIP prefill still ~2.4–3× faster (~278 µs vs DIRECT ~675–910 µs).
+**Decode DIRECT fixed at 16 waves + long context.** Prefill still opt-in
+(`AMD_FLASH_DIRECT=1`), ~2.4× behind HIP (~665 vs ~278 µs). Packing /
+FMA_MIX / K-unroll stay off for prefill.
 
-## Decode DIRECT (2026-09-07)
+## Decode ml_lds fix (2026-09-08)
 
-After merging `#18010` (online-softmax past 16k), **DIRECT decode_gqa failed**
-(err~1.18). HIP OK. Root cause:
+**Bug:** `ml_lds (WAVES, G, 2)` aliases when `G==SEC` (16-wave GQA). Stats `L`
+undercounts on AMDRenderer; partials look fine → combine scales wrong.
+HIP unaffected. Misdiagnosed earlier as #18010 REG / waves=8-only.
 
-1. `#18010` REG `sum_reg` undercounts on AMDRenderer (partials cancel via
-   normalize; stats L wrong → combine scales).
-2. **waves=16** breaks DIRECT LDS exchange even on pre-#18010 partial;
-   **waves=8** is correct.
+**Fix:** layout `ml_lds` as `(WAVES, 2, G)`. DIRECT uses upstream #18010
+online-softmax path at 16 waves; works through **32k** kv.
 
-**Fix:** DIRECT uses pre-#18010 partial + default 8 waves; SDPA if
-`max_kv_len > chunks*64`. HIP keeps `#18010` / 16-wave path.
+| | DIRECT | HIP |
+|--|--:|--:|
+| decode median | ~56 µs | ~51 µs |
+| decode err | ~7e-5 | ~7e-5 |
+| prefill median | ~665 µs | ~278 µs |
 
-Serial on 7900: **13/13 OK** after fix.
+Soak: 43+ clean rounds on prior tip; restart after this fix.
 
-## Prefill validation (earlier)
+## Prefill gap (next)
 
-61 clean multi-shape soak rounds then SSH disconnect. Re-soak on tip after
-decode fix.
+DIRECT: priv 212, 21 spills, 385 `v_mov`. HIP: priv 0, `s_delay_alu`.
+Existing toggles (FMA_MIX, K_UNROLL, VEC_COPY) do not close the gap.
 
 ## Next
 
-1. Continuous soak on tip (prefill + serial).
-2. Re-bench prefill/decode vs HIP.
-3. Perf leftovers only after soak confidence.
+1. Continuous soak on tip.
+2. Prefill scratch / spill reduction (main remaining gap).
+3. Optional: close remaining ~5 µs decode (gloads 20 vs 12, FMA_MIX unsafe).
 4. Do not flip DIRECT default yet.
 
 ```bash
