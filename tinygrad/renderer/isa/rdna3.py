@@ -1042,8 +1042,9 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
 def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
   # Bottom-up isel can match STORE before INDEX→EXTRACT on vec/WMMA values. Defer (return None)
   # so the INDEX child is rewritten first; only raise when the value is already final.
-  def try_store(check, op, peel:bool=False, max_byte:int=0xffff, deep:bool=False):
-    if check(val.dtype, _elem_count(val)) is None:
+  def try_store(check, op, peel:bool=False, max_byte:int=0xffff, deep:bool=False, allow_half16:bool=False):
+    n = _elem_count(val)
+    if check(val.dtype, n) is None and not (allow_half16 and val.dtype is dtypes.half and n == 16):
       if val.op is Ops.INDEX and _elem_count(val.src[0]) > 1: return None
       raise CompileError(f"no store {val.dtype}")
     if peel:
@@ -1056,7 +1057,7 @@ def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
       src = (a.src[0], idx, val) if off == 0 else (a.src[0], idx, val, _tconst(off, dtypes.int32).rtag())
       return x.ins(op, src=src)
     return x.ins(op, src=(a.src[0], a.src[1], val))
-  if _is_lds_ref(a.src[0]): return try_store(_local_store, AMDOps.LSTORE, peel=True)
+  if _is_lds_ref(a.src[0]): return try_store(_local_store, AMDOps.LSTORE, peel=True, allow_half16=True)
   # Peel scratch REG stores to shared base + imm offset (flash init: 200× lshl+add → few bases).
   if _is_scratch_ref(a.src[0]): return try_store(_scratch_store, AMDOps.SSTORE, peel=True, max_byte=0xfff)
   # Soft-peel any ADD+imm (incl. nested). Emit uses GLOBAL offset when ≤4095 else v_lshl_add.
@@ -2410,10 +2411,19 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if (local_load:=_local_load(u.dtype, _elem_count(u))) is None: raise CompileError(f"no lds load {u.dtype}")
       return pre + [local_load(vdst=_dst(u), addr=addr, **_ds_off(off))]
     case AMDOps.LSTORE:
-      if (local_store:=_local_store(u.src[2].dtype, _elem_count(u.src[2]))) is None: raise CompileError(f"no lds store {u.src[2].dtype}")
+      nstore = _elem_count(u.src[2])
+      # half×16 → two B128 (mirror LLOAD); _local_store has no single 32B op.
+      if u.src[2].dtype is dtypes.half and nstore == 16:
+        pre, addr = _local_addr(u.src[0], u.src[1], 2)
+        pre, addr = _masked_addr(pre, addr, masked)
+        off = _lds_byte_off(u)
+        r = greg(u.src[2])
+        return pre + [r3.ds_store_b128(addr=addr, data0=_reg_chunk(r, 0, 4), **_ds_off(off)),
+                      r3.ds_store_b128(addr=addr, data0=_reg_chunk(r, 4, 4), **_ds_off(off + 16))]
+      if (local_store:=_local_store(u.src[2].dtype, nstore)) is None: raise CompileError(f"no lds store {u.src[2].dtype}")
       pre, addr = _local_addr(u.src[0], u.src[1], _mem_itemsize(u.src[2].dtype))
       pre, addr = _masked_addr(pre, addr, masked)
-      if _elem_count(u.src[2]) == 1:
+      if nstore == 1:
         # Scalar LDS store: PACK_F16 in the general pool can surface as a multi-slot
         # phys; ds_store_* wants a single VGPR lane.
         dpre, data = _vgpr_data(TMP_VDATA, u.src[2])
