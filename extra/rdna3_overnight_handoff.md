@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: see latest push (ml_lds G==SEC fix).
+Tip: **`b63240d51`** (ml_lds G==SEC fix; decode 16-wave + 32k).
 
 ## Headline
 
