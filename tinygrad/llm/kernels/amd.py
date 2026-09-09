@@ -706,33 +706,23 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
 def _flash_direct_compile_env(*, flash_acc_small:bool=True):
   """Flash-only compile envs for hand-kernel build+realize.
 
-  Prefill: ACC_SMALL remat (restored on exit) + ALLOW_UPCAST16=0.
-  Decode: ALLOW_UPCAST16=0 only.
-
-  ALLOW_UPCAST16=0 is *sticky* for the process once flash DIRECT runs: TinyJit
-  re-reads env after realize returns, so popping restores product-16 and SPILL≈21.
-  Leaving it off: SPILL 0, private≈128, VGPR≈206. Override: AMD_FLASH_ALLOW_UPCAST16=1
-  or explicit ALLOW_UPCAST16 before first flash. Also sticky AMD_PACK_SLOAD_B128=1
-  (~5–10µs; opt out AMD_FLASH_PACK_SLOAD_B128=0).
+  Prefill: ACC_SMALL remat + ALLOW_UPCAST16=0 + PACK_SLOAD_B128=1 (SPILL 0).
+  Decode: ALLOW_UPCAST16=1 + PACK_SLOAD off (~134µs vs ~153µs with prefill stickies).
+  Policies are sticky for TinyJit (capture sees post-realize env) and are re-applied
+  per path so prefill↔decode order cannot poison the other.
   """
   prev = os.environ.get("AMD_FLASH_ACC_SMALL")
   prev_remat = os.environ.get("AMD_REMAT_ADDR")
   prev_deep = os.environ.get("AMD_REMAT_ADDR_DEEP")
-  prev_up16 = os.environ.get("ALLOW_UPCAST16")
-  prev_pack = os.environ.get("AMD_PACK_SLOAD_B128")
   if flash_acc_small:
     os.environ["AMD_FLASH_ACC_SMALL"] = "1"
     if prev_remat is None: os.environ["AMD_REMAT_ADDR"] = "1"
     if prev_deep is None: os.environ["AMD_REMAT_ADDR_DEEP"] = "1"
-  # Sticky: do not pop ALLOW_UPCAST16 on exit (TinyJit capture sees post-realize env).
-  if prev_up16 is None and not getenv("AMD_FLASH_ALLOW_UPCAST16", 0):
-    os.environ["ALLOW_UPCAST16"] = "0"
-  elif prev_up16 is None and getenv("AMD_FLASH_ALLOW_UPCAST16", 0):
-    os.environ["ALLOW_UPCAST16"] = "1"
-  # Sticky PACK_SLOAD_B128: ~5–10µs prefill; serial 13/13 with default bases=1/max=8.
-  # Diag scripts may force 0; opt out AMD_FLASH_PACK_SLOAD_B128=0.
-  if prev_pack is None and getenv("AMD_FLASH_PACK_SLOAD_B128", 1):
-    os.environ["AMD_PACK_SLOAD_B128"] = "1"
+    os.environ["ALLOW_UPCAST16"] = "1" if getenv("AMD_FLASH_ALLOW_UPCAST16", 0) else "0"
+    os.environ["AMD_PACK_SLOAD_B128"] = "1" if getenv("AMD_FLASH_PACK_SLOAD_B128", 1) else "0"
+  else:
+    os.environ["ALLOW_UPCAST16"] = "1" if getenv("AMD_FLASH_DECODE_ALLOW_UPCAST16", 1) else "0"
+    os.environ["AMD_PACK_SLOAD_B128"] = "1" if getenv("AMD_FLASH_DECODE_PACK_SLOAD", 0) else "0"
   getenv.cache_clear()  # type: ignore[attr-defined]
   try:
     yield
@@ -744,6 +734,7 @@ def _flash_direct_compile_env(*, flash_acc_small:bool=True):
       else: os.environ["AMD_REMAT_ADDR"] = prev_remat
       if prev_deep is None: os.environ.pop("AMD_REMAT_ADDR_DEEP", None)
       else: os.environ["AMD_REMAT_ADDR_DEEP"] = prev_deep
+    # Keep ALLOW_UPCAST16 / PACK_SLOAD sticky for TinyJit; next flash path re-applies.
     getenv.cache_clear()  # type: ignore[attr-defined]
 
 def _flash_direct_realize(out:Tensor, *, flash_acc_small:bool=True) -> Tensor:
