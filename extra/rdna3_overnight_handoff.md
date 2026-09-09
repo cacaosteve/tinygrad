@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`9b60cb7f1`**.
+Tip: **`8f6950f61`**.
 
 ## Headline (remeasured fair)
 
@@ -32,6 +32,7 @@ HIP: 32 MOV, 0 scratch, 64× 2addr, 119 delay_alu, VOPD
 - **DECODE_PACK_SLOAD**: wash / regress (decode noisy; prefill ~848 when set)  
 - **ACC_WORK=0**: slower (~840 vs ~790), more waits; keep default  
 - **SCRATCH_STORE_B64**: ~164→156 st32, timing wash; b128 fusion still 0
+- **scratch_store b128**: 22× contiguous-16B groups exist but data is often the **same SSA MOV** (regs all vN) — not 4 distinct VGPRs; only ~3 fusible
 
 ## Confirmed keep
 
@@ -39,6 +40,6 @@ HIP: 32 MOV, 0 scratch, 64× 2addr, 119 delay_alu, VOPD
 
 ## Next
 
-1. Why 164× scratch_store_b32 don’t pair for b128 (VGPR adjacency / schedule).  
+1. Decode priv 64 / remaining ~12µs vs HIP (scratch b128 mostly blocked by same-SSA stores).  
 2. Decode priv 64 / remaining ~12µs vs HIP.  
 3. Prefill still ~2.3× HIP beyond LDS parity. Fork-only; soak.
