@@ -64,6 +64,7 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - `AMD_FLASH_DECODE_LATE_V` (defer V load): SCORE_BATCH=8 still **priv 64** (park temps, not V prefetch) — unmerged
 - Prefill `SOFT_SCALE=0` / `ACC_SEP=0`: **serial FAIL**; `SOFT_FUSE=0` slower (~731 vs ~648)
 - `AMD_FMA_MIX_EXP=1` + `MAX_CAST=128`: **MMU fault** on serial — leave off
+- Env recheck after SCORE_BATCH=4: `ACC_UNROLL=0` **FAIL**; `PEER_SWIZZLE=0` / `PEER_NOPARK` / `SINK_VALU` / `VOPD_FMAC_SCAN` wash; `PV_ACC_DIRECT` decode noise / prefill slower; `REG_PROMOTE=0` decode ~237µs; `BATCH_SWIZZLE_MOV=0` regress; K_UNROLL=1 still best
 
 ## Confirmed keep
 
