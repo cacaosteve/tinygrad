@@ -43,6 +43,9 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - Prefill env wash/regress: `SOFT_SCALE=0`, `SOFT_FUSE=0`, `VEC_COPY`, `PV_ACC_DIRECT`, `K_UNROLL=-1`, `MIDSTORE=5`, `REG_PROMOTE_MAX=128`; WAVES 2/4/16 worse/wash
 - **Emit-time VOPD MOV pair** (~21 dual / −16 MOV): serial OK, **fair wash** (~714µs); most adjacent MOVs are **broadcast** (same src→many dst) — not VOPD-bankable. Unmerged.
 - **Prefill promote slot2** (`AMD_FLASH_PREFILL_SKIP_SLOTS=`): vgpr stays 206 but **priv 128→368**, **SPILL 132 / FILL 66** (base had 0 spills) → ~1.5–1.7ms. Soft/ACC_SEP/PROMOTE_MAX cuts do not fix. Slot2 scratch is intentional; promote displaces other live values into worse spill.
+- **SCRATCH_STORE_B64**: fair wash (~714µs); only +4 b64 / −8 st32 — leave off
+- **SCRATCH_DEST_ADDR=0**: fair **regress** (~725–730 vs ~714); keep default 1 (s_clause path)
+- Prefill `lshl` tax (~196): mostly **LDS** addr (`ds_load_2addr` within +3), not DEST_ADDR scratch; HIP has same 64× 2addr
 
 ## Confirmed keep
 
@@ -50,6 +53,6 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 ## Next
 
-1. Prefill **priv 128 / 556 MOV** vs HIP 0 scratch / 32 MOV — need structural (not more env washes). Ideas: cut broadcast-MOV tax at source; shrink REDUCE-carried scratch traffic without promoting slot 2 into the 1.5ms cliff.
-2. Decode leftover ~10µs: HIP wait→ADD / delay_alu / fma_mix scheduling (park path still wins e2e vs NO_PARK).
+1. Prefill: priv **128 = TM×TD×4** (slot 2 only). Promote spills elsewhere — need VGPR freed before promote, or fewer scratch round-trips without promote. LDS-park for slot2 untried (likely same ACC_WORK roundtrip).
+2. Decode ~10µs: HIP wait→ADD / delay_alu / fma_mix; park path still wins vs NO_PARK.
 3. Fork-only; soak on tip.
