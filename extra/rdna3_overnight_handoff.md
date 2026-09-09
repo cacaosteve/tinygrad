@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`1651686f1`**.
+Tip: **`0b2556b78`**.
 
 ## Headline (remeasured fair)
 
@@ -40,6 +40,8 @@ HIP: 32 MOV, 0 scratch, 64× 2addr, 119 delay_alu, VOPD
 
 ## Next
 
-1. Decode steady **~120–134** vs HIP ~108 (~12–25µs); VOPD never fires on flash (bank/pair).
+1. Decode steady **~120–134** vs HIP ~108. Partial already has **20× global_load_b64** (HIP-parity VMEM); leftover is swizzle/MOV/scratch (32 st / 12 ld) + 16× ds_load_u16.
+2. Prefill ~711 serial / ~2.3× HIP: 556 MOV class tax, priv 128; VOPD=0 on prefill; defaults beat ACC_SEP=0 / ACC_SMALL=0 / K_UNROLL=2.
+3. Fork-only; soak.
 2. Prefill still ~2.3× HIP (556 MOV / priv 128); scratch b128 mostly same-SSA zeros.
 3. Fork-only; soak.  
