@@ -36,6 +36,9 @@ Decode: DIRECT **beats** HIP. Prefill ~**2.1×** behind.
 - **`AMD_FLASH_QIDX_REG=1`**: correct but **~977 vs ~723** — leave off
 - **Shared q_lane `(k-rm)<=q` soft-fuse**: **prefill_gqa FAIL** + slower + SPILL 30 — reverted
 
+- LDS_PAD≠4: pad0 wrong prefill; pad8 wrong; pad16/32 MMU — keep 4
+- Slot-2 promote / ACC_WORK=0: slower
+
 ## Next
 
 1. Keep soak on tip; recover after MMU with fresh process.
