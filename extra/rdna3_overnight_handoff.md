@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`6f2a0ba6c`**.
+Tip: **`2f677c75e`**.
 
 ## Headline (remeasured fair)
 
@@ -54,6 +54,7 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - **AMD_LGKM_DELAY** (s_delay_alu before every lgkm flush): e2e wash
 - **AMD_FLASH_ACC_LDS**: park slot2 in per-thread LDS — **slower** (~1250), priv **200**, **serial FAIL** prefill — leave off
 - Decode schedule toggles: `AMD_SCHEDULE_ALU=0` / `AMD_SCHEDULE_VMEM=0` **regress** (~133–140µs) — keep defaults
+- **Skip park on permlanex16** (`AMD_SWIZZLE_PARK_PERMLANE=0`): MOV 262→230 but **e2e regress** (~126–128 vs ~120–121); isolated partial ~45 vs park baseline. Keep parking offset-16.
 
 ## Confirmed keep
 
@@ -61,6 +62,6 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 ## Next
 
-1. Prefill: priv **128 = TM×TD×4** (slot 2 only). Promote spills elsewhere — need VGPR freed before promote, or fewer scratch round-trips without promote. LDS-park for slot2 untried (likely same ACC_WORK roundtrip).
-2. Decode ~10µs: HIP wait→ADD / delay_alu / fma_mix; park path still wins vs NO_PARK.
+1. Prefill: priv **128 = TM×TD×4** (slot 2 only). Promote spills elsewhere — need VGPR freed before promote, or fewer scratch round-trips without promote.
+2. Decode ~10µs partial (~41→~30): HIP `s_delay_alu` / fma_mix / wait→ADD; park still required (incl. permlane). Re-check SCORE_BATCH=16 after slot2 promote.
 3. Fork-only; soak on tip.
