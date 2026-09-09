@@ -65,6 +65,7 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - Prefill `SOFT_SCALE=0` / `ACC_SEP=0`: **serial FAIL**; `SOFT_FUSE=0` slower (~731 vs ~648)
 - `AMD_FMA_MIX_EXP=1` + `MAX_CAST=128`: **MMU fault** on serial — leave off
 - Env recheck after SCORE_BATCH=4: `ACC_UNROLL=0` **FAIL**; `PEER_SWIZZLE=0` / `PEER_NOPARK` / `SINK_VALU` / `VOPD_FMAC_SCAN` wash; `PV_ACC_DIRECT` decode noise / prefill slower; `REG_PROMOTE=0` decode ~237µs; `BATCH_SWIZZLE_MOV=0` regress; K_UNROLL=1 still best
+- Decode partial: **0 VOPD** (HIP ~62) — FMAC dest banks not even/odd; scan=64 no help. LDS_2ADDR no-op on decode (48× `ds_load_b32`). Vec swizzle park ≡ scalar (wash).
 
 ## Confirmed keep
 
@@ -74,5 +75,5 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 ## Next
 
 1. Prefill: priv **128 = TM×TD×4** (slot 2). Promote spills; need fewer scratch round-trips or freed VGPRs before promote.
-2. Decode ~10µs vs HIP: partial park MOV tax (262 MOV / 0 HIP); HIP has ~150 `s_delay_alu` + `v_fma_mix`/`cndmask`. SCORE_BATCH=4 is the spill-safe batch.
+2. Decode ~10µs vs HIP (~120 vs ~110): HIP partial has vgpr **83** / 0 MOV / 234 `fma_mix` / 162 cndmask / 62 VOPD / 150 delay_alu vs DIRECT vgpr **121** / 262 MOV / 0 mix / 0 VOPD. FMA_MIX paths MMU — need a correct fold, not env wash. VOPD needs bank-aware alloc.
 3. Fork-only; soak on tip.
