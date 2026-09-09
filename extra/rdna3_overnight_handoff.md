@@ -66,6 +66,7 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - `AMD_FMA_MIX_EXP=1` + `MAX_CAST=128`: **MMU fault** on serial — leave off
 - Env recheck after SCORE_BATCH=4: `ACC_UNROLL=0` **FAIL**; `PEER_SWIZZLE=0` / `PEER_NOPARK` / `SINK_VALU` / `VOPD_FMAC_SCAN` wash; `PV_ACC_DIRECT` decode noise / prefill slower; `REG_PROMOTE=0` decode ~237µs; `BATCH_SWIZZLE_MOV=0` regress; K_UNROLL=1 still best
 - Decode partial: **0 VOPD** (HIP ~62) — FMAC dest banks not even/odd; scan=64 no help. LDS_2ADDR no-op on decode (48× `ds_load_b32`). Vec swizzle park ≡ scalar (wash).
+- Decode-scoped `FMA_MIX` sticky: **decode_gqa err=inf** — leave off (process-wide FMA_MIX still MMUs prefill)
 
 ## Confirmed keep
 
