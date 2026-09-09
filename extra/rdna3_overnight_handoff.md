@@ -29,8 +29,12 @@ Gap to HIP still ~**2.3×**. Do **not** flip DIRECT default.
 - K_UNROLL=-1 ×pv: correct but slower (~887)
 - PACK_SLOAD_BASES=2: **wrong** (as documented)
 - PACK_SLOAD_MAX 4|12|16: wash vs 8
+- SCRATCH_STORE_B64=1: wash (~789)
+- Promote slot 2 (`REG_PROMOTE_SKIP_SLOTS=`): serial OK, ~8µs bench win but **SPILL 16 / priv 256** — wrong direction
 - ACC_SEP=0, INSTR_WAIT, PV_ACC_DIRECT, SOFT_FUSE=0, deeper remat: no win / worse
+- REG_PROMOTE=0: ~1.5ms (promote essential)
 - SHALLOW remat: now correct under SPILL0 but slower
+- Emit noise knobs (WAIT_EXP/LDS_BANK/D16/PREFETCH explicit): wash or worse
 
 ## Scratch note
 
