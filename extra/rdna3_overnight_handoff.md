@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`d66015850`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
+Tip: **`0efe48386`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
 
 ## Headline (remeasured fair)
 
@@ -97,8 +97,10 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - Default **K_UNROLL=1 + MIDSTORE=4** (WMMA24) beats factor2 (~750 vs ~790; serial 13/13)
 - Default **SCORE_BATCH=4** with decode slot-2 promote (batch=8 spills)
 
+
+- Gaming PC SSH briefly unreachable mid-loop (2026-09-09 ~04:52 PDT); tip docs pushed; resume HW probes when back.
 ## Next
 
 1. Decode partial ~42→~30: park MOV tax (wait→ADD 9 ops; HIP 1). Need HIP-like VALU-in-gap or correct `fma_mix` (current fold wrong/MMU). VOPD needs bank-aware VGPR alloc (0 duals today).
 2. Prefill: priv **128** slot2; promote still spills/FAIL; fewer scratch round-trips without promote.
-3. Fork-only; soak on tip **`d66015850`**; code tip **`7e1af310e`**.
+3. Fork-only; soak on tip **`0efe48386`**; code tip **`7e1af310e`**.
