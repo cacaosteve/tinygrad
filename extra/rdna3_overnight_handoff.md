@@ -43,6 +43,9 @@ Decode: DIRECT **beats** HIP. Prefill ~**2.1×** behind.
 
 - AMD_MUL_LEA (two-bit MUL→LSHL_ADD): **prefill_gqa FAIL** — reverted
 
+- AMD_REMAT_CONST_OUTER: correct? **no** (prefill_gqa/mha fail) — reverted
+- K_UNROLL scoped qk/pv / HIP_SCOPE=-1: wrong, slower, or MMU
+
 ## Next
 
 1. Keep soak on tip; recover after MMU with fresh process.
