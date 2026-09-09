@@ -74,6 +74,7 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - Remat/cluster recheck: `REMAT_ADDR=0` / `DEEP=0` / `CLUSTER_SLOAD=0` decode wash; `REMAT_ADDR_SHALLOW=1` **FAIL** prefill_gqa_32
 - `AMD_FLASH_SCORE_HEAD_BATCH` 1/2: serial OK, e2e/partial wash vs all-heads (unmerged)
 - `AMD_GATED_VMEM=0`: decode e2e wash. Fair tip: partial **~42** vs HIP **~29.5**; combine **~9.4** vs **~11**
+- `AMD_LOAD_EXEC=1`: no change on flash_decode_partial asm (WHERE≠LOAD pattern); e2e wash
 
 ## Confirmed keep
 
