@@ -43,6 +43,8 @@ Soak: continuous on tip; serial 13/13 when healthy. After MMU experiments, recov
 - K_UNROLL 2/4 / scoped qk|pv / HIP_SCOPE=-1: slower, wrong, or MMU
 - Emit toggles (PACK_SLOAD_B128, FMA_MIX, INSTR_WAIT, WMMA_DELAY, …): no win vs ~720
 
+- Soft-fuse `q_uni+lane_m` split: correct but SPILL 14→21 / ~976µs — reverted
+
 ## Next
 
 1. Keep soak; fresh process after any MMU.
