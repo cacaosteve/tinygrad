@@ -914,12 +914,11 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     S_soft = UOp.placeholder((TM, TN), dtypes.float, slot=16, addrspace=AddrSpace.REG)
     if _soft_scale and getenv("AMD_FLASH_SOFT_FUSE", 1):
       # Scale+mask while copying ACC→soft (one SSTORE wave; was copy then rewrite).
-      # Hoist shared q_lane (same as inlined form; helps LinearScan see one base).
-      q_lane = q_base + block_m * BLOCK_M + wave_m * WMMA_M + lane_m
+      # AMD_FLASH_QIDX_REG / shared q_lane rewrites: correct? no — wrong tiles or ~250µs slower.
       sm_stores = []
       for rm_i in range(TM):
-        q_idx = q_lane + rm_i * LANES_PER_WAVE_M
         for rn_i in range(TN):
+          q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
           k_idx = n_tile * BLOCK_N + rn_i * LANES_PER_WAVE_N + lane_n
           scaled = S_masked[rm_i, rn_i] * SCALE
           sm_stores.append(S_soft[rm_i, rn_i].store((k_idx <= q_idx).where(scaled, scaled.const_like(-math.inf))))
