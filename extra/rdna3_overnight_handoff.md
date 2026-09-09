@@ -7,33 +7,26 @@ Tip: **`ac577e6a4`** (code **`897c8e806`**).
 
 | | DIRECT (`DEV=AMD:AMD`) | HIP (`DEV=AMD`) |
 |--|--:|--:|
-| prefill median | **~730–750 µs** (serial ~736) | **~324 µs** |
-| decode median | **~121–134 µs** (SCORE_BATCH=8) | **~108 µs** |
-| WMMA / SPILL / priv / VGPR | **24 / 0 / 128 / 206** | (HIP) |
+| prefill median | **~715–738 µs** (midstore K1) | **~293–324 µs** |
+| decode median | **~120–125 µs** quiet (SCORE_BATCH=8) | **~108 µs** |
+| flash VGPR / priv / SPILL | **206 / 128 / 0** | **206 / 0 / —** |
 
-Prefill ~**2.3×** HIP. Decode ~**1.12–1.25×** HIP. No DIRECT default flip.
+Same VGPR as HIP; DIRECT still pays **priv 128** (slot-2 `acc`). Prefill ~**2.4×**. Decode ~**1.12×**.
 
 ## Landed tonight
 
 1. Prefill sticky **`ALLOW_UPCAST16=0`** + **`PACK_SLOAD_B128=1`** → SPILL 0  
-2. **Decode-scoped envs** + **`AMD_FLASH_SCORE_BATCH=8`** (`warp_reduce_many`)  
-3. **`AMD_FLASH_K_UNROLL=1` + auto `MIDSTORE=4`**: ACC checkpoint every 4 WMMA → **WMMA 24**, ~790→~735µs, serial 13/13
+2. **`AMD_FLASH_SCORE_BATCH=8`** restore — decode ~134→~121  
+3. Prefill **`K_UNROLL=1` + `MIDSTORE=4`** — serial ~731–738 vs ~768 @factor2
 
-## Dead ends / washes
+## Dead ends
 
-- CLUSTER_SLOAD_SCAN=128, COMBINE_UNROLL=64, K_TILE_OUTER, SWIZZLE_DELAY/VALU_GAP e2e  
-- DECODE_PACK_SLOAD: wash when quiet; REG_PROMOTE_MAX does not cut decode priv 64  
-- MIDSTORE=2 slower; MIDSTORE=8 **MMU**; hip without midstore **MMU**  
-- WMMA_DELAY probe flaked MMU (recover+serial OK) — leave off  
-- Scoped K_UNROLL slower; slot-2 promote SPILL16/priv256; ACC_SHARED off  
-- SCORE_BATCH 1/2 slower than 8 on aggregate
-
-## Decode asm gap (remaining)
-
-DIRECT: waits ~95 after SCORE_BATCH; priv 64, 0 delay_alu · HIP: 146 waits historically, 120 delay_alu, priv 0.
+- MIDSTORE=8 / hip_qk without mid → **MMU**  
+- Slot-2 promote under midstore → SPILL132 / priv368 / ~1.5ms (and HW fault once)  
+- SCORE_BATCH=2/1 slower; PACK_MAX/CLUSTER/FMA_MIX/SWIZZLE_DELAY wash  
 
 ## Next
 
-1. Close remaining decode vs HIP (~108); cut decode priv 64.  
-2. Prefill still ~2.3× HIP — cut priv 128 / schedule.  
+1. Get DIRECT prefill priv **128→0** like HIP (without promote spill).  
+2. Decode priv 64 + remaining ~12µs.  
 3. Fork-only; soak on tip.
