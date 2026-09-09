@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`eb0a021af`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
+Tip: **`6ce78c79b`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
 
 ## Headline (remeasured fair)
 
@@ -85,6 +85,10 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - `AMD_REMAT_NO_STICKY_ADD=1`: decode-only can look fast but **serial MMU** — leave off (matches prior hung/MMU note)
 - `AMD_FLASH_DECODE_ALLOW_UPCAST16=0`: wash/slight regress
 
+- `AMD_FLASH_K_MIDSTORE=6/7`: serial OK but **regress** (~978 / ~1377 vs ~660 @4) — keep 4
+- Scratch sclause toggles (`STORE_SCLAUSE=0` / `SCLAUSE=0` / `SCLAUSE_MAX`): **MMU** after first fault — leave defaults (DEST_ADDR=1)
+- `AMD_VOPD_PAIR_ALLOC` sticky even→odd LinearScan affinity: **0 dual_fmac** still; e2e **regress** (~126 vs ~122); serial **FAIL nan + MMU** — unmerged (needs true sibling affinity + mul-src banks, not global sticky)
+
 ## Confirmed keep
 
 - Default **K_UNROLL=1 + MIDSTORE=4** (WMMA24) beats factor2 (~750 vs ~790; serial 13/13)
@@ -94,4 +98,4 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 1. Decode partial ~42→~30: park MOV tax (wait→ADD 9 ops; HIP 1). Need HIP-like VALU-in-gap or correct `fma_mix` (current fold wrong/MMU). VOPD needs bank-aware VGPR alloc (0 duals today).
 2. Prefill: priv **128** slot2; promote still spills/FAIL; fewer scratch round-trips without promote.
-3. Fork-only; soak on tip **`eb0a021af`**; code tip **`7e1af310e`**.
+3. Fork-only; soak on tip **`6ce78c79b`**; code tip **`7e1af310e`**.
