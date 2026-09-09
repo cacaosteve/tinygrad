@@ -914,10 +914,20 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     S_soft = UOp.placeholder((TM, TN), dtypes.float, slot=16, addrspace=AddrSpace.REG)
     if _soft_scale and getenv("AMD_FLASH_SOFT_FUSE", 1):
       # Scale+mask while copying ACC→soft (one SSTORE wave; was copy then rewrite).
+      # AMD_FLASH_QIDX_REG=1: park causal q_idx in a REG-promoted buffer once per row so
+      # LinearScan does not SPILL the ADD(ADD(SHL,MOV),C) trees across TN compares.
+      _qidx_reg = bool(getenv("AMD_FLASH_QIDX_REG", 1))
+      Qidx = None
+      if _qidx_reg:
+        Qidx = UOp.placeholder((TM,), dtypes.int32, slot=18, addrspace=AddrSpace.REG)
+        Qidx = Qidx.after(UOp.group(*[
+          Qidx[rm_i].store(q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m)
+          for rm_i in range(TM)]))
       sm_stores = []
       for rm_i in range(TM):
+        q_idx = Qidx[rm_i].load() if Qidx is not None else (
+          q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m)
         for rn_i in range(TN):
-          q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
           k_idx = n_tile * BLOCK_N + rn_i * LANES_PER_WAVE_N + lane_n
           scaled = S_masked[rm_i, rn_i] * SCALE
           sm_stores.append(S_soft[rm_i, rn_i].store((k_idx <= q_idx).where(scaled, scaled.const_like(-math.inf))))
