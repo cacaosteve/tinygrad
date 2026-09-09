@@ -31,6 +31,7 @@ HIP: 32 MOV, 0 scratch, 64× 2addr, 119 delay_alu, VOPD
 - LDS_2ADDR miss was **qrange (>2KB offs)**, not consecutive VGPRs (only 1 not_cons)  
 - **DECODE_PACK_SLOAD**: wash / regress (decode noisy; prefill ~848 when set)  
 - **ACC_WORK=0**: slower (~840 vs ~790), more waits; keep default  
+- **AMD_D16_HI=1**: wash/regress decode; serial HW wait timeouts — leave off
 - **SCRATCH_STORE_B64**: ~164→156 st32, timing wash; b128 fusion still 0
 - **scratch_store b128**: 22× contiguous-16B groups exist but data is often the **same SSA MOV** (regs all vN) — not 4 distinct VGPRs; only ~3 fusible
 
