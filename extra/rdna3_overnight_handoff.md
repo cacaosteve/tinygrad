@@ -69,6 +69,7 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - Decode-scoped `FMA_MIX` sticky: **decode_gqa err=inf** — leave off (process-wide FMA_MIX still MMUs prefill)
 - WHERE-peel for `AMD_FMA_MIX_EXP` (decode beta): fires **112× fma_mix** but output **wrong** (mean 0 vs ~0.38) / MMU on serial — unmerged. Keep-cast vs skip-cast both fail correctness.
 - `AMD_FLASH_UNROLL` 0/1/2/4/5/7: prefill serial wash (~640–662); `AMD_IN_ORDER_EMIT` decode wash
+- Selective `AMD_SWIZZLE_NO_PARK_OFFSETS` (1 / 1,2 / 16 / 8,4,2,1): e2e wash vs park-all
 
 ## Confirmed keep
 
