@@ -1,48 +1,41 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`2777961c1`** (code tip **`a3d953ae8`**).
+Tip: **`c9054ea37`** (code tip **`a3d953ae8`**).
 
-## Headline
+## Headline (remeasured fair)
 
-Flash DIRECT **opt-in**. Serial PERF **~763 µs**; fair often **~790** (noisy after MMU probes):
+| | DIRECT (`DEV=AMD:AMD`) | HIP (`DEV=AMD`) |
+|--|--:|--:|
+| prefill median | **~770–790 µs** (serial PERF **~760**) | **~324 µs** (best ~314) |
+| decode median | **~133–153 µs** | **~107 µs** |
+| WMMA / SPILL / priv / VGPR | **12 / 0 / 128 / 206** | (HIP path) |
 
-| | DIRECT (now) | start of night | HIP (prior) |
-|--|--:|--:|--:|
-| prefill | **~760–790 µs** | ~700–720 / SPILL14 | **best ~328** |
-| WMMA | **12** | 6 | **24** |
-| private / VGPR | **128 / 206** | 404 / 166 | **0 / 206** |
-| SPILL | **0** | **14** | **0** |
-| decode | **beats HIP** (~136–145) | ~141 | ~156 |
-
-Gap to HIP still ~**2.3×**. Do **not** flip DIRECT default.
+Prefill gap **~2.4×**. Decode: HIP ahead (~1.3×); older “DIRECT beats HIP decode” was vs a slower HIP baseline.
+Do **not** flip DIRECT default.
 
 ## Landed tonight
 
-1. Sticky **`ALLOW_UPCAST16=0`** (TinyJit-safe) → SPILL 0, HIP-like VGPR/priv
-2. Default **`AMD_FLASH_K_UNROLL=2`** → WMMA 6→12 (~100µs)
-3. Sticky **`AMD_PACK_SLOAD_B128=1`** → ~5–10µs (bases=1/max=8)
+1. Sticky **`ALLOW_UPCAST16=0`** → SPILL 0, HIP-like VGPR/priv  
+2. Default **`AMD_FLASH_K_UNROLL=2`** → WMMA 6→12  
+3. Sticky **`AMD_PACK_SLOAD_B128=1`** → ~5–10µs  
 
 ## Dead ends (do not revive)
 
-- K_UNROLL=-1 (HIP QK) / 1 / 8 / 8×qk: **MMU** even with SPILL_DRAIN
-- K_UNROLL=-1 ×pv: correct but slower (~887)
-- PACK_SLOAD_BASES=2: **wrong** (as documented)
-- PACK_SLOAD_MAX 4|12|16: wash vs 8
-- SCRATCH_STORE_B64=1: wash (~789)
-- Promote slot 2 (`REG_PROMOTE_SKIP_SLOTS=`): serial OK, ~8µs bench win but **SPILL 16 / priv 256** — wrong direction
-- ACC_SEP=0, INSTR_WAIT, PV_ACC_DIRECT, SOFT_FUSE=0, deeper remat: no win / worse
-- REG_PROMOTE=0: ~1.5ms (promote essential)
-- SHALLOW remat: now correct under SPILL0 but slower
-- Emit noise knobs (WAIT_EXP/LDS_BANK/D16/PREFETCH explicit): wash or worse
+- K_UNROLL=-1/1/8 (and 8×qk): **MMU**; -1×pv slower  
+- WAVES=4 decode: faster but **decode_gqa FAIL** (err ~676)  
+- WAVES=32 decode: hang/timeout  
+- PACK_SLOAD_BASES=2: wrong  
+- Slot-2 promote: ~8µs but SPILL16/priv256  
+- SCRATCH_STORE_B64, WMMA_DELAY, REG_PROMOTE=0, etc.: wash/worse  
 
 ## Scratch note
 
-SPILL 0 but **private 128** remains: SOURCE has SCRATCH_SIZE/ADDR (no FILL/SPILL). Likely REG-scratch plumbing / ACC work — not free spills.
+SPILL 0 but priv **128** remains (SCRATCH_SIZE/ADDR; slot-2 acc path).
 
 ## Next
 
-1. Soak on tip; **avoid** K_UNROLL=-1/1/8 probes (MMU tax).
-2. Structural path to WMMA 24 without HIP-style full-K MMU.
-3. Cut remaining private 128 or SLOAD pressure (148 SLOADs in ISA).
+1. Soak; avoid MMU probes (-1/1/8 K_UNROLL, WAVES=32).  
+2. Prefill: WMMA 12→24 without MMU; cut SLOAD/MOV pressure (262 MOV).  
+3. Decode: close gap to HIP ~107 without WAVES=4.  
 4. Fork-only.
