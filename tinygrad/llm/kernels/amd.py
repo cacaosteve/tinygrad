@@ -1,5 +1,5 @@
 from __future__ import annotations
-import functools, math, os
+import contextlib, functools, math, os
 from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.device import Buffer
@@ -702,6 +702,50 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
   return UOp.group(*[o[b, h, 0, d].store(acc[i].load() * inv) for i, d in enumerate(dims)]) \
     .end(lane, block_dt, block_bh).sink(arg=KernelInfo(name="flash_decode_combine", opts_to_apply=()))
 
+@contextlib.contextmanager
+def _flash_direct_compile_env(*, flash_acc_small:bool=True):
+  """Flash-only compile envs for hand-kernel build+realize.
+
+  Prefill: ACC_SMALL remat (restored on exit) + ALLOW_UPCAST16=0.
+  Decode: ALLOW_UPCAST16=0 only.
+
+  ALLOW_UPCAST16=0 is *sticky* for the process once flash DIRECT runs: TinyJit
+  re-reads env after realize returns, so popping restores product-16 and SPILL≈21.
+  Leaving it off: SPILL 0, private≈128, ~45µs faster; serial peers (eye/GEMM)
+  stay OK. Opt back in with AMD_FLASH_ALLOW_UPCAST16=1 or explicit ALLOW_UPCAST16
+  before the first flash call.
+  """
+  prev = os.environ.get("AMD_FLASH_ACC_SMALL")
+  prev_remat = os.environ.get("AMD_REMAT_ADDR")
+  prev_deep = os.environ.get("AMD_REMAT_ADDR_DEEP")
+  prev_up16 = os.environ.get("ALLOW_UPCAST16")
+  if flash_acc_small:
+    os.environ["AMD_FLASH_ACC_SMALL"] = "1"
+    if prev_remat is None: os.environ["AMD_REMAT_ADDR"] = "1"
+    if prev_deep is None: os.environ["AMD_REMAT_ADDR_DEEP"] = "1"
+  # Sticky: do not pop ALLOW_UPCAST16 on exit (TinyJit capture sees post-realize env).
+  if prev_up16 is None and not getenv("AMD_FLASH_ALLOW_UPCAST16", 0):
+    os.environ["ALLOW_UPCAST16"] = "0"
+  elif prev_up16 is None and getenv("AMD_FLASH_ALLOW_UPCAST16", 0):
+    os.environ["ALLOW_UPCAST16"] = "1"
+  getenv.cache_clear()  # type: ignore[attr-defined]
+  try:
+    yield
+  finally:
+    if flash_acc_small:
+      if prev is None: os.environ.pop("AMD_FLASH_ACC_SMALL", None)
+      else: os.environ["AMD_FLASH_ACC_SMALL"] = prev
+      if prev_remat is None: os.environ.pop("AMD_REMAT_ADDR", None)
+      else: os.environ["AMD_REMAT_ADDR"] = prev_remat
+      if prev_deep is None: os.environ.pop("AMD_REMAT_ADDR_DEEP", None)
+      else: os.environ["AMD_REMAT_ADDR_DEEP"] = prev_deep
+    getenv.cache_clear()  # type: ignore[attr-defined]
+
+def _flash_direct_realize(out:Tensor, *, flash_acc_small:bool=True) -> Tensor:
+  """Realize under flash compile envs (ACC_SMALL remat). Prefer wrapping build+realize."""
+  with _flash_direct_compile_env(flash_acc_small=flash_acc_small):
+    return out.realize()
+
 def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, max_kv_len:int) -> Tensor:
   B, H, D = cache_kv.shape[1], q.shape[1], cache_kv.shape[4]
   chunks = min(48, max_kv_len // 64)
@@ -1226,7 +1270,12 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
     mask = None if decode else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
     return q.float().scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
-  if decode: return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N))
+  if decode:
+    if not (amd_direct_isa(q.device) or getenv("AMD_FLASH_DIRECT", 0)):
+      return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N))
+    # ALLOW_UPCAST16=0 for whole decode build+realize (see _flash_direct_compile_env).
+    with _flash_direct_compile_env(flash_acc_small=False):
+      return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N)).realize()
   # Direct ISA can render the hand WMMA prefill correctly, but still trails HIP and
   # often SDPA. With AMD_FLASH_ACC_SMALL (default on for DIRECT): ~670µs vs ~1030µs
   # scratch ACC; HIP ~268µs. SDPA fallback ~306µs remains the non-DIRECT default.
@@ -1246,39 +1295,22 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # work-copy active nans; promoting slot 2 alone is the alternate path (see handoff).
   _skip_reg = {int(s) for s in getenv("AMD_REG_PROMOTE_SKIP_SLOTS", "2").split(",") if s.strip()}
   use_acc_work = bool(use_acc_small and (2 in _skip_reg) and getenv("AMD_FLASH_ACC_WORK", 1))
-  if isinstance(T_real, UOp):
-    # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
-    T_pad = q.max_shape[2]
-    assert T_pad % BLOCK_M == 0, "chunk_size must be a multiple of 32"
-    q, q_start = q.pad_to((*q.shape[:2], T_pad, q.shape[3])), valid_end - T_real
-  B, H, T, D = q.shape
-  out = Tensor.empty(B*H, T, D, dtype="float32", device=q.device)
-  fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start,
-                          acc_small=use_acc_small, k_unroll=use_k_unroll, use_acc_work=use_acc_work,
-                          k_hip_scope=use_k_hip_scope)
-  out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
-  if q_start is not None: out = out[:, :, :T_real]
-  if not use_acc_small: return out
-  # Compile under ACC_SMALL env so renderer parks flash tiles without poisoning peers.
-  # Remat one nested addr level: base flash spills are ADD/SHL trees; full deep (2) MMUs.
-  # AMD_REMAT_ADDR_SHALLOW=1 (opt-in): SPILL 14→5; enable here only after clean latency win.
-  prev = os.environ.get("AMD_FLASH_ACC_SMALL")
-  prev_remat = os.environ.get("AMD_REMAT_ADDR")
-  prev_deep = os.environ.get("AMD_REMAT_ADDR_DEEP")
-  os.environ["AMD_FLASH_ACC_SMALL"] = "1"
-  if prev_remat is None: os.environ["AMD_REMAT_ADDR"] = "1"
-  if prev_deep is None: os.environ["AMD_REMAT_ADDR_DEEP"] = "1"
-  getenv.cache_clear()  # type: ignore[attr-defined]
-  try:
+  # Build+realize under ACC_SMALL remat + ALLOW_UPCAST16=0 (must wrap custom_kernel).
+  with _flash_direct_compile_env(flash_acc_small=use_acc_small):
+    if isinstance(T_real, UOp):
+      # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
+      T_pad = q.max_shape[2]
+      assert T_pad % BLOCK_M == 0, "chunk_size must be a multiple of 32"
+      q, q_start = q.pad_to((*q.shape[:2], T_pad, q.shape[3])), valid_end - T_real
+    B, H, T, D = q.shape
+    out = Tensor.empty(B*H, T, D, dtype="float32", device=q.device)
+    fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start,
+                            acc_small=use_acc_small, k_unroll=use_k_unroll, use_acc_work=use_acc_work,
+                            k_hip_scope=use_k_hip_scope)
+    out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
+    if q_start is not None: out = out[:, :, :T_real]
+    if not use_acc_small: return out
     return out.realize()
-  finally:
-    if prev is None: os.environ.pop("AMD_FLASH_ACC_SMALL", None)
-    else: os.environ["AMD_FLASH_ACC_SMALL"] = prev
-    if prev_remat is None: os.environ.pop("AMD_REMAT_ADDR", None)
-    else: os.environ["AMD_REMAT_ADDR"] = prev_remat
-    if prev_deep is None: os.environ.pop("AMD_REMAT_ADDR_DEEP", None)
-    else: os.environ["AMD_REMAT_ADDR_DEEP"] = prev_deep
-    getenv.cache_clear()  # type: ignore[attr-defined]
 
 # ******** gated delta net: fused recurrent scan ********
 
