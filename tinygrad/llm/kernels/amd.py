@@ -601,16 +601,23 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   valids: list[UOp] = []
   scores: list[list[UOp]] = [[zerof]*G for _ in range(SEC)]
   vfrags: list[tuple[UOp, ...]] = [()]*SEC
-  for j in range(SEC):
-    key = chunk_id*CHUNK + wave*SEC + j
-    valid = key < valid_kv_len
-    valids.append(valid)
-    kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
-    # V is prefetched in the score pass so both streams are in flight together
-    vfrags[j] = tuple(valid.where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
-    for h in range(G):
-      s = warp_reduce(sum((qf[h][i]*kfrag[i] for i in range(DPL)), UOp.const(0, dtypes.float)), full_wave=True) * (1/math.sqrt(D))
-      scores[j][h] = valid.where(s, UOp.const(-1e30, dtypes.float))
+  # Batch keys into one warp_reduce_many so swizzle/permlane stages share lgkm waits.
+  # Default 8 = full SEC at waves=8. Lost in the #18010 merge; restore (was ~57→54µs).
+  score_batch = getenv("AMD_FLASH_SCORE_BATCH", 8)
+  for j0 in range(0, SEC, score_batch):
+    js = range(j0, min(j0 + score_batch, SEC))
+    dots: list[UOp] = []
+    for j in js:
+      key = chunk_id*CHUNK + wave*SEC + j
+      valid = key < valid_kv_len
+      valids.append(valid)
+      kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
+      # V is prefetched in the score pass so both streams are in flight together
+      vfrags[j] = tuple(valid.where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
+      dots.extend([sum((qf[h][i]*kfrag[i] for i in range(DPL)), zerof) for h in range(G)])
+    for t, s in enumerate(warp_reduce_many(dots, full_wave=True)):
+      j, h = j0 + t // G, t % G
+      scores[j][h] = valids[j].where(s * (1/math.sqrt(D)), UOp.const(-1e30, dtypes.float))
   # A finite initial max keeps fully masked waves from computing exp(-inf - -inf).
   acc_reg, max_reg, sum_reg = _reg((G, DPL), 2, 0), _reg((G,), 3, -1e30), _reg((G,), 4, 0)
   prev_acc, prev_max, prev_sum = acc_reg.after(chunk_round), max_reg.after(chunk_round), sum_reg.after(chunk_round)
