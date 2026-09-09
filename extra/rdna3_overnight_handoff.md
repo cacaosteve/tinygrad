@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **pending LDS_2ADDR land**.
+Tip: **`281bb2e2a`**.
 
 ## Headline (remeasured fair)
 
