@@ -36,6 +36,7 @@ HIP: 32 MOV, 0 scratch, 64× 2addr, 119 delay_alu, VOPD
 - **AMD_D16_HI=1**: wash/regress decode; serial HW wait timeouts — leave off
 - **SCRATCH_STORE_B64**: ~164→156 st32, timing wash; b128 fusion still 0
 - **scratch_store b128**: 22× contiguous-16B groups exist but data is often the **same SSA MOV** (regs all vN) — not 4 distinct VGPRs; only ~3 fusible
+- **AMD_WHERE_ALIAS=1**: decode wash (~112–121→~121); prefill wash; **serial FAIL 8/13** (flash + eye) — leave off
 
 ## Confirmed keep
 
