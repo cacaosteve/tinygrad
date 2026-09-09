@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`87c5b8ae7`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
+Tip: **`545b49229`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
 
 ## Headline (remeasured fair)
 
@@ -76,6 +76,7 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - `AMD_GATED_VMEM=0`: decode e2e wash. Fair tip: partial **~42** vs HIP **~29.5**; combine **~9.4** vs **~11**
 - `AMD_LOAD_EXEC=1`: no change on flash_decode_partial asm (WHERE≠LOAD pattern); e2e wash
 - `AMD_HOIST_KERNARG=0` / `PACK_F16_GENERAL` / VOPD disable: decode e2e wash
+- Prefill scratch/LDS dest-addr env re-touch (`SCLAUSE`/`LDS_DEST_ADDR`): serial hung/no PERF after baseline — leave defaults; GPU recovered
 
 ## Confirmed keep
 
