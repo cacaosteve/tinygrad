@@ -1,14 +1,14 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`2d1df0c33`** (docs); next code: SCORE_BATCH default **4**.
+Tip: **`8aaf91ed8`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
 
 ## Headline (remeasured fair)
 
 | | DIRECT (`DEV=AMD:AMD`) | HIP (`DEV=AMD`) |
 |--|--:|--:|
-| prefill median | **~666–716 µs** serial | **~293–324 µs** fair historically |
-| decode e2e | **~123–125 µs** (SCORE_BATCH=4) | **~109–110 µs** |
+| prefill median | **~647–676 µs** serial | **~293–324 µs** fair historically |
+| decode e2e | **~119–123 µs** (SCORE_BATCH=4) | **~110–111 µs** |
 | decode partial (isolated) | **~42 µs** | **~30 µs** |
 | decode combine (isolated) | **~9 µs** (ahead of HIP) | **~11 µs** |
 | flash VGPR / priv | **206 / 128** prefill; decode partial **121 / 0** | **206 / 0** |
@@ -59,6 +59,10 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - **SCORE_BATCH=8** after slot-2 promote: **priv 64** / scratch — leave at default **4** (6≈4; 12/16 same spill class as 8)
 - **AMD_FLASH_WAVES=4**: isolated partial ~39 vs ~41 but **serial FAIL decode_gqa (nan)**; priv 16 / vgpr 194 — keep default 8
 - Prefill scratch env: `AMD_SCRATCH_LOAD_B64=1` → **MMU fault** (recoverable); leave off. Odd SCORE_BATCH=3/5 ≈ 4 (wash)
+- `AMD_FMA_MIX=1` alone: fair wash; serial can **MMU fault** — leave off (MAX_CAST=128 already FAIL)
+- `AMD_COMBINE_UNROLL=64`: fair wash vs default 32; serial OK — keep 32
+- `AMD_FLASH_DECODE_LATE_V` (defer V load): SCORE_BATCH=8 still **priv 64** (park temps, not V prefetch) — unmerged
+- Prefill `SOFT_SCALE=0` / `ACC_SEP=0`: **serial FAIL**; `SOFT_FUSE=0` slower (~731 vs ~648)
 
 ## Confirmed keep
 
@@ -67,6 +71,6 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 ## Next
 
-1. Prefill: priv **128 = TM×TD×4** (slot 2 only). Promote spills elsewhere — need VGPR freed before promote, or fewer scratch round-trips without promote.
-2. Decode remaining ~13µs vs HIP (~123 vs ~110): partial ~42→~30; park still required.
+1. Prefill: priv **128 = TM×TD×4** (slot 2). Promote spills; need fewer scratch round-trips or freed VGPRs before promote.
+2. Decode ~10µs vs HIP: partial park MOV tax (262 MOV / 0 HIP); HIP has ~150 `s_delay_alu` + `v_fma_mix`/`cndmask`. SCORE_BATCH=4 is the spill-safe batch.
 3. Fork-only; soak on tip.
