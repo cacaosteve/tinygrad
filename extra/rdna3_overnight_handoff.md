@@ -37,6 +37,8 @@ HIP: 32 MOV, 0 scratch, 64× 2addr, 119 delay_alu, VOPD
 - **SCRATCH_STORE_B64**: ~164→156 st32, timing wash; b128 fusion still 0
 - **scratch_store b128**: 22× contiguous-16B groups exist but data is often the **same SSA MOV** (regs all vN) — not 4 distinct VGPRs; only ~3 fusible
 - **AMD_WHERE_ALIAS=1**: decode wash (~112–121→~121); prefill wash; **serial FAIL 8/13** (flash + eye) — leave off
+- **AMD_FMA_MIX / MAX_CAST=128 / ALL**: fires ~126 `v_fma_mix` on partial but **MOV stays ~264**; timing wash/regress; **MAX_CAST=128 serial FAIL decode_gqa** — leave off (HIP mix comes with different scheduling)
+- Decode leftover env wash: `SWIZZLE_NO_PARK`, `BATCH_SWIZZLE_MOV=0`, `VOPD_FMAC_SCAN=32`, `LOAD_GAP_FILL=0`, `SINK_VALU_SWIZZLE`, `SWIZZLE_VALU_GAP`, `SWIZZLE_DELAY`; SCORE_BATCH 4/16/32 ≈ default 8
 
 ## Confirmed keep
 
