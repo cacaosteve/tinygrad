@@ -1,17 +1,17 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`2f677c75e`**.
+Tip: **`2d1df0c33`** (docs); next code: SCORE_BATCH default **4**.
 
 ## Headline (remeasured fair)
 
 | | DIRECT (`DEV=AMD:AMD`) | HIP (`DEV=AMD`) |
 |--|--:|--:|
-| prefill median | **~708–716 µs** serial | **~293–324 µs** fair historically |
-| decode e2e | **~120–121 µs** | **~109–112 µs** |
-| decode partial (isolated) | **~41 µs** | **~30 µs** |
+| prefill median | **~666–716 µs** serial | **~293–324 µs** fair historically |
+| decode e2e | **~123–125 µs** (SCORE_BATCH=4) | **~109–110 µs** |
+| decode partial (isolated) | **~42 µs** | **~30 µs** |
 | decode combine (isolated) | **~9 µs** (ahead of HIP) | **~11 µs** |
-| flash VGPR / priv | **206 / 128** | **206 / 0** |
+| flash VGPR / priv | **206 / 128** prefill; decode partial **121 / 0** | **206 / 0** |
 
 ## Landed tonight
 
@@ -20,6 +20,7 @@ Tip: **`2f677c75e`**.
 3. Prefill **K_UNROLL=1 + MIDSTORE=4** — ~731–738 vs ~768 @factor2  
 4. **`AMD_LDS_2ADDR=1`** + **`AMD_LDS_2ADDR_FOLD=1`** + LLOAD pair schedule
 5. **Decode-scoped `SKIP_SLOTS=`** (promote slot 2) — ~134→~119µs; prefill keeps SKIP=2 — fold min LDS imm into addr so u8 qword offs fit; **40→64 2addr / 48→0 b64**; ~7µs vs fold=0; serial 13/13
+6. **SCORE_BATCH default 8→4** — after slot-2 promote, batch=8 spills (`priv 64`, scratch st/ld, ~139µs); batch=4 stays `priv 0` (~123–125µs); serial 13/13
 
 ## Asm gap (prefill)
 
@@ -55,13 +56,15 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - **AMD_FLASH_ACC_LDS**: park slot2 in per-thread LDS — **slower** (~1250), priv **200**, **serial FAIL** prefill — leave off
 - Decode schedule toggles: `AMD_SCHEDULE_ALU=0` / `AMD_SCHEDULE_VMEM=0` **regress** (~133–140µs) — keep defaults
 - **Skip park on permlanex16** (`AMD_SWIZZLE_PARK_PERMLANE=0`): MOV 262→230 but **e2e regress** (~126–128 vs ~120–121); isolated partial ~45 vs park baseline. Keep parking offset-16.
+- **SCORE_BATCH=8** after slot-2 promote: **priv 64** / scratch — leave at default **4** (6≈4; 12/16 same spill class as 8)
 
 ## Confirmed keep
 
 - Default **K_UNROLL=1 + MIDSTORE=4** (WMMA24) beats factor2 (~750 vs ~790; serial 13/13)
+- Default **SCORE_BATCH=4** with decode slot-2 promote (batch=8 spills)
 
 ## Next
 
 1. Prefill: priv **128 = TM×TD×4** (slot 2 only). Promote spills elsewhere — need VGPR freed before promote, or fewer scratch round-trips without promote.
-2. Decode ~10µs partial (~41→~30): HIP `s_delay_alu` / fma_mix / wait→ADD; park still required (incl. permlane). Re-check SCORE_BATCH=16 after slot2 promote.
+2. Decode remaining ~13µs vs HIP (~123 vs ~110): partial ~42→~30; park still required.
 3. Fork-only; soak on tip.

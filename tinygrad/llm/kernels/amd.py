@@ -602,9 +602,9 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   scores: list[list[UOp]] = [[zerof]*G for _ in range(SEC)]
   vfrags: list[tuple[UOp, ...]] = [()]*SEC
   # Batch keys into one warp_reduce_many so swizzle/permlane stages share lgkm waits.
-  # Default 8 = full SEC at waves=8. Lost in the #18010 merge; restore (~134→~121µs e2e).
-  # batch=2/1 are slower on average despite shorter live ranges (remeasured interleaved).
-  score_batch = getenv("AMD_FLASH_SCORE_BATCH", 8)
+  # After decode-scoped slot-2 promote, batch=8 spills (priv 64, ~139µs e2e); batch=4 stays
+  # priv 0 (~123µs). Override AMD_FLASH_SCORE_BATCH=8 for the old full-SEC batch.
+  score_batch = getenv("AMD_FLASH_SCORE_BATCH", 4)
   for j0 in range(0, SEC, score_batch):
     js = range(j0, min(j0 + score_batch, SEC))
     dots: list[UOp] = []
