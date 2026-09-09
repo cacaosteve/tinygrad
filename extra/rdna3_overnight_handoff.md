@@ -41,6 +41,8 @@ Decode: DIRECT **beats** HIP. Prefill ~**2.1×** behind.
 
 - Soft-fuse q_lane hoist (algebra-identical): SPILL 14→21 and ~977µs — reverted
 
+- AMD_MUL_LEA (two-bit MUL→LSHL_ADD): **prefill_gqa FAIL** — reverted
+
 ## Next
 
 1. Keep soak on tip; recover after MMU with fresh process.
