@@ -71,6 +71,7 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - `AMD_FLASH_UNROLL` 0/1/2/4/5/7: prefill serial wash (~640–662); `AMD_IN_ORDER_EMIT` decode wash
 - Selective `AMD_SWIZZLE_NO_PARK_OFFSETS` (1 / 1,2 / 16 / 8,4,2,1): e2e wash vs park-all
 - Prefill `SKIP_SLOTS=10,17` / `3,4,10,17` (promote slot2 + skip soft/pv): slower (790–1430 vs ~653); empty SKIP **FAIL** err~0.75
+- Remat/cluster recheck: `REMAT_ADDR=0` / `DEEP=0` / `SHALLOW` / `NO_STICKY_ADD` / `CLUSTER_SLOAD=0` decode wash
 
 ## Confirmed keep
 
