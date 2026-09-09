@@ -2135,7 +2135,10 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
     case AMDOps.WMMA:
       acc, src0, src1 = u.src[0], u.src[1], u.src[2]
       vdst = _reg_to_amd(greg(acc), 8)
-      return [_wmma_inst(u)(vdst=vdst, src0=_reg_to_amd(greg(src0), 8), src1=_reg_to_amd(greg(src1), 8), src2=vdst)]
+      out = [_wmma_inst(u)(vdst=vdst, src0=_reg_to_amd(greg(src0), 8), src1=_reg_to_amd(greg(src1), 8), src2=vdst)]
+      # HIP flash inserts s_delay_alu after WMMA; opt-in (default off — no win yet on prefill).
+      if (d:=getenv("AMD_WMMA_DELAY", 0)): out.append(r3.s_delay_alu(int(d) if int(d) > 1 else 1))
+      return out
     case AMDOps.SWIZZLE:
       pre, val = _vgpr_data(TMP_VDATA, u.src[0])
       if (offset:=_const_int(u.src[1])) is None: raise CompileError("non-constant swizzle offset")
