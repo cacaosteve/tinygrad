@@ -1,42 +1,44 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`a3d953ae8`**.
+Tip: **`20d2fdfd2`** (code tip **`a3d953ae8`**).
 
 ## Headline
 
-Flash DIRECT **opt-in**. Fair/serial (7900 XTX):
+Flash DIRECT **opt-in**. Serial PERF **~763 µs**; fair often **~790** (noisy after MMU probes):
 
-| | DIRECT (now) | earlier tonight | HIP |
+| | DIRECT (now) | start of night | HIP (prior) |
 |--|--:|--:|--:|
-| prefill | **~760–790 µs** (serial PERF **~763**) | ~700–720 / SPILL14 | **best ~328** |
+| prefill | **~760–790 µs** | ~700–720 / SPILL14 | **best ~328** |
 | WMMA | **12** | 6 | **24** |
 | private / VGPR | **128 / 206** | 404 / 166 | **0 / 206** |
 | SPILL | **0** | **14** | **0** |
-| decode | **~136–145 µs** | ~141 | **~156** |
+| decode | **beats HIP** (~136–145) | ~141 | ~156 |
 
-Decode beats HIP. Prefill still ~**2.3×**. No DIRECT default flip.
+Gap to HIP still ~**2.3×**. Do **not** flip DIRECT default.
 
-## Landed (stable)
+## Landed tonight
 
-- Sticky **`ALLOW_UPCAST16=0`** (TinyJit-safe): SPILL→0, HIP-like VGPR/priv
-- Default **`AMD_FLASH_K_UNROLL=2`**: WMMA 6→12; was unsafe under product-16
-- Sticky **`AMD_PACK_SLOAD_B128=1`**: ~5–10µs; serial OK; opt out `AMD_FLASH_PACK_SLOAD_B128=0`
-- Decode ml_lds + WAVES=8; remat depth-1; soft-fuse / ACC_SEP / ACC_SMALL
+1. Sticky **`ALLOW_UPCAST16=0`** (TinyJit-safe) → SPILL 0, HIP-like VGPR/priv
+2. Default **`AMD_FLASH_K_UNROLL=2`** → WMMA 6→12 (~100µs)
+3. Sticky **`AMD_PACK_SLOAD_B128=1`** → ~5–10µs (bases=1/max=8)
 
 ## Dead ends (do not revive)
 
-- K_UNROLL=-1 / 1 / 8: **MMU**
-- K_UNROLL=4: slower than 2
-- ACC_SEP=0: ~2.5ms
-- INSTR_WAIT=1: much slower
-- PV_ACC_DIRECT=1: slower + spill
-- REG_PROMOTE_SKIP empty: tiny best, spill 16 — not default
-- Realize-only UPCAST16 pop: TinyJit misses it
+- K_UNROLL=-1 (HIP QK) / 1 / 8 / 8×qk: **MMU** even with SPILL_DRAIN
+- K_UNROLL=-1 ×pv: correct but slower (~887)
+- PACK_SLOAD_BASES=2: **wrong** (as documented)
+- PACK_SLOAD_MAX 4|12|16: wash vs 8
+- ACC_SEP=0, INSTR_WAIT, PV_ACC_DIRECT, SOFT_FUSE=0, deeper remat: no win / worse
+- SHALLOW remat: now correct under SPILL0 but slower
+
+## Scratch note
+
+SPILL 0 but **private 128** remains: SOURCE has SCRATCH_SIZE/ADDR (no FILL/SPILL). Likely REG-scratch plumbing / ACC work — not free spills.
 
 ## Next
 
-1. Soak; recover after MMU.
-2. WMMA 12→24 without MMU (not full/HIP K_UNROLL).
-3. Occupancy/emit with SPILL0 headroom.
+1. Soak on tip; **avoid** K_UNROLL=-1/1/8 probes (MMU tax).
+2. Structural path to WMMA 24 without HIP-style full-K MMU.
+3. Cut remaining private 128 or SLOAD pressure (148 SLOADs in ISA).
 4. Fork-only.
