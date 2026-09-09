@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`1d7f0907d`** (`AMD_WMMA_DELAY` opt-in, default off).
+Tip: **`954cd25ae`** (`AMD_WMMA_DELAY` opt-in, default off).
 
 ## Headline
 
@@ -44,6 +44,8 @@ Soak: continuous on tip; serial 13/13 when healthy. After MMU experiments, recov
 - Emit toggles (PACK_SLOAD_B128, FMA_MIX, INSTR_WAIT, WMMA_DELAY, …): no win vs ~720
 
 - Soft-fuse `q_uni+lane_m` split: correct but SPILL 14→21 / ~976µs — reverted
+
+- AMD_WMMA_ACC_BASE sweep: spill stays 14; 201 slower
 
 ## Next
 
