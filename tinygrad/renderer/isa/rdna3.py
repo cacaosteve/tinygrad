@@ -4004,6 +4004,29 @@ def _fused_lds_pack_load(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|No
   deps = _reg_idxs(idx)
   return 4, pre + [r3.ds_load_b128(vdst=_reg_chunk(greg(loads[0]), 0, 4), addr=addr, **_ds_off(off0))], deps
 
+def _fused_lds_2addr_b64(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
+  """Fold two 8-byte LLOADs into DS_LOAD_2ADDR_B64 (HIP flash LDS pattern).
+
+  offset0/1 are qword indices (byte_off/8). Requires consecutive dest VGPRs (4 lanes)
+  and the same base+idx. Default on (AMD_LDS_2ADDR=0 opts out). Needs consecutive dest
+  VGPRs from regalloc — when unavailable, falls through to scalar ds_load_b64.
+  """
+  if not _emit_optional() or not getenv("AMD_LDS_2ADDR", 1) or i + 1 >= len(uops): return None
+  a, b = uops[i], uops[i + 1]
+  if not (a.op is Ops.INS and b.op is Ops.INS and _iop(a) is AMDOps.LLOAD and _iop(b) is AMDOps.LLOAD): return None
+  if not (isinstance(greg(a), Register) and isinstance(greg(b), Register)): return None
+  if _elem_count(a) * a.dtype.itemsize != 8 or _elem_count(b) * b.dtype.itemsize != 8: return None
+  if a.src[0] is not b.src[0] or a.src[1] is not b.src[1]: return None
+  ra, rb = greg(a), greg(b)
+  if ra.index + 2 != rb.index or _reg_slots(a) != 2 or _reg_slots(b) != 2: return None
+  off0, off1 = _lds_byte_off(a), _lds_byte_off(b)
+  if off0 % 8 or off1 % 8: return None
+  q0, q1 = off0 // 8, off1 // 8
+  if not (0 <= q0 <= 0xff and 0 <= q1 <= 0xff): return None
+  pre, addr = _local_addr(a.src[0], a.src[1], a.dtype.itemsize)
+  deps = _reg_idxs(a.src[1])
+  return 2, pre + [r3.ds_load_2addr_b64(vdst=_reg_chunk(ra, 0, 4), addr=addr, offset0=q0, offset1=q1)], deps
+
 def _fused_mixed_dot4_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
   """Wide-load an exact four-element f16*f32 dot while retaining its sequential FMA order."""
   if not _emit_optional() or i + 14 >= len(uops): return None
@@ -4487,6 +4510,14 @@ def insts_from_linear(lin:UOp):
         store_addr_cache.key, store_addr_cache.page = cache_snap
     if mask_depth == 0 and (fused_load:=_fused_lds_pack_load(scheduled, oi)) is not None:
       count, emitted, deps = fused_load
+      if deps and _pending_src(deps): flush_regs(deps)
+      store_addr_cache.clear()
+      for inst in emitted: emit(inst)
+      for k in range(oi, oi + count): note_lgkm(_reg_idxs(scheduled[k]))
+      oi += count
+      continue
+    if mask_depth == 0 and (fused_2addr:=_fused_lds_2addr_b64(scheduled, oi)) is not None:
+      count, emitted, deps = fused_2addr
       if deps and _pending_src(deps): flush_regs(deps)
       store_addr_cache.clear()
       for inst in emitted: emit(inst)
