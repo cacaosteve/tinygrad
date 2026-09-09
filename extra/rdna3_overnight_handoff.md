@@ -1,14 +1,14 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`c61942cc7`**.
+Tip: **`1651686f1`**.
 
 ## Headline (remeasured fair)
 
 | | DIRECT (`DEV=AMD:AMD`) | HIP (`DEV=AMD`) |
 |--|--:|--:|
 | prefill median | **~711–720 µs** (64× `ds_load_2addr_b64`) | **~293–324 µs** |
-| decode median | **~90–125 µs** (bimodal; SCORE_BATCH=8) | **~88–110 µs** |
+| decode median | **~120–134 µs** (SCORE_BATCH=8; ~90 was clock noise) | **~108 µs** |
 | flash VGPR / priv | **206 / 128** | **206 / 0** |
 
 ## Landed tonight
@@ -40,6 +40,6 @@ HIP: 32 MOV, 0 scratch, 64× 2addr, 119 delay_alu, VOPD
 
 ## Next
 
-1. Decode is **bimodal** (~90 vs ~120); fast mode matches/beats HIP — find what flips the mode.
+1. Decode steady **~120–134** vs HIP ~108 (~12–25µs); VOPD never fires on flash (bank/pair).
 2. Prefill still ~2.3× HIP (556 MOV / priv 128); scratch b128 mostly same-SSA zeros.
 3. Fork-only; soak.  
