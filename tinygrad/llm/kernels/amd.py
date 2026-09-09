@@ -850,8 +850,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   S_view = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)
   Q_view = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)
   K_view = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)
-  # AMD_FLASH_K_UNROLL: 0=ranged; N>=2 chained; 1=full chain (MMU); -1=HIP-style store-each-K
-  # (needs AMD_SPILL_DRAIN_LGKM≥1 on DIRECT or MMU-faults). Scope via k_hip_scope / AMD_FLASH_K_HIP_SCOPE.
+  # AMD_FLASH_K_UNROLL: 0=ranged; N>=2 chained (default 2 w/ ACC_SMALL+UPCAST16=0);
+  # 1=full chain (MMU); -1=HIP-style store-each-K; 8 MMUs. Scope via k_hip_scope.
   _k_factor = int(k_unroll) if _acc_small else 0
   _k_hip = _k_factor == -1
   _hip_scope = (k_hip_scope or getenv("AMD_FLASH_K_HIP_SCOPE", "all")).lower() if _k_hip or _k_factor >= 2 else ""
@@ -1288,8 +1288,10 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # AMD_FLASH_ACC_SMALL is set for this realize (not via FLASH_DIRECT process-wide —
   # that parked every matmul and broke eye/GEMM). ACC_SMALL defaults on for DIRECT;
   # AMD_FLASH_ACC_SMALL=0 disables; AMD_WMMA_ACC_SMALL=1 forces (unsafe for quant).
+  # K_UNROLL default 2: WMMA 6→12, ~797µs vs ~911 @0 with sticky UPCAST16=0; serial OK.
+  # K_UNROLL=8 MMUs — leave off. Override AMD_FLASH_K_UNROLL=0 for ranged baseline.
   use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
-  use_k_unroll = getenv("AMD_FLASH_K_UNROLL", 0) if use_acc_small else 0
+  use_k_unroll = getenv("AMD_FLASH_K_UNROLL", 2) if use_acc_small else 0
   use_k_hip_scope = getenv("AMD_FLASH_K_HIP_SCOPE", "all") if (use_k_unroll == -1 or use_k_unroll >= 2) else "all"
   # Work-copy (slot 19) only while slot 2 is in SKIP_SLOTS. Promoting slot 2 with the
   # work-copy active nans; promoting slot 2 alone is the alternate path (see handoff).
