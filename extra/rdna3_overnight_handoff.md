@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`0efe48386`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
+Tip: **`adc25cfe5`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
 
 ## Headline (remeasured fair)
 
@@ -99,8 +99,12 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 
 - Gaming PC SSH briefly unreachable mid-loop (2026-09-09 ~04:52 PDT); tip docs pushed; resume HW probes when back.
+- Gaming PC `69.57.221.45` unreachable since ~04:52 PDT (ping/SSH network unreachable); small leftovers exhausted; next HW probe ready: FMA_MIX_EXP accept WHERE(EXP2,0) without peel.
+
 ## Next
 
-1. Decode partial ~42→~30: park MOV tax (wait→ADD 9 ops; HIP 1). Need HIP-like VALU-in-gap or correct `fma_mix` (current fold wrong/MMU). VOPD needs bank-aware VGPR alloc (0 duals today).
-2. Prefill: priv **128** slot2; promote still spills/FAIL; fewer scratch round-trips without promote.
-3. Fork-only; soak on tip **`0efe48386`**; code tip **`7e1af310e`**.
+1. **HW**: restore SSH to gaming PC, then probe FMA_MIX_EXP + WHERE(EXP2,0) accept (no peel) — local WIP in `rdna3.py` uncommitted.
+2. Decode partial ~42→~30: park MOV tax; true sibling VOPD affinity (sticky pair-alloc dead); correct fma_mix.
+3. Prefill: priv **128** slot2; MIDSTORE stays 4.
+4. Fork-only; tip **`adc25cfe5`**; code tip **`7e1af310e`**.
+
