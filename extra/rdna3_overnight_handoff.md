@@ -1,14 +1,16 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`ae467f6e0`** (docs); code tip still **`657680b41`** decode promote slot2.
+Tip: **`484c61660`**.
 
 ## Headline (remeasured fair)
 
 | | DIRECT (`DEV=AMD:AMD`) | HIP (`DEV=AMD`) |
 |--|--:|--:|
-| prefill median | **~708–716 µs** serial (64× `ds_load_2addr_b64`) | **~293–324 µs** fair historically; noisy runs vary |
-| decode median | **~118–121 µs** (decode promote slot2) | **~108–111 µs** |
+| prefill median | **~708–716 µs** serial | **~293–324 µs** fair historically |
+| decode e2e | **~120–121 µs** | **~109–112 µs** |
+| decode partial (isolated) | **~41 µs** | **~30 µs** |
+| decode combine (isolated) | **~9 µs** (ahead of HIP) | **~11 µs** |
 | flash VGPR / priv | **206 / 128** | **206 / 0** |
 
 ## Landed tonight
@@ -46,6 +48,7 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - **SCRATCH_STORE_B64**: fair wash (~714µs); only +4 b64 / −8 st32 — leave off
 - **SCRATCH_DEST_ADDR=0**: fair **regress** (~725–730 vs ~714); keep default 1 (s_clause path)
 - Prefill `lshl` tax (~196): mostly **LDS** addr (`ds_load_2addr` within +3), not DEST_ADDR scratch; HIP has same 64× 2addr
+- Swizzle gap fill (`VALU_GAP` / `LOAD_GAP` / skip-scan): **no bubble change** (ops_before still 3.5, pct_global 0) — nothing independent after SW×N,MOV×N in flash_decode; e2e wash. Unmerged.
 
 ## Confirmed keep
 
