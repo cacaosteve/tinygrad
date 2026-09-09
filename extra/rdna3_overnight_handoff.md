@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`fcd65ce71`** (docs); code: decode waves **`e1fea66f8`**, NO_STICKY_CONST opt-in **`bdbc7cbbd`**, SHALLOW **`40e16ec0a`** (do **not** enable).
+Tip: recover soft-fuse (post q_lane revert); prior docs tip `2f5d4ae28`.
 
 ## Headline
 
@@ -15,9 +15,7 @@ Flash DIRECT **opt-in**. Fair fresh-process (7900, recovered 2026-09-09):
 | SPILL | **14** | **0** |
 | decode (WAVES=8) | **~141 µs** | **~156 µs** |
 
-Decode: DIRECT **beats** HIP. Prefill ~**2.1×** behind (HIP remeasured ~330).
-
-Soak: continuous on tip after host reboot. GPU OK: Navi 31, `/dev/kfd`, serial 13/13.
+Decode: DIRECT **beats** HIP. Prefill ~**2.1×** behind.
 
 ## Landed
 
@@ -31,15 +29,16 @@ Soak: continuous on tip after host reboot. GPU OK: Navi 31, `/dev/kfd`, serial 1
 
 ## Dead ends this loop
 
-- SHALLOW remat (`AMD_REMAT_ADDR_SHALLOW=1`): SPILL 14→5 but **prefill_gqa_32 FAIL** (err~1.2) and **slower** (~940 vs ~685) — leave off
-- `NO_STICKY_CONST_ADD` alone: no spill/latency win; combined with SHALLOW still wrong
-- `NO_STICKY_ADD`: hang/MMU — leave off
-- Soft toggles / ACC_WORK=0 / VEC_COPY / K_UNROLL=2 pv / FLASH_UNROLL 1–7: all ≥ baseline
-- Prior: K_UNROLL=1 MMU; cmp-deep remat; causal unsigned rewrite; q_row CSE; etc.
+- SHALLOW remat: SPILL↓ but **FAIL** + slower — leave off
+- `NO_STICKY_*` ADD: hang or no win
+- Emit toggles (PACK_SLOAD_B128, SCRATCH_STORE_B64, FMA_MIX, LOAD_EXEC, …): no win vs ~720
+- Soft_fuse off / ACC_SEP=0 / SOFT_SCALE=0: much slower
+- **`AMD_FLASH_QIDX_REG=1`**: correct but **~977 vs ~723** — leave off
+- **Shared q_lane `(k-rm)<=q` soft-fuse**: **prefill_gqa FAIL** + slower + SPILL 30 — reverted
 
 ## Next
 
-1. Keep soak; after any MMU recover with fresh process.
-2. Prefill: WMMA 6→24 needs new ACC/spill plan (not more unroll toggles).
-3. Cut causal/MUL spills without broken remat (emit-time cmp imm, or leaf-only remat fix).
-4. Do not flip DIRECT default; do not enable SHALLOW.
+1. Keep soak on tip; recover after MMU with fresh process.
+2. Prefill: WMMA 6→24 needs ACC/spill plan (not mask algebra / QIDX REG).
+3. Cut MUL/FILL spills; do not revive SHALLOW / q_lane / QIDX_REG without new plan.
+4. Fork-only; no DIRECT default flip.
