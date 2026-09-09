@@ -1180,12 +1180,7 @@ def _isel_wmma(ctx:IselContext, x:UOp) -> UOp:
     # tile. pre-assign a unique vreg so each tile's accumulator stays distinct.
     quantized = bool(getenv("AMD_PACKED_WMMA_ACC", 1)) and any(
       u.op in (Ops.CUSTOM, Ops.CUSTOMI) and _custom_name(u) in (AMD_FMA_TO_F16, AMD_PACKED_F16_MUL_TO_F16) for u in ctx.uses)
-    # AMD_WMMA_ACC_SHARED=1: park ACC in the full VGPR pool (HIP-like). Soft-partitioned
-    # WMMA_ACC_VGPR leaves ~40 unused high regs while LinearScan spills addr ADDs (priv≠0).
-    if quantized: acc_pool = WMMA_ACC_QUANT_VGPR
-    elif getenv("AMD_WMMA_ACC_SHARED", 0): acc_pool = VGPR
-    else: acc_pool = WMMA_ACC_VGPR
-    c = _wmma_stack_operand(cin, 2).replace(tag=(ctx.vreg(acc_pool),))
+    c = _wmma_stack_operand(cin, 2).replace(tag=(ctx.vreg(WMMA_ACC_QUANT_VGPR if quantized else WMMA_ACC_VGPR),))
   return UOp(Ops.INS, src=(c, a, b), arg=(AMDOps.WMMA, dtypes.float if x.dtype is dtypes.float else x.dtype), tag=x.tag)
 
 def _wmma_inst(u:UOp):
