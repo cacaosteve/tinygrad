@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`ab8354538`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
+Tip: **`946a0d556`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
 
 ## Headline (remeasured fair)
 
@@ -86,6 +86,6 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 ## Next
 
-1. Prefill: priv **128 = TM×TD×4** (slot 2). Promote spills; need fewer scratch round-trips or freed VGPRs before promote.
-2. Decode ~10µs vs HIP (~120 vs ~110): HIP partial has vgpr **83** / 0 MOV / 234 `fma_mix` / 162 cndmask / 62 VOPD / 150 delay_alu vs DIRECT vgpr **121** / 262 MOV / 0 mix / 0 VOPD. FMA_MIX paths MMU — need a correct fold, not env wash. VOPD needs bank-aware alloc.
-3. Fork-only; soak on tip.
+1. Decode partial ~42→~30: park MOV tax (wait→ADD 9 ops; HIP 1). Need HIP-like VALU-in-gap or correct `fma_mix` (current fold wrong/MMU). VOPD needs bank-aware VGPR alloc (0 duals today).
+2. Prefill: priv **128** slot2; promote still spills/FAIL; fewer scratch round-trips without promote.
+3. Fork-only; soak on tip **`946a0d556`**; code tip **`7e1af310e`**.
