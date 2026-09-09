@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`a530fc720`**.
+Tip: **`9b60cb7f1`**.
 
 ## Headline (remeasured fair)
 
@@ -16,7 +16,7 @@ Tip: **`a530fc720`**.
 1. Prefill sticky **UPCAST16=0** + **PACK_SLOAD** → SPILL 0  
 2. **SCORE_BATCH=8** — decode ~134→~121  
 3. Prefill **K_UNROLL=1 + MIDSTORE=4** — ~731–738 vs ~768 @factor2  
-4. **`AMD_LDS_2ADDR=1`** + **`AMD_LDS_2ADDR_FOLD=1`** — fold min LDS imm into addr so u8 qword offs fit; **40→64 2addr / 48→0 b64**; ~7µs vs fold=0; serial 13/13
+4. **`AMD_LDS_2ADDR=1`** + **`AMD_LDS_2ADDR_FOLD=1`** + LLOAD pair schedule — fold min LDS imm into addr so u8 qword offs fit; **40→64 2addr / 48→0 b64**; ~7µs vs fold=0; serial 13/13
 
 ## Asm gap still (prefill)
 
