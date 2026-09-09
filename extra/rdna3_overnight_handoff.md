@@ -22,11 +22,12 @@ Same VGPR as HIP; DIRECT still pays **priv 128** (slot-2 `acc`). Prefill ~**2.4�
 ## Dead ends
 
 - MIDSTORE=8 / hip_qk without mid → **MMU**  
-- Slot-2 promote under midstore → SPILL132 / priv368 / ~1.5ms (and HW fault once)  
-- SCORE_BATCH=2/1 slower; PACK_MAX/CLUSTER/FMA_MIX/SWIZZLE_DELAY wash  
+- Slot-2 promote / ACC_SLOT=19 → SPILL~115–132 / priv~300–368 / ~1.5ms  
+- ACC_SHARED re-probe: no MMU now, but **priv still 128** (wash)  
+- SCORE_BATCH=2/1 slower; scratch B64/SCLAUSE/PACK_MAX/CLUSTER/FMA wash  
 
 ## Next
 
-1. Get DIRECT prefill priv **128→0** like HIP (without promote spill).  
-2. Decode priv 64 + remaining ~12µs.  
+1. Prefill: close ~2.4× vs HIP beyond priv (asm: waits/SLOAD/WMMA shape).  
+2. Decode priv 64 + ~12µs.  
 3. Fork-only; soak on tip.
