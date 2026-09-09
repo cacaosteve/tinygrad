@@ -1,14 +1,14 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`0b2556b78`**.
+Tip: **`657680b41`**.
 
 ## Headline (remeasured fair)
 
 | | DIRECT (`DEV=AMD:AMD`) | HIP (`DEV=AMD`) |
 |--|--:|--:|
 | prefill median | **~711–720 µs** (64× `ds_load_2addr_b64`) | **~293–324 µs** |
-| decode median | **~120–134 µs** (SCORE_BATCH=8; ~90 was clock noise) | **~108 µs** |
+| decode median | **~118–121 µs** (decode promote slot2) | **~108–110 µs** |
 | flash VGPR / priv | **206 / 128** | **206 / 0** |
 
 ## Landed tonight
@@ -16,7 +16,8 @@ Tip: **`0b2556b78`**.
 1. Prefill sticky **UPCAST16=0** + **PACK_SLOAD** → SPILL 0  
 2. **SCORE_BATCH=8** — decode ~134→~121  
 3. Prefill **K_UNROLL=1 + MIDSTORE=4** — ~731–738 vs ~768 @factor2  
-4. **`AMD_LDS_2ADDR=1`** + **`AMD_LDS_2ADDR_FOLD=1`** + LLOAD pair schedule — fold min LDS imm into addr so u8 qword offs fit; **40→64 2addr / 48→0 b64**; ~7µs vs fold=0; serial 13/13
+4. **`AMD_LDS_2ADDR=1`** + **`AMD_LDS_2ADDR_FOLD=1`** + LLOAD pair schedule
+5. **Decode-scoped `SKIP_SLOTS=`** (promote slot 2) — ~134→~119µs; prefill keeps SKIP=2 — fold min LDS imm into addr so u8 qword offs fit; **40→64 2addr / 48→0 b64**; ~7µs vs fold=0; serial 13/13
 
 ## Asm gap still (prefill)
 
@@ -42,7 +43,7 @@ HIP: 32 MOV, 0 scratch, 64× 2addr, 119 delay_alu, VOPD
 
 ## Next
 
-1. Decode steady **~120–134** vs HIP ~108. Partial already has **20× global_load_b64** (HIP-parity VMEM); leftover is swizzle/MOV/scratch (32 st / 12 ld) + 16× ds_load_u16.
+1. Decode ~119 vs HIP ~109 (~10µs); leftover swizzle/MOV. Prefill still ~2.3× HIP (priv 128).
 2. Prefill ~711 serial / ~2.3× HIP: 556 MOV class tax, priv 128; VOPD=0 on prefill; defaults beat ACC_SEP=0 / ACC_SMALL=0 / K_UNROLL=2.
 3. Fork-only; soak.
 2. Prefill still ~2.3× HIP (556 MOV / priv 128); scratch b128 mostly same-SSA zeros.
