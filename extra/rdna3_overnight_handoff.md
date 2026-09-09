@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`11c4d4f73`** (ACC_SHARED reverted; WMMA_DELAY opt-in remains).
+Tip: **`a2a25e13f`**.
 
 ## Headline
 
@@ -50,6 +50,8 @@ Soak: continuous on tip; serial 13/13 when healthy. After MMU experiments, recov
 - AMD_WMMA_ACC_SHARED (full VGPR ACC pool): **MMU fault** — leave off
 - Fair meta: HIP flash **priv=0 vgpr=206**; DIRECT **priv=404 vgpr=166** (spill under soft partition)
 - FU=4 enables ACC_WORK; FU=0 range-corr is fine (~717); FU=4+ACC_WORK=0 is ~1000
+
+- Sequential soft-fuse per-row after(): **prefill_mha FAIL** + slower — reverted
 
 ## Next
 
