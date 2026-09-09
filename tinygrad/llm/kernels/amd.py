@@ -602,7 +602,8 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   scores: list[list[UOp]] = [[zerof]*G for _ in range(SEC)]
   vfrags: list[tuple[UOp, ...]] = [()]*SEC
   # Batch keys into one warp_reduce_many so swizzle/permlane stages share lgkm waits.
-  # Default 8 = full SEC at waves=8. Lost in the #18010 merge; restore (was ~57→54µs).
+  # Default 8 = full SEC at waves=8. Lost in the #18010 merge; restore (~134→~121µs e2e).
+  # batch=2/1 are slower on average despite shorter live ranges (remeasured interleaved).
   score_batch = getenv("AMD_FLASH_SCORE_BATCH", 8)
   for j0 in range(0, SEC, score_batch):
     js = range(j0, min(j0 + score_batch, SEC))
@@ -855,6 +856,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   K_view = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)
   # AMD_FLASH_K_UNROLL: 0=ranged; N>=2 chained (default 2 w/ ACC_SMALL+UPCAST16=0);
   # 1=full chain (MMU); -1=HIP-style store-each-K; 8 MMUs. Scope via k_hip_scope.
+  # AMD_FLASH_K_MIDSTORE=N: in full/hip QK|PV chains, store ACC every N WMMA (breaks MMU at N=4).
   _k_factor = int(k_unroll) if _acc_small else 0
   _k_hip = _k_factor == -1
   _hip_scope = (k_hip_scope or getenv("AMD_FLASH_K_HIP_SCOPE", "all")).lower() if _k_hip or _k_factor >= 2 else ""
@@ -862,6 +864,9 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   _k_hip_pv = _k_hip and _hip_scope in ("all", "pv", "v")
   _k_unroll_full = _k_factor == 1
   _k_unroll_factor = _k_factor if _k_factor >= 2 and (D // WMMA_K) % _k_factor == 0 else 0
+  # Mid-store every 4 WMMA unlocks full K chain without MMU (~731µs vs ~768 @factor2).
+  _mid_default = 4 if (_k_unroll_full or _k_hip or _k_factor >= 8) else 0
+  _mid_every = getenv("AMD_FLASH_K_MIDSTORE", _mid_default) if _acc_small else 0
   # Factor unroll can be scoped like hip: qk|pv|all (default all when scope unset).
   _factor_scope = (k_hip_scope or getenv("AMD_FLASH_K_HIP_SCOPE", "all")).lower() if _k_unroll_factor else ""
   _factor_qk = bool(_k_unroll_factor) and _factor_scope in ("all", "qk", "q", "")
@@ -869,6 +874,12 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   if not _k_unroll_factor: _factor_qk = _factor_pv = False
   if _factor_scope in ("qk", "q"): _factor_pv = False
   if _factor_scope in ("pv", "v"): _factor_qk = False
+  # Factor-8 with outer range of 1 is a full WMMA chain (MMU). Prefer hip-style + midstore.
+  if _mid_every and _k_unroll_factor >= 8:
+    if _factor_qk: _k_hip_qk = True
+    if _factor_pv: _k_hip_pv = True
+    _k_unroll_factor = 0
+    _factor_qk = _factor_pv = False
   if _acc_small and _k_hip_qk:
     # HIP-style: chain all K in ACC, one store per (tm,tn) — not store-reload each K.
     qk_stores = []
@@ -880,6 +891,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
           q_frag = Q_view[wave_m, tm_i, lane_n, k_i]
           k_frag = K_view[tn_i, lane_n, k_i]
           wmma_c = UOp.wmma(q_frag, k_frag, wmma_c, *WMMA_ARG)
+          if _mid_every and (k_i + 1) % _mid_every == 0 and k_i + 1 < D // WMMA_K:
+            wmma_c = S_frag.after(S_frag.store(wmma_c))
         qk_stores.append(S_frag.store(wmma_c))
     qk_done = UOp.group(*qk_stores)
   elif _acc_small and _k_unroll_full:
@@ -892,6 +905,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
           q_frag = Q_view[wave_m, tm_i, lane_n, k_i]
           k_frag = K_view[tn_i, lane_n, k_i]
           wmma_c = UOp.wmma(q_frag, k_frag, wmma_c, *WMMA_ARG)
+          if _mid_every and (k_i + 1) % _mid_every == 0 and k_i + 1 < D // WMMA_K:
+            wmma_c = S_frag.after(S_frag.store(wmma_c))
         qk_stores.append(S_frag.store(wmma_c))
     qk_done = UOp.group(*qk_stores)
   elif _acc_small and _factor_qk:
@@ -1151,6 +1166,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
           p_frag = P_view[wave_m, tm_i, lane_n, k_i]
           v_frag = V_view[wave_n, td_i, lane_n, k_i]
           wmma_c = UOp.wmma(p_frag, v_frag, wmma_c, *WMMA_ARG)
+          if _mid_every and (k_i + 1) % _mid_every == 0 and k_i + 1 < BLOCK_N // WMMA_K:
+            wmma_c = pv_frag.after(pv_frag.store(wmma_c))
         pv_stores.append(pv_frag.store(wmma_c))
     pv_done = UOp.group(*pv_stores)
   elif _acc_small and _k_unroll_full:
@@ -1163,6 +1180,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
           p_frag = P_view[wave_m, tm_i, lane_n, k_i]
           v_frag = V_view[wave_n, td_i, lane_n, k_i]
           wmma_c = UOp.wmma(p_frag, v_frag, wmma_c, *WMMA_ARG)
+          if _mid_every and (k_i + 1) % _mid_every == 0 and k_i + 1 < BLOCK_N // WMMA_K:
+            wmma_c = pv_frag.after(pv_frag.store(wmma_c))
         pv_stores.append(pv_frag.store(wmma_c))
     pv_done = UOp.group(*pv_stores)
   elif _acc_small and _factor_pv and (BLOCK_N // WMMA_K) % _k_unroll_factor == 0:
@@ -1291,11 +1310,11 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # AMD_FLASH_ACC_SMALL is set for this realize (not via FLASH_DIRECT process-wide —
   # that parked every matmul and broke eye/GEMM). ACC_SMALL defaults on for DIRECT;
   # AMD_FLASH_ACC_SMALL=0 disables; AMD_WMMA_ACC_SMALL=1 forces (unsafe for quant).
-  # K_UNROLL default 2: WMMA 6→12, ~797µs vs ~911 @0 with sticky UPCAST16=0; serial OK.
-  # K_UNROLL=8 MMUs — leave off. Override AMD_FLASH_K_UNROLL=0 for ranged baseline.
+  # K_UNROLL default 1 + MIDSTORE=4: full K chain with ACC checkpoints (~731µs serial vs
+  # ~768 @factor2). Override AMD_FLASH_K_UNROLL=2 for ranged-factor baseline; MIDSTORE=0 disables.
   use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
-  use_k_unroll = getenv("AMD_FLASH_K_UNROLL", 2) if use_acc_small else 0
-  use_k_hip_scope = getenv("AMD_FLASH_K_HIP_SCOPE", "all") if (use_k_unroll == -1 or use_k_unroll >= 2) else "all"
+  use_k_unroll = getenv("AMD_FLASH_K_UNROLL", 1) if use_acc_small else 0
+  use_k_hip_scope = getenv("AMD_FLASH_K_HIP_SCOPE", "all") if (use_k_unroll == -1 or use_k_unroll >= 1) else "all"
   # Work-copy (slot 19) only while slot 2 is in SKIP_SLOTS. Promoting slot 2 with the
   # work-copy active nans; promoting slot 2 alone is the alternate path (see handoff).
   _skip_reg = {int(s) for s in getenv("AMD_REG_PROMOTE_SKIP_SLOTS", "2").split(",") if s.strip()}
