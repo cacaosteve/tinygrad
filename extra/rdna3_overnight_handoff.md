@@ -39,6 +39,8 @@ Decode: DIRECT **beats** HIP. Prefill ~**2.1×** behind.
 - LDS_PAD≠4: pad0 wrong prefill; pad8 wrong; pad16/32 MMU — keep 4
 - Slot-2 promote / ACC_WORK=0: slower
 
+- Soft-fuse q_lane hoist (algebra-identical): SPILL 14→21 and ~977µs — reverted
+
 ## Next
 
 1. Keep soak on tip; recover after MMU with fresh process.
