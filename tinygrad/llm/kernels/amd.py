@@ -714,8 +714,8 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
 def _flash_direct_compile_env(*, flash_acc_small:bool=True):
   """Flash-only compile envs for hand-kernel build+realize.
 
-  Prefill: ACC_SMALL remat + ALLOW_UPCAST16=0 + PACK_SLOAD_B128=1 (SPILL 0).
-  Decode: ALLOW_UPCAST16=1 + PACK_SLOAD off (~134µs vs ~153µs with prefill stickies).
+  Prefill: ACC_SMALL remat + ALLOW_UPCAST16=0 + PACK_SLOAD_B128=1 (SPILL 0) + SKIP_SLOTS=2.
+  Decode: ALLOW_UPCAST16=1 + PACK_SLOAD off + SKIP_SLOTS= (promote slot 2; ~112µs vs ~134).
   Policies are sticky for TinyJit (capture sees post-realize env) and are re-applied
   per path so prefill↔decode order cannot poison the other.
   """
@@ -728,9 +728,14 @@ def _flash_direct_compile_env(*, flash_acc_small:bool=True):
     if prev_deep is None: os.environ["AMD_REMAT_ADDR_DEEP"] = "1"
     os.environ["ALLOW_UPCAST16"] = "1" if getenv("AMD_FLASH_ALLOW_UPCAST16", 0) else "0"
     os.environ["AMD_PACK_SLOAD_B128"] = "1" if getenv("AMD_FLASH_PACK_SLOAD_B128", 1) else "0"
+    # Prefill must keep slot-2 skipped (promoting it ~1.5ms). Re-assert after decode sticky.
+    os.environ["AMD_REG_PROMOTE_SKIP_SLOTS"] = os.environ.get("AMD_FLASH_PREFILL_SKIP_SLOTS", "2")
   else:
     os.environ["ALLOW_UPCAST16"] = "1" if getenv("AMD_FLASH_DECODE_ALLOW_UPCAST16", 1) else "0"
     os.environ["AMD_PACK_SLOAD_B128"] = "1" if getenv("AMD_FLASH_DECODE_PACK_SLOAD", 0) else "0"
+    # Empty SKIP_SLOTS → promote slot 2 (decode FMAC scratch). Opt out: AMD_FLASH_DECODE_PROMOTE_SLOT2=0.
+    if getenv("AMD_FLASH_DECODE_PROMOTE_SLOT2", 1):
+      os.environ["AMD_REG_PROMOTE_SKIP_SLOTS"] = ""
   getenv.cache_clear()  # type: ignore[attr-defined]
   try:
     yield
@@ -742,7 +747,7 @@ def _flash_direct_compile_env(*, flash_acc_small:bool=True):
       else: os.environ["AMD_REMAT_ADDR"] = prev_remat
       if prev_deep is None: os.environ.pop("AMD_REMAT_ADDR_DEEP", None)
       else: os.environ["AMD_REMAT_ADDR_DEEP"] = prev_deep
-    # Keep ALLOW_UPCAST16 / PACK_SLOAD sticky for TinyJit; next flash path re-applies.
+    # Keep ALLOW_UPCAST16 / PACK_SLOAD / SKIP_SLOTS sticky for TinyJit; next flash path re-applies.
     getenv.cache_clear()  # type: ignore[attr-defined]
 
 def _flash_direct_realize(out:Tensor, *, flash_acc_small:bool=True) -> Tensor:
