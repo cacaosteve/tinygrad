@@ -1359,23 +1359,6 @@ def _lshl_or(x:UOp, value:UOp, shift:UOp, other:UOp) -> UOp:
 def _lshl_add(x:UOp, value:UOp, shift:UOp, other:UOp) -> UOp:
   return x.ins(AMDOps.LSHL_ADD, src=(value, shift, other))
 
-def _isel_int_mul(x:UOp) -> UOp:
-  # AMD_MUL_LEA: x*(2^a+2^b) → v_lshl_add (flash LDS strides 132/1056/2112); pow2 → SHL.
-  if x.dtype not in dtypes.ints or not getenv("AMD_MUL_LEA", 1): return x.ins(AMDOps.MUL)
-  a, b = x.src[0], x.src[1]
-  ca, cb = _const_int(a), _const_int(b)
-  if ca is not None and cb is None: c, v = ca, b
-  elif cb is not None and ca is None: c, v = cb, a
-  else: return x.ins(AMDOps.MUL)
-  if c <= 0: return x.ins(AMDOps.MUL)
-  if c & (c - 1) == 0:
-    return x.ins(AMDOps.SHL, src=(v, _tconst(c.bit_length() - 1, dtypes.uint32).rtag()))
-  bits = [i for i in range(31) if (c >> i) & 1]
-  if len(bits) != 2: return x.ins(AMDOps.MUL)
-  lo, hi = bits[0], bits[1]
-  sh_lo = v.ins(AMDOps.SHL, src=(v, _tconst(lo, dtypes.uint32).rtag()))
-  return _lshl_add(x, v, _tconst(hi, dtypes.uint32).rtag(), sh_lo)
-
 def _atomic_add_ins(x:UOp) -> UOp|None:
   if _custom_name(x) != AMD_ATOMIC_ADD: return None
   if len(x.src) != 2 or x.src[0].op is not Ops.INDEX: raise CompileError(f"bad atomic {x}")
@@ -1790,8 +1773,7 @@ def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Regis
     ((UPat(Ops.MUL, (dtypes.float16, dtypes.float32), name="a") + UPat.var("b")).named("c"), _fused_mulacc),
     ((UPat(dtype=dtypes.ints+(dtypes.bool, dtypes.float16, dtypes.float32)) + UPat()).named("x"), lambda x: x.ins(AMDOps.ADD)),
     (UPat(Ops.SUB, dtype=dtypes.ints+(dtypes.float16, dtypes.float32), name="x"), lambda x: x.ins(AMDOps.SUB)),
-    ((UPat(dtype=dtypes.ints+(dtypes.float16, dtypes.float32)) * UPat()).named("x"),
-     lambda x: _isel_int_mul(x) if x.dtype in dtypes.ints else x.ins(AMDOps.MUL)),
+    ((UPat(dtype=dtypes.ints+(dtypes.float16, dtypes.float32)) * UPat()).named("x"), lambda x: x.ins(AMDOps.MUL)),
     (UPat(Ops.MULACC, dtype=(dtypes.float16, dtypes.float32), name="x"), lambda x: x.ins(AMDOps.MULACC)),
     *((UPat.var("y", fr).cast(to, name="x"), lambda y,x,op=op: x.ins(op, src=(y,)))
       for fr,to,op in ((dtypes.float16, dtypes.float32, AMDOps.CAST), (dtypes.float32, dtypes.float16, AMDOps.CAST),
