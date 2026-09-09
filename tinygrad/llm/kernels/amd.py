@@ -711,14 +711,15 @@ def _flash_direct_compile_env(*, flash_acc_small:bool=True):
 
   ALLOW_UPCAST16=0 is *sticky* for the process once flash DIRECT runs: TinyJit
   re-reads env after realize returns, so popping restores product-16 and SPILL≈21.
-  Leaving it off: SPILL 0, private≈128, ~45µs faster; serial peers (eye/GEMM)
-  stay OK. Opt back in with AMD_FLASH_ALLOW_UPCAST16=1 or explicit ALLOW_UPCAST16
-  before the first flash call.
+  Leaving it off: SPILL 0, private≈128, VGPR≈206. Override: AMD_FLASH_ALLOW_UPCAST16=1
+  or explicit ALLOW_UPCAST16 before first flash. Also sticky AMD_PACK_SLOAD_B128=1
+  (~5–10µs; opt out AMD_FLASH_PACK_SLOAD_B128=0).
   """
   prev = os.environ.get("AMD_FLASH_ACC_SMALL")
   prev_remat = os.environ.get("AMD_REMAT_ADDR")
   prev_deep = os.environ.get("AMD_REMAT_ADDR_DEEP")
   prev_up16 = os.environ.get("ALLOW_UPCAST16")
+  prev_pack = os.environ.get("AMD_PACK_SLOAD_B128")
   if flash_acc_small:
     os.environ["AMD_FLASH_ACC_SMALL"] = "1"
     if prev_remat is None: os.environ["AMD_REMAT_ADDR"] = "1"
@@ -728,6 +729,10 @@ def _flash_direct_compile_env(*, flash_acc_small:bool=True):
     os.environ["ALLOW_UPCAST16"] = "0"
   elif prev_up16 is None and getenv("AMD_FLASH_ALLOW_UPCAST16", 0):
     os.environ["ALLOW_UPCAST16"] = "1"
+  # Sticky PACK_SLOAD_B128: ~5–10µs prefill; serial 13/13 with default bases=1/max=8.
+  # Diag scripts may force 0; opt out AMD_FLASH_PACK_SLOAD_B128=0.
+  if prev_pack is None and getenv("AMD_FLASH_PACK_SLOAD_B128", 1):
+    os.environ["AMD_PACK_SLOAD_B128"] = "1"
   getenv.cache_clear()  # type: ignore[attr-defined]
   try:
     yield

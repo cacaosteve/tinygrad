@@ -1,45 +1,42 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`79e15511c`**.
+Tip: *(update after commit)*.
 
 ## Headline
 
-Flash DIRECT **opt-in**. Fair (7900 XTX; recovering GPU soft):
+Flash DIRECT **opt-in**. Fair/serial (7900 XTX):
 
-| | DIRECT (now) | prior tip | HIP |
+| | DIRECT (now) | earlier tonight | HIP |
 |--|--:|--:|--:|
-| prefill median | **~767–800 µs** (serial PERF **~767**) | ~700–720 / SPILL14 | **best ~328** |
+| prefill | **~760–790 µs** (serial PERF **~763**) | ~700–720 / SPILL14 | **best ~328** |
 | WMMA | **12** | 6 | **24** |
-| private | **~128 B** | ~184–404 | **0** |
+| private / VGPR | **128 / 206** | 404 / 166 | **0 / 206** |
 | SPILL | **0** | **14** | **0** |
-| VGPR | **~206** | ~166 | **~206** |
-| decode (WAVES=8) | **~136–145 µs** | ~141 | **~156** |
+| decode | **~136–145 µs** | ~141 | **~156** |
 
-Decode still beats HIP. Prefill ~**2.3×** HIP best. Do **not** flip DIRECT default.
+Decode beats HIP. Prefill still ~**2.3×**. No DIRECT default flip.
 
 ## Landed (stable)
 
-- Decode ml_lds + **default `AMD_FLASH_WAVES=8`**
-- Addr remat depth-1; const MOV remat
-- Soft-fuse / ACC_SEP / ACC_SMALL defaults
-- **Sticky `ALLOW_UPCAST16=0`** for flash DIRECT (`_flash_direct_compile_env`): SPILL→0, priv→128, VGPR→206. TinyJit-safe sticky. Override `AMD_FLASH_ALLOW_UPCAST16=1`.
-- **Default `AMD_FLASH_K_UNROLL=2`** (with ACC_SMALL): WMMA 6→12, ~797 vs ~911 @unroll0; serial 13/13. Was unsafe under product-16 spills — OK after UPCAST16=0.
+- Sticky **`ALLOW_UPCAST16=0`** (TinyJit-safe): SPILL→0, HIP-like VGPR/priv
+- Default **`AMD_FLASH_K_UNROLL=2`**: WMMA 6→12; was unsafe under product-16
+- Sticky **`AMD_PACK_SLOAD_B128=1`**: ~5–10µs; serial OK; opt out `AMD_FLASH_PACK_SLOAD_B128=0`
+- Decode ml_lds + WAVES=8; remat depth-1; soft-fuse / ACC_SEP / ACC_SMALL
 
 ## Dead ends (do not revive)
 
-- Prior remat/q_idx/ALU dead ends (see history)
-- AMD_WMMA_ACC_SHARED: MMU
-- Sequential soft-fuse rows: FAIL
-- Realize-only UPCAST16 pop: no effect (TinyJit)
-- **K_UNROLL=8**: MMU fault
-- K_UNROLL=4: slower than 2 (same WMMA 12)
-- Scoped HIP_SCOPE qk|pv: worse than all@2
-- PACK_F16_GENERAL / WAVES 4|16 / WMMA_DELAY / SOFT_SCALE=0: no win vs sticky baseline
+- K_UNROLL=-1 / 1 / 8: **MMU**
+- K_UNROLL=4: slower than 2
+- ACC_SEP=0: ~2.5ms
+- INSTR_WAIT=1: much slower
+- PV_ACC_DIRECT=1: slower + spill
+- REG_PROMOTE_SKIP empty: tiny best, spill 16 — not default
+- Realize-only UPCAST16 pop: TinyJit misses it
 
 ## Next
 
-1. Soak on tip; recover after MMU/HW.
-2. Prefill: WMMA 12→24 without MMU (not full K=8).
-3. Occupancy / emit / waitcnt with SPILL0+206 VGPR headroom.
-4. Fork-only; no DIRECT default flip.
+1. Soak; recover after MMU.
+2. WMMA 12→24 without MMU (not full/HIP K_UNROLL).
+3. Occupancy/emit with SPILL0 headroom.
+4. Fork-only.
