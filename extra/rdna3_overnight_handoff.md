@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`231b44a3b`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
+Tip: **`2a69a571c`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
 
 ## Headline (remeasured fair)
 
@@ -79,6 +79,8 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - Prefill scratch/LDS dest-addr env re-touch (`SCLAUSE`/`LDS_DEST_ADDR`): serial hung/no PERF after baseline — leave defaults; GPU recovered
 - Swizzle bubbles @ tip: DIRECT wait→ADD **9** ops (park MOVs) / 0% VALU before wait; HIP wait→ADD **1** / **35.9%** VALU before wait. `SINK_VALU`+MAX 0..16 wash
 
+- `AMD_FLASH_DECODE_PACK_SLOAD=1` after SCORE_BATCH=4: e2e noisy wash (~113–125); serial OK — leave off
+
 ## Confirmed keep
 
 - Default **K_UNROLL=1 + MIDSTORE=4** (WMMA24) beats factor2 (~750 vs ~790; serial 13/13)
@@ -88,4 +90,4 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 1. Decode partial ~42→~30: park MOV tax (wait→ADD 9 ops; HIP 1). Need HIP-like VALU-in-gap or correct `fma_mix` (current fold wrong/MMU). VOPD needs bank-aware VGPR alloc (0 duals today).
 2. Prefill: priv **128** slot2; promote still spills/FAIL; fewer scratch round-trips without promote.
-3. Fork-only; soak on tip **`946a0d556`**; code tip **`7e1af310e`**.
+3. Fork-only; soak on tip **`2a69a571c`**; code tip **`7e1af310e`**.
