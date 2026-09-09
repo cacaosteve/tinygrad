@@ -51,8 +51,7 @@ def _elem_count(u:UOp) -> int:
     if _iop(u) is AMDOps.WMMA: return 8
     if _iop(u) is AMDOps.PACK: return len(u.src)
     if _iop(u) is AMDOps.PACK_F16:
-      # Vec-load form: srcs are half×n LOAD/LLOAD (see _wmma_ab_vec_loads); else EXTRACT/scalar list.
-      if _pack_f16_is_vec_load(u): return sum(_elem_count(s) for s in u.src)
+      if _pack_f16_is_vec_load(u): return sum(_elem_count(s) for s in _pack_f16_mem_srcs(u))
       return len(u.src)
     if _iop(u) is AMDOps.EXTRACT: return 1
     if _iop(u) in (AMDOps.LOAD, AMDOps.LLOAD, AMDOps.SLOAD):
@@ -69,7 +68,7 @@ def _reg_slots(u:UOp) -> int:
     if _iop(u) is AMDOps.WMMA: return 8
     if _iop(u) is AMDOps.PACK: return len(u.src)
     if _iop(u) is AMDOps.PACK_F16:
-      if _pack_f16_is_vec_load(u): return sum(_reg_slots(s) for s in u.src)
+      if _pack_f16_is_vec_load(u): return sum(_reg_slots(s) for s in _pack_f16_mem_srcs(u))
       return max(1, len(u.src) // 2)
     if _iop(u) is AMDOps.EXTRACT: return 1
     if _iop(u) is AMDOps.FILL:
@@ -1099,7 +1098,33 @@ def _pack_f16_is_vec_load(u:UOp) -> bool:
   def is_vec_mem(s:UOp) -> bool:
     if s.op is Ops.LOAD and s.max_numel() >= 2: return True
     return s.op is Ops.INS and _iop(s) in (AMDOps.LOAD, AMDOps.LLOAD) and _elem_count(s) >= 2
-  return bool(u.src) and all(is_vec_mem(s) for s in u.src)
+  srcs = _pack_f16_mem_srcs(u)
+  return bool(srcs) and all(is_vec_mem(s) for s in srcs)
+
+def _pack_f16_mem_srcs(u:UOp) -> tuple[UOp, ...]:
+  """LOAD/LLOAD srcs only — trailing CONST may carry LDS half×8→PACK lane shuffle."""
+  if not u.src: return ()
+  if u.src[-1].op is Ops.CONST or (u.src[-1].op is Ops.INS and _iop(u.src[-1]) is AMDOps.MOV and
+      u.src[-1].src and _unwrap_const(u.src[-1].src[0]) is not None):
+    return u.src[:-1]
+  return u.src
+
+def _pack_f16_lds_shuffle(u:UOp) -> tuple[tuple[int, int], ...]|None:
+  """Decode optional LDS wide-load shuffle from trailing CONST (see _pack_lload_half8_for_wmma)."""
+  if len(u.src) < 3: return None
+  c = _const_int(u.src[-1])
+  if c is None and u.src[-1].op is Ops.INS and _iop(u.src[-1]) is AMDOps.MOV and u.src[-1].src:
+    c = _const_int(u.src[-1].src[0])
+  if c is None or c < 0: return None
+  # 4 lanes × (src_i:1 bit, slot0_is_2:1 bit)
+  return tuple((((c >> (2 * i)) & 1), 0 if ((c >> (2 * i + 1)) & 1) == 0 else 2) for i in range(4))
+
+def _encode_pack_f16_lds_shuffle(shuffle:list[tuple[int, int]]) -> int:
+  v = 0
+  for i, (si, so) in enumerate(shuffle):
+    v |= (int(si) & 1) << (2 * i)
+    v |= (0 if int(so) == 0 else 1) << (2 * i + 1)
+  return v
 
 def _wmma_ab_from_lds(wmma:UOp) -> bool:
   """True if WMMA A/B is staged from LDS (TC_LDS_AB), not unrelated LLOAD elsewhere in the kernel."""
@@ -4007,9 +4032,10 @@ def _fused_lds_pack_load(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|No
 def _fused_lds_2addr_b64(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
   """Fold two 8-byte LLOADs into DS_LOAD_2ADDR_B64 (HIP flash LDS pattern).
 
-  offset0/1 are qword indices (byte_off/8). Requires consecutive dest VGPRs (4 lanes)
-  and the same base+idx. Default on (AMD_LDS_2ADDR=0 opts out). Needs consecutive dest
-  VGPRs from regalloc — when unavailable, falls through to scalar ds_load_b64.
+  offset0/1 are u8 *qword* indices (not the ordinary ds 16-bit byte split). Requires
+  consecutive dest VGPRs (4 lanes) and the same base+idx. Default on (AMD_LDS_2ADDR=0
+  opts out). Flash LDS imm offs are often >2KB — fold min(off0,off1) into the address
+  VGPR so both qword indices fit in 0..255 (AMD_LDS_2ADDR_FOLD=0 disables).
   """
   if not _emit_optional() or not getenv("AMD_LDS_2ADDR", 1) or i + 1 >= len(uops): return None
   a, b = uops[i], uops[i + 1]
@@ -4021,9 +4047,13 @@ def _fused_lds_2addr_b64(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|No
   if ra.index + 2 != rb.index or _reg_slots(a) != 2 or _reg_slots(b) != 2: return None
   off0, off1 = _lds_byte_off(a), _lds_byte_off(b)
   if off0 % 8 or off1 % 8: return None
-  q0, q1 = off0 // 8, off1 // 8
+  fold = min(off0, off1) if getenv("AMD_LDS_2ADDR_FOLD", 1) else 0
+  q0, q1 = (off0 - fold) // 8, (off1 - fold) // 8
   if not (0 <= q0 <= 0xff and 0 <= q1 <= 0xff): return None
   pre, addr = _local_addr(a.src[0], a.src[1], a.dtype.itemsize)
+  if fold:
+    pre = pre + [r3.v_add_nc_u32_e64(TMP_VADDR, fold, addr)]
+    addr = TMP_VADDR
   deps = _reg_idxs(a.src[1])
   return 2, pre + [r3.ds_load_2addr_b64(vdst=_reg_chunk(ra, 0, 4), addr=addr, offset0=q0, offset1=q1)], deps
 
