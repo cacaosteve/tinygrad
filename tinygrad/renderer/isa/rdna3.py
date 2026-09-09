@@ -51,7 +51,8 @@ def _elem_count(u:UOp) -> int:
     if _iop(u) is AMDOps.WMMA: return 8
     if _iop(u) is AMDOps.PACK: return len(u.src)
     if _iop(u) is AMDOps.PACK_F16:
-      if _pack_f16_is_vec_load(u): return sum(_elem_count(s) for s in _pack_f16_mem_srcs(u))
+      # Vec-load form: srcs are half×n LOAD/LLOAD (see _wmma_ab_vec_loads); else EXTRACT/scalar list.
+      if _pack_f16_is_vec_load(u): return sum(_elem_count(s) for s in u.src)
       return len(u.src)
     if _iop(u) is AMDOps.EXTRACT: return 1
     if _iop(u) in (AMDOps.LOAD, AMDOps.LLOAD, AMDOps.SLOAD):
@@ -68,7 +69,7 @@ def _reg_slots(u:UOp) -> int:
     if _iop(u) is AMDOps.WMMA: return 8
     if _iop(u) is AMDOps.PACK: return len(u.src)
     if _iop(u) is AMDOps.PACK_F16:
-      if _pack_f16_is_vec_load(u): return sum(_reg_slots(s) for s in _pack_f16_mem_srcs(u))
+      if _pack_f16_is_vec_load(u): return sum(_reg_slots(s) for s in u.src)
       return max(1, len(u.src) // 2)
     if _iop(u) is AMDOps.EXTRACT: return 1
     if _iop(u) is AMDOps.FILL:
@@ -1098,33 +1099,7 @@ def _pack_f16_is_vec_load(u:UOp) -> bool:
   def is_vec_mem(s:UOp) -> bool:
     if s.op is Ops.LOAD and s.max_numel() >= 2: return True
     return s.op is Ops.INS and _iop(s) in (AMDOps.LOAD, AMDOps.LLOAD) and _elem_count(s) >= 2
-  srcs = _pack_f16_mem_srcs(u)
-  return bool(srcs) and all(is_vec_mem(s) for s in srcs)
-
-def _pack_f16_mem_srcs(u:UOp) -> tuple[UOp, ...]:
-  """LOAD/LLOAD srcs only — trailing CONST may carry LDS half×8→PACK lane shuffle."""
-  if not u.src: return ()
-  if u.src[-1].op is Ops.CONST or (u.src[-1].op is Ops.INS and _iop(u.src[-1]) is AMDOps.MOV and
-      u.src[-1].src and _unwrap_const(u.src[-1].src[0]) is not None):
-    return u.src[:-1]
-  return u.src
-
-def _pack_f16_lds_shuffle(u:UOp) -> tuple[tuple[int, int], ...]|None:
-  """Decode optional LDS wide-load shuffle from trailing CONST (see _pack_lload_half8_for_wmma)."""
-  if len(u.src) < 3: return None
-  c = _const_int(u.src[-1])
-  if c is None and u.src[-1].op is Ops.INS and _iop(u.src[-1]) is AMDOps.MOV and u.src[-1].src:
-    c = _const_int(u.src[-1].src[0])
-  if c is None or c < 0: return None
-  # 4 lanes × (src_i:1 bit, slot0_is_2:1 bit)
-  return tuple((((c >> (2 * i)) & 1), 0 if ((c >> (2 * i + 1)) & 1) == 0 else 2) for i in range(4))
-
-def _encode_pack_f16_lds_shuffle(shuffle:list[tuple[int, int]]) -> int:
-  v = 0
-  for i, (si, so) in enumerate(shuffle):
-    v |= (int(si) & 1) << (2 * i)
-    v |= (0 if int(so) == 0 else 1) << (2 * i + 1)
-  return v
+  return bool(u.src) and all(is_vec_mem(s) for s in u.src)
 
 def _wmma_ab_from_lds(wmma:UOp) -> bool:
   """True if WMMA A/B is staged from LDS (TC_LDS_AB), not unrelated LLOAD elsewhere in the kernel."""
