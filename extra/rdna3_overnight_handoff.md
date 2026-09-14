@@ -1,31 +1,36 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`b05eac9ce`** (CI green: output_shape + E303 + mypy `colored_shape`).
+Tip: **`b05eac9ce`** (CI green); docs tip may be ahead.
 
 ## Status (2026-09-14 re-baseline)
 
-- Master merge through `#18185`; tip **0 behind** at merge time; CI **green** on `b05eac9ce`.
-- Gaming PC back (fresh reboot earlier); checkout synced to tip.
-- **HCQ2=1 regression:** TinyJit **multi-submit** (batch≥2 then sync) **hangs** (`AMD signal wait timed out`) for **both** HIP and DIRECT flash. Single submit+sync OK.
-- **HCQ2=0:** batched TinyJit works for HIP, but **no `AMDRenderer`** (`DEV=AMD:AMD` → `AMD has no renderer 'AMD'`). DIRECT requires HCQ2=1.
-- **DIRECT peer poison:** any GEMM (half/float) **before** flash in the same process → **MMU** on flash; flash-then-GEMM OK. Serial script fails on first flash after pre_flash_matmul64.
-- Do **not** pop FMA_MIX WHERE-accept stash casually (historically wrong/MMU).
+- Master merge through `#18185`; CI **green** on `b05eac9ce`.
+- Gaming PC synced to tip.
 
-## Headline (post-merge; HCQ2=1 sync-each ≈ fair; batch fair blocked)
+### HCQ2=1 TinyJit multi-submit (root cause narrowed)
 
-Method: TinyJit capture, then 40× (1 launch + synchronize). Sync-each adds submit overhead vs old 50-launch batches.
+- **Not** general TinyJit / not graph coalescing: matmul batch50 OK; decode batch2/50 OK when GPU clean; **prefill batch≥2 hangs** (HIP + DIRECT). `JIT=2` (no `graph_split_rewrite`) still hangs on prefill.
+- **Smoking gun:** prefill `submit(); time.sleep(2); submit(); sync` **OK**; `submit(); submit(); sync` **hangs**. So `hcq_fence` host wait does **not** reliably wait for prior GPU work before re-arming signals — race bites long kernels (prefill ~ms) more than short (decode ~tens of µs).
+- **HCQ2=0:** HIP prefill batch works (~358 µs @50). No `AMDRenderer` under HCQ2=0 → DIRECT needs HCQ2=1.
+- After a hang, GPU stays poisoned until process death + recover; later decode batches can fail too.
 
-| | DIRECT (`DEV=AMD:AMD`) | HIP (`DEV=AMD`) |
+### GEMM→flash
+
+- Previously MMU when GPU already poisoned; on clean GPU **GEMM then flash OK**. Treat earlier serial MMU as likely poison/cascade, re-check serial after reboot.
+
+## Headline (post-merge)
+
+| Method | DIRECT | HIP |
 |--|--:|--:|
-| prefill median | **~622 µs** (best ~616) | **~342 µs** (best ~318) |
-| decode e2e | **~119 µs** (best ~116) | **~110 µs** (best ~107) |
+| prefill sync-each (HCQ2=1) | **~622 µs** | **~342 µs** |
+| decode sync-each (HCQ2=1) | **~119 µs** | **~110 µs** |
+| decode batch50 (HCQ2=1, clean) | **~58 µs** (one clean run) | **~63 µs** (earlier clean run) |
+| prefill batch50 (HCQ2=0 HIP only) | n/a | **~358 µs** |
 
-HIP batched under **HCQ2=0** (not comparable stack): prefill **~271 µs**, decode **~47 µs**.
+Prefill classic fair still blocked on HCQ2=1. Decode gap on sync-each ~9 µs; batched decode looks much closer (needs clean re-measure after reboot).
 
-Gaps vs pre-merge headline: similar shape (prefill ~2×; decode ~9 µs). Prefill slightly better than stale ~647–676 sync-ish numbers.
-
-## Headline (remeasured fair; **stale until HW re-baseline** — superseded above)
+## Headline (pre-merge; historical)
 
 | | DIRECT (`DEV=AMD:AMD`) | HIP (`DEV=AMD`) |
 |--|--:|--:|
@@ -125,8 +130,8 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 ## Next
 
-1. **HCQ2=1 TinyJit multi-submit hang** — blocks classic fair benches for HIP+DIRECT; bisect vs master / HCQ graph replay.
-2. **GEMM→flash MMU** under `AMD_FLASH_DIRECT=1` — serial peer check; flash-first OK.
-3. Decode gap ~119 vs ~110 (sync-each); prefill priv **128** / MOV tax; avoid dead-end envs.
+1. **HCQ2 `hcq_fence` race** — host wait before signal re-arm fails for long prefill schedules; sleep gap works. Likely timeline[0]/[1] / wait target bug in `tinygrad/runtime/support/hcq2.py` `hcq_fence` (post `#18094` host syncs). Reboot GPU then re-measure decode batch50 fair.
+2. Prefill fair: sync-each or HCQ2=0 (HIP only) until fence fixed; DIRECT needs HCQ2=1.
+3. Decode gap leftovers + prefill priv 128 (once fair method stable).
 4. Fork-only; tip **`b05eac9ce`**; CI green.
 
