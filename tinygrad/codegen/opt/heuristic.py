@@ -61,7 +61,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     reduce_axes = k.axes_of(AxisType.REDUCE)
     if force_axis < 0: force_axis = reduce_axes[-1]
     else: force_axis = reduce_axes[force_axis]
-    if DEBUG >= 3: print(f"FORCE_GROUP: {k.full_shape=} {k.shape_str()=} {force_axis=} {force_group=}")
+    if DEBUG >= 3: print(f"FORCE_GROUP: {k.full_shape=} {k.colored_shape()=} {force_axis=} {force_group=}")
     k.apply_opt(Opt(OptOps.SPLIT, force_axis, (force_group, AxisType.GROUP_REDUCE)))
     force_unroll = getenv("MV_FORCE_UNROLL_INNER", 0)
     if force_unroll < 0: _unroll_small_inner_reduces(k)
