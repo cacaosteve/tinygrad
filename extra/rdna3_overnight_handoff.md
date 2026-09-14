@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **post-master merge** (was `445a58b2a`); CI fix for `#18090` `output_shape` + E303 blank line pending push.
+Tip: **`b6b994a07`** (post-master CI fix: `output_shape` + E303).
 
 ## Status (2026-09-14)
 
