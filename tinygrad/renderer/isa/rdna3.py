@@ -2675,7 +2675,9 @@ def _schedule_lload_2addr_pairs(ops:list[UOp]) -> list[UOp]:
   while i < len(ops):
     u = ops[i]
     if not (u.op is Ops.INS and _iop(u) is AMDOps.LLOAD):
-      out.append(u); i += 1; continue
+      out.append(u)
+      i += 1
+      continue
     j = i
     while j < len(ops) and ops[j].op is Ops.INS and _iop(ops[j]) is AMDOps.LLOAD:
       j += 1
@@ -2691,15 +2693,19 @@ def _schedule_lload_2addr_pairs(ops:list[UOp]) -> list[UOp]:
         if a not in unused: continue
         sa = streak[a]
         if _elem_count(sa) * sa.dtype.itemsize != 8:
-          ordered.append(sa); unused.remove(a); continue
+          ordered.append(sa)
+          unused.remove(a)
+          continue
         off = _lds_byte_off(sa)
         partner = next((b for b in unused if b != a and streak[b].src[0] is sa.src[0] and
                         streak[b].src[1] is sa.src[1] and
                         _elem_count(streak[b]) * streak[b].dtype.itemsize == 8 and
                         _lds_byte_off(streak[b]) == off + 8), None)
-        ordered.append(sa); unused.remove(a)
+        ordered.append(sa)
+        unused.remove(a)
         if partner is not None:
-          ordered.append(streak[partner]); unused.remove(partner)
+          ordered.append(streak[partner])
+          unused.remove(partner)
       # any remaining (should be empty)
       ordered.extend(streak[b] for b in sorted(unused))
       out.extend(ordered)
