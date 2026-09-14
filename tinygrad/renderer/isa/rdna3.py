@@ -2661,7 +2661,6 @@ def _hoist_lloads_before_extracts(ops:list[UOp]) -> list[UOp]:
   return out
 
 
-
 def _schedule_lload_2addr_pairs(ops:list[UOp]) -> list[UOp]:
   """Within each LLOAD streak, order fusible 8-byte pairs adjacent for ds_load_2addr_b64.
 
@@ -5068,7 +5067,8 @@ class AMDRenderer(ISARenderer):
   def get_complex_matvec_rows(self, k) -> int:
     # Large packed-quant projections amortize the activation reads across two rows.
     # Below this threshold the extra code/register pressure only increases cold latency.
-    output_size = prod(k.output_shape)
+    # output elems = non-reduce axes (Scheduler.output_shape was removed in #18090)
+    output_size = prod((1 if i in k.reduce_axes else s) for i,s in enumerate(k.full_shape))
     if not isinstance(output_size, int) or output_size < 16384: return 1
     if not any(u.op is Ops.PARAM and u.dtype is dtypes.uchar for u in k.ast.toposort()): return 1
     return 2
@@ -5076,7 +5076,8 @@ class AMDRenderer(ISARenderer):
   def apply_quant_matvec_opts(self, k) -> bool:
     """Expose memory-level parallelism that LLVM's loop optimizer otherwise supplies for Q8_0/IQ4_XS GEMV."""
     from tinygrad.codegen.opt import Opt, OptOps
-    if k.reduceop is None or k.reduceop.arg[0] is not Ops.ADD or not isinstance(output_size:=prod(k.output_shape), int) or output_size < 1024:
+    output_size = prod((1 if i in k.reduce_axes else s) for i,s in enumerate(k.full_shape))
+    if k.reduceop is None or k.reduceop.arg[0] is not Ops.ADD or not isinstance(output_size, int) or output_size < 1024:
       return False
     if not any(u.op is Ops.PARAM and u.dtype is dtypes.uchar for u in k.ast.toposort()): return False
     reduce_sizes = tuple(k.full_shape[a] for a in k.axes_of(AxisType.REDUCE))

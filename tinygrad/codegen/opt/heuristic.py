@@ -89,7 +89,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # ISAs can opt into a one-wave-per-row mapping for these complex matvecs without broadening the generic rule below.
   complex_mv_group = getattr(k.ren, "preferred_complex_matvec_group", None)
   if complex_mv_group is not None and getenv("MV", 1) != 0 and k.ren.has_local and k.ren.has_shared and k.reduceop is not None and \
-     k.reduceop.arg[0] is Ops.ADD and resolve(prod(k.output_shape) >= 1024, False):
+     k.reduceop.arg[0] is Ops.ADD and \
+     resolve(prod((1 if i in k.reduce_axes else s) for i,s in enumerate(k.full_shape)) >= 1024, False):
     reduce_term = k.reduceop.src[0]
     simple_matvec = reduce_term.op is Ops.MUL and all(x.op is Ops.INDEX for x in reduce_term.src)
     indexes = [u for u in reduce_term.toposort() if u.op is Ops.INDEX]
@@ -141,7 +142,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             return k
 
   if k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and (pg:=getattr(k.ren, 'preferred_reduce_group', None)) is not None and \
-     len(k.axes_of(AxisType.REDUCE)) == 1 and k.reduceop.src[0].op is Ops.INDEX and resolve(prod(k.output_shape) > 1, False):
+     len(k.axes_of(AxisType.REDUCE)) == 1 and k.reduceop.src[0].op is Ops.INDEX and \
+     resolve(prod((1 if i in k.reduce_axes else s) for i,s in enumerate(k.full_shape)) > 1, False):
     try: k.apply_opt(Opt(OptOps.SPLIT, k.axes_of(AxisType.REDUCE)[0], (pg, AxisType.GROUP_REDUCE)))
     except KernelOptError: pass
     else: return k

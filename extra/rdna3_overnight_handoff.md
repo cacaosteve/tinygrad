@@ -1,9 +1,17 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`adc25cfe5`** (docs); code tip **`7e1af310e`** SCORE_BATCH=4.
+Tip: **post-master merge** (was `445a58b2a`); CI fix for `#18090` `output_shape` + E303 blank line pending push.
 
-## Headline (remeasured fair)
+## Status (2026-09-14)
+
+- Merged `origin/master` through `#18185`; fork tip was **0 behind** master.
+- CI on `445a58b2a` failed **Linters** (E303 at LLOAD schedule) + **AMD ASM IDE** (`k.output_shape` removed in `#18090`).
+- Gaming PC SSH **unreachable** (`69.57.221.45`) — cannot re-baseline or resume HW leftovers until back.
+- Stash still holds unfinished **FMA_MIX WHERE-accept** (historically wrong/MMU) — do not pop casually.
+- Next after green CI + HW: re-baseline fair (prefill ~650 / decode ~120 may move); decode gap vs HIP ~108; prefill priv 128 / MOV tax.
+
+## Headline (remeasured fair; **stale until HW re-baseline**)
 
 | | DIRECT (`DEV=AMD:AMD`) | HIP (`DEV=AMD`) |
 |--|--:|--:|
