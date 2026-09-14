@@ -92,7 +92,7 @@ def expand_wmma(ctx:dict[int, int], u:UOp):
     return ret
   return unroll_axis(ctx, u.replace(src=(a, b, c), arg=done_arg), out0)
 
-expander2 = PatternMatcher([
+expander = PatternMatcher([
   (UPat(Ops.REDUCE, name="r"), expand_reduce),
   (UPat(Ops.RANGE, name="r"),
    lambda ctx, r: UOp.const(tuple(range(r.vmax+1)), r.dtype) \
@@ -371,7 +371,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
                        name="postopt symbolic")
 
   # expand
-  sink = graph_rewrite(sink, expander2, ctx=build_range_map(sink), name="expander")
+  sink = graph_rewrite(sink, expander, ctx=build_range_map(sink), name="expander")
 
   # ISA renderers may lower narrowly supported group reductions to native wave operations.
   if (pm := getattr(ren, "pm_group_reduce", None)) is not None:
@@ -490,7 +490,7 @@ def line_rewrite(lst:list[UOp], pm:PatternMatcher, ctx=None) -> list[UOp]:
 
 def _print_compile_stage(prg:UOp, stage:str, st:int, uops:int) -> None:
   if getenv("COMPILE_TIMING", 0):
-    print("COMPILE_STAGE "+json.dumps({"name": prg.arg.function_name, "stage": stage,
+    print("COMPILE_STAGE "+json.dumps({"name": prg.src[0].arg.function_name, "stage": stage,
       "ms": (time.perf_counter_ns() - st) / 1e6, "uops": uops}), flush=True)
 
 def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:
@@ -597,7 +597,7 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   if compile_timing:
     timings["linearize_render_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
     timings["total_ms"] = (time.perf_counter_ns() - total_st) / 1e6
-    print("COMPILE_TIMING "+json.dumps({"name": prg.arg.function_name, "renderer": type(renderer).__name__,
+    print("COMPILE_TIMING "+json.dumps({"name": prg.src[0].arg.function_name, "renderer": type(renderer).__name__,
       "ast_uops": len(ast.toposort()), "program_uops": len(prg.src[1].src), "binary_bytes": len(prg.src[-1].arg), **timings}), flush=True)
   if VIZ: graph_rewrite(prg, PatternMatcher([]), name="View Program")
   return prg

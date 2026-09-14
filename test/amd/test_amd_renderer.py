@@ -1395,7 +1395,7 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertNotIn(amd_lib.TMP_VDATA.offset, allocatable)
     self.assertNotIn(amd_lib.TMP_VADDR.offset, allocatable)
     for prg in (_simple_add_program(), _range_program(), _var_range_program()):
-      with self.subTest(name=prg.arg.name):
+      with self.subTest(name=prg.src[0].arg.name):
         regs = [greg(u).index for u in _prg_lin(prg).src if isinstance(greg(u), Register)]
         self.assertLess(max(regs, default=0), 256 + 32)
 
@@ -1403,7 +1403,7 @@ class TestAMDRenderer(unittest.TestCase):
     progs = (_multi_dim_program(), _z_dim_program(), _uint_var_program(), _global_dim_program(),
              _spill_program(), _multi_spill_program(), _local_program(), _multi_local_program())
     for prg in progs:
-      with self.subTest(name=prg.arg.name):
+      with self.subTest(name=prg.src[0].arg.name):
         _assert_abi_reg_isolation(self, prg)
 
   def test_live_kernarg_sgpr_pairs_do_not_overlap(self):
@@ -1424,7 +1424,7 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_linear_has_no_explicit_end_op(self):
     for prg in (_simple_add_program(), _range_program(), _nested_range_program(), _var_range_program()):
-      with self.subTest(name=prg.arg.name):
+      with self.subTest(name=prg.src[0].arg.name):
         self.assertFalse(any(u.op is Ops.END for u in _prg_lin(prg).src))
         linear_ops = _lin_ops(prg)
         self.assertNotIn("END", [getattr(op, "name", op) for op in linear_ops])
@@ -1533,7 +1533,7 @@ class TestAMDRenderer(unittest.TestCase):
       (_float16_cast_program(), (AMDOps.CAST,), ("V_CVT_F32_F16_E32", "V_CVT_F16_F32_E32")),
     )
     for prg, ops, insts in cases:
-      with self.subTest(name=prg.arg.name):
+      with self.subTest(name=prg.src[0].arg.name):
         _check_asm(self, prg, *ops, insts=insts)
 
   def test_bfloat16_tagged_param_lowers_to_kernarg(self):
@@ -1550,7 +1550,7 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_emulated_int64_cmod_assembles(self):
     for prg in (_emulated_int64_cmod_const_program(), _emulated_int64_index_cmod_program()):
-      with self.subTest(name=prg.arg.name):
+      with self.subTest(name=prg.src[0].arg.name):
         _check_elf(self, prg)
         self.assertFalse(any(u.op is Ops.CMOD for u in _prg_lin(prg).src))
 
@@ -3459,7 +3459,7 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_cast_and_reciprocal_assemble(self):
     for prg in (_cast_reciprocal_program(), _float_to_int_cast_program()):
-      with self.subTest(name=prg.arg.name):
+      with self.subTest(name=prg.src[0].arg.name):
         _check_elf(self, prg)
         linear_ops = _lin_ops(prg)
         self.assertIn(AMDOps.CAST, linear_ops)

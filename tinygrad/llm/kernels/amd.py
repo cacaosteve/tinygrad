@@ -3,6 +3,7 @@ import contextlib, functools, math, os
 from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.device import Buffer
+from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
@@ -120,10 +121,14 @@ class Linear(nn.Linear):
     raw = next((u for u in graph if u.op is Ops.SHRINK and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes), None)
     if raw is None: return
     ggml_type = packed_sizes[prod(raw.shape)]
-    # the packed byte rate alone can't distinguish same-rate formats (Q4_0 vs Q4_K, Q5_0 vs Q5_K, MXFP4 vs IQ4_XS).
-    # the supported formats are 256-wide superblocks: their decode views the packed bytes at the superblock width
-    # (ggml_data_to_tensor reshapes to (-1, QUANT_SIZES[type])), while same-rate 32-wide formats reshape to 17-22
-    if not any(u.op is Ops.RESHAPE and u.shape[-1:] == (QUANT_SIZES[ggml_type],) for u in graph): return
+    # Only unwrap storage/order-preserving views, then require the exact dequantization expression.
+    # This rejects subsequent arithmetic and permutations, including RoPE's concatenated query weights.
+    def unwrapped(u:UOp) -> UOp:
+      while u.op in (Ops.RESHAPE, Ops.COPY) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
+        u = u.src[0]
+      return u
+    expected = ggml_data_to_tensor(Tensor(raw), self.in_features * self.out_features, ggml_type)
+    if unwrapped(decoded.uop).key != unwrapped(expected.uop).key: return
     raw_offset = raw.contiguous_view_offset()
     assert raw_offset is not None and raw_offset % 4 == 0 and raw.buf_uop.dtype == dtypes.uint8
     self.ggml_type = ggml_type
@@ -135,7 +140,7 @@ class Linear(nn.Linear):
       nbytes, nblocks = raw.max_numel(), raw.max_numel() // Q6_BYTES
       byte_view = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer).view(nbytes, dtypes.uint8, raw_offset)))
       padded = byte_view.reshape((nblocks, Q6_BYTES)).pad_to((nblocks, Q6_PADDED)).bitcast(dtypes.uint32)
-      self.weight = padded.contiguous().reshape(nblocks * Q6_WORDS)
+      self.weight = padded.clone().reshape(nblocks * Q6_WORDS)
     else:
       self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
         .view(raw.max_numel() * raw.dtype.itemsize // dtypes.uint32.itemsize, dtypes.uint32, raw_offset)))

@@ -940,6 +940,11 @@ class TestSymbolic(unittest.TestCase):
     self.helper_test_variable((a % -8) // 2, -4, 0, "(a%-8//2)")
     self.helper_test_variable((a % -8) % 2, 0, 1, "(a%2)")
 
+  def test_nested_div_mod_symbolic_inner_divisor(self):
+    a = Variable("a", 0, 100)
+    self.helper_test_variable((a % (Variable("n", 1, 10)*4)) // 2, 0, 19, "(a//2%(n*2))")
+    check_uop_against_string(self, (a % (Variable("n", 0, 10)*4) // 2).simplify(), "(a%(n*4)//2)")
+
   def test_floordiv_lt_negative_c(self):
     # x//d<c with negative c also reduces to x<c*d for d>0
     idx = Variable("idx", -20, 20)
@@ -1528,6 +1533,14 @@ class TestBounds(unittest.TestCase):
     assert (alu0+2559).vmin == 0 and (alu0+2559).vmax == 2559
     assert ((alu0+2559)//-4).vmin == -640 and ((alu0+2559)//-4).vmax == 0
     assert (((alu0+2559)//-4)*(-1)).vmin == 0 and (((alu0+2559)//-4)*(-1)).vmax == 640
+
+  def test_where_float_consts(self):
+    cond = Variable("s", 0, 3) < 2
+    w = cond.where(uconst(0.0), cond.where(uconst(1.0), uconst(3.0)))
+    self.assertEqual((w.vmin, w.vmax), (0.0, 3.0))
+    self.assertEqual((w.cast(dtypes.int).vmin, w.cast(dtypes.int).vmax), (0, 3))
+    n = cond.where(uconst(math.nan), uconst(1.0))
+    self.assertEqual((n.vmin, n.vmax), (-math.inf, math.inf))
 
 class TestFuzzFailure(unittest.TestCase):
   def test_fuzz_failure1(self):

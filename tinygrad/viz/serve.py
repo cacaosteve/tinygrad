@@ -2,7 +2,7 @@
 import multiprocessing, pickle, difflib, os, threading, json, time, sys, socket, argparse, codecs, io, struct, re, traceback, itertools, socketserver
 from contextlib import redirect_stdout, redirect_stderr, contextmanager
 from decimal import Decimal
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler
 from typing import Any, TypedDict, TypeVar, Generator, Callable
@@ -49,10 +49,10 @@ uops_colors = {Ops.LOAD: "#ffc0c0", Ops.STORE: "#87CEEB", Ops.CONST: "#e0e0e0", 
                Ops.INDEX: "#CEF9B7", Ops.STACK: "#D8F9E4",
                Ops.WMMA: "#efefc0", Ops.UNSHARD: "#f6ccff", Ops.INS: "#eec4ff",
                **{x:"#D8F9E4" for x in GroupOp.Movement}, **{x:"#ffffc0" for x in GroupOp.ALU}, Ops.THREEFRY:"#ffff80",
-               Ops.BUFFER: "#B0BDFF", Ops.GETADDR: "#9DB1F0", Ops.COPY: "#a040a0", Ops.CUSTOM_FUNCTION: "#bf71b6",
+               Ops.BUFFER: "#B0BDFF", Ops.GETADDR: "#9DB1F0", Ops.COPY: "#ff90c0", Ops.CUSTOM_FUNCTION: "#bf71b6",
                Ops.CALL: "#00B7C8", Ops.PARAM: "#14686F", Ops.SOURCE: "#c0c0c0", Ops.BINARY: "#404040",
                Ops.LINEAR: "#7DF4FF",
-               Ops.ALLREDUCE: "#ff40a0", Ops.MSELECT: "#d040a0", Ops.MSTACK: "#d040a0", Ops.CONTIGUOUS: "#FFC14D",
+               Ops.ALLREDUCE: "#ff40a0", Ops.MSELECT: "#d040a0", Ops.MSTACK: "#d040a0",
                Ops.STAGE: "#AC640D", Ops.REWRITE_ERROR: "#1a1b26", Ops.AFTER: "#8A7866", Ops.END: "#524C46"}
 
 addrspace_colors = {AddrSpace.ALU: "#AAAAAA", AddrSpace.REG:"#e68181", AddrSpace.LOCAL:"#e7c86a", AddrSpace.GLOBAL:"#75bd7b"}
@@ -173,6 +173,10 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
 def _reconstruct(data:VizData, a:int, depth:int|None=None):
   if depth is None and a in data.all_uops: return data.all_uops[a]
   op, src, arg, *rest = data.trace.uop_fields[a]
+  # mirror of the trace_num encoding, viz must not save buffers
+  if op is Ops.CALL and hasattr(aux:=arg.aux, "written_bufs"):
+    arg = replace(arg, aux=replace(aux, written_bufs=tuple(_reconstruct(data, b, depth) for b in aux.written_bufs),
+                                   inputs=tuple((_reconstruct(data, u, depth), d, i) for u, d, i in aux.inputs)))
   if depth is not None and depth <= 0: return UOp(op, (), arg, *rest)
   ret = UOp(op, tuple(_reconstruct(data, s, None if depth is None else depth-1) for s in src), arg, *rest)
   if depth is None: data.all_uops[a] = ret
@@ -479,10 +483,11 @@ def get_profile(data:VizData, profile:list[ProfileEvent], sort_fn:Callable[[str]
   scache:dict[str, int] = {}
   peaks:list[int] = []
   dtype_size:dict[str, int] = {}
-  for k,v in dev_events.items():
-    v.sort(key=lambda e:e[0])
-    layout[k] = timeline_layout(data, v, start_ts, scache)
-    layout.update([graph_layout(k, v, start_ts, unwrap(end_ts), peaks, dtype_size, scache)])
+  with soft_err():
+    for k,v in dev_events.items():
+      v.sort(key=lambda e:e[0])
+      layout[k] = timeline_layout(data, v, start_ts, scache)
+      layout.update([graph_layout(k, v, start_ts, unwrap(end_ts), peaks, dtype_size, scache)])
   sorted_layout = sorted([k for k,v in layout.items() if v is not None], key=sort_fn)
   ret = [b"".join([struct.pack("<B", len(k)), k.encode(), unwrap(layout[k])]) for k in sorted_layout]
   index = json.dumps({"strings":list(scache), "dtypeSize":dtype_size,
