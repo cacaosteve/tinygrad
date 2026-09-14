@@ -1,17 +1,31 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`b6b994a07`** (post-master CI fix: `output_shape` + E303).
+Tip: **`b05eac9ce`** (CI green: output_shape + E303 + mypy `colored_shape`).
 
-## Status (2026-09-14)
+## Status (2026-09-14 re-baseline)
 
-- Merged `origin/master` through `#18185`; fork tip was **0 behind** master.
-- CI on `445a58b2a` failed **Linters** (E303 at LLOAD schedule) + **AMD ASM IDE** (`k.output_shape` removed in `#18090`).
-- Gaming PC SSH **unreachable** (`69.57.221.45`) — cannot re-baseline or resume HW leftovers until back.
-- Stash still holds unfinished **FMA_MIX WHERE-accept** (historically wrong/MMU) — do not pop casually.
-- Next after green CI + HW: re-baseline fair (prefill ~650 / decode ~120 may move); decode gap vs HIP ~108; prefill priv 128 / MOV tax.
+- Master merge through `#18185`; tip **0 behind** at merge time; CI **green** on `b05eac9ce`.
+- Gaming PC back (fresh reboot earlier); checkout synced to tip.
+- **HCQ2=1 regression:** TinyJit **multi-submit** (batch≥2 then sync) **hangs** (`AMD signal wait timed out`) for **both** HIP and DIRECT flash. Single submit+sync OK.
+- **HCQ2=0:** batched TinyJit works for HIP, but **no `AMDRenderer`** (`DEV=AMD:AMD` → `AMD has no renderer 'AMD'`). DIRECT requires HCQ2=1.
+- **DIRECT peer poison:** any GEMM (half/float) **before** flash in the same process → **MMU** on flash; flash-then-GEMM OK. Serial script fails on first flash after pre_flash_matmul64.
+- Do **not** pop FMA_MIX WHERE-accept stash casually (historically wrong/MMU).
 
-## Headline (remeasured fair; **stale until HW re-baseline**)
+## Headline (post-merge; HCQ2=1 sync-each ≈ fair; batch fair blocked)
+
+Method: TinyJit capture, then 40× (1 launch + synchronize). Sync-each adds submit overhead vs old 50-launch batches.
+
+| | DIRECT (`DEV=AMD:AMD`) | HIP (`DEV=AMD`) |
+|--|--:|--:|
+| prefill median | **~622 µs** (best ~616) | **~342 µs** (best ~318) |
+| decode e2e | **~119 µs** (best ~116) | **~110 µs** (best ~107) |
+
+HIP batched under **HCQ2=0** (not comparable stack): prefill **~271 µs**, decode **~47 µs**.
+
+Gaps vs pre-merge headline: similar shape (prefill ~2×; decode ~9 µs). Prefill slightly better than stale ~647–676 sync-ish numbers.
+
+## Headline (remeasured fair; **stale until HW re-baseline** — superseded above)
 
 | | DIRECT (`DEV=AMD:AMD`) | HIP (`DEV=AMD`) |
 |--|--:|--:|
@@ -111,8 +125,8 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 ## Next
 
-1. **HW**: restore SSH to gaming PC, then probe FMA_MIX_EXP + WHERE(EXP2,0) accept (no peel) — local WIP in `rdna3.py` uncommitted.
-2. Decode partial ~42→~30: park MOV tax; true sibling VOPD affinity (sticky pair-alloc dead); correct fma_mix.
-3. Prefill: priv **128** slot2; MIDSTORE stays 4.
-4. Fork-only; tip **`adc25cfe5`**; code tip **`7e1af310e`**.
+1. **HCQ2=1 TinyJit multi-submit hang** — blocks classic fair benches for HIP+DIRECT; bisect vs master / HCQ graph replay.
+2. **GEMM→flash MMU** under `AMD_FLASH_DIRECT=1` — serial peer check; flash-first OK.
+3. Decode gap ~119 vs ~110 (sync-each); prefill priv **128** / MOV tax; avoid dead-end envs.
+4. Fork-only; tip **`b05eac9ce`**; CI green.
 
