@@ -330,19 +330,15 @@ def hcq_fence(ctx:EncodeCtx, f:UOp) -> UOp:
   # TODO: timeout?
   for i, dev in enumerate(ctx.devs):
     slots, off = unwrap_view(lasts[i])
-    slots = patch(slots, [], bytes(slots.max_numel() * slots.dtype.itemsize)) # zeroed at link
-    # timeline = [signal, expected]. Host synchronize waits signal>=expected.
-    # Fence bumps expected; epilogue then signals (expected+1) onto timeline[0], so after a
-    # completed batch [0] is already ahead of [1]. Waiting [0]>=[1] returns immediately and
-    # re-arms queue signals while a prior TinyJit submit is still in flight (prefill hang).
-    # Wait until [0] catches the previous epilogue ([0] >= [1]+1), but skip when [1]==0 so the
-    # first batch does not deadlock before any signal has been written.
-    tv = timeline_value((dev,))
-    one = UOp.const(1, dtypes.uint64)
-    done = timeline((dev,)).after(*last, tv, loop:=UOp.loop(i)).index(0).load()
-    wait = (done < (tv + one)) & (tv != 0)
-    bumped = timeline((dev,)).after(done.end(loop, wait)).index(1).store(nxt:=tv + one)
-    last = (slots.after(bumped).index(off // slots.dtype.itemsize).store(nxt),)
+    # Sched slot holds the value the *previous* epilogue writes to timeline[0]
+    # (timeline_value+1 after that fence bumped [1]). Do not zero slots before the
+    # load — that forced target=0 every run and skipped the wait. Store nxt+1 so the
+    # next fence waits past the already-visible [0] from the last completed batch
+    # (storing only nxt matched the stale [0] and still raced on TinyJit multi-submit).
+    target = slots.after(*last, tv:=timeline_value((dev,))).index(off // slots.dtype.itemsize).load()
+    done = timeline((dev,)).after(target, loop:=UOp.loop(i)).index(0).load()
+    bumped = timeline((dev,)).after(done.end(loop, done < target)).index(1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
+    last = (slots.after(bumped).index(off // slots.dtype.itemsize).store(nxt + UOp.const(1, dtypes.uint64)),)
 
   # re-arm the signals
   for sig in sigs:

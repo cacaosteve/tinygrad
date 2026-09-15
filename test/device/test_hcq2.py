@@ -159,9 +159,8 @@ class TestHCQ2Schedule(unittest.TestCase):
 
   def test_jit_multi_submit_no_mid_sync(self):
     # Regression: hcq_fence must not re-arm queue signals while a prior TinyJit submit is still
-    # in flight. Waiting for timeline[0] >= timeline[1] is insufficient because the epilogue
-    # signals expected+1, leaving [0] ahead of [1] so the next fence wait returns immediately
-    # (flash prefill hang on back-to-back submit without a mid sync).
+    # in flight. The sched slot must persist the previous epilogue's timeline[0] target (not be
+    # zeroed before load, and not store only nxt which matches the already-visible [0]).
     x = self.input()
     f = TinyJit(lambda a: chain(a, 65).realize())
     for _ in range(3):
