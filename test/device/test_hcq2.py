@@ -158,9 +158,9 @@ class TestHCQ2Schedule(unittest.TestCase):
           self.assertEqual(out.tolist(), [2 + n] * 4)
 
   def test_jit_multi_submit_no_mid_sync(self):
-    # Regression: hcq_fence must not re-arm queue signals while a prior TinyJit submit is still
-    # in flight. Sched slot must: (1) start zero without per-run zero-before-load, (2) store the
-    # previous epilogue's timeline[0] target (nxt+1), not nxt which matches the already-visible [0].
+    # Regression: host fence re-arms queue signals; must wait for the prior TinyJit submit's
+    # timeline before re-arm. The UOp spin in hcq_fence can be optimized into a no-op, so
+    # exec_hcq performs a Python _wait_signal (flash prefill hang without it).
     x = self.input()
     f = TinyJit(lambda a: chain(a, 65).realize())
     for _ in range(3):

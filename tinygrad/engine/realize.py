@@ -203,6 +203,13 @@ def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
     addrs = [cast(Buffer, _resolve(u, ctx.input_uops).buffer).get_buf(dev) + off for u, dev, off in info.inputs]
     cast(Buffer, call.src[1 + info.table].buffer).host.view(fmt='Q')[:] = array.array('Q', addrs)
   ctx = replace(ctx, var_vals={**ctx.var_vals, **{k: v for d in info.device for k, v in cast(Any, Device[d]).var_vals.items()}})
+  # Serialize against prior GPU work before the host fence re-arms queue signals. The UOp spin
+  # inside hcq_fence is compiled to a CPU kernel that can hoist the timeline load and skip the
+  # wait, which hangs TinyJit multi-submit of long kernels (flash prefill).
+  for device in info.device:
+    d = cast(Any, Device[device])
+    tl = d.timeline.host.view(fmt='Q')
+    d._wait_signal(tl, int(tl[1]))
   ets = exec_kernel(ctx, call, ast, devices=(Device[info.device[0]].host,))
   for host, dev in info.host_deps: Device[host].pending[Device[dev]] = Device[dev].timeline.host.view(fmt='Q')[1]
   if not (ctx.wait or PROFILE): return ets
