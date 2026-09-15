@@ -331,12 +331,17 @@ def hcq_fence(ctx:EncodeCtx, f:UOp) -> UOp:
   for i, dev in enumerate(ctx.devs):
     slots, off = unwrap_view(lasts[i])
     slots = patch(slots, [], bytes(slots.max_numel() * slots.dtype.itemsize)) # zeroed at link
-    # Wait on timeline[1] (issued count), not the sched_timeline slot. Host synchronize already
-    # keys off timeline[1]; the slot can be 0 across TinyJit multi-submit while timeline[1] is
-    # correct, which skipped this wait, re-armed in-flight queue signals, and hung long kernels.
+    # timeline = [signal, expected]. Host synchronize waits signal>=expected.
+    # Fence bumps expected, then epilogue signals (expected+1) onto timeline[0].
+    # After a completed batch, [0] is already ahead of [1], so waiting for [0]>=[1]
+    # returns immediately and re-arms queue signals while the previous TinyJit submit
+    # is still in flight (prefill hang). Wait for the previous epilogue write instead:
+    # [0] >= [1]+1. First batch ([1]==0) uses target 0 so we do not deadlock.
     tv = timeline_value((dev,))
-    done = timeline((dev,)).after(*last, tv, loop:=UOp.loop(i)).index(0).load()
-    bumped = timeline((dev,)).after(done.end(loop, done < tv)).index(1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
+    zero, one = UOp.const(0, dtypes.uint64), UOp.const(1, dtypes.uint64)
+    target = tv.eq(zero).where(zero, tv + one)
+    done = timeline((dev,)).after(*last, tv, target, loop:=UOp.loop(i)).index(0).load()
+    bumped = timeline((dev,)).after(done.end(loop, done < target)).index(1).store(nxt:=tv + one)
     last = (slots.after(bumped).index(off // slots.dtype.itemsize).store(nxt),)
 
   # re-arm the signals

@@ -158,9 +158,10 @@ class TestHCQ2Schedule(unittest.TestCase):
           self.assertEqual(out.tolist(), [2 + n] * 4)
 
   def test_jit_multi_submit_no_mid_sync(self):
-    # Regression: hcq_fence waited on the sched_timeline slot (can read 0) instead of timeline[1],
-    # skipped the wait, re-armed in-flight queue signals, and hung the next host synchronize on long
-    # TinyJit schedules (e.g. flash prefill) when two submits ran back-to-back without a mid sync.
+    # Regression: hcq_fence must not re-arm queue signals while a prior TinyJit submit is still
+    # in flight. Waiting for timeline[0] >= timeline[1] is insufficient because the epilogue
+    # signals expected+1, leaving [0] ahead of [1] so the next fence wait returns immediately
+    # (flash prefill hang on back-to-back submit without a mid sync).
     x = self.input()
     f = TinyJit(lambda a: chain(a, 65).realize())
     for _ in range(3):
