@@ -331,9 +331,12 @@ def hcq_fence(ctx:EncodeCtx, f:UOp) -> UOp:
   for i, dev in enumerate(ctx.devs):
     slots, off = unwrap_view(lasts[i])
     slots = patch(slots, [], bytes(slots.max_numel() * slots.dtype.itemsize)) # zeroed at link
-    target = slots.after(*last, tv:=timeline_value((dev,))).index(off // slots.dtype.itemsize).load()
-    done = timeline((dev,)).after(target, loop:=UOp.loop(i)).index(0).load()
-    bumped = timeline((dev,)).after(done.end(loop, done < target)).index(1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
+    # Wait on timeline[1] (issued count), not the sched_timeline slot. Host synchronize already
+    # keys off timeline[1]; the slot can be 0 across TinyJit multi-submit while timeline[1] is
+    # correct, which skipped this wait, re-armed in-flight queue signals, and hung long kernels.
+    tv = timeline_value((dev,))
+    done = timeline((dev,)).after(*last, tv, loop:=UOp.loop(i)).index(0).load()
+    bumped = timeline((dev,)).after(done.end(loop, done < tv)).index(1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
     last = (slots.after(bumped).index(off // slots.dtype.itemsize).store(nxt),)
 
   # re-arm the signals

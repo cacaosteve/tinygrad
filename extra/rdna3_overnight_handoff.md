@@ -10,10 +10,10 @@ Tip: **`b05eac9ce`** (CI green); docs tip may be ahead.
 
 ### HCQ2=1 TinyJit multi-submit (root cause narrowed)
 
-- **Not** general TinyJit / not graph coalescing: matmul batch50 OK; decode batch2/50 OK when GPU clean; **prefill batch≥2 hangs** (HIP + DIRECT). `JIT=2` (no `graph_split_rewrite`) still hangs on prefill.
-- **Smoking gun:** prefill `submit(); time.sleep(2); submit(); sync` **OK**; `submit(); submit(); sync` **hangs**. So `hcq_fence` host wait does **not** reliably wait for prior GPU work before re-arming signals — race bites long kernels (prefill ~ms) more than short (decode ~tens of µs).
-- **HCQ2=0:** HIP prefill batch works (~358 µs @50). No `AMDRenderer` under HCQ2=0 → DIRECT needs HCQ2=1.
-- After a hang, GPU stays poisoned until process death + recover; later decode batches can fail too.
+- Prefill batch≥2 hung; decode/matmul OK when clean. `submit(); sleep(2); submit()` OK; back-to-back hung.
+- **Cause:** `hcq_fence` waited on sched_timeline **slot** (can read 0) instead of **`timeline[1]`** (issued count used by `Device.synchronize`). Skipped wait → re-armed in-flight queue signals → GPU hang on long schedules.
+- **Fix (in tree):** wait on `timeline[1]` before re-arm; regression test `test_jit_multi_submit_no_mid_sync`. **Needs HW verify** (gaming PC currently unreachable).
+- **HCQ2=0:** HIP prefill batch works; no `AMDRenderer` under HCQ2=0.
 
 ### GEMM→flash
 
@@ -130,8 +130,7 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 ## Next
 
-1. **HCQ2 `hcq_fence` race** — host wait before signal re-arm fails for long prefill schedules; sleep gap works. Likely timeline[0]/[1] / wait target bug in `tinygrad/runtime/support/hcq2.py` `hcq_fence` (post `#18094` host syncs). Reboot GPU then re-measure decode batch50 fair.
-2. Prefill fair: sync-each or HCQ2=0 (HIP only) until fence fixed; DIRECT needs HCQ2=1.
-3. Decode gap leftovers + prefill priv 128 (once fair method stable).
-4. Fork-only; tip **`b05eac9ce`**; CI green.
+1. **HCQ2 `hcq_fence` fix landed (untested on HW):** wait on `timeline[1]` (issued) instead of sched_timeline slot. Reboot/restore gaming PC → verify prefill TinyJit batch2/50; remeasure fair decode+prefill.
+2. Decode gap leftovers + prefill priv 128 once fair method works.
+3. Fork-only; tip pending push after fence fix.
 
