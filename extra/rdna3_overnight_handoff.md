@@ -1,7 +1,8 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`277f88bfc`** (`hcq_fence` wait on timeline[1]; needs HW verify).
+Tip: **review-fix tip pending** — LDS 2addr deps, prefill SKIP after compile_env, MIDSTORE cache key.
+Fence tip **`56270ce80`** / **`277f88bfc`**: mock test passes with old *and* new fence — **does not prove HW hang fixed**; wait also broadens to device latest issued (check latency on HW).
 
 ## Status (2026-09-14 re-baseline)
 
@@ -130,7 +131,8 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 ## Next
 
-1. **HCQ2 `hcq_fence` fix landed (untested on HW):** wait on `timeline[1]` (issued) instead of sched_timeline slot. Reboot/restore gaming PC → verify prefill TinyJit batch2/50; remeasure fair decode+prefill.
-2. Decode gap leftovers + prefill priv 128 once fair method works.
-3. Fork-only; tip pending push after fence fix.
+1. **Review fixes landed:** LDS 2addr dependency-safe schedule; prefill reads SKIP inside `_flash_direct_compile_env`; `k_midstore` in `_amd_flash_attention` cache key. Tests: `test_lload_2addr_*`, `test_prefill_acc_work_ignores_decode_sticky_skip`, `test_flash_k_midstore_is_cache_key`.
+2. **HCQ2 fence HW validate** (mock insufficient): prefill TinyJit batch2/50 + latency vs pre-fix; paired fair DIRECT vs HIP.
+3. Freeze comparable timings → resume prefill (priv 128 / MOV/scratch). Decode gap small.
+4. Fork-only; no upstream PRs.
 

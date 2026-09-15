@@ -2661,12 +2661,19 @@ def _hoist_lloads_before_extracts(ops:list[UOp]) -> list[UOp]:
   return out
 
 
+def _lload_addr_depends_on(consumer:UOp, producer:UOp) -> bool:
+  """True if consumer's LLOAD address (base/idx) uses producer in its SSA."""
+  for s in consumer.src[:2]:
+    if s is producer or producer in s.toposort(): return True
+  return False
+
 def _schedule_lload_2addr_pairs(ops:list[UOp]) -> list[UOp]:
   """Within each LLOAD streak, order fusible 8-byte pairs adjacent for ds_load_2addr_b64.
 
   Flash PACK_F16 often schedules offs as 0,16,24,8 — only one adjacent pair can fuse.
   Reordering to [o,o+8,...] doubles 2addr opportunities when dest VGPRs are consecutive.
-  AMD_LDS_2ADDR=0 opts out.
+  Only moves a partner earlier when it does not depend on intervening LLOADs (stable,
+  dependency-safe — never sort by Python object id). AMD_LDS_2ADDR=0 opts out.
   """
   if not getenv("AMD_LDS_2ADDR", 1): return ops
   out: list[UOp] = []
@@ -2682,31 +2689,28 @@ def _schedule_lload_2addr_pairs(ops:list[UOp]) -> list[UOp]:
       j += 1
     streak = ops[i:j]
     if len(streak) >= 2:
-      # Greedy: emit (off, off+8) pairs with same base+idx first, then leftovers.
-      unused = set(range(len(streak)))
+      # Left-to-right: keep relative order; only advance an off+8 partner when independent.
+      used = [False] * len(streak)
       ordered: list[UOp] = []
-      def key(k:int):
-        s = streak[k]
-        return (id(s.src[0]), id(s.src[1]), _lds_byte_off(s))
-      for a in sorted(unused, key=key):
-        if a not in unused: continue
+      for a in range(len(streak)):
+        if used[a]: continue
         sa = streak[a]
-        if _elem_count(sa) * sa.dtype.itemsize != 8:
-          ordered.append(sa)
-          unused.remove(a)
-          continue
-        off = _lds_byte_off(sa)
-        partner = next((b for b in unused if b != a and streak[b].src[0] is sa.src[0] and
-                        streak[b].src[1] is sa.src[1] and
-                        _elem_count(streak[b]) * streak[b].dtype.itemsize == 8 and
-                        _lds_byte_off(streak[b]) == off + 8), None)
+        used[a] = True
         ordered.append(sa)
-        unused.remove(a)
-        if partner is not None:
-          ordered.append(streak[partner])
-          unused.remove(partner)
-      # any remaining (should be empty)
-      ordered.extend(streak[b] for b in sorted(unused))
+        if _elem_count(sa) * sa.dtype.itemsize != 8: continue
+        off = _lds_byte_off(sa)
+        for b in range(a + 1, len(streak)):
+          if used[b]: continue
+          sb = streak[b]
+          if not (sb.src[0] is sa.src[0] and sb.src[1] is sa.src[1] and
+                  _elem_count(sb) * sb.dtype.itemsize == 8 and
+                  _lds_byte_off(sb) == off + 8):
+            continue
+          if any(_lload_addr_depends_on(sb, streak[k]) for k in range(a + 1, b)):
+            continue
+          used[b] = True
+          ordered.append(sb)
+          break
       out.extend(ordered)
     else:
       out.extend(streak)

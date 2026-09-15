@@ -333,4 +333,43 @@ class TestQ8Quantize(unittest.TestCase):
     expected = np.stack([values[:start_pos+i+1].mean(0) for i in range(32)])[None, None].repeat(8, axis=1)
     np.testing.assert_allclose(out.numpy(), expected, rtol=2e-3, atol=2e-3)
 
+  def test_prefill_acc_work_ignores_decode_sticky_skip(self):
+    """Decode leaves AMD_REG_PROMOTE_SKIP_SLOTS=""; prefill must still enable work-copy."""
+    from tinygrad.helpers import getenv
+    from tinygrad.llm.kernels import amd as amd_mod
+    keys = ("AMD_REG_PROMOTE_SKIP_SLOTS", "AMD_FLASH_PREFILL_SKIP_SLOTS", "AMD_FLASH_ACC_WORK",
+            "AMD_FLASH_ACC_SMALL", "AMD_WMMA_ACC_SMALL")
+    old = {k: os.environ.get(k) for k in keys}
+    try:
+      # Simulate decode sticky empty SKIP before prefill policy decision.
+      os.environ["AMD_REG_PROMOTE_SKIP_SLOTS"] = ""
+      os.environ.pop("AMD_FLASH_PREFILL_SKIP_SLOTS", None)
+      os.environ["AMD_FLASH_ACC_WORK"] = "1"
+      os.environ["AMD_FLASH_ACC_SMALL"] = "1"
+      os.environ["AMD_WMMA_ACC_SMALL"] = "0"
+      getenv.cache_clear()
+      use_acc_small = True
+      with amd_mod._flash_direct_compile_env(flash_acc_small=use_acc_small):
+        _skip_reg = {int(s) for s in getenv("AMD_REG_PROMOTE_SKIP_SLOTS", "2").split(",") if s.strip()}
+        use_acc_work = bool(use_acc_small and (2 in _skip_reg) and getenv("AMD_FLASH_ACC_WORK", 1))
+      self.assertEqual(os.environ.get("AMD_REG_PROMOTE_SKIP_SLOTS"), "2")
+      self.assertTrue(use_acc_work)
+    finally:
+      for k, v in old.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+      getenv.cache_clear()
+
+  def test_flash_k_midstore_is_cache_key(self):
+    """In-process MIDSTORE sweeps must not reuse a graph built under a different value."""
+    _amd_flash_attention.cache_clear()
+    o = UOp.placeholder((32, 32, 128), dtypes.float32, 0)
+    q = UOp.placeholder((32, 32, 128), dtypes.float16, 1)
+    kv = UOp.placeholder((2, 1, 8, 64, 128), dtypes.float16, 2)
+    a = _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=1, k_midstore=4)
+    b = _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=1, k_midstore=2)
+    self.assertIsNot(a, b)
+    # Same key hits cache.
+    self.assertIs(a, _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=1, k_midstore=4))
+
 if __name__ == "__main__": unittest.main()

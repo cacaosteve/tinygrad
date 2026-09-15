@@ -721,8 +721,9 @@ def _flash_direct_compile_env(*, flash_acc_small:bool=True):
 
   Prefill: ACC_SMALL remat + ALLOW_UPCAST16=0 + PACK_SLOAD_B128=1 (SPILL 0) + SKIP_SLOTS=2.
   Decode: ALLOW_UPCAST16=1 + PACK_SLOAD off + SKIP_SLOTS= (promote slot 2; ~112µs vs ~134).
-  Policies are sticky for TinyJit (capture sees post-realize env) and are re-applied
-  per path so prefill↔decode order cannot poison the other.
+  ALLOW_UPCAST16 / PACK_SLOAD / SKIP_SLOTS stay sticky for TinyJit capture after realize.
+  Each path re-applies its policy on enter — read those envs only *inside* this context
+  (reading SKIP_SLOTS before enter can see the other path's sticky value).
   """
   prev = os.environ.get("AMD_FLASH_ACC_SMALL")
   prev_remat = os.environ.get("AMD_REMAT_ADDR")
@@ -782,7 +783,7 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
 @functools.cache
 def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None,
                          acc_small:bool=False, k_unroll:int=0, use_acc_work:bool=False,
-                         k_hip_scope:str="all",
+                         k_hip_scope:str="all", k_midstore:int|None=None,
                          phase_dumps: tuple[tuple[str, UOp], ...]=()) -> UOp:
   """Hand flash-attn. Optional phase_dumps=(("qk", buf), ...) for diagnostics.
 
@@ -875,8 +876,12 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   _k_unroll_full = _k_factor == 1
   _k_unroll_factor = _k_factor if _k_factor >= 2 and (D // WMMA_K) % _k_factor == 0 else 0
   # Mid-store every 4 WMMA unlocks full K chain without MMU (~731µs vs ~768 @factor2).
+  # k_midstore is part of the functools.cache key — flash_attention always passes it.
+  # None keeps getenv for direct script calls (not cache-safe across env flips).
   _mid_default = 4 if (_k_unroll_full or _k_hip or _k_factor >= 8) else 0
-  _mid_every = getenv("AMD_FLASH_K_MIDSTORE", _mid_default) if _acc_small else 0
+  if not _acc_small: _mid_every = 0
+  elif k_midstore is None: _mid_every = getenv("AMD_FLASH_K_MIDSTORE", _mid_default)
+  else: _mid_every = k_midstore
   # Factor unroll can be scoped like hip: qk|pv|all (default all when scope unset).
   _factor_scope = (k_hip_scope or getenv("AMD_FLASH_K_HIP_SCOPE", "all")).lower() if _k_unroll_factor else ""
   _factor_qk = bool(_k_unroll_factor) and _factor_scope in ("all", "qk", "q", "")
@@ -1325,12 +1330,16 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
   use_k_unroll = getenv("AMD_FLASH_K_UNROLL", 1) if use_acc_small else 0
   use_k_hip_scope = getenv("AMD_FLASH_K_HIP_SCOPE", "all") if (use_k_unroll == -1 or use_k_unroll >= 1) else "all"
-  # Work-copy (slot 19) only while slot 2 is in SKIP_SLOTS. Promoting slot 2 with the
-  # work-copy active nans; promoting slot 2 alone is the alternate path (see handoff).
-  _skip_reg = {int(s) for s in getenv("AMD_REG_PROMOTE_SKIP_SLOTS", "2").split(",") if s.strip()}
-  use_acc_work = bool(use_acc_small and (2 in _skip_reg) and getenv("AMD_FLASH_ACC_WORK", 1))
+  # Mid-store belongs in the cache key (not a bare getenv inside the cached builder).
+  _mid_default = 4 if (use_k_unroll == -1 or use_k_unroll == 1 or use_k_unroll >= 8) else 0
+  use_k_midstore = int(getenv("AMD_FLASH_K_MIDSTORE", _mid_default)) if use_acc_small else 0
   # Build+realize under ACC_SMALL remat + ALLOW_UPCAST16=0 (must wrap custom_kernel).
+  # Read SKIP_SLOTS only after compile_env re-applies prefill policy (decode leaves sticky "").
   with _flash_direct_compile_env(flash_acc_small=use_acc_small):
+    # Work-copy (slot 19) only while slot 2 is in SKIP_SLOTS. Promoting slot 2 with the
+    # work-copy active nans; promoting slot 2 alone is the alternate path (see handoff).
+    _skip_reg = {int(s) for s in getenv("AMD_REG_PROMOTE_SKIP_SLOTS", "2").split(",") if s.strip()}
+    use_acc_work = bool(use_acc_small and (2 in _skip_reg) and getenv("AMD_FLASH_ACC_WORK", 1))
     if isinstance(T_real, UOp):
       # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
       T_pad = q.max_shape[2]
@@ -1340,7 +1349,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     out = Tensor.empty(B*H, T, D, dtype="float32", device=q.device)
     fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start,
                             acc_small=use_acc_small, k_unroll=use_k_unroll, use_acc_work=use_acc_work,
-                            k_hip_scope=use_k_hip_scope)
+                            k_hip_scope=use_k_hip_scope, k_midstore=use_k_midstore)
     out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
     if q_start is not None: out = out[:, :, :T_real]
     if not use_acc_small: return out

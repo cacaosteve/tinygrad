@@ -2708,6 +2708,49 @@ class TestAMDRenderer(unittest.TestCase):
     os.environ.pop("AMD_BATCH_SLOAD_USE", None)
     getenv.cache_clear()
 
+  def test_lload_2addr_preserves_addr_dependency(self):
+    """LDS 2addr pair schedule must not move LDS[a] before a = LDS[i].
+
+    Old id(base)/id(idx) sort could emit the dependent load first when bases differ
+    (lower id(base) on the consumer) — reproduced here.
+    """
+    from tinygrad.renderer.isa.rdna3 import _schedule_lload_2addr_pairs
+    os.environ["AMD_LDS_2ADDR"] = "1"
+    getenv.cache_clear()
+    # Lower-id consumer base first so object-id sort would put b before a.
+    base_b = UOp.placeholder((256,), dtypes.half, 0, addrspace=AddrSpace.LOCAL)
+    base_a = UOp.placeholder((256,), dtypes.half, 1, addrspace=AddrSpace.LOCAL)
+    idx = UOp.cconst(0, dtypes.int32).rtag()
+    count = UOp.cconst(4, dtypes.int32).rtag()  # half×4 = 8 bytes
+    def lload(name, base, addr_idx):
+      return UOp(Ops.INS, src=(base, addr_idx, count), arg=(AMDOps.LLOAD, dtypes.half),
+                 tag=(Register(name, 0, _cons=amd_lib.VGPR),))
+    a = lload("a", base_a, idx)
+    b = lload("b", base_b, a)  # address depends on a
+    out = _schedule_lload_2addr_pairs([a, b])
+    self.assertLess(out.index(a), out.index(b), "dependent LLOAD must stay after its address producer")
+    os.environ.pop("AMD_LDS_2ADDR", None)
+    getenv.cache_clear()
+
+  def test_lload_2addr_pairs_out_of_order_offs(self):
+    """Independent same-base offs 0,16,24,8 become (0,8),(16,24) without id-sort."""
+    from tinygrad.renderer.isa.rdna3 import _schedule_lload_2addr_pairs
+    os.environ["AMD_LDS_2ADDR"] = "1"
+    getenv.cache_clear()
+    base = UOp.placeholder((256,), dtypes.half, 0, addrspace=AddrSpace.LOCAL)
+    idx = UOp.cconst(0, dtypes.int32).rtag()
+    count = UOp.cconst(4, dtypes.int32).rtag()
+    def lload(name, off):
+      src = (base, idx, count, UOp.cconst(off, dtypes.int32).rtag())
+      return UOp(Ops.INS, src=src, arg=(AMDOps.LLOAD, dtypes.half),
+                 tag=(Register(name, 0, _cons=amd_lib.VGPR),))
+    loads = {off: lload(f"o{off}", off) for off in (0, 16, 24, 8)}
+    out = _schedule_lload_2addr_pairs([loads[o] for o in (0, 16, 24, 8)])
+    # LTR: emit 0 then pull 8 next; then 16 then pull 24.
+    self.assertEqual(out, [loads[0], loads[8], loads[16], loads[24]])
+    os.environ.pop("AMD_LDS_2ADDR", None)
+    getenv.cache_clear()
+
   def test_in_order_emit_disables_optional_motion(self):
     """AMD_IN_ORDER_EMIT must turn off VOPD/WMMA-sink optional emit transforms."""
     from tinygrad.renderer.isa import rdna3 as r
