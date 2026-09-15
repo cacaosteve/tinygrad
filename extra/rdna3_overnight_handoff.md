@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **review-fix tip pending** — LDS 2addr deps, prefill SKIP after compile_env, MIDSTORE cache key.
+Tip: **`8f02f8445`** — LDS 2addr deps, prefill SKIP after compile_env, MIDSTORE cache key.
 Fence tip **`56270ce80`** / **`277f88bfc`**: mock test passes with old *and* new fence — **does not prove HW hang fixed**; wait also broadens to device latest issued (check latency on HW).
 
 ## Status (2026-09-14 re-baseline)
