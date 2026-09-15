@@ -482,14 +482,14 @@ def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp|None: # ctx: a kept link (the jit's
   # device owns the placeholders it names
   if (r:=cast(Buffer|None, dev.pm_bufferize.rewrite(b, ctx=dev))) is not None: pass
   elif not ctx.use_rt:
-    # slots must start zero: hcq_fence loads the sched-timeline target before any store.
-    init = bytes(nbytes) if b.tag == "slots" else None
     spec = BufferSpec(host=b.arg.volatile, uncached=b.arg.volatile, cpu_access=True)
-    r = Buffer(dev.device, b.max_numel(), b.dtype, options=spec, initial_value=init, preallocate=True)
+    r = Buffer(dev.device, b.max_numel(), b.dtype, options=spec, preallocate=True)
   else:
     off = dev.rt_allocator(True, b.arg.volatile).alloc(max(nbytes, 1), alignment=256)
     r = dev.rt_buffer(True, b.arg.volatile).view(b.max_numel(), b.dtype, off).ensure_allocated()
-    if b.tag == "slots": r.host.view(fmt='B')[:nbytes] = bytes(nbytes)
+
+  # slots must start zero: hcq_fence loads the sched-timeline target before any store.
+  if b.tag == "slots": cast(Buffer, r).ensure_allocated().host.view(fmt='B')[:nbytes] = bytes(nbytes)
 
   return UOp.from_buffer(r, HCQ_RUNTIME_DEV.value)
 
