@@ -1,7 +1,7 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`b05eac9ce`** (CI green); docs tip may be ahead.
+Tip: **`277f88bfc`** (`hcq_fence` wait on timeline[1]; needs HW verify).
 
 ## Status (2026-09-14 re-baseline)
 
