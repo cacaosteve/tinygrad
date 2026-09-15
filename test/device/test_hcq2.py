@@ -159,8 +159,8 @@ class TestHCQ2Schedule(unittest.TestCase):
 
   def test_jit_multi_submit_no_mid_sync(self):
     # Regression: hcq_fence must not re-arm queue signals while a prior TinyJit submit is still
-    # in flight. The sched slot must persist the previous epilogue's timeline[0] target (not be
-    # zeroed before load, and not store only nxt which matches the already-visible [0]).
+    # in flight. Sched slot must: (1) start zero without per-run zero-before-load, (2) store the
+    # previous epilogue's timeline[0] target (nxt+1), not nxt which matches the already-visible [0].
     x = self.input()
     f = TinyJit(lambda a: chain(a, 65).realize())
     for _ in range(3):
