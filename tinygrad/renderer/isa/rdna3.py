@@ -2663,8 +2663,8 @@ def _hoist_lloads_before_extracts(ops:list[UOp]) -> list[UOp]:
 
 def _lload_addr_depends_on(consumer:UOp, producer:UOp) -> bool:
   """True if consumer's LLOAD address (base/idx) uses producer in its SSA."""
-  for s in consumer.src[:2]:
-    if s is producer or producer in s.toposort(): return True
+  for addr in consumer.src[:2]:
+    if addr is producer or producer in addr.toposort(): return True
   return False
 
 def _schedule_lload_2addr_pairs(ops:list[UOp]) -> list[UOp]:
