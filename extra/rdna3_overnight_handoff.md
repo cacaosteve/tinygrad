@@ -1,20 +1,23 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`8f02f8445`** — LDS 2addr deps, prefill SKIP after compile_env, MIDSTORE cache key.
-Fence tip **`56270ce80`** / **`277f88bfc`**: mock test passes with old *and* new fence — **does not prove HW hang fixed**; wait also broadens to device latest issued (check latency on HW).
+Tip: **`bbc455a3e`** — hcq_fence waits for prior epilogue (`[0]>=[1]+1`); earlier `277f88bfc` still hung on HW.
 
-## Status (2026-09-14 re-baseline)
+## Status (2026-09-14/15 fence HW)
 
-- Master merge through `#18185`; CI **green** on `b05eac9ce`.
-- Gaming PC synced to tip.
+- Gaming PC up; tip synced; 7900 XTX / `AMDRenderer` confirmed.
+- **`277f88bfc` fence insufficient on HW:** prefill TinyJit batch2 still times out; `sleep(2)` between submits OK.
+- Root cause refined: after a batch, epilogue writes `timeline[0]=expected+1`, so `[0]` is already ahead of `[1]`. Waiting `[0]>=[1]` returns immediately and re-arms in-flight queue signals.
+- **`bbc455a3e`:** wait `[0] >= [1]+1` (target 0 on first batch). Mock HCQ2 6/6. **HW re-check blocked — GPU wedged after hang; needs reboot** (no passwordless sudo for `/sys/class/drm/card1/device/reset`).
 
-### HCQ2=1 TinyJit multi-submit (root cause narrowed)
+### Paired sync-each (pre-wedge, tip `a4b05be10`, n=30)
 
-- Prefill batch≥2 hung; decode/matmul OK when clean. `submit(); sleep(2); submit()` OK; back-to-back hung.
-- **Cause:** `hcq_fence` waited on sched_timeline **slot** (can read 0) instead of **`timeline[1]`** (issued count used by `Device.synchronize`). Skipped wait → re-armed in-flight queue signals → GPU hang on long schedules.
-- **Fix (in tree):** wait on `timeline[1]` before re-arm; regression test `test_jit_multi_submit_no_mid_sync`. **Needs HW verify** (gaming PC currently unreachable).
-- **HCQ2=0:** HIP prefill batch works; no `AMDRenderer` under HCQ2=0.
+| Method | DIRECT | HIP |
+|--|--:|--:|
+| prefill sync-each | **~726 µs** | **~523 µs** |
+| decode sync-each | **~127 µs** | **~116 µs** |
+
+(HIP prefill noisier than older ~342 fair; treat as provisional until post-reboot fence-clean remeasure.)
 
 ### GEMM→flash
 
@@ -131,8 +134,8 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 ## Next
 
-1. **Review fixes landed:** LDS 2addr dependency-safe schedule; prefill reads SKIP inside `_flash_direct_compile_env`; `k_midstore` in `_amd_flash_attention` cache key. Tests: `test_lload_2addr_*`, `test_prefill_acc_work_ignores_decode_sticky_skip`, `test_flash_k_midstore_is_cache_key`.
-2. **HCQ2 fence HW validate** (mock insufficient): prefill TinyJit batch2/50 + latency vs pre-fix; paired fair DIRECT vs HIP.
-3. Freeze comparable timings → resume prefill (priv 128 / MOV/scratch). Decode gap small.
-4. Fork-only; no upstream PRs.
+1. **Reboot gaming PC** (GPU wedged; no passwordless DRM reset). Then HW-validate `bbc455a3e` fence: prefill TinyJit batch2/50 + sync-each paired DIRECT vs HIP (`extra/rdna3_fence_hw_validate.py`).
+2. If fence clean: freeze paired timings → prefill scratch/liveness diagnosis only (no env sweeps).
+3. Decode = validation track (~10% OK → leave). One Llama/GGUF health check per prefill milestone.
+4. Freeze performance, then split renderer. Fork-only; no upstream PRs.
 
