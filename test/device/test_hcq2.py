@@ -79,6 +79,32 @@ class TestHCQ2Deps(unittest.TestCase):
       self.assertEqual(tracker.access_resources([b.shrink(((12, 16),))], [0], 3), [0])
       self.assertEqual(tracker.access_resources([b.shrink(((4, 12),))], [], 4), [1])
 
+  def test_fence_slot_persists_epilogue_target(self):
+    # Codegen property only — does not reproduce the TinyJit/HW re-arm race.
+    # Zeroing the sched slot before the wait load forces target=0 (`done < 0` is a no-op).
+    from tinygrad.runtime.support.hcq2 import EncodeCtx, hcq_fence
+    ctx = EncodeCtx(("CPU",))
+    slots = UOp.placeholder((4,), dtypes.uint64, device="CPU", tag="slots")
+    sig = UOp.placeholder((1,), dtypes.uint64, device="CPU", tag="sig")
+    out = hcq_fence(ctx, UOp.custom_function("hcq_fence", slots.index(0), sig.index(0)))
+    def mem_root(u:UOp) -> UOp:
+      x = u.src[0]
+      while x.op in {Ops.INDEX, Ops.AFTER}: x = x.src[0]
+      return x
+    zeros = [u for u in out.toposort() if u.op is Ops.BINARY and isinstance(u.arg, (bytes, bytearray)) and set(u.arg) <= {0}]
+    slot_loads = [u for u in out.toposort() if u.op is Ops.LOAD and getattr(mem_root(u), "tag", None) == "slots"]
+    slot_stores = [u for u in out.toposort() if u.op is Ops.STORE and getattr(mem_root(u), "tag", None) == "slots"]
+    self.assertEqual(len(slot_loads), 1, "fence must load the persisted sched-slot target once")
+    self.assertFalse(zeros, "per-run zero of the sched slot makes the wait a no-op")
+    self.assertEqual(len(slot_stores), 1, "fence must store the next epilogue target back into the slot")
+    wait = next(u for u in out.toposort() if u.op is Ops.CMPLT)
+    self.assertIs(wait.src[1], slot_loads[0], "wait target must be the slot load, not timeline[1] or 0")
+    # nxt = timeline_value+1; persist nxt+1 (two adds) so the next wait is past the visible epilogue write.
+    def is_one(u:UOp) -> bool:
+      return (u.op is Ops.CONST and u.arg == 1) or any(is_one(s) for s in u.src)
+    adds = [u for u in slot_stores[0].src[1].toposort() if u.op is Ops.ADD and any(is_one(s) for s in u.src)]
+    self.assertGreaterEqual(len(adds), 2)
+
 @unittest.skipUnless(all_devices_in(Device.DEFAULT, HCQ_DEVS), "hcq2 device required")
 class TestHCQ2Schedule(unittest.TestCase):
   @staticmethod
@@ -158,9 +184,8 @@ class TestHCQ2Schedule(unittest.TestCase):
           self.assertEqual(out.tolist(), [2 + n] * 4)
 
   def test_jit_multi_submit_no_mid_sync(self):
-    # Regression: host fence re-arms queue signals; must wait for the prior TinyJit submit's
-    # timeline before re-arm. The UOp spin in hcq_fence can be optimized into a no-op, so
-    # exec_hcq performs a Python _wait_signal (flash prefill hang without it).
+    # Mock-only. Passes without reproducing the hardware TinyJit re-arm race; not a proof.
+    # Slot persistence (previous epilogue target, not a per-run zero) is what the fence relies on.
     x = self.input()
     f = TinyJit(lambda a: chain(a, 65).realize())
     for _ in range(3):

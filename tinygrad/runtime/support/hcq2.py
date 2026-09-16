@@ -328,16 +328,17 @@ def hcq_fence(ctx:EncodeCtx, f:UOp) -> UOp:
 
   # wait for prev schedule to not collide
   # TODO: timeout?
-  # The UOp spin is compiled into a CPU kernel that can hoist the timeline load and become a
-  # no-op under TinyJit multi-submit. exec_hcq runs a real Python _wait_signal before this
-  # host program so re-arm cannot race a prior in-flight submit.
   for i, dev in enumerate(ctx.devs):
     slots, off = unwrap_view(lasts[i])
-    slots = patch(slots, [], bytes(slots.max_numel() * slots.dtype.itemsize)) # zeroed at link
-    tv = timeline_value((dev,))
-    done = timeline((dev,)).after(*last, tv, loop:=UOp.loop(i)).index(0).load()
-    bumped = timeline((dev,)).after(done.end(loop, done < tv)).index(1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
-    last = (slots.after(bumped).index(off // slots.dtype.itemsize).store(nxt),)
+    # Slot holds the value the previous epilogue writes to timeline[0] (timeline_value+1
+    # after that fence bumped [1]). Do not zero the slot before this load — a fresh zero
+    # forces target=0, and `done < 0` is a no-op, so later fences re-arm in-flight signals.
+    # Slots are zeroed once at link. Store nxt+1 so the next fence waits past the already-
+    # visible [0] from the last completed batch (storing only nxt matches that stale [0]).
+    target = slots.after(*last, tv:=timeline_value((dev,))).index(off // slots.dtype.itemsize).load()
+    done = timeline((dev,)).after(target, loop:=UOp.loop(i)).index(0).load()
+    bumped = timeline((dev,)).after(done.end(loop, done < target)).index(1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
+    last = (slots.after(bumped).index(off // slots.dtype.itemsize).store(nxt + UOp.const(1, dtypes.uint64)),)
 
   # re-arm the signals
   for sig in sigs:
@@ -476,6 +477,7 @@ def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp|None: # ctx: a kept link (the jit's
   if b.tag is None: return None # a param, not a placeholder
 
   dev = Device[to_tuple(b.device)[0]]
+  nbytes = b.max_numel() * b.dtype.itemsize
 
   # device owns the placeholders it names
   if (r:=cast(Buffer|None, dev.pm_bufferize.rewrite(b, ctx=dev))) is not None: pass
@@ -483,8 +485,12 @@ def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp|None: # ctx: a kept link (the jit's
     spec = BufferSpec(host=b.arg.volatile, uncached=b.arg.volatile, cpu_access=True)
     r = Buffer(dev.device, b.max_numel(), b.dtype, options=spec, preallocate=True)
   else:
-    off = dev.rt_allocator(True, b.arg.volatile).alloc(max(b.max_numel() * b.dtype.itemsize, 1), alignment=256)
+    off = dev.rt_allocator(True, b.arg.volatile).alloc(max(nbytes, 1), alignment=256)
     r = dev.rt_buffer(True, b.arg.volatile).view(b.max_numel(), b.dtype, off).ensure_allocated()
+
+  # Once, at link: bump-allocated slots are uninitialized, and hcq_fence loads the
+  # previous epilogue target before any store. Do not zero again per fence run.
+  if b.tag == "slots": cast(Buffer, r).ensure_allocated().host.view(fmt='B')[:nbytes] = bytes(nbytes)
 
   return UOp.from_buffer(r, HCQ_RUNTIME_DEV.value)
 
