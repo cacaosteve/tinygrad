@@ -1,38 +1,41 @@
 # Overnight RDNA3
 
 Fork remote only: `tinygrad-cacaosteve` / `codex/rdna3-perf-coverage`.
-Tip: **`bbc455a3e`** — hcq_fence waits for prior epilogue (`[0]>=[1]+1`); earlier `277f88bfc` still hung on HW.
+Tip: **`038c948dc`** — HCQ2 fence proven on HW (slot=`nxt` + one-time link zero + Python wait before re-arm).
 
-## Status (2026-09-14/15 fence HW)
+## Status (2026-09-17 fence HW — DONE)
 
-- Gaming PC up; tip synced; 7900 XTX / `AMDRenderer` confirmed.
-- **`277f88bfc` fence insufficient on HW:** prefill TinyJit batch2 still times out; `sleep(2)` between submits OK.
-- Root cause refined: after a batch, epilogue writes `timeline[0]=expected+1`, so `[0]` is already ahead of `[1]`. Waiting `[0]>=[1]` returns immediately and re-arms in-flight queue signals.
-- **`bbc455a3e`:** wait `[0] >= [1]+1` (target 0 on first batch). Mock HCQ2 6/6. **HW re-check blocked — GPU wedged after hang; needs reboot** (no passwordless sudo for `/sys/class/drm/card1/device/reset`).
+- Gaming PC up (fresh boot earlier); tip synced; 7900 XTX / `AMDRenderer`.
+- **Fence protocol (final):**
+  1. Sched slot loads prior `nxt` (zero once at link — never per-run).
+  2. CPU kernel spins until `timeline[0] >= target`.
+  3. `nxt = timeline[1]+1`; store `nxt` to both `timeline[1]` and the slot.
+  4. `exec_hcq` also Python-`_wait_signal(tl, tl[1])` before the host fence: UOp spin alone still races long flash TinyJit (dual submit → `[n,n+1]`, second kernel hangs; `sleep` between submits works).
+- **`nxt+1` store was wrong** — completed batch leaves `[nxt,nxt]`; waiting for `nxt+1` deadlocks synced warms.
+- **HW proof @ `038c948dc`:** short TinyJit batch10/50/100 no mid-sync OK; DIRECT flash batch2/50/100 OK (~753/692 µs/call @50/100); HIP flash batch2/50/100 OK; outputs finite + stable checksum.
 
-### Paired sync-each (pre-wedge, tip `a4b05be10`, n=30)
+### Frozen paired sync-each (tip `038c948dc`, n=30, fresh process)
 
 | Method | DIRECT | HIP |
 |--|--:|--:|
-| prefill sync-each | **~726 µs** | **~523 µs** |
-| decode sync-each | **~127 µs** | **~116 µs** |
+| prefill sync-each | **~724 µs** (best ~716) | **~361 µs** (best ~337) |
+| decode sync-each | **~128 µs** (best ~125) | **~119 µs** (best ~115) |
+| prefill TinyJit batch50 | **~753 µs/call** | **~397 µs/call** |
+| prefill TinyJit batch100 | **~692 µs/call** | **~298 µs/call** |
 
-(HIP prefill noisier than older ~342 fair; treat as provisional until post-reboot fence-clean remeasure.)
+Prefill gap ~2.0× sync-each / ~1.9× batch50. Decode ~7% — validation track.
 
 ### GEMM→flash
 
-- Previously MMU when GPU already poisoned; on clean GPU **GEMM then flash OK**. Treat earlier serial MMU as likely poison/cascade, re-check serial after reboot.
+- On clean GPU **GEMM then flash OK**.
 
-## Headline (post-merge)
+## Headline (historical; pre-fence-clean)
 
 | Method | DIRECT | HIP |
 |--|--:|--:|
 | prefill sync-each (HCQ2=1) | **~622 µs** | **~342 µs** |
 | decode sync-each (HCQ2=1) | **~119 µs** | **~110 µs** |
-| decode batch50 (HCQ2=1, clean) | **~58 µs** (one clean run) | **~63 µs** (earlier clean run) |
-| prefill batch50 (HCQ2=0 HIP only) | n/a | **~358 µs** |
-
-Prefill classic fair still blocked on HCQ2=1. Decode gap on sync-each ~9 µs; batched decode looks much closer (needs clean re-measure after reboot).
+| decode batch50 (HCQ2=1, clean) | **~58 µs** | **~63 µs** |
 
 ## Headline (pre-merge; historical)
 
@@ -134,8 +137,7 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 ## Next
 
-1. **Reboot gaming PC** (GPU wedged; no passwordless DRM reset). Then HW-validate `bbc455a3e` fence: prefill TinyJit batch2/50 + sync-each paired DIRECT vs HIP (`extra/rdna3_fence_hw_validate.py`).
-2. If fence clean: freeze paired timings → prefill scratch/liveness diagnosis only (no env sweeps).
-3. Decode = validation track (~10% OK → leave). One Llama/GGUF health check per prefill milestone.
+1. ~~HW-validate fence + freeze paired timings~~ **DONE @ `038c948dc`**.
+2. **Prefill scratch/liveness** (no env sweeps): slot-2 traffic vs MOV tax; normalize-from-`acc_work` was parked in stash.
+3. Decode = validation track. One Llama/GGUF health check per prefill milestone.
 4. Freeze performance, then split renderer. Fork-only; no upstream PRs.
-
