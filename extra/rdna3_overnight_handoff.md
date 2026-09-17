@@ -144,6 +144,9 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 
 **Landed:** normalize from ACC_WORK (`a2a8fc136`) — correct, cleaner epilogue, fair wash.
 
+**Tried:** carried ACC on **slot 19** (promotable) + ACC_WORK=0: SSTORE/SLOAD **0**, but **SPILL 112 / FILL 45**, priv 96, ~**1487 µs** serial (vs ~690). Correct 13/13 — promote works, LinearScan spill tax dominates intentional slot-2 scratch. Leave SKIP=2 + ACC_WORK.
+
+
 **Still open (no env sweeps):** per-tile slot-2 load/store; MOV/delay_alu/VOPD gap vs HIP (~32 MOV / 119 delay / ~103 VOPD).
 
 ## Next
