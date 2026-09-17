@@ -160,7 +160,7 @@ def stage_wmma_ab_bounce(wmma:UOp, coop:list[UOp]) -> UOp|None:
     # unstaged; mixing with a staged peer breaks expand_broadcast (eye@B IndexError).
     if ab.op is not Ops.INDEX or ab.addrspace != AddrSpace.GLOBAL: return None
     if not any(u in coop for u in ab.toposort() if u.op is Ops.RANGE): return None
-    frag_rns = {rn for rn, _ in wmma.arg[4][i]}
+    frag_rns = {rn for rn, _ in wmma.arg[3][i]}
     frag = list(dict.fromkeys(u for u in ab.toposort() if u.op is Ops.RANGE and u.arg[0] in frag_rns))
     tile = list(dict.fromkeys(u for u in ab.toposort()
       if u.op is Ops.RANGE and u.arg[1] in (AxisType.UPCAST, AxisType.UNROLL) and u.arg[0] not in frag_rns))
@@ -182,7 +182,7 @@ def stage_wmma_ab_bounce(wmma:UOp, coop:list[UOp]) -> UOp|None:
       news.append(staged.contract(*as_up) if as_up else staged)
     changed = True
   if not changed: return None
-  _in0, _in1, out0 = wmma.arg[4]
+  _in0, _in1, out0 = wmma.arg[3]
   return wmma.replace(src=(news[0], news[1], wmma.src[2]), arg=(*wmma.arg[:4], ((), (), out0)))
 
 def stage_wmma_ab_tid(wmma:UOp, coop:list[UOp]) -> UOp|None:
@@ -201,7 +201,7 @@ def stage_wmma_ab_tid(wmma:UOp, coop:list[UOp]) -> UOp|None:
     if not any(u in coop for u in ab.toposort() if u.op is Ops.RANGE): return None
     buf, stride = ab.src[0], _index_row_stride(ab)
     if stride is None: return None
-    frag_rns = {rn for rn, _ in wmma.arg[4][i]}
+    frag_rns = {rn for rn, _ in wmma.arg[3][i]}
     frag = list(dict.fromkeys(u for u in ab.toposort() if u.op is Ops.RANGE and u.arg[0] in frag_rns))
     tile = list(dict.fromkeys(u for u in ab.toposort()
       if u.op is Ops.RANGE and u.arg[1] in (AxisType.UPCAST, AxisType.UNROLL) and u.arg[0] not in frag_rns))
@@ -252,7 +252,7 @@ def stage_wmma_ab_tid(wmma:UOp, coop:list[UOp]) -> UOp|None:
     news.append(read.contract(*as_up) if as_up else read)
     changed = True
   if not changed: return None
-  _in0, _in1, out0 = wmma.arg[4]
+  _in0, _in1, out0 = wmma.arg[3]
   return wmma.replace(src=(news[0], news[1], wmma.src[2]), arg=(*wmma.arg[:4], ((), (), out0)))
 
 def stage_wmma_ab_to_local(wmma:UOp) -> UOp|None:
@@ -270,7 +270,7 @@ _WMMA_AB_WIDTH = 16
 # Product-8 is OK with batch 2 + disjoint LLOAD/PACK pools. Product-16 under LDS still spills /
 # mis-lives without stronger live-range constraints than AFTER provides.
 
-def expand_wmma_lds_tiles(u, a, b, c, done_arg, unroll_axis, ctx):
+def expand_wmma_lds_tiles(u, a, b, c, done_arg, unroll_axis, out0, sizes):
   # Shared AMDRenderer / AMDLLVMRenderer hook for TC_LDS_AB WMMA expansion: pre-contracted
   # STACK(16*tile,) is sliced per tile here. Staging only runs when the renderer installs
   # pm_stage_wmma_ab and TC_LDS_AB is set; import of this module wires the codegen hook.
@@ -296,4 +296,4 @@ def expand_wmma_lds_tiles(u, a, b, c, done_arg, unroll_axis, ctx):
         batch.append(u.replace(src=(aa, bb, c_stk), arg=done_arg))
     wmmas.extend(batch)
     prev_batch = UOp.stack(*batch)
-  return unroll_axis(ctx, UOp.stack(*wmmas).reshape(ta, tb, c_stk.max_numel()), u.arg[4][2])
+  return unroll_axis(UOp.stack(*wmmas).reshape(ta, tb, c_stk.max_numel()), out0, sizes)
