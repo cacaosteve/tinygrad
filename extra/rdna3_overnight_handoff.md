@@ -135,9 +135,20 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 - Gaming PC SSH briefly unreachable mid-loop (2026-09-09 ~04:52 PDT); tip docs pushed; resume HW probes when back.
 - Gaming PC `69.57.221.45` unreachable since ~04:52 PDT (ping/SSH network unreachable); small leftovers exhausted; next HW probe ready: FMA_MIX_EXP accept WHERE(EXP2,0) without peel.
 
+## Prefill scratch/liveness (post-fence)
+
+**Attribution @ `a2a8fc136`:** SPILL/FILL=0. Scratch is slot-2 only.
+- After normalize-from-`acc_work`: IR SLOAD **40→8**, SSTORE 64, ELF ~1885 insn, MOV **558**, delay_alu **0**, VOPD **0**, priv 128.
+- MOV sources (IR): 128 EXTRACT, 80 MOV←MOV, 40 FMAC, plus MAX/MUL/EXP2; long machine runs up to 64; ~94 movs in broadcast runs (same src).
+- Fair sync-each after normalize: DIRECT **~720 µs** (wash vs frozen ~724). Serial PERF ~689.
+
+**Landed:** normalize from ACC_WORK (`a2a8fc136`) — correct, cleaner epilogue, fair wash.
+
+**Still open (no env sweeps):** per-tile slot-2 load/store; MOV/delay_alu/VOPD gap vs HIP (~32 MOV / 119 delay / ~103 VOPD).
+
 ## Next
 
 1. ~~HW-validate fence + freeze paired timings~~ **DONE @ `038c948dc`**.
-2. **Prefill scratch/liveness** (no env sweeps): slot-2 traffic vs MOV tax; normalize-from-`acc_work` was parked in stash.
-3. Decode = validation track. One Llama/GGUF health check per prefill milestone.
+2. Prefill: attack MOV tax or per-tile scratch (not env sweeps). Decode = validation.
+3. One Llama/GGUF health check per prefill milestone.
 4. Freeze performance, then split renderer. Fork-only; no upstream PRs.
