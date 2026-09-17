@@ -188,7 +188,7 @@ class TestHCQ2Schedule(unittest.TestCase):
 
   def test_jit_multi_submit_no_mid_sync(self):
     # Mock-only. Passes without reproducing the hardware TinyJit re-arm race; not a proof.
-    # Slot persistence (previous epilogue target, not a per-run zero) is what the fence relies on.
+    # Sched slot persists prior nxt; long kernels also need exec_hcq's Python timeline wait.
     x = self.input()
     f = TinyJit(lambda a: chain(a, 65).realize())
     for _ in range(3):
