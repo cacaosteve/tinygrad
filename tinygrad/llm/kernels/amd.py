@@ -1257,6 +1257,9 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   if dumps and "pv" in dumps:
     pv_acc = pv_acc.after(UOp.group(*_pv_logical_stores(dumps["pv"], pv_acc)))
   ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
+  # When ACC_WORK is on, normalize from the last tile's VGPR work copy so the epilogue
+  # does not reload slot-2 scratch (writeback still feeds the next n_tile iter).
+  acc_work_final: UOp|None = None
   if _fu & 4 and getenv("AMD_FLASH_ACC_UNROLL", 1):
     # Const-index acc update. Slot 2 stays unpromoted (REDUCE-carried); soft/stats promote.
     acc_c = acc.after(n_tile)
@@ -1272,6 +1275,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
       else:
         writeback = UOp.group(*[acc_c[ri, rj].store(work[ri, rj]) for ri in range(TM) for rj in range(TD)])
       n_tile_end = writeback.barrier().end(n_tile)
+      acc_work_final = work.after(n_tile_end)
     else:
       acc_up = UOp.group(*[acc_c[ri, rj].store(acc_c[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
                            for ri in range(TM) for rj in range(TD)])
@@ -1290,10 +1294,12 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         acc_stores.append(da[block_bh, block_m, qrow, dcol].store(acc[ri, rj]))
     acc = acc.after(UOp.group(*acc_stores))
   # Fuse normalize into the global store — avoid writing scaled acc back through slot-2 scratch.
+  # Prefer ACC_WORK VGPRs when present so we also skip the epilogue scratch reload.
+  acc_out = acc_work_final if acc_work_final is not None else acc
   inv_l = (1 / l_i).reshape(TM, 1).expand(TM, TD)
   o = o.reshape(WAVES_M, TM, LANES_PER_WAVE_M, 1, WAVES_N, TD, LANES_PER_WAVE_N, 1) \
     .permute((0, 4, 2, 6, 1, 3, 5, 7)).reshape(THREADS_PER_BLOCK, TM, TD)
-  return o[tid].store(acc * inv_l).end(wave_m, wave_n, lane).end(block_m, block_bh).sink(arg=KernelInfo(opts_to_apply=()))
+  return o[tid].store(acc_out * inv_l).end(wave_m, wave_n, lane).end(block_m, block_bh).sink(arg=KernelInfo(opts_to_apply=()))
 
 def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
