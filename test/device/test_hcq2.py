@@ -99,11 +99,14 @@ class TestHCQ2Deps(unittest.TestCase):
     self.assertEqual(len(slot_stores), 1, "fence must store the next epilogue target back into the slot")
     wait = next(u for u in out.toposort() if u.op is Ops.CMPLT)
     self.assertIs(wait.src[1], slot_loads[0], "wait target must be the slot load, not timeline[1] or 0")
-    # nxt = timeline_value+1; persist nxt+1 (two adds) so the next wait is past the visible epilogue write.
+    # Persist nxt = timeline_value+1 (one +1). nxt+1 deadlocks once timeline is [nxt, nxt].
     def is_one(u:UOp) -> bool:
       return (u.op is Ops.CONST and u.arg == 1) or any(is_one(s) for s in u.src)
     adds = [u for u in slot_stores[0].src[1].toposort() if u.op is Ops.ADD and any(is_one(s) for s in u.src)]
-    self.assertGreaterEqual(len(adds), 2)
+    self.assertEqual(len(adds), 1)
+    self.assertIs(slot_stores[0].src[1], next(u for u in out.toposort()
+      if u.op is Ops.STORE and getattr(mem_root(u), "tag", None) == "timeline").src[1],
+      "slot must store the same nxt written to timeline[1]")
 
 @unittest.skipUnless(all_devices_in(Device.DEFAULT, HCQ_DEVS), "hcq2 device required")
 class TestHCQ2Schedule(unittest.TestCase):

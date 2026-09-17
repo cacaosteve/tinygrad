@@ -330,15 +330,14 @@ def hcq_fence(ctx:EncodeCtx, f:UOp) -> UOp:
   # TODO: timeout?
   for i, dev in enumerate(ctx.devs):
     slots, off = unwrap_view(lasts[i])
-    # Slot holds the value the previous epilogue writes to timeline[0] (timeline_value+1
-    # after that fence bumped [1]). Do not zero the slot before this load — a fresh zero
-    # forces target=0, and `done < 0` is a no-op, so later fences re-arm in-flight signals.
-    # Slots are zeroed once at link. Store nxt+1 so the next fence waits past the already-
-    # visible [0] from the last completed batch (storing only nxt matches that stale [0]).
+    # Slot holds the previous fence's nxt (what that epilogue writes to timeline[0]).
+    # Do not zero before load — that forces target=0 and makes the wait a no-op.
+    # Slots are zeroed once at link. Store nxt (not nxt+1): after a completed batch
+    # timeline is [nxt, nxt], so the next fence must wait for nxt.
     target = slots.after(*last, tv:=timeline_value((dev,))).index(off // slots.dtype.itemsize).load()
     done = timeline((dev,)).after(target, loop:=UOp.loop(i)).index(0).load()
     bumped = timeline((dev,)).after(done.end(loop, done < target)).index(1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
-    last = (slots.after(bumped).index(off // slots.dtype.itemsize).store(nxt + UOp.const(1, dtypes.uint64)),)
+    last = (slots.after(bumped).index(off // slots.dtype.itemsize).store(nxt),)
 
   # re-arm the signals
   for sig in sigs:
