@@ -11,6 +11,7 @@ class Register:
   name: str
   index: int
   _cons: tuple[Register, ...] = field(default_factory=tuple)
+  # vreg size represents the area an instructions output occupies, not necessarily the entire register
   size: int = 8
   _cons_hash: int = field(init=False, repr=False, compare=False)
   def __post_init__(self): object.__setattr__(self, "_cons_hash", hash(tuple(r.index for r in self._cons)))
@@ -29,8 +30,9 @@ class IselContext:
       return (0, u.arg.slot) if u.arg.addrspace is not None else (1, u.expr)
     self.func_args = sorted([u for u in self.uses if u.op in {Ops.PARAM, Ops.SPECIAL}], key=arg_key)
 
-  def vreg(self, cons:tuple[Register, ...]|Register):
-    return Register(f"v{next(self.reg_n)}", 0, _cons=cons if isinstance(cons, tuple) else (cons,))
+  def vreg(self, cons:tuple[Register, ...]|Register, size:int=0):
+    cons = cons if isinstance(cons, tuple) else (cons,)
+    return Register(f"v{next(self.reg_n)}", 0, cons, size or cons[0].size)
 
 def rdef(u:UOp):
   if u.op in {Ops.NOOP, Ops.AFTER, Ops.BITCAST} and u.src: return rdef(u.src[0])

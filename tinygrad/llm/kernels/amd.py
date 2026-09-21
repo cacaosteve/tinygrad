@@ -2,7 +2,6 @@ from __future__ import annotations
 import contextlib, functools, math, os
 from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
-from tinygrad.device import Buffer
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
@@ -20,7 +19,8 @@ def flash_tile_dims(D:int=128) -> tuple[int, int, int]:
           BLOCK_N // LANES_PER_WAVE_N,
           D // (WAVES_N * LANES_PER_WAVE_N))
 Q4_K, Q5_K, Q6_K, IQ4_XS, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS = 12, 13, 14, 23, 256, 32, 36, 44, 210, 34
-Q6_PADDED, Q6_WORDS = 212, 53  # the 210-byte Q6 blocks are padded to 212 bytes so they are word-addressable
+# Legacy padded Q6 word count kept for unused DIRECT Q6-WMMA helpers; decode uses Q6_BYTES u16 views.
+Q6_WORDS = 53
 QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4}  # bytes per 256-weight block
 AMD_PACKED_U32X4_LOAD = "__builtin_nontemporal_load((const unsigned_int4*){0})"
 AMD_FMA_TO_F16 = "__builtin_amdgcn_fma_mixlo_f16({}, {}, {})"
@@ -35,6 +35,7 @@ def _unbind(v:int|UOp) -> int|UOp: return kernel_var(v.unbind_all()[0]) if isins
 
 @functools.cache
 def amd_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
+  if getenv("DISABLE_AMD_KERNELS"): return False
   # the custom kernels are tuned for RDNA3 (gfx11): the WMMA register layouts don't match gfx12 (RDNA4)
   # or CDNA (MFMA-only, wave64), and the dp4a builtins and 32-lane wave ops aren't portable either.
   if isinstance(device, tuple): device = device[0]
@@ -123,26 +124,17 @@ class Linear(nn.Linear):
     # Only unwrap storage/order-preserving views, then require the exact dequantization expression.
     # This rejects subsequent arithmetic and permutations, including RoPE's concatenated query weights.
     def unwrapped(u:UOp) -> UOp:
-      while u.op in (Ops.RESHAPE, Ops.COPY) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
+      while u.op in (Ops.RESHAPE, Ops.STAGE) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
         u = u.src[0]
       return u
     expected = ggml_data_to_tensor(Tensor(raw), self.in_features * self.out_features, ggml_type)
     if unwrapped(decoded.uop).key != unwrapped(expected.uop).key: return
+    # Q6's 210-byte blocks are only halfword-aligned; keep all formats as zero-copy views of the GGUF storage.
+    word_dtype = dtypes.uint16 if ggml_type == Q6_K else dtypes.uint32
     raw_offset = raw.contiguous_view_offset()
-    assert raw_offset is not None and raw_offset % 4 == 0 and raw.buf_uop.dtype == dtypes.uint8
+    assert raw_offset is not None and raw_offset % word_dtype.itemsize == 0 and raw.buf_uop.dtype == dtypes.uint8
     self.ggml_type = ggml_type
-    # store a typed buffer view: a lazy BITCAST is decomposed into byte-combining ALU before custom-kernel
-    # scheduling and would copy the entire packed weight on every JIT graph
-    if self.ggml_type == Q6_K:
-      # Q6 blocks are 210 bytes, so consecutive blocks are only 2-byte aligned. pad each block to 212 bytes
-      # the kernel can do all its reads as aligned u32 words
-      nbytes, nblocks = raw.max_numel(), raw.max_numel() // Q6_BYTES
-      byte_view = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer).view(nbytes, dtypes.uint8, raw_offset)))
-      padded = byte_view.reshape((nblocks, Q6_BYTES)).pad_to((nblocks, Q6_PADDED)).bitcast(dtypes.uint32)
-      self.weight = padded.clone().reshape(nblocks * Q6_WORDS)
-    else:
-      self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
-        .view(raw.max_numel() * raw.dtype.itemsize // dtypes.uint32.itemsize, dtypes.uint32, raw_offset)))
+    self.weight = Tensor(raw).bitcast(word_dtype).contiguous()
   def __call__(self, x:Tensor) -> Tensor:
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
@@ -178,7 +170,7 @@ def _amd_packed_f16_mul_to_f16(a:UOp, b:UOp, high:int) -> UOp:
   if a.op is Ops.INDEX: a = a.load()
   return UOp(Ops.CUSTOMI, src=(a, b, UOp.const(high, dtypes.uint32)), arg=(AMD_PACKED_F16_MUL_TO_F16, dtypes.float16))
 
-def _amd_load(ptr:UOp, lanes:int|None=None, packed_u32:bool=False) -> UOp:
+def _amd_load(ptr:UOp, lanes:int|None=None, packed_u32:bool=False, stream:bool=False) -> UOp:
   assert ptr.op is Ops.INDEX
   # nontemporal scalar load: streamed weights must not evict the activations/KV cache from L2
   if lanes is None: return ptr.load(arg="nontemporal")
@@ -188,7 +180,7 @@ def _amd_load(ptr:UOp, lanes:int|None=None, packed_u32:bool=False) -> UOp:
   if packed_u32:
     assert lanes == 4 and ptr.dtype is dtypes.uint32
     return UOp(Ops.CUSTOM, src=(shrink,), arg=(AMD_PACKED_U32X4_LOAD, dtypes.uint32))
-  return shrink.load()
+  return shrink.load(arg="nontemporal" if stream else None)
 
 def _load_byte(raw:UOp, base:UOp, offset:UOp) -> UOp: return (raw[base + offset//4] >> ((offset&3)*8).cast(dtypes.uint32)) & 255
 def _half(value:UOp) -> UOp:
@@ -298,25 +290,26 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
         dot = _amd_dp4a(_iq4_bytes(packed, 4*(word_idx//4)), xwords[word_idx], dot)
       d, scale = _iq4_scales(raw, base, subgroup)
       return dot.float() * xd[token, group] * d * scale
-    # the packed rows were padded to 212 bytes (53 words) per 256-block in set_quantized: everything is word-aligned
-    base = (output*in_features//GGML_BLOCK_SIZE+block)*Q6_WORDS
-    # Issue packed-weight VMEM first so the decode scheduler can burst raw reads before activations/scales.
-    lows = tuple(_amd_load(raw[base + (subgroup//4)*16 + (subgroup%2)*8 + half*4], 4) for half in range(2))
-    highs = tuple(_amd_load(raw[base + 32 + (subgroup//4)*8 + half*4], 4) for half in range(2))
+    # Read GGUF's 210-byte Q6 blocks directly. Odd blocks are not u32-aligned, so assemble words from two u16 loads.
+    base = (output*in_features//GGML_BLOCK_SIZE+block)*(Q6_BYTES//2)
+    def load_word(offset:UOp) -> UOp:
+      return _amd_load(raw[base+offset], stream=True).cast(dtypes.uint32) | \
+             (_amd_load(raw[base+offset+1], stream=True).cast(dtypes.uint32) << 16)
+    lows = tuple(load_word((subgroup//4)*32 + (subgroup%2)*16 + i*2) for i in range(8))
+    highs = tuple(load_word(64 + (subgroup//4)*16 + i*2) for i in range(8))
     xwords = load_xwords(token, group)
     dots = [UOp.const(0, dtypes.int32)] * 2
     for word_idx in range(8):
       within = (subgroup*32 + word_idx*4)%128
-      low = lows[word_idx//4][word_idx%4] >> ((within//64)*4).cast(dtypes.uint32)
-      high = highs[word_idx//4][word_idx%4] >> ((within//32)*2).cast(dtypes.uint32)
+      low = lows[word_idx] >> ((within//64)*4).cast(dtypes.uint32)
+      high = highs[word_idx] >> ((within//32)*2).cast(dtypes.uint32)
       # 4 values per word: (low nibble) | (2 high bits << 4). values stay positive, so the int8-bitcast/-32 of the
       # naive dequant is skipped and the -32 offset is applied later via the per-16 sums of the quantized inputs
       word = (low & 0x0f0f0f0f) | ((high & 0x03030303) << 4)
       dots[word_idx//4] = _amd_dp4a(word, xwords[word_idx], dots[word_idx//4])
-    scales = [((raw[base + 48 + (subgroup*2+i)//4] >> (((subgroup*2+i)%4)*8).cast(dtypes.uint32)) & 255)
-              .cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(2)]
+    scales = [(raw[base + 96 + subgroup] >> (i*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(2)]
     gsum = [xs[token, group, i].load() * 32 for i in range(2)]
-    return ((dots[0].float() - gsum[0])*scales[0] + (dots[1].float() - gsum[1])*scales[1]) * xd[token, group] * _half(raw[base+52] & 0xffff)
+    return ((dots[0].float() - gsum[0])*scales[0] + (dots[1].float() - gsum[1])*scales[1]) * xd[token, group] * _half(raw[base+104])
   names = {Q4_K: "linear_q4_k", Q5_K: "linear_q5_k", IQ4_XS: "linear_iq4_xs", Q6_K: "linear_q6"}
   return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type])
 
@@ -525,10 +518,10 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     result = result.reshape(*x.shape[:-1], out_features)
     return result if layer.bias is None else result + layer.bias
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
-  if tokens % 16 == 0 and out_features % 16 == 0:
+  # Q6 stays on the decode path: master stores Q6 as u16 GGUF views (not the old 212-byte pad).
+  if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in (Q4_K, Q5_K, IQ4_XS):
     fxn:Callable[..., UOp]
     if layer.ggml_type == IQ4_XS: fxn = functools.partial(_iq4_linear_f16_wmma_kernel, direct_isa=amd_direct_isa(x.device))
-    elif layer.ggml_type == Q6_K: fxn = functools.partial(_q6_linear_f16_wmma_kernel, direct_isa=amd_direct_isa(x.device))
     else: fxn = functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type, direct_isa=amd_direct_isa(x.device))
     extra = (iq4_half_lut(str(x.device)).uop,) if layer.ggml_type == IQ4_XS else ()
     return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop, *extra)

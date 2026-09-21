@@ -84,7 +84,9 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
         flat = fully_flatten(index)
         inferred = dtypes.from_py(flat)
         if not dtypes.is_int(inferred): raise IndexError(f"{index=} contains non-int element")
-        index = self._wrap_uop(UOp._frompy([i+size if i<0 else i for i in flat], inferred, self.device)).reshape(get_shape(index))
+        index_uop = UOp._frompy([i+size if i<0 else i for i in flat], inferred)
+        if index_uop.device != self.device and self.device is not None: index_uop = index_uop.copy_to_device(self.device)
+        index = self._wrap_uop(index_uop).reshape(get_shape(index))
       elif is_adv(index):
         if not dtypes.is_int(index.dtype): raise IndexError(f"index dtype {index.dtype} is not supported")
         if index.device is not None and self.device is not None and index.device != self.device:
@@ -189,7 +191,8 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     if lo < (dt:=to_dtype(dtype)).min or dt.max < hi: raise OverflowError(f"arange [{start}, {stop}) is not representable in dtype {dtype}")
     # NOTE: this matches numpy, torch raises RuntimeError if stop-start and step have different signs
     if (output_len:=ceildiv(stop-start, step)) <= 0: return cls.full((0,), 0, dtype=dtype, buffer=False)
-    return (cls.full((output_len,), step, dtype=dtype, buffer=False)._cumalu(0, Ops.ADD) + (start - step)).cast(dtype)
+    acc_dtype = least_upper_dtype(dt, dtypes.float32) if dtypes.is_float(dt) else dt
+    return (cls.full((output_len,), step, dtype=acc_dtype, buffer=False)._cumalu(0, Ops.ADD) + (start - step)).cast(dtype)
 
   @classmethod
   def linspace(cls, start:int|float, stop:int|float, steps:int, dtype:DTypeLike|None=None) -> Self:
