@@ -75,17 +75,19 @@ spec_shared = PatternMatcher([
   (UPat(Ops.RANGE, src=(UPat(),), allow_any_len=True, name="rng"), lambda rng: isinstance(rng.arg, tuple) and len(rng.arg) >= 2 and \
       all(isinstance(ra, int) for ra in rng.arg[0:-1]) and isinstance(rng.arg[-1], AxisType)),
   (UPat(Ops.INDEX, name="x"), lambda x: len(x.src)>0 and all(dtypes.is_int(y.dtype) or y.base.is_invalid for y in x.src[1:]) or None),
-  # END closes RANGEs
-  (UPat(Ops.END, src=(UPat(),), allow_any_len=True, name="x"), lambda x: all(u.op is Ops.RANGE for u in x.src[1:]) or None),
-  # a loop-ended END requires a trailing bool condition for the backedge (loop again while true)
-  (UPat(Ops.END, src=(UPat(), UPat(Ops.RANGE, dtypes.void), UPat(dtype=dtypes.bool))), lambda: True),
+  # END closes bounded RANGEs around a void effect; it does not discard a value. Conditional loops use BACKEDGE.
+  (UPat(Ops.END, src=(UPat(dtype=dtypes.void),), allow_any_len=True, name="x"),
+   lambda x: x.arg is None and all(u.op is Ops.RANGE and dtypes.is_int(u.dtype) for u in x.src[1:])),
+  # Execute body (discarding its value), then repeat the unbounded loop while the scalar condition is true.
+  (UPat(Ops.BACKEDGE, dtypes.void, src=(UPat(), UPat(Ops.RANGE, dtypes.void), UPat(dtype=dtypes.bool)), name="x"),
+   lambda x: x.arg is None and x.src[2].shape == () and not x.src[2].base.is_invalid),
 
   # PARAM/BUFFER have a size in the arg, no shape input
   (UPat(Ops.PARAM, src=(), name="x"), lambda x: isinstance(x.arg, ParamArg)),
   (UPat(Ops.BUFFER, src=(), name="x"), lambda x: isinstance(x.arg, ParamArg) and x.addrspace in (AddrSpace.REG, AddrSpace.LOCAL)),
 
-  # GROUP of stores (or groups, or NOOPs)
-  (UPat(Ops.GROUP, dtypes.void, src=UPat((Ops.GROUP, Ops.STORE, Ops.NOOP, Ops.INS, Ops.END))), lambda: True),
+  # GROUP combines void effects, not values.
+  (UPat(Ops.GROUP, dtypes.void, src=UPat(dtype=dtypes.void)), lambda: True),
 
   # AFTER on Movement Op, PARAM, BUFFER, ALLOC, STAGE, or another AFTER
   (UPat(Ops.AFTER, src=(UPat(GroupOp.Movement.union({Ops.PARAM, Ops.BUFFER, Ops.ALLOC, Ops.STAGE, Ops.INDEX,
@@ -138,12 +140,13 @@ spec_tensor = PatternMatcher([
   (UPat(Ops.BUFFER, src=(), name="buf"), lambda buf:
    isinstance(buf.dtype, DType) and isinstance(buf.arg.size, int) and is_device(buf.arg.device) and buf.arg.buffer is not None
    if isinstance(buf.arg, ParamArg) and buf.addrspace is AddrSpace.GLOBAL else None),
-  (UPat(Ops.ALLOC, src=(), name="buf"), lambda buf: isinstance(buf.arg, ParamArg) and buf.addrspace is AddrSpace.GLOBAL
+  (UPat(Ops.ALLOC, src=(), name="buf"), lambda buf: isinstance(buf.arg, ParamArg)
+   and buf.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL, AddrSpace.REG)
    and buf.arg.buffer is None and (buf.arg.size is None or isinstance(buf.arg.size, int))
-   and (buf.arg.device is None or is_device(buf.arg.device))),
+   and (buf.arg.device is None or (buf.addrspace is AddrSpace.GLOBAL and is_device(buf.arg.device)))),
 
-  # a Variable is a 0-d ALU BUFFER with a value range and no device
-  (UPat(Ops.BUFFER, src=(), name="buf"), lambda buf: buf.arg.device is None if buf.is_variable else None),
+  # a Variable is a scalar ALU PARAM with a value range and no device
+  (UPat(Ops.PARAM, src=(), name="buf"), lambda buf: buf.arg.device is None if buf.is_variable else None),
 
   # custom function
   (UPat(Ops.CUSTOM_FUNCTION, name="x"), lambda x: isinstance(x.arg, str)),
@@ -196,13 +199,13 @@ spec_program = PatternMatcher([
   (UPat(GroupOp.All-{Ops.CONST}, dtypes.weaks), lambda: False),
 
   # allow special SHRINK of a buffer or its bitcast
-  (UPat(Ops.SHRINK, src=(UPat((Ops.PARAM, Ops.BUFFER, Ops.AFTER)).or_bitcasted(), UPat(), UPat.cvar().or_casted())), lambda: True),
+  (UPat(Ops.SHRINK, src=(UPat((Ops.PARAM, Ops.BUFFER, Ops.ALLOC, Ops.AFTER)).or_bitcasted(), UPat(), UPat.cvar().or_casted())), lambda: True),
 
   # movement ops are not allowed in programs
   (UPat(GroupOp.Movement), lambda: False),
 
   # REG/LOCAL buffer
-  (UPat(Ops.BUFFER, name="x"), lambda x: isinstance(x.arg, ParamArg) and x.addrspace in (AddrSpace.REG, AddrSpace.LOCAL)),
+  (UPat((Ops.BUFFER, Ops.ALLOC), name="x"), lambda x: isinstance(x.arg, ParamArg) and x.addrspace in (AddrSpace.REG, AddrSpace.LOCAL)),
 
   # Invalid is not allowed in program
   (UPat(Ops.CONST, arg=Invalid), lambda: False),
@@ -227,7 +230,8 @@ spec_full = PatternMatcher([
   (UPat(Ops.REWRITE_ERROR, dtypes.void, name="x"), lambda x: isinstance(x.arg, str)),
 
   # codegen may end ranges after gpudims has replaced RANGE with SPECIAL.
-  (UPat(Ops.END, src=(UPat(), UPat()), allow_any_len=True), lambda: True),
+  (UPat(Ops.END, src=(UPat(dtype=dtypes.void), UPat()), allow_any_len=True, name="x"),
+   lambda x: x.arg is None and all(dtypes.is_int(u.dtype) for u in x.src[1:])),
 
   # allow any AFTER
   (UPat(Ops.AFTER, src=(UPat(),), allow_any_len=True), lambda: True),
@@ -241,18 +245,16 @@ spec_full = PatternMatcher([
 spec_kernel_graph = PatternMatcher([
   # sink
   (UPat(Ops.SINK, dtypes.void), lambda: True),
-  # the store of a bound Variable binds it: AFTER(BUFFER, STORE(BUFFER, CONST)) in call args
-  (UPat(Ops.STORE, dtypes.void, (UPat(Ops.BUFFER, name="b"), UPat(Ops.CONST))), lambda b: b.is_variable),
   # const + stack to make vconsts and shape args. a 0-size/bound reduce keeps its const casted
   (UPat(Ops.CONST, src=()), lambda: True),
   (UPat(Ops.CAST, src=(UPat(Ops.CONST, src=()),)), lambda: True),
-  (UPat(Ops.STACK, name="s"), lambda s: all(x.op in (Ops.CONST, Ops.PARAM) or x.is_variable or x.is_bound_var for x in s.src) or None),
+  (UPat(Ops.STACK, name="s"), lambda s: all(x.op in (Ops.CONST, Ops.PARAM) for x in s.src) or None),
   # linear for more kernels (TODO: we should enter non sink calls)
   #(UPat(Ops.LINEAR), lambda: True),
-  # PARAM is caller-provided storage, ALLOC is call-local storage; size is in the arg, no shape input
+  # PARAM is caller-provided storage (or a Variable in the ALU addrspace), ALLOC is call-local storage; size is in the arg, no shape input
   (UPat(Ops.PARAM, src=(), name="x"), lambda x: isinstance(x.arg, ParamArg)),
   (UPat(Ops.BUFFER, name="x"), lambda x: isinstance(x.arg, ParamArg) and
-   (x.arg.buffer is not None if x.addrspace is AddrSpace.GLOBAL else x.addrspace is AddrSpace.ALU)),
+   (x.arg.buffer is not None if x.addrspace is AddrSpace.GLOBAL else x.addrspace in (AddrSpace.LOCAL, AddrSpace.REG))),
   (UPat(Ops.ALLOC, src=(), name="x"), lambda x:
    isinstance(x.arg, ParamArg) and x.addrspace is AddrSpace.GLOBAL and x.arg.buffer is None),
   (UPat(Ops.BITCAST), lambda: True),

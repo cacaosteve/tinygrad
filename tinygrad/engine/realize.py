@@ -1,11 +1,11 @@
 from __future__ import annotations
 from typing import cast, Iterator, Any, Sequence
-import weakref, decimal, array
+import decimal, array
 from dataclasses import dataclass, replace, field
 from tinygrad.helpers import colored, DEBUG, GlobalCounters, ansipad, prod, flatten, Context, to_tuple, tqdm, dedup
 from tinygrad.helpers import diskcache_get, diskcache_put
 from tinygrad.helpers import BEAM, size_to_str, time_to_str, VALIDATE_WITH_CPU, PROFILE, ProfilePointEvent, cpu_events, perf_counter_us, cpu_profile
-from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, AxisType, sym_infer, graph_rewrite, ProgramInfo
+from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, AxisType, sym_infer, graph_rewrite, ProgramInfo, KernelInfo
 from tinygrad.device import Device, Buffer, MultiBuffer, ProfileGraphEntry
 from tinygrad.renderer import Estimates, Renderer
 from tinygrad.codegen import to_program, to_program_cache, to_program_mem_key, to_program_disk_key, to_program_context
@@ -15,7 +15,8 @@ from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
 
 def get_call_arg_uops(call:UOp) -> tuple[UOp, ...]: return tuple(s for s in call.src[1:] if not s.is_bound_var)
 def get_call_var_uops(call:UOp, prg:UOp) -> list[UOp]:
-  bound = {s.src[0].expr: s.src[1].src[1] for s in call.src[1:] if s.is_bound_var}
+  # a bound value is a bare CONST: the Variable states the width
+  bound = {s.expr: UOp.const(s.arg.val) for s in call.src[1:] if s.is_bound_var}
   return [bound.get(v.expr, v) for v in prg.arg.vars]
 
 def get_call_outs_ins(call:UOp) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -37,7 +38,6 @@ def get_call_kernels(call:UOp) -> list[tuple[str, UOp, tuple|None]]:
     kernels:list[tuple[str, UOp, tuple|None]] = [(Device[call.arg.aux.device[0]].host, call, None)]
     return kernels + [(d, call, (name, estimates, key, bufs, io)) for devices,name,estimates,_,key,bufs,io in call.arg.aux.kernels for d in devices]
   ast = call.body
-  if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "graph": return [(to_tuple(ast.device)[0], call, None)]
   if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "validate": return []
   return [(d, call, None) for d in to_tuple(call.src[1].device)]
 
@@ -49,7 +49,6 @@ def get_call_name(call:UOp, bufs:Sequence[Buffer|UOp], var_vals:dict[str, int]|N
   if ast.op is Ops.PROGRAM: return ast.src[0].arg.name
   if ast.op is Ops.STORE: return colored(f"copy {_uop_sz_to_str(arg_uops[0]):>10}, {_dev_str(bufs[0]):>7s} <- {_dev_str(bufs[1]):7s}", "yellow")
   if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "encdec": return colored(f"enc/dec {_uop_sz_to_str(arg_uops[0])}", "yellow")
-  if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "graph": return colored(f"batched {len(ast.src[0].src)}", "cyan")
   raise NotImplementedError("get_call_name is not implemented")
 
 # **************** Stat ****************
@@ -60,7 +59,6 @@ def estimate_uop(call:UOp) -> Estimates:
   if (ast:=call.body).op is Ops.PROGRAM: return ast.src[0].arg.estimates or Estimates()
   if ast.op is Ops.STORE or (ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "encdec"):
     return Estimates(lds=(nbytes:=prod(call.src[1].shape) * call.src[1].dtype.itemsize), mem=nbytes)
-  if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "graph": return get_graph_runtime(ast).estimates
   return Estimates()
 
 first_run_cache:set[bytes] = set()
@@ -112,13 +110,6 @@ def get_runtime(device:str, ast:UOp, cache=True):
   if (runtime:=runtime_cache.get(key:=(ast.key, device))) is None:
     runtime = Device[device].runtime(ast.to_elf())
     if cache: runtime_cache[key] = runtime
-  return runtime
-
-graph_cache:weakref.WeakKeyDictionary[UOp, Any] = weakref.WeakKeyDictionary()
-def get_graph_runtime(ast:UOp, input_uops:tuple[UOp, ...]|None=None):
-  assert ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "graph", "get_graph_runtime should only be called with a graph ast"
-  if (runtime:=graph_cache.get(ast)) is None and input_uops is not None:
-    graph_cache[ast] = runtime = Device[ast.device if isinstance(ast.device, str) else ast.device[0]].graph(ast, input_uops=input_uops)
   return runtime
 
 # **************** run linear ****************
@@ -190,15 +181,6 @@ def exec_validate(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
     for i in prg.arg.outs: np.testing.assert_allclose(dev_bufs[i].ensure_allocated().numpy(), bufs[i].numpy(), rtol=1e-3, atol=1e-3)
   return []
 
-def exec_encdec(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
-  bufs = [cast(Buffer, b.buffer).ensure_allocated() for b in resolve_params(call, ctx.input_uops)]
-  shape, pos_var = tuple(s.val for s in ast.src if s.op is Ops.CONST), ast.variables()[0].expr
-  bufs[0].allocator._encode_decode(bufs[0]._buf, bufs[1]._buf, bufs[2]._buf, [x._buf for x in bufs[3:]], shape, ctx.var_vals[pos_var])
-  return []
-
-def exec_graph(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
-  return [get_graph_runtime(ast, ctx.input_uops)(ctx.input_uops, ctx.var_vals, wait=ctx.wait)]
-
 def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
   if (info:=call.arg.aux).inputs:
     addrs = [cast(Buffer, _resolve(u, ctx.input_uops).buffer).get_buf(dev) + off for u, off, dev in info.inputs]
@@ -254,7 +236,8 @@ def _compile_kernel(x:tuple[int, tuple[UOp, Renderer], dict]) -> tuple[int, UOp]
 def _get_call_to_compile(c:UOp) -> tuple[UOp, Renderer]|None:
   ast = c.body
   # a PROGRAM with a ProgramInfo and a BINARY is already compiled
-  if ast.op is Ops.SINK or (ast.op is Ops.PROGRAM and not (isinstance(ast.arg, ProgramInfo) and ast.src[-1].op is Ops.BINARY)):
+  if (ast.op is Ops.SINK and isinstance(ast.arg, KernelInfo)) or \
+     (ast.op is Ops.PROGRAM and not (isinstance(ast.arg, ProgramInfo) and ast.src[-1].op is Ops.BINARY)):
     return ast, Device[c.device if isinstance(c.device, str) else c.device[0]].renderer
   return None
 
@@ -299,16 +282,14 @@ def lower_and_compile(linear:UOp, verbose=True) -> UOp:
   return linear.substitute({c: c.replace(src=(c.body.substitute({a[0]: to_program_cache[keys[c]]}), *c.src[1:])) for c, a in ar.items()},
                            name="precompile kernels")
 
+from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link, HCQInfo # noqa: E402 # down here, hcq2 imports realize
+
 pm_exec = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.STORE, name="ast"),), name="call", allow_any_len=True), exec_copy),
   (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="ast"),), name="call", allow_any_len=True),
    lambda ctx, call, ast: exec_hcq(ctx, call, ast) if isinstance(call.arg.aux, HCQInfo) else exec_kernel(ctx, call, ast)),
-  (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="encdec", name="ast"),), name="call", allow_any_len=True), exec_encdec),
-  (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="graph", name="ast"),), name="call", allow_any_len=True), exec_graph),
   (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="validate", name="ast"),), name="call", allow_any_len=True), exec_validate),
 ])
-
-from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link, HCQInfo # noqa: E402 # down here, hcq2 imports realize
 
 def compile_linear(linear:UOp, beam:int|None=None, validate=False, input_uops:list[UOp]|None=None, profile:bool|None=None, cache=False) -> UOp:
   if validate: linear = graph_rewrite(linear, pm_validate, name="validate", walk=True)

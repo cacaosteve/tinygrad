@@ -115,7 +115,8 @@ class LinearScanRegallocContext:
       loop_end = ren.loop_end(u)
       pinned = set()
       for s in u.src:
-        if loop_end is not None: continue
+        # HACK: cause of later hacks to lower range
+        if loop_end is not None or u.op is Ops.BACKEDGE: continue
         if not isinstance(v:=greg(s), Register): continue
         # Remat usually rebuilds at every use; keep_remat ops reuse the phys reg.
         if self.wide and v in self.remat and not ren.keep_remat(self.vdef(v)): live.pop(v, None)
@@ -184,7 +185,8 @@ class LinearScanRegallocContext:
           live_in[v] = live[v]
         live_ins.append(live_in)
 
-      if loop_end is not None:
+      # loop epilogue, reload registers that were live at loop entry
+      if loop_end is not None or u.op is Ops.BACKEDGE:
         # loop-carried restores need exact phys regs
         for v,r in live_ins.pop().items():
           if v not in live or live[v] != r: live[v] = fill(v, i, (r,), pin=False)
@@ -317,6 +319,6 @@ def regalloc_rewrite(ctx:LinearScanRegallocContext, x:UOp):
   return nx, before + [nx] + after
 
 pm_regalloc_rewrite = PatternMatcher([
-  (UPat({Ops.INS, Ops.RANGE, Ops.END, Ops.BUFFER, Ops.PARAM, Ops.SPECIAL, Ops.SHRINK, Ops.LOAD, Ops.STORE} | PSEUDO_OPS, name="x"),
+  (UPat({Ops.INS, Ops.RANGE, Ops.END, Ops.BACKEDGE, Ops.BUFFER, Ops.PARAM, Ops.SPECIAL, Ops.SHRINK, Ops.LOAD, Ops.STORE} | PSEUDO_OPS, name="x"),
         regalloc_rewrite),
 ])

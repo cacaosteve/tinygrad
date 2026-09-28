@@ -135,7 +135,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             if DEBUG >= 3:
               print(f"MATVEC: {k.full_shape=} {first_reduce_rng.render()} {MV_BLOCKSIZE=} {MV_THREADS_PER_ROW=} {MV_ROWS_PER_THREAD=}")
             try:
-              if MV_THREADS_PER_ROW > 1: k.apply_opt(Opt(OptOps.SPLIT, k.axes_of(AxisType.REDUCE)[0], (MV_THREADS_PER_ROW, AxisType.GROUP_REDUCE)))
+              if MV_THREADS_PER_ROW > 1: k.apply_opt(Opt(OptOps.SPLIT, k.axes_of(AxisType.REDUCE)[0], (MV_THREADS_PER_ROW, AxisType.LOCAL)))
             except KernelOptError: pass
             if MV_BLOCKSIZE > 1: k.apply_opt(Opt(OptOps.SPLIT, global_idx, (MV_BLOCKSIZE, AxisType.LOCAL)))
             if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.SPLIT, global_idx, (MV_ROWS_PER_THREAD, AxisType.UPCAST)))
@@ -154,7 +154,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   if kernel_name != "flash_decode_combine" and resolve(prod(k.full_shape[i] for i in k.upcastable_dims) <= group_limit, False):
     for axis, sz in itertools.product(k.axes_of(AxisType.REDUCE)[:3], (16,)):
       try:
-        k.apply_opt(Opt(OptOps.SPLIT, axis, (sz, AxisType.GROUP_REDUCE, True)))
+        k.apply_opt(Opt(OptOps.SPLIT, axis, (sz, AxisType.LOCAL, True)))
         break
       except KernelOptError: pass
 

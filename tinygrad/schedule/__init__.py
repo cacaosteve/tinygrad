@@ -1,8 +1,11 @@
 import time, inspect
 from collections import deque
+from dataclasses import dataclass, field, replace
+from tinygrad.dtype import AddrSpace
+from tinygrad.uop.ops import GroupOp, remove_all_tags
 from tinygrad.uop.ops import UOp, Ops, UOpMetaClass, rewrite_group, graph_rewrite, gate_kernel_sink, KernelInfo
 from tinygrad.uop.spec import type_verify, spec_tensor
-from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, pluralize, SCACHE, BASEDIR, partition, dedup
+from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, pluralize, SCACHE, BASEDIR, partition, dedup, all_int, VIZ
 
 # **** schedule linearizer
 
@@ -81,6 +84,7 @@ def create_schedule(sched_sink:UOp) -> UOp:
 from tinygrad.schedule.memory import memory_plan_rewrite
 from tinygrad.engine.realize import capturing, pm_flatten_linear
 from tinygrad.schedule.prepare import prepare_rangeify
+from tinygrad.schedule.multi import multi_pm
 from tinygrad.schedule.rangeify import get_kernel_graph
 from tinygrad.helpers import CAPTURING
 from tinygrad.uop.ops import PatternMatcher, UPat
@@ -92,21 +96,23 @@ def create_new_buffer(ctx:tuple[dict[UOp, UOp], tuple[UOp, ...]], b:UOp):
   return ret
 
 pm_post_sched_cache = PatternMatcher([
-  # only resolve buffer PARAMs (slot>=0); ALU/shape vars use slot=-1 and must not be swapped for call args
+  # Resolve positional arguments outside kernel bodies; free Variables have slot -1.
   (UPat(Ops.PARAM, name="x"), lambda ctx,x: ctx[1][x.arg.slot] if x.arg.slot >= 0 else None),
   # bind ALLOCs to fresh BUFFERs for this invocation
   (UPat(Ops.ALLOC, src=(), name="b"), create_new_buffer),
 ])
 
-def resolve_linear_call(linear_call:UOp, outer_binds:dict[str, UOp]|None=None):
+def resolve_linear_call(linear_call:UOp, outer_binds:dict[int, UOp]|None=None):
   linear = graph_rewrite(linear_call.body, pm_post_sched_cache, ctx=({}, linear_call.src[1:]), walk=True, name="params to buffers")
   # nested LINEAR calls are lexical scopes: their positional params shadow the enclosing scope, while calls without
   # scalar args (e.g. precompiled allreduce) inherit it
   binds = {**(outer_binds or {}),
-           **{f"p{i}":x.src[0].replace(op=Ops.PARAM) for i,x in enumerate(linear_call.src[1:]) if x.is_bound_var}}
+           **{i:x.unbound() if x.is_variable else x for i,x in enumerate(linear_call.src[1:])
+              if x.op is Ops.PARAM and x.addrspace is AddrSpace.ALU}}
   def apply_binds(si:UOp) -> UOp:
     if si.op is Ops.CALL and si.body.op is Ops.LINEAR: return resolve_linear_call(si, binds)
-    subs = {v:binds[v.expr] for v in si.variables() if v.expr in binds}
+    if si.op is Ops.CALL and si.body.op is Ops.PROGRAM: return si  # compiled parameters already have ABI slots
+    subs = {v:binds[v.arg.slot] for v in si.variables() if v.arg.slot in binds}
     return si.replace(src=tuple(s.substitute(subs, name="resolve scalar params") for s in si.src))
   return linear.replace(src=tuple(apply_binds(si) for si in linear.src))
 
@@ -179,8 +185,91 @@ pm_copy_from_store = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.SINK, name="ast"),), allow_any_len=True), assert_all_same_devices),
 ])
 
+# **** callify: transform a tensor graph into a CALL UOp such that all state is properly scoped
+
+@dataclass
+class CallifyCtx:
+  replacements: list[UOp] = field(default_factory=list)
+  allocs: dict[UOp, UOp] = field(default_factory=dict)
+  views: set[UOp] = field(default_factory=set)
+  stores: list[UOp] = field(default_factory=list)
+
+def contiguous_mops_to_view(ctx:CallifyCtx|None, c:UOp, src:UOp):
+  """MOPS(BUFFER) → SHRINK when movement ops collapse to a contiguous range."""
+  if not all_int(c.shape): return None
+  buf = src.base
+  while buf.op is Ops.BITCAST: buf = buf.src[0].base
+  if buf.op is Ops.UNSHARD:
+    if isinstance(c.device, str): return None
+    if (unshard := graph_rewrite(src, multi_pm, name="multi_buffer_view")).op is not Ops.UNSHARD: return None
+    view = contiguous_mops_to_view(ctx, unshard.src[0], unshard.src[0])
+    return None if view is None else view.unshard(unshard.arg, unshard.src[1:])
+
+  if buf.op is not Ops.BUFFER or (cv := src.contiguous_view()) is None or cv[0].op is not Ops.BUFFER: return None
+  buf, offset = cv
+  view = buf[offset:offset + src.max_numel() * src.element_size() // buf.element_size()].bitcast(src.dtype)
+  if ctx is not None: ctx.views.add(view)
+  view = view.reshape(c.shape)
+  return c.replace(src=(view,)+c.src[1:]) if c.op in {Ops.COPY, Ops.STORE} else view
+
+def is_store_after(u:UOp) -> bool:
+  return u.op is Ops.AFTER and (u.src[0].unsharded_base.op is not Ops.ALLOC or u.src[1].op is Ops.STORE)
+
+def collect_stores(ctx:CallifyCtx, u:UOp):
+  if is_store_after(u): ctx.stores.append(u)
+
+# NOTE: scheduling rewrites belong in prepare; only storage/interface normalization belongs here.
+pm_callify_ctx_collect = PatternMatcher([
+  # fold MOPS+BITCAST over BUFFER into SHRINK when movement ops collapse to contiguous range
+  (UPat((Ops.COPY, Ops.STAGE), src=(UPat(GroupOp.Movement|{Ops.BITCAST}, name="src"),), name="c"), contiguous_mops_to_view),
+  (UPat(Ops.STORE, src=(UPat(Ops.BITCAST, name="src"), UPat()), name="c", allow_any_len=True), contiguous_mops_to_view),
+
+  # Collect effects after their sources have been rewritten, without entering call bodies.
+  (UPat(Ops.AFTER, name="u"), collect_stores),
+])
+
+# ALLOCs get canonical scope-local id slots here so structurally identical calls hash identically for the
+# schedule cache (fresh slots are all positive from the global counter; negative slots are already canonical)
+def canonicalize_alloc(ctx:CallifyCtx, b:UOp):
+  if b.arg.slot >= 0 and b not in ctx.allocs: ctx.allocs[b] = b.replace(arg=replace(b.arg, slot=-1-len(ctx.allocs)))
+  return ctx.allocs.get(b)
+
+def canonicalize_call_body(c:UOp):
+  return c.replace(src=(graph_rewrite(c.body, pm_canonicalize_alloc, ctx=CallifyCtx(), bottom_up=True),)+c.src[1:])
+
+pm_canonicalize_alloc = PatternMatcher([
+  # NOTE: lambda for late binding, canonicalize_call_body references pm_canonicalize_alloc
+  (UPat(Ops.CALL, name="c"), lambda c: canonicalize_call_body(c)),
+  (UPat(Ops.ALLOC, src=(), name="b"), canonicalize_alloc),
+])
+
+def replace_input_buffer(ctx:CallifyCtx, b:UOp):
+  ctx.replacements.append(b)
+  return b.param_like(len(ctx.replacements)-1)
+
+pm_replace_buf = PatternMatcher([
+  # replace GLOBAL BUFFERs with PARAMs for cache key normalization (Variables are ALU PARAMs, they don't match this)
+  (UPat(Ops.BUFFER, src=(), name="b"), lambda ctx,b: replace_input_buffer(ctx, b) if b.addrspace is AddrSpace.GLOBAL else None),
+  # replace buffer views (SHRINK/BITCAST) with PARAM (only the views created by contiguous_mops_to_view)
+  (UPat((Ops.SHRINK, Ops.BITCAST), name="b"), lambda ctx,b: replace_input_buffer(ctx, b) if b in ctx.views else None),
+  # replace bound Variables with renamed value-stripped PARAMs for cache key normalization, so different values hit same cache
+  (UPat(Ops.PARAM, name="b"), lambda ctx,b: replace_input_buffer(ctx, b) if b.is_bound_var else None),
+])
+
+def transform_to_call(big_sink:UOp) -> UOp:
+  if VIZ: graph_rewrite(big_sink, PatternMatcher([]), name="View Tensor Graph")
+  if SPEC: type_verify(big_sink, spec_tensor)
+
+  # The tensor replacement map is collected before these rewrites change node identities.
+  graph_rewrite(big_sink, pm_callify_ctx_collect, ctx=(ctx:=CallifyCtx()), name="early transform tensor graph")
+  ret = graph_rewrite(UOp.sink(*ctx.stores), pm_canonicalize_alloc+pm_replace_buf+remove_all_tags, ctx=ctx, bottom_up=True, name="replace bufs")
+  ret = ret.call(*ctx.replacements, precompile=True)
+  if VIZ: graph_rewrite(ret, PatternMatcher([]), name="View Call")
+  return ret
+
 @rewrite_group(lambda _,ret: f"Schedule {pluralize('Kernel', len(ret[0].src))}")
 def create_linear_with_vars(big_sink:UOp) -> tuple[UOp, dict[str, int]]:
+  big_sink = transform_to_call(big_sink)
   # big_sink srcs are all the Tensors
   linear_call = graph_rewrite(big_sink, pm_schedule, name="schedule to linear", enter_calls=True)
 
@@ -196,8 +285,7 @@ def create_linear_with_vars(big_sink:UOp) -> tuple[UOp, dict[str, int]]:
   var_vals: dict[str, int] = {}
   for b in big_sink.src[1:]:
     if b.is_bound_var:
-      v, val = b.unbind()
-      nm = v.expr
+      nm, val = b.expr, b.arg.val
       if nm not in used_vars: continue
       if var_vals.get(nm, val) != val: raise RuntimeError(f"bind mismatch on {nm}, {var_vals[nm]} != {val}")
       var_vals[nm] = val

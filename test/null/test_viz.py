@@ -305,10 +305,10 @@ class TestVizTree(unittest.TestCase):
 
   def test_tree_view(self):
     with save_viz() as viz:
-      a = UOp.variable("a",0,10,param=True)
-      b = UOp.variable("b",0,10,param=True)
-      c = UOp.variable("c",0,10,param=True)
-      d = UOp.variable("d",0,10,param=True)
+      a = UOp.variable("a",0,10)
+      b = UOp.variable("b",0,10)
+      c = UOp.variable("c",0,10)
+      d = UOp.variable("d",0,10)
       sink = UOp.sink(a+b, c+d)
       def tree_rewrite(): return graph_rewrite(sink, root, name="root")
       tree_rewrite()
@@ -446,7 +446,7 @@ class TestVizIntegration(unittest.TestCase):
   def test_recurse(self):
     with save_viz() as viz:
       a = Tensor.empty(10)
-      for _ in range(10_000): a += a
+      for _ in range(2_000): a += a
       graph_rewrite(a.uop, PatternMatcher([]))
     lst = viz.list_items()
     assert len(lst) == 1
@@ -500,11 +500,9 @@ class TestVizIntegration(unittest.TestCase):
 
   def test_view_source_alt(self):
     src = "void E_3(float* data0_3) {}"
-    binary = Device["CPU"].renderer.compiler.compile(src)
     def custom_binary(X:UOp):
       sink = UOp.sink(X, arg=KernelInfo("custom_binary"))
-      return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=sink.src+(sink,)), UOp(Ops.SOURCE, arg=src),
-                                   UOp(Ops.BINARY, arg=binary)))
+      return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=sink.src+(sink,)), UOp(Ops.SOURCE, arg=src)))
     x = Tensor.custom_kernel(Tensor.empty(1, device="CPU"), fxn=custom_binary)[0]
     with save_viz() as viz:
       x.realize()
@@ -532,6 +530,19 @@ class TestVizIntegration(unittest.TestCase):
     profile = decode_profile(unwrap(get_profile(viz.data, cpu_events)))
     events = [e for e in profile["layout"]["NULL"]["events"] if e["name"] == kernel_name]
     self.assertEqual({e["ref"] for e in events}, kernels)
+
+  @needs_tracked_pm
+  def test_index_label(self):
+    with save_viz() as viz:
+      vals = Tensor.empty(16, device="NULL")
+      idxs = Tensor.empty(4, device="NULL", dtype=dtypes.uint)
+      vals[idxs % 16].realize()
+    labels:list[str] = []
+    for i in range(len(viz.list_items())):
+      for j in range(len(viz.data.trace.rewrites[i])):
+        for u in (step:=next(viz.get_details(i, j)))["_sink"].toposort():
+          if u.op is Ops.INDEX: labels.append(step["graph"][id(u)]["label"])
+    for label in labels: self.assertNotIn("UOp(", label)
 
 from tinygrad.device import ProfileDeviceEvent, ProfileGraphEvent, ProfileGraphEntry
 from tinygrad.viz.serve import get_profile

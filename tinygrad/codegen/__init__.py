@@ -32,7 +32,7 @@ from tinygrad.schedule.prepare import pm_mops
 from tinygrad.codegen.late.linearizer import CFGContext, pm_split_ends, pm_add_control_flow, linearize
 from tinygrad.codegen.late.regalloc import LinearScanRegallocContext, pm_regalloc_rewrite
 from tinygrad.codegen.late.coalesce import memory_coalescing, pm_simplify_add_image
-from tinygrad.helpers import all_same, all_int, flatten, argsort, partition
+from tinygrad.helpers import all_same, all_int, argsort, partition
 from tinygrad.uop.ops import _broadcast_shape, identity_element
 from tinygrad.schedule.rangeify import BufferizeOpts
 
@@ -45,12 +45,11 @@ pm_number_params = PatternMatcher([
   (UPat(Ops.PARAM, name="x"), do_number_param),
 ])
 
-def build_range_map(sink:UOp) -> dict[int, int]:
-  ctx: dict[int, int] = {}
+def build_range_map(sink:UOp) -> dict[tuple[int, ...], int]:
+  ctx: dict[tuple[int, ...], int] = {}
   for x in sink.toposort():
-    # TODO: the AxisType is arg[-1]
-    if x.op is Ops.RANGE and x.arg[1] in {AxisType.UNROLL, AxisType.UPCAST}:
-      ctx[x.arg[0]] = len(ctx)
+    if x.op is Ops.RANGE and x.axis_type in {AxisType.UNROLL, AxisType.UPCAST}:
+      ctx[x.axis_id] = len(ctx)
   return ctx
 
 def expand_reduce(r:UOp):
@@ -77,7 +76,7 @@ def unroll_axis(u:UOp, dims:list[int], sizes:list[int]) -> UOp:
   out = u.unflatten(-1, tuple(sizes))
   return out.permute(argsort([i for i in range(out.ndim) if i not in dims]+dims))
 
-def expand_wmma(ctx:dict[int, int], u:UOp):
+def expand_wmma(ctx:dict[tuple[int, ...], int], u:UOp):
   if u.arg[3] is None: return None
   in0, in1, out0 = [[ctx[rn] for rn,_ in upcast_axes] for upcast_axes in u.arg[3]]
   a, b, c = contract_axis(u.src[0], in0), contract_axis(u.src[1], in1), u.src[2]
@@ -90,7 +89,7 @@ expander = PatternMatcher([
   (UPat(Ops.REDUCE, name="r"), expand_reduce),
   (UPat(Ops.RANGE, name="r"),
    lambda ctx, r: UOp.const(tuple(range(r.vmax+1)), r.dtype) \
-    .reshape(tuple([r.vmax+1 if i == ctx[r.arg[0]] else 1 for i in range(len(ctx))])) if r.arg[0] in ctx else None),
+    .reshape(tuple([r.vmax+1 if i == ctx[r.axis_id] else 1 for i in range(len(ctx))])) if r.axis_id in ctx else None),
   (UPat(Ops.WMMA, name="u"), expand_wmma),
 ])+pm_flatten_range+codegen_mops
 
@@ -163,10 +162,10 @@ devectorizer2 = codegen_mops+pm_mops+PatternMatcher([
   # unpack WMMA
   (UPat(Ops.WMMA, name="u"), do_stack_wmma),
   # stacked INDEX is many INDEX
-  (UPat(Ops.INDEX, src=(UPat((Ops.PARAM, Ops.BUFFER), name="b"), UPat(Ops.STACK, name="s")), name="x"),
+  (UPat(Ops.INDEX, src=(UPat((Ops.PARAM, Ops.BUFFER, Ops.ALLOC), name="b"), UPat(Ops.STACK, name="s")), name="x"),
    lambda b,s,x: UOp.stack(*[x.replace(src=(b,u)) for u in s.src])),
   # INDEX into RESHAPE moves the RESHAPE
-  (UPat(Ops.INDEX, src=(UPat((Ops.PARAM, Ops.BUFFER), name="b"), UPat(Ops.RESHAPE, name="s"))),
+  (UPat(Ops.INDEX, src=(UPat((Ops.PARAM, Ops.BUFFER, Ops.ALLOC), name="b"), UPat(Ops.RESHAPE, name="s"))),
    lambda b,s: b.index(s.src[0]).reshape(s.shape)),
   # RESHAPE a void is removed (hack for AFTER)
   (UPat(Ops.RESHAPE, dtype=dtypes.void, name="x"), lambda x: x.src[0]),
@@ -179,24 +178,21 @@ devectorizer2 = codegen_mops+pm_mops+PatternMatcher([
 ])
 
 def fix_group_for_reduce(x:UOp):
-  reduce_gfr, reduce_r = partition(x.src[1:], lambda u: u.op is Ops.RANGE and u.axis_type == AxisType.GROUP_REDUCE)
+  threads = (AxisType.WARP, AxisType.LOCAL)
+  reduce_gfr, reduce_r = partition(x.src[1:], lambda u: u.op is Ops.RANGE and u.axis_type in threads)
   if len(reduce_gfr) == 0: return None
 
   # NOTE: if there's other locals here, we need them in the buffer too
-  upstream_locals = [u for u in x.toposort() if u.op is Ops.RANGE and u.axis_type in (AxisType.WARP, AxisType.LOCAL)]
+  upstream_locals = [u for u in x.ranges if u.axis_type in threads]
 
   # do only the non grouped reduces early
   ret = x.replace(src=(x.src[0],)+tuple(reduce_r))
   reduce_loop = [x.replace(arg=(x.arg[0]+100, *x.arg[1:-1], AxisType.REDUCE)) for x in reduce_gfr]
-  buf = ret.bufferize(*upstream_locals, *reduce_gfr, arg=BufferizeOpts(reduce_gfr[0].arg[0], AddrSpace.LOCAL)).index(*upstream_locals, *reduce_loop)
+  buf = ret.bufferize(*upstream_locals, *reduce_gfr, arg=BufferizeOpts(None, AddrSpace.LOCAL)).index(*upstream_locals, *reduce_loop)
 
   # do the final reduce (if/barrier are added in gpudims step)
   # NOTE: we remove all horizontal reduces here, they remain in the first reduce
   return buf.reduce(*reduce_loop, arg=(x.arg[0], 0))
-
-@dataclass
-class ReduceContext:
-  acc_num: int = 0
 
 def merge_reduce_ends(sink:UOp):
   # merge ENDs that share the same range and nesting context (only those created by reduce_to_acc)
@@ -218,12 +214,9 @@ def merge_reduce_ends(sink:UOp):
       for e in group: subs[e] = merged
   return sink.substitute(subs) if subs else None
 
-def reduce_ranges_to_acc(ctx:ReduceContext, r:UOp):
-  acc = UOp.placeholder_like(r, ctx.acc_num, AddrSpace.REG)
-  ctx.acc_num += 1
-  topo = r.src[0].toposort()
-  ended_ranges = flatten([x.ended_ranges for x in topo if x.op is Ops.END])
-  input_ranges = tuple(x for x in topo if x.op is Ops.RANGE and x not in r.src[1:] and x not in ended_ranges)
+def reduce_ranges_to_acc(ctx:itertools.count, r:UOp):
+  acc = UOp.alloc_like(r, next(ctx), AddrSpace.REG)
+  input_ranges = tuple(x for x in r.src[0].ranges if x not in r.src[1:])
   acc_init = acc.after(*input_ranges).store(UOp.const(identity_element(r.arg[0], r.dtype)))
   acc_initted = acc.after(acc_init, *r.src[1:])
   inp = r.src[0].reduce(arg=r.arg) if r.arg[1] else r.src[0]
@@ -259,7 +252,7 @@ pm_add_loads = PatternMatcher([
 ])
 
 def add_local_buffer(ctx, x:UOp):
-  buf = UOp.placeholder(x.max_shape, x.dtype, slot=next(ctx), addrspace=x.arg.addrspace)
+  buf = UOp.alloc(x.max_shape, x.dtype, slot=next(ctx), addrspace=x.arg.addrspace)
   return buf.after(buf.index(*x.src[1:]).store(x.src[0]).end(*x.src[1:]))  # barrier via pm_implicit_barriers
 
 pm_add_local_buffers = PatternMatcher([
@@ -310,18 +303,18 @@ def add_raw_barrier(ctx, after:UOp):
 
 def add_war_barrier(end:UOp):
   # a LOCAL buffer stored and loaded in the same loop needs a barrier at the end of the loop body
-  rngs = [r for r in end.src[1:] if r.op is Ops.RANGE and r.axis_type in (AxisType.REDUCE, AxisType.WEAK, AxisType.LOOP) and r.vmax > 0]
+  rngs = [r for r in end.ended_ranges if r.axis_type in (AxisType.REDUCE, AxisType.WEAK, AxisType.LOOP) and r.vmax > 0]
   if not rngs or end.src[0].op is Ops.BARRIER: return None
   sl = end.src[0].backward_slice_with_self
   # only stores that are inside this loop body (not in the backward slice through AFTER chains from other loops)
   store_bufs = {x.buf_uop for x in sl if _is_local_store(x) and any(r in x.ranges for r in rngs)}
   # a load whose buffer matches a local store's buffer is necessarily a local load
-  if not (loads:=[x for x in sl if x.op is Ops.LOAD and x.src[0].buf_uop in store_bufs]): return None
-  return end.replace(src=(UOp(Ops.BARRIER, src=(end.src[0], *loads)),)+end.src[1:])
+  if not any(x.op is Ops.LOAD and x.src[0].buf_uop in store_bufs for x in sl): return None
+  return end.replace(src=(UOp(Ops.BARRIER, src=(end.src[0],)),)+end.src[1:])
 
 pm_implicit_barriers = PatternMatcher([
   (UPat(Ops.AFTER, name="after"), add_raw_barrier),
-  (UPat(Ops.END, name="end"), add_war_barrier),
+  (UPat((Ops.END, Ops.BACKEDGE), name="end"), add_war_barrier),
 ])
 
 def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
@@ -367,11 +360,13 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   if (pm := getattr(ren, "pm_group_reduce", None)) is not None:
     sink = graph_rewrite(sink, pm, name="native group reduce")
 
+  slots = itertools.count(max([u.arg.slot+1 for u in sink.toposort() if u.op in {Ops.BUFFER, Ops.ALLOC}], default=0))
+
   # remove reduce
-  sink = graph_rewrite(sink, codegen_mops+pm_reduce_local, ctx=ReduceContext(), name="remove reduces")
+  sink = graph_rewrite(sink, mop_cleanup+pm_reduce_local, ctx=slots, name="remove reduces")
 
   # add locals
-  sink = graph_rewrite(sink, pm_add_local_buffers, ctx=itertools.count(0), name="add local buffers")
+  sink = graph_rewrite(sink, pm_add_local_buffers, ctx=slots, name="add local buffers")
 
   # add gpu dims (late). this works after devectorize, but it's faster here
   sink = graph_rewrite(sink, pm_add_gpudims, ctx=ren, name="add gpudims")
@@ -466,6 +461,8 @@ pm_linearize_cleanups = PatternMatcher([
    lambda u, gate: ((st:=u.replace(src=u.src[0:2])), [mif:=UOp(Ops.IF, src=(gate, u.src[0])), st, UOp(Ops.ENDIF, src=(mif,))]))
 ])
 
+pm_alloc_to_buf = PatternMatcher([(UPat(Ops.ALLOC, name="x"), lambda x: ((buf:=x.replace(op=Ops.BUFFER)), [buf])),])
+
 # requires lst be toposorted. like graph rewrite, but for lines
 def line_rewrite(lst:list[UOp], pm:PatternMatcher, ctx=None) -> list[UOp]:
   newlst = []
@@ -486,8 +483,9 @@ def _print_compile_stage(prg:UOp, stage:str, st:int, uops:int) -> None:
 def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:
   if DEBUG >= 3 and sink.arg.applied_opts: print(f"{sink.arg.function_name:<25} opts: {sink.arg.applied_opts}")
   stage_st = time.perf_counter_ns()
-  lst = line_rewrite(linearize(sink), pm_linearize_cleanups)
+  lst = line_rewrite(linearize(sink), pm_linearize_cleanups+pm_alloc_to_buf)
   _print_compile_stage(prg, "linearize", stage_st, len(lst))
+  prg = prg.replace(src=(lst[-1],))
   # isa renderers need to allocate registers
   if isinstance(ctx, ISARenderer):
     lin_ctx = ctx.linear_ctx_type(ctx)
@@ -569,9 +567,10 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
     if compile_timing: timings["rewrite_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
     prog_info = ProgramInfo.from_sink(full_sink, renderer.target)
     if isinstance(renderer, ISARenderer):
+      # Instruction selection replaces LOAD/STORE/ALU with INS, so estimate while their meaning is still available.
       stage_st = time.perf_counter_ns()
       if full_sink.arg.estimates is None:
-        full_sink = full_sink.replace(arg=replace(full_sink.arg, estimates=Estimates.from_uops(tuple(full_sink.toposort()), ignore_indexing=True)))
+        full_sink = full_sink.replace(arg=replace(full_sink.arg, estimates=Estimates.from_uops(tuple(linearize(full_sink)), ignore_indexing=True)))
       if compile_timing: timings["estimates_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
       stage_st = time.perf_counter_ns()
       full_sink = graph_rewrite(full_sink, renderer.pre_isel_matcher, ctx=itertools.count(-1, -1), name="pre instruction selection", bottom_up=True)

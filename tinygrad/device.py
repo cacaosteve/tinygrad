@@ -92,7 +92,6 @@ class BufferSpec:
   cpu_access: bool = False
   host: bool = False
   nolru: bool = False
-  zero: bool = False
   external_ptr: int|None = None
 
 class MultiBuffer:
@@ -276,7 +275,7 @@ class Allocator(Generic[DeviceType]):
 
   def free(self, storage:BufferStorage, size:int, options:BufferSpec|None=None):
     spec = options if options is not None else self.default_buffer_spec
-    if LRU and self.lru and not (spec.nolru or spec.zero) and spec.external_ptr is None: self.cache[(size, options)].append(storage)
+    if LRU and self.lru and not spec.nolru and spec.external_ptr is None: self.cache[(size, options)].append(storage)
     else: self.do_free(storage, spec)
 
   def free_cache(self):
@@ -300,7 +299,6 @@ class Allocator(Generic[DeviceType]):
   def _unmap(self, mb): pass  # default no-op; override if _map allocates iface-side state
   def _offset(self, buf, size:int, offset:int): raise NotImplementedError("need offset")
   # def _transfer(self, dest, src, sz:int, src_dev, dest_dev):
-  def _encode_decode(self, bufout, bufin, desc, hist:list, shape:tuple[int,...], frame_pos:int): raise NotImplementedError("need encdec") # optional
 
 class HostAllocator(Allocator):
   def __init__(self, dev): super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
@@ -328,38 +326,6 @@ class HostAllocator(Allocator):
     if Device[buf.device].host != self.dev.host: raise RuntimeError(f"host memory is not on the node of {self.dev.device}")
     return BufferStorage(buf.host.addr)
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
-
-class DepsTracker:
-  def __init__(self):
-    # tracks (offset, end, dep) ranges per base buffer id to handle suballocated buffers correctly.
-    self.w_dependency_map: dict[int, list[tuple[int, int, Any]]] = defaultdict(list)
-    self.r_dependency_map: dict[int, list[tuple[int, int, Any]]] = defaultdict(list)
-
-  @staticmethod
-  def _key(buf:Any) -> tuple[Any, int, int]: return id(buf.base), buf.offset, buf.offset + buf.nbytes
-
-  def access_resources(self, bufs:list[Any], write:list[int], new_dependency:Any):
-    wait_nodes = []
-    for i,buf in enumerate(bufs):
-      key, s, e = self._key(buf)
-      wait_nodes += [dep for st,en,dep in self.w_dependency_map[key] if st < e and s < en]
-      if i in write: wait_nodes += [dep for st,en,dep in self.r_dependency_map[key] if st < e and s < en]
-    for i,buf in enumerate(bufs):
-      key, s, e = self._key(buf)
-      if i in write:
-        for dmap in [self.w_dependency_map, self.r_dependency_map]:
-          kept = []
-          for entry in dmap[key]:
-            st, en, dep = entry
-            if st == en: continue
-            if en <= s or e <= st: kept.append(entry)
-            else:
-              if st < s: kept.append((st, s, dep))
-              if e < en: kept.append((e, en, dep))
-          dmap[key] = kept
-        self.w_dependency_map[key].append((s, e, new_dependency))
-      else: self.r_dependency_map[key].append((s, e, new_dependency))
-    return list({id(x):x for x in wait_nodes}.values())
 
 # **************** for Compiled Devices ****************
 
@@ -420,12 +386,12 @@ class Compiled:
   pm_encode:Any = None
   pm_lower:Any = None
 
-  def __init__(self, device:str, allocator:Allocator, renderers:list[type[Renderer]], runtime:type[Program[Self]]|None, graph=None, arch=None):
+  def __init__(self, device:str, allocator:Allocator, renderers:list[type[Renderer]], runtime:type[Program[Self]]|None, arch=None):
     from tinygrad.renderer import Renderer
     from tinygrad.uop.ops import Ops, UPat, PatternMatcher
     from tinygrad.runtime.support.hcq2 import cfunc_buf
 
-    self.device, self.allocator, self.runtime_t, self.graph, self.renderers = device, allocator, runtime, graph, renderers or [Renderer]
+    self.device, self.allocator, self.runtime_t, self.renderers = device, allocator, runtime, renderers or [Renderer]
     self.device_id, self.arch = (int(idx) if ":" in device and (idx:=device.split(":")[1]).isdigit() else 0), arch
     self.peer_group = getattr(getattr(self, 'iface', None), 'peer_group', device.split(":")[0])
     self.cached_renderer:dict[Any, Renderer] = {}

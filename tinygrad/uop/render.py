@@ -31,6 +31,17 @@ def strip_binary_parens(x:UOp, left:str, right:str, code_for_op) -> str:
   return code_for_op(strip_parens(left) if precedence.get(x.src[0].op,99)<=precedence[x.op] else left, strip_parens(right) if
     precedence.get(x.src[1].op,99)<precedence[x.op] else right)
 
+# marg is ssimplify'd, so a bound can be a node this graph never contained
+def marg_str(ctx, a:sint) -> str: return str(a) if not isinstance(a, UOp) else ctx[a] if a in ctx else a.render()
+
+def render_marg(ctx,x:UOp):
+  if x.op is Ops.PERMUTE: return str(x.marg)
+  if x.op is Ops.FLIP: return str(tuple([i for i,x in enumerate(x.marg) if x]))
+  pieces = []
+  if x.op in {Ops.RESHAPE, Ops.EXPAND}: pieces = [marg_str(ctx, a) for a in x.marg]
+  if x.op in {Ops.PAD, Ops.SHRINK}: pieces = [f"({marg_str(ctx, a[0])}, {marg_str(ctx, a[1])})" for a in x.marg]
+  return f"({','.join(pieces)})" if len(pieces) != 1 else f"({pieces[0]},)"
+
 renderer = PatternMatcher([
   (UPat(Ops.PARAM, name="x"), lambda x: x.arg.name if x.arg.name is not None else f"p{x.arg.slot}"),
   (UPat((Ops.BUFFER, Ops.ALLOC), name="x"), lambda x:
@@ -53,6 +64,9 @@ renderer = PatternMatcher([
   (UPat(GroupOp.Movement, name="x"), lambda ctx,x: f"{ctx[x.src[0]]}.{x.op.name.lower()}({render_marg(ctx, x)})"),
   (UPat(set(syms.keys()), name="x"), lambda ctx,x: strip_binary_parens(x, ctx[x.src[0]], ctx[x.src[1]], lambda a,b: f"({a}{syms[x.op]}{b})")),
   (UPat((Ops.INDEX, Ops.STAGE), name="x"), lambda x, ctx: ''.join([f"[{strip_parens(ctx[y])}]" for y in x.src[1:]])),
+  (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, name="idx"),)), lambda ctx,idx: f"{ctx[idx.src[0]]}{ctx[idx]}"),
+  (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, name="idx"), UPat(name="alt"), UPat(name="gate"))),
+   lambda ctx,idx,alt,gate: f"({ctx[idx.src[0]]}{ctx[idx]} if {ctx[gate]} else {ctx[alt]})"),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"{{{','.join([ctx[y] for y in x.src])}}}"),
   (UPat(GroupOp.All, name="x"), lambda x: str(x)),
 ])
@@ -68,18 +82,8 @@ renderer_infer = PatternMatcher([
 # *** pyrender ***
 
 def srcs(ctx, src): return f"({ctx[src[0]]},)" if len(src) == 1 else f"({', '.join([ctx[x] for x in src])})"
-# marg is ssimplify'd, so a bound can be a node this graph never contained
-def marg_str(ctx, a:sint) -> str: return str(a) if not isinstance(a, UOp) else ctx[a] if a in ctx else a.render()
 
-def render_marg(ctx,x:UOp):
-  if x.op is Ops.PERMUTE: return str(x.marg)
-  if x.op is Ops.FLIP: return str(tuple([i for i,x in enumerate(x.marg) if x]))
-  pieces = []
-  if x.op in {Ops.RESHAPE, Ops.EXPAND}: pieces = [marg_str(ctx, a) for a in x.marg]
-  if x.op in {Ops.PAD, Ops.SHRINK}: pieces = [f"({marg_str(ctx, a[0])}, {marg_str(ctx, a[1])})" for a in x.marg]
-  return f"({','.join(pieces)})" if len(pieces) != 1 else f"({pieces[0]},)"
-
-sugar = {Ops.SINK, Ops.END, Ops.STORE, Ops.LOAD, Ops.SQRT, Ops.INDEX, Ops.REDUCE, Ops.AFTER, Ops.THREEFRY,
+sugar = {Ops.SINK, Ops.END, Ops.BACKEDGE, Ops.STORE, Ops.LOAD, Ops.SQRT, Ops.INDEX, Ops.REDUCE, Ops.AFTER, Ops.THREEFRY,
          Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.BARRIER, Ops.DETACH}
 pm_pyrender_extra = PatternMatcher([
   (UPat(Ops.CONST, src=(), name="x"), lambda x: f"UOp.const({x.val})"),
@@ -141,7 +145,7 @@ def pyrender(ast:UOp) -> str:
   cmap = consumer_map_from_toposort(lst)
   not_rendered = {Ops.CONST}
   always_rendered = {Ops.PARAM, Ops.LOAD, Ops.SPECIAL, Ops.RANGE, Ops.STACK,
-                     Ops.BUFFER, Ops.ALLOC, Ops.COPY, Ops.CALL, Ops.WHERE, Ops.END}
+                     Ops.BUFFER, Ops.ALLOC, Ops.COPY, Ops.CALL, Ops.WHERE, Ops.END, Ops.BACKEDGE}
 
   to_render: set[UOp] = {ast}
   for u in lst:

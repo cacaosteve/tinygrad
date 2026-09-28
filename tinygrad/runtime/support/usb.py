@@ -1,13 +1,12 @@
 from typing import cast
 import ctypes, struct, time, functools, itertools
 from tinygrad.runtime.autogen import libusb, libc
-from tinygrad.helpers import DEBUG, DEV, to_mv, round_up, ceildiv, to_tuple
+from tinygrad.helpers import DEBUG, DEV, to_mv, round_up, ceildiv, to_tuple, flatten
 from tinygrad.dtype import dtypes, DType, AddrSpace
-from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, graph_rewrite
-from tinygrad.engine.realize import pm_flatten_linear
+from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher
 from tinygrad.device import Buffer, BufferSpec
 from tinygrad.runtime.support.hcq2 import HCQ_RUNTIME_DEV, HCQ_DEVS, ccall, cfield, patch, unwrap_view, all_devices_in
-from tinygrad.runtime.support.hcq import MMIOInterface
+from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.runtime.support import c
 
 def alloc_cbuffer(sz:int) -> tuple[ctypes.Array, memoryview]: return (buf:=(ctypes.c_ubyte * sz)()), to_mv(ctypes.addressof(buf), sz)
@@ -235,10 +234,10 @@ def usb_stack(dt:DType, *vals:UOp|int) -> UOp: # stack array for transfer data
   return r.after(*[r.index(i).store(usb_word(v, dt)) for i, v in enumerate(vals)])
 
 def usb_ctrl(h:UOp, rtype:int, req:int, val:UOp|int, idx:UOp|int, data:UOp, n:UOp|int, timeout:int=1000) -> UOp:
-  return ccall(libusb.libusb_control_transfer, h.index(0).load(), rtype, req, val, idx, data, n, timeout)
+  return ccall(libusb.libusb_control_transfer, h.index(0).load(), rtype, req, val, idx, data, n, timeout).cast(dtypes.void)
 
 def usb_bulk(h:UOp, ep:int, data:UOp, n:UOp|int, timeout:int=10000) -> UOp: # NULL actual_length
-  return ccall(libusb.libusb_bulk_transfer, h.index(0).load(), ep, data, n, UOp.const(0, dtypes.uint64), timeout)
+  return ccall(libusb.libusb_bulk_transfer, h.index(0).load(), ep, data, n, UOp.const(0, dtypes.uint64), timeout).cast(dtypes.void)
 
 def usb_poke(h:UOp, addr:UOp, val:UOp) -> UOp: # 0xF0 mode 0: write a dword
   return usb_ctrl(h, 0x40, 0xF0, 0x60 | 0x0F00, 0, usb_stack(dtypes.uint64, addr, val.bitcast(dtypes.uint32).cast(dtypes.uint64)).index(0), 12, 5000)
@@ -264,17 +263,15 @@ def usb_split(nbytes:int, win:int) -> list[tuple[UOp|int, int]]: # (chunk, bytes
 def usb_ins(name:str, *src:UOp|int) -> UOp:
   return UOp(Ops.INS, arg=(name, dtypes.void), src=tuple(s if isinstance(s, UOp) else UOp.const(s, dtypes.uint32) for s in src))
 
-def usb_copy_slicer(ctx:dict[UOp, tuple[int, int]], call:UOp, dst:UOp, src:UOp) -> UOp|None:
-  if (nums:=ctx.get(call)) is None: return None
-
+def usb_copy_slicer(call:UOp, first:int, run:int) -> list[UOp]: # first: chunk id of the copy and of its run
+  dst, src = call.src[1:]
   vram, (host, win), ops = (dst if is_host(src) else src).bitcast(dtypes.uint8), usb_window(call), list[UOp]()
   dev, sram = vram.device, usb_sram(vram.device).getaddr(vram.device)
 
-  # nums: first chunk id of the copy and of its run
   for r, nb in usb_split(host.nbytes(), win):
-    n, va = (i:=usb_word(r, dtypes.uint64)) + nums[0], vram.getaddr(dev) + i * win
+    n, va = (i:=usb_word(r, dtypes.uint64)) + first, vram.getaddr(dev) + i * win
     if is_host(src): # copyin: wait for data, copy, release the half
-      end = sram + (((n - nums[1]) & 1) + 1) * HALF
+      end = sram + (((n - run) & 1) + 1) * HALF
       ins = [usb_ins("wait_eq", end - 4, usb_sentinel(n)), usb_ins("copy", va, end - usb_wire(nb), nb), usb_ins("store", end - 4, 0)]
     else: # copyout: wait for the read, fill sram, send
       ins = [usb_ins("wait", usb_go(dev), n + 1), usb_ins("store", usb_go(dev), 0)]
@@ -282,26 +279,25 @@ def usb_copy_slicer(ctx:dict[UOp, tuple[int, int]], call:UOp, dst:UOp, src:UOp) 
       ins += [usb_ins("store", usb_cq(dev), 0)]
     ins += [usb_ins("store", usb_fence(dev), n + 1)]
     ops += [UOp(Ops.LINEAR, src=tuple(ins)).end(r)] if isinstance(r, UOp) else ins # the full chunks are one ranged block
-  return UOp(Ops.LINEAR, src=tuple(ops))
-pm_usb_copy_slicer = PatternMatcher([
-  (UPat(Ops.CALL, src=(UPat(Ops.STORE), UPat(name="dst"), UPat(name="src")), name="call"), usb_copy_slicer)]) + pm_flatten_linear
+  return ops
 
 def usb_copy_rewriter(s:UOp) -> UOp|None:
   lins = [submit.without_after.src[0] for submit in s.src]
   if not (copies:=[call for lin in lins for call in lin.src if is_staged(call)]): return None
 
   # group copies
-  runs, nums, n = [], {}, 0
+  runs, nums, n = [], list[tuple[int, int]](), 0
   for cin, grp in itertools.groupby(copies, key=lambda call: is_host(call.src[2])):
     hosts, k = list[tuple[UOp, int]](), 0 # (host view, first chunk in the run) per copy
     for call in grp:
       host, win = usb_window(call)
-      nums[call], hosts, k = (n + k, n), hosts + [(host, k)], k + ceildiv(host.nbytes(), win)
+      nums, hosts, k = nums + [(n + k, n)], hosts + [(host, k)], k + ceildiv(host.nbytes(), win)
     runs.append((cin, n, usb_table(hosts, k, win, lins[0].arg[0][0]), k))
     n += k
 
   # rewrite gpu
-  s = graph_rewrite(s, pm_usb_copy_slicer, ctx=nums, name="usb copy slicer")
+  chunks = (usb_copy_slicer(call, *num) for call, num in zip(copies, nums))
+  s = s.substitute({lin: lin.replace(src=tuple(flatten(next(chunks) if is_staged(c) else [c] for c in lin.src))) for lin in lins})
 
   # host side
   # TODO: maybe as cf and then unwrap?
@@ -329,12 +325,13 @@ def usb_reap(h:UOp, xfer:UOp) -> UOp: # poll while pending (0xff); idle transfer
   loop = UOp.range(UOp(Ops.NOOP), next(UOp.unique_num), dtype=dtypes.void, src=(h,))
   events = ccall(libusb.libusb_handle_events_timeout, h.after(loop).index(1).load(), usb_stack(dtypes.uint64, 0, 0).index(0)) # zero timeout
   status = cfield(xfer.after(events), libusb.struct_libusb_transfer, "status").load()
-  return status.end(loop, status.eq(0xff))
+  return events.backedge(loop, status.eq(0xff))
 
 def usb_drained(h:UOp, need:UOp) -> UOp: # wait for fence == need - 1 or need, mod 256. one byte read avoids tearing
   loop, slot = UOp.range(UOp(Ops.NOOP), next(UOp.unique_num), dtype=dtypes.void, src=(h,)), usb_stack(dtypes.uint32)
-  fence = slot.after(usb_ctrl(h.after(loop), 0xC0, 0xE4, usb_fence(h.device).getaddr("CPU"), 0, slot.index(0), 1)).index(0).load()
-  return fence.end(loop, ((need - fence.cast(dtypes.uint64)) & 0xff) > 1)
+  read = usb_ctrl(h.after(loop), 0xC0, 0xE4, usb_fence(h.device).getaddr("CPU"), 0, slot.index(0), 1)
+  fence = slot.after(read).index(0).load()
+  return read.backedge(loop, ((need - fence.cast(dtypes.uint64)) & 0xff) > 1)
 
 def usb_chunk(h:UOp, table:UOp, i:UOp, half:int, run:int) -> UOp: # send chunk i, numbered run + i
   addr, size = table.index(2 * i).load(), table.index(2 * i + 1).load().cast(dtypes.int)
@@ -352,7 +349,7 @@ def usb_chunk(h:UOp, table:UOp, i:UOp, half:int, run:int) -> UOp: # send chunk i
   field = functools.partial(cfield, xfer:=xfer.after(h), libusb.struct_libusb_transfer)
   xfer = xfer.after(field("status").store(0xff), field("length").store(wire.cast(dtypes.uint)),
                     field("buffer").store(stage.getaddr("CPU") + (end - wire).cast(dtypes.uint64)))
-  return ccall(libusb.libusb_submit_transfer, xfer.index(0))
+  return ccall(libusb.libusb_submit_transfer, xfer.index(0)).cast(dtypes.void)
 
 def usb_copyin(h:UOp, table:UOp, n:int, run:int) -> UOp: # pipeline writes through two halves
   h = h.after(usb_drained(h, UOp.const(run + 1, dtypes.uint64))) # both halves must be free
@@ -379,8 +376,8 @@ def usb_copyout(h:UOp, table:UOp, n:int, run:int) -> UOp: # read back through bo
   hi = hi.after(usb_poke(hi, usb_go(h.device).getaddr("CPU"), (i + run + 1).cast(dtypes.uint32)))
   hi = hi.after(usb_bulk(hi, 0x81, stage.index(0), wire))
   hi = hi.after(ccall(libc.memcpy, addr, stage.after(hi).index(0), first.cast(dtypes.uint64)))
-  hi = hi.after(ccall(libc.memcpy, addr + CHUNK, stage.after(hi).index(HALF), second.cast(dtypes.uint64)))
-  return h.after(hi.end(i))
+  done = ccall(libc.memcpy, addr + CHUNK, stage.after(hi).index(HALF), second.cast(dtypes.uint64)).cast(dtypes.void)
+  return h.after(done.end(i))
 
 # lower device memory accesses to USB transfers
 def is_remote(b:UOp) -> bool:

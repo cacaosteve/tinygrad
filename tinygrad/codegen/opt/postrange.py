@@ -9,23 +9,22 @@ from tinygrad.helpers import colored, getenv, DEBUG, NOOPT, round_up, prod, merg
 from tinygrad.helpers import ALLOW_TF32, count, Context
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, check
 from tinygrad.codegen.simplify import pm_flatten_range
-from tinygrad.renderer import Renderer, TensorCore
+from tinygrad.renderer import Renderer
 
-split_targets = {AxisType.UPCAST: (AxisType.GLOBAL, AxisType.LOCAL, AxisType.WEAK), AxisType.UNROLL: (AxisType.REDUCE, AxisType.GROUP_REDUCE),
-                 AxisType.LOCAL: (AxisType.GLOBAL, AxisType.WEAK), AxisType.GROUP_REDUCE: (AxisType.REDUCE,)}
+split_targets = {AxisType.UPCAST: (AxisType.GLOBAL, AxisType.LOCAL, AxisType.WEAK), AxisType.UNROLL: (AxisType.REDUCE, AxisType.LOCAL),
+                 AxisType.LOCAL: (AxisType.GLOBAL, AxisType.WEAK, AxisType.REDUCE)}
 
 class Scheduler:
   def __init__(self, ast:UOp, ren:Renderer):
     self.ast, self.ren = ast, ren
     self.applied_opts = list(self.ast.arg.applied_opts) if self.ast.arg is not None else []
-    self.tensor_core:TensorCore|None = None
-    self.opt_range = count(start=max([x.arg[0] for x in self.rngs], default=0)+1)
+    self.opt_range = count(start=max([x.arg[0] for x in self.ast.backward_slice if x.op is Ops.RANGE], default=0)+1)
 
   @property
   def rngs(self):
     # always in order by axistype. void RANGEs are loops, not opt axes. the DEVICE axis is launched, not an opt axis
     return sorted([u for u in self.ast.backward_slice if u.op is Ops.RANGE and u.dtype is not dtypes.void and u.vmax > 0
-                   and u.axis_type is not AxisType.DEVICE], key=lambda x: (axis_to_pos[x.axis_type],) + x.arg[0:-1])
+                   and u.axis_type is not AxisType.DEVICE], key=lambda x: (axis_to_pos[x.axis_type],) + x.axis_id)
   @property
   def shape_len(self) -> int: return len(self.rngs)
   @property
@@ -36,7 +35,6 @@ class Scheduler:
   def copy(self) -> Scheduler:
     ret = Scheduler(self.ast, self.ren)
     ret.applied_opts = self.applied_opts[:]
-    ret.tensor_core = self.tensor_core
     return ret
 
   def get_optimized_ast(self, name_override:str|None=None) -> UOp:
@@ -63,7 +61,7 @@ class Scheduler:
     if not self.ren.has_local: return
 
     globalizible_rngs = self._globalizable_rngs()
-    rng = [x.replace(arg=x.arg[0:-1]+(AxisType.GLOBAL,)) if x in globalizible_rngs else x for x in self.rngs]
+    rng = [x.replace(arg=x.axis_id+(AxisType.GLOBAL,)) if x in globalizible_rngs else x for x in self.rngs]
 
     self.ast = self.ast.substitute(dict(zip(self.rngs, rng)))
 
@@ -85,7 +83,7 @@ class Scheduler:
     new_rng = UOp.range(amount, next(self.opt_range), new_type, dtype=rng.dtype) if input_new_rng is None else input_new_rng
     replaced_rng = rng.replace(src=(old_sz,))
     sub_axis = (new_rng * old_sz + replaced_rng) if top else (replaced_rng * amount + new_rng)
-    self.ast = self.ast.substitute({rng:sub_axis}, name=f"shift {rng.arg[:-1]} {amount} {str(new_type).split('.')[1].lower()}")
+    self.ast = self.ast.substitute({rng:sub_axis}, name=f"shift {rng.axis_id} {amount} {str(new_type).split('.')[1].lower()}")
     return replaced_rng, new_rng
 
   def ranges_of(self, *axis_type:AxisType) -> list[UOp]: return [r for r in self.rngs if r.axis_type in axis_type]
@@ -102,7 +100,7 @@ class Scheduler:
   def upcastable_dims(self) -> list[int]: return [i for i in self.axes_of(AxisType.GLOBAL, AxisType.LOCAL, AxisType.WEAK) \
                                                   if isinstance(s:=self.full_shape[i], int) and s > 1]
   @property
-  def unrollable_dims(self) -> list[int]: return [i for i in self.reduce_axes if self.axis_types[i] in (AxisType.GROUP_REDUCE, AxisType.REDUCE) \
+  def unrollable_dims(self) -> list[int]: return [i for i in self.reduce_axes if self.axis_types[i] in (AxisType.LOCAL, AxisType.REDUCE) \
                                                   and isinstance(s:=self.full_shape[i], int) and s > 1]
 
   def apply_opt(self, opt:Opt, append_opt:bool=True):
@@ -117,29 +115,28 @@ class Scheduler:
       amt, new_type, top = (*cast(tuple, opt.arg), False)[0:3]
       check(type(amt) is int and (amt == 0 or amt > 1) and isinstance(new_type, AxisType) and new_type in split_targets and isinstance(top, bool),
             f"invalid split arg {opt.arg}")
-      check(not top or new_type is AxisType.GROUP_REDUCE, "top is only for group reduce")
-      if new_type in (AxisType.LOCAL, AxisType.GROUP_REDUCE): check(self.ren.has_local, "locals needed for opt")
+      if new_type is AxisType.LOCAL: check(self.ren.has_local, "locals needed for opt")
 
       if amt == 0: amt = int(rng.vmax+1)
       if new_type is AxisType.UNROLL: check(amt <= 32, "don't unroll more than 32")
       if new_type is AxisType.UPCAST: check(self.ren.target.device == "DSP" or amt <= 16, "don't upcast more than 16")
       # prevents METAL compiler hangs
-      if self.reduceop is not None and (new_type is AxisType.GROUP_REDUCE or self.group_for_reduces):
-        upcast_local_sz = prod([self.full_shape[a] for a in self.axes_of(AxisType.UPCAST, AxisType.WARP, AxisType.LOCAL, AxisType.GROUP_REDUCE)])
+      if self.reduceop is not None and ((new_type is AxisType.LOCAL and opt.axis in self.reduce_axes) or self.group_for_reduces):
+        upcast_local_sz = prod([self.full_shape[a] for a in self.axes_of(AxisType.UPCAST, AxisType.WARP, AxisType.LOCAL)])
         smem_sz = amt*upcast_local_sz*self.reduceop.dtype.itemsize
         check(smem_sz <= self.ren.shared_max, f"exceeds maximum shared memory size: needs {smem_sz}, max {self.ren.shared_max}")
-      if new_type is AxisType.GROUP_REDUCE:
+      if new_type is AxisType.UNROLL or rng.axis_type is AxisType.REDUCE:
         reduces = [u for u in self.reduceops if rng in merge_dicts([r.ranges for r in u.src[1:]])]
-        check(len(reduces) > 0, "cannot GROUP_REDUCE an axis that's not in a REDUCE")
+        check(len(reduces) > 0, f"cannot {new_type.name} an axis that's not in a REDUCE")
         # We currently dont support a group within another rudece, TODO: fix if-contexts
-        from tinygrad.renderer.isa import ISARenderer
-        # ISA allows UNROLL under GROUP_REDUCE (vectorizable inner loop before native lowering).
-        bad: tuple[AxisType, ...] = (AxisType.REDUCE, AxisType.GROUP_REDUCE) if isinstance(self.ren, ISARenderer) else \
-                                    (AxisType.REDUCE, AxisType.UNROLL, AxisType.GROUP_REDUCE)
-        check(not any(u.axis_type in bad for u in reduces[0].ranges),
-          "cannot have a GROUP_REDUCE inside another reduce")
-      if new_type in {AxisType.LOCAL, AxisType.GROUP_REDUCE} and (lpm:=getattr(self.ren, 'local_prod_max', None)) is not None:
-        local_sz = prod([self.full_shape[a] for a in self.axes_of(AxisType.WARP, AxisType.LOCAL, AxisType.GROUP_REDUCE)]) * amt
+        if new_type is AxisType.LOCAL:
+          from tinygrad.renderer.isa import ISARenderer
+          # ISA allows UNROLL under LOCAL reduce groups (vectorizable inner loop before native lowering).
+          bad: tuple[AxisType, ...] = (AxisType.REDUCE,) if isinstance(self.ren, ISARenderer) else (AxisType.REDUCE, AxisType.UNROLL)
+          check(not any(u.axis_type in bad for u in reduces[0].ranges),
+            "cannot have a group inside another reduce")
+      if new_type is AxisType.LOCAL and (lpm:=getattr(self.ren, 'local_prod_max', None)) is not None:
+        local_sz = prod([self.full_shape[a] for a in self.axes_of(AxisType.WARP, AxisType.LOCAL)]) * amt
         check(local_sz <= lpm, f"exceeds maximum local workgroup size: needs {local_sz}, max {lpm}")
       ret = self.shift_to(rng, amt, new_type, top=top)
     elif opt.op is OptOps.TC:
@@ -159,7 +156,7 @@ class Scheduler:
       check(rng.axis_type not in {AxisType.UPCAST, AxisType.UNROLL, AxisType.WARP}, "cannot pad upcasted or warp")
       new_sz = round_up(int(rng.vmax+1), cast(int, opt.arg))
       check(rng.vmax+1 > new_sz//4, "pad adds more than quadruple the work")
-      replaced_rng = UOp.range(new_sz, *rng.arg, dtype=rng.dtype)
+      replaced_rng = rng.replace(src=(rng.src[0].const_like(new_sz),))
       replaces = {rng:replaced_rng}
       valid = replaced_rng < rng.vmax+1
       for b in self.bufs:
@@ -167,15 +164,15 @@ class Scheduler:
       for r in self.reduceops:
         if any(rng in y.ranges for y in r.src[1:]):
           replaces[r] = r.replace(src=(valid.where(r.src[0], UOp.const(identity_element(r.arg[0], r.dtype), r.dtype)),)+r.src[1:])
-      self.ast = self.ast.substitute(replaces, f"padto {rng.arg[:-1]} {opt.arg}")
+      self.ast = self.ast.substitute(replaces, f"padto {rng.axis_id} {opt.arg}")
       ret = replaced_rng
     elif opt.op is OptOps.SWAP:
       check(type(opt.arg) is int and 0 <= opt.arg < self.shape_len, f"invalid swap axis on {opt.arg=} {self.shape_len=}")
       altrng:UOp = self.rngs[cast(int, opt.arg)]
       check(rng.axis_type == AxisType.GLOBAL and altrng.axis_type == AxisType.GLOBAL, "swap only for globals")
-      self.ast = self.ast.substitute({rng:rng.replace(arg=(*altrng.arg[0:-1], rng.axis_type)),
-                                      altrng:altrng.replace(arg=(*rng.arg[0:-1], altrng.axis_type))},
-                                      name=f"swap {rng.arg[:-1]} {altrng.arg[:-1]}", walk=True)
+      self.ast = self.ast.substitute({rng:rng.replace(arg=(*altrng.axis_id, rng.axis_type)),
+                                      altrng:altrng.replace(arg=(*rng.axis_id, altrng.axis_type))},
+                                      name=f"swap {rng.axis_id} {altrng.axis_id}", walk=True)
     else:
       raise KernelOptError(f"unsupported opt {opt.op}")
 
@@ -206,6 +203,7 @@ class Scheduler:
           axis_choices = list(itertools.product(in1_ranges, in0_ranges, red_ranges))
           if not (axis < len(axis_choices)): continue
           axes = list(axis_choices[axis])
+          check(not any(self.rngs[i] in axes[:2] for i in self.reduce_axes), "tensor core N and M can't be contracted")
 
           # do optimizations and save the ranges
           ast, warp, ne = self.ast, UOp.range(tc.threads, -1, AxisType.WARP), {}
@@ -231,7 +229,7 @@ class Scheduler:
             srcs = [x.substitute({ne[a]: ne[b] for a,b in rl.items()}, walk=True) for x,rl in zip(ins, tc.relabel())]
 
             # get upcast axes for the tensor cores
-            base_upcast_axes = [ne[c].arg[0] for c in tc.base_upcast_axes()]
+            base_upcast_axes = [ne[c].axis_id for c in tc.base_upcast_axes()]
             upcast_cnt = [len(f[1]) for f in (tc.frag_a, tc.frag_b, tc.frag_c)]
             # each operand upcasts its first upcast_cnt axes, the axes only A or B upcast are size 1 so the operands broadcast
             tc_upcast_axes = tuple([tuple([(a, 2 if j < cnt else 1) for j,a in enumerate(base_upcast_axes[:max(cnt, *upcast_cnt[:2])])])
@@ -246,7 +244,6 @@ class Scheduler:
             reduce_ranges = [x for x in UOp.sink(*reduceop.src[1:]).toposort() if x.op is Ops.RANGE and x not in [ne[c] for c in ne if c[0] == "k"]]
             if len(reduce_ranges): tc_uop = UOp(Ops.REDUCE, src=(tc_uop,)+tuple(reduce_ranges), arg=(Ops.ADD, 0))
             self.ast = self.ast.substitute({reduceop: tc_uop})
-          self.tensor_core = tc
           return axes
     return None
 
@@ -260,7 +257,7 @@ class Scheduler:
   @property
   def upcasted(self) -> int: return len(self.axes_of(AxisType.UPCAST, AxisType.UNROLL))
   @property
-  def group_for_reduces(self) -> int: return len(self.axes_of(AxisType.GROUP_REDUCE))
+  def group_for_reduces(self) -> int: return len([i for i in self.reduce_axes if self.axis_types[i] in (AxisType.WARP, AxisType.LOCAL)])
 
 def args_from_ast(ast:UOp, dname:str) -> tuple[list[Buffer], dict[str, int]]:
   glbls = sorted([x for x in ast.backward_slice if x.op is Ops.PARAM and x.arg.slot >= 0], key=lambda x: x.arg.slot)

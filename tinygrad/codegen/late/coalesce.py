@@ -27,7 +27,7 @@ def _drop_valid_stmts(valid:UOp, idx:UOp, height:int, width:int) -> list[UOp]:
     # check if idx is out of bound when X is on the wrong side of the bound: X in [c+1, vmax] or [vmin, c-1]
     lo, hi = (c + 1, X.vmax) if is_upper_bound else (X.vmin, c - 1)
     if lo <= hi:
-      fake = UOp.variable(f"fake{i}", lo, hi, X.dtype, param=True)
+      fake = UOp.variable(f"fake{i}", lo, hi, X.dtype)
       subs = [{X: fake}]
       # idx may not have X itself, so also substitute a term of X: v -> fake - (X - v)
       terms = list(X.split_uop(Ops.ADD))
@@ -98,7 +98,8 @@ def store_image(x:UOp, d:UOp) -> UOp:
   # image load/store is always float, a half image converts on store
   def as_float(s:UOp):
     return s.src[0] if x.src[0].dtype is dtypes.half and s.op is Ops.CAST and s.src[0].dtype is dtypes.float else s.cast(dtypes.float)
-  return x.store(UOp.stack(*[as_float(s) for s in d.src]) if d.op is Ops.STACK else as_float(d))
+  lanes = d.src if d.op is Ops.STACK else tuple(d.index(i) for i in range(d.shape[0]))
+  return x.store(UOp.stack(*[as_float(s) for s in lanes]))
 
 pm_simplify_add_image = PatternMatcher([
   (UPat(Ops.SHRINK, src=(UPat(Ops.PARAM, name="buf"), UPat(name="x"), UPat(arg=4))), transform_to_image),
@@ -138,12 +139,12 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       if buf.addrspace == AddrSpace.REG: continue
       if buf.buf_uop.op is Ops.PARAM and buf.buf_uop.arg.volatile: continue # volatile accesses never merge
       idx, valid = idx_u.get_idx(), idx_u.get_valid()
+      if idx.is_invalid: continue
       value_dtype = u.src[1].dtype if u.op is Ops.STORE else u.dtype
       if mem_ok is not None and not mem_ok(f4, float4_safe, buf, value_dtype, u, uses, valid): continue
       root_src: UOp|str
       if idx.op is Ops.ADD and idx.src[1].op is Ops.CONST: root_src, arg = idx.src[0], idx.src[1].val
       elif idx.op is Ops.ADD and idx.src[0].op is Ops.CONST: root_src, arg = idx.src[1], idx.src[0].val
-      elif idx.op is Ops.CONST and idx.val is Invalid: root_src, arg = "INVALID", 0
       elif idx.op is Ops.CONST: root_src, arg = "CONST", idx.val
       else: root_src, arg = idx, 0
       # loads/stores only coalesce with others carrying the same arg (e.g. the nontemporal flag)
@@ -175,18 +176,18 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
         offset = (base+full_grp[0]) if isinstance(base, UOp) else UOp.const(full_grp[0])
         length = [l for l in lengths if l <= len(full_grp) and (not must_divide or offset.divides(l) is not None) and
                   (alignment == 1 or l*buf.dtype.itemsize < 4 or offset.divides(alignment) is not None)][0]
-        grp = full_grp[:length]
+        grp, full_grp = full_grp[:length], full_grp[length:]
+        # NOTE: we apply the valid again after we determine the length
         offset = offset.valid(valid) if valid is not None else offset
         idx = UOp(Ops.SHRINK, src=(buf, offset, UOp.const(len(grp)))) if len(grp) > 1 else buf.index(offset)
         if op == Ops.STORE:
+          assert all(len(offsets[g]) == 1 for g in grp), "attempting multiple stores"
           datas = [offsets[g][0].src[1] for g in grp]
-          assert all(len(offsets[g]) == 1 for g in grp)
           store = idx.store(UOp.stack(*datas) if len(datas) > 1 else datas[0])
           for g in grp: replacements[offsets[g][0]] = store
         else:
           ld = idx.load(arg=ld_arg)
           for i,g in enumerate(grp):
             for oo in offsets[g]: replacements[oo] = ld.index(i) if len(grp) > 1 else ld
-        full_grp = full_grp[length:]
 
   return sink.substitute(replacements, name="memory coalescing")
