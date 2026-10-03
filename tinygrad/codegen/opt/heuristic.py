@@ -39,7 +39,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       # check TC first and apply hand-coded opts if successful
       try: rngs = tk.apply_opt(Opt(OptOps.TC, axis, (TC_SELECT.value, TC_OPT.value, USE_TC.value)))
       except KernelOptError: continue
-      if (fn:=getattr(tk.ren, "apply_tc_hand_opts", None)) is not None: return fn(tk, rngs) or tk
+      if (fn:=getattr(tk.ren, "apply_tc_hand_opts", None)) is not None:
+        # Renderer may refuse after TC shape is applied (e.g. RDNA3 fused float→half CAST).
+        try: return fn(tk, rngs) or tk
+        except KernelOptError: continue
       def split(idx, size, atype): rngs[idx] = tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[idx]), (size, atype)))[0]
       if TC_MIN_GLOBALS: # attempt to upcast M, local N, upcast N, skipping upcast N if we'd end up with too few globals
         if (size:=next(filter(lambda sz: rngs[1].src[0].divides(sz) is not None, [5,4,3,2]), None)) is not None: split(1, size, AxisType.UPCAST)
@@ -62,7 +65,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     if force_axis < 0: force_axis = reduce_axes[-1]
     else: force_axis = reduce_axes[force_axis]
     if DEBUG >= 3: print(f"FORCE_GROUP: {k.full_shape=} {k.colored_shape()=} {force_axis=} {force_group=}")
-    k.apply_opt(Opt(OptOps.SPLIT, force_axis, (force_group, AxisType.GROUP_REDUCE)))
+    k.apply_opt(Opt(OptOps.SPLIT, force_axis, (force_group, AxisType.LOCAL)))
     force_unroll = getenv("MV_FORCE_UNROLL_INNER", 0)
     if force_unroll < 0: _unroll_small_inner_reduces(k)
     else:
@@ -109,7 +112,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         group_rng = unit_reduce_ranges[-1]
         group_axis = k.rngs.index(group_rng)
         if DEBUG >= 3: print(f"COMPLEX MATVEC: {k.full_shape=} {group_axis=} {complex_mv_group=}")
-        try: k.apply_opt(Opt(OptOps.SPLIT, group_axis, (complex_mv_group, AxisType.GROUP_REDUCE)))
+        try: k.apply_opt(Opt(OptOps.SPLIT, group_axis, (complex_mv_group, AxisType.LOCAL)))
         except KernelOptError: pass
         else:
           _unroll_small_inner_reduces(k)
@@ -144,7 +147,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   if k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and (pg:=getattr(k.ren, 'preferred_reduce_group', None)) is not None and \
      len(k.axes_of(AxisType.REDUCE)) == 1 and k.reduceop.src[0].op is Ops.INDEX and \
      resolve(prod((1 if i in k.reduce_axes else s) for i,s in enumerate(k.full_shape)) > 1, False):
-    try: k.apply_opt(Opt(OptOps.SPLIT, k.axes_of(AxisType.REDUCE)[0], (pg, AxisType.GROUP_REDUCE)))
+    try: k.apply_opt(Opt(OptOps.SPLIT, k.axes_of(AxisType.REDUCE)[0], (pg, AxisType.LOCAL)))
     except KernelOptError: pass
     else: return k
 

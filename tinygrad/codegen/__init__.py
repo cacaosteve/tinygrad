@@ -32,6 +32,7 @@ from tinygrad.schedule.prepare import pm_mops
 from tinygrad.codegen.late.linearizer import CFGContext, pm_split_ends, pm_add_control_flow, linearize
 from tinygrad.codegen.late.regalloc import LinearScanRegallocContext, pm_regalloc_rewrite
 from tinygrad.codegen.late.coalesce import memory_coalescing, pm_simplify_add_image
+from tinygrad.codegen.late.interleave import WMMASchedulePolicy, pm_schedule_interleave_wmma
 from tinygrad.helpers import all_same, all_int, argsort, partition
 from tinygrad.uop.ops import _broadcast_shape, identity_element
 from tinygrad.schedule.rangeify import BufferizeOpts
@@ -78,10 +79,11 @@ def unroll_axis(u:UOp, dims:list[int], sizes:list[int]) -> UOp:
 
 def expand_wmma(ctx:dict[tuple[int, ...], int], u:UOp):
   if u.arg[3] is None: return None
-  in0, in1, out0 = [[ctx[rn] for rn,_ in upcast_axes] for upcast_axes in u.arg[3]]
+  # Skip axes absent from the expand map (e.g. size-1 TC pads dropped after TC_LDS_AB staging).
+  in0, in1, out0 = [[ctx[rn] for rn,_ in upcast_axes if rn in ctx] for upcast_axes in u.arg[3]]
   a, b, c = contract_axis(u.src[0], in0), contract_axis(u.src[1], in1), u.src[2]
   done_arg = (*u.arg[:3], None)
-  sizes = [sz for _,sz in u.arg[3][2]]
+  sizes = [sz for rn,sz in u.arg[3][2] if rn in ctx]
   if expand_wmma_lds_hook is not None and (ret := expand_wmma_lds_hook(u, a, b, c, done_arg, unroll_axis, out0, sizes)) is not None:
     return ret
   return unroll_axis(u.replace(src=(a, b, c), arg=done_arg), out0, sizes)
@@ -345,6 +347,8 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
     # do postrange optimization, BEAM or hand_coded_optimizations
     sink = apply_opts(sink, ren, beam=ast.arg.beam)
 
+    # DIRECT half GEMM: register product-16 (ACC_BASE=96) beats LDS_AB (~1.03× vs ~1.9× HIP).
+    # Opt in to LDS_AB via TC_LDS_AB=1. LLVM stays off.
     if getenv("TC_LDS_AB", 0) and (pm := getattr(ren, "pm_stage_wmma_ab", None)) is not None:
       sink = graph_rewrite(sink, pm, name="stage wmma ab lds")
 
@@ -565,6 +569,10 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
     stage_st = time.perf_counter_ns()
     full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.tag is None)
     if compile_timing: timings["rewrite_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
+    # Opt-in: schedule later WMMA groups' loads after prior WMMA (flash latency hide).
+    if getenv("AMD_WMMA_INTERLEAVE", 0):
+      full_sink = graph_rewrite(full_sink, pm_schedule_interleave_wmma, ctx=WMMASchedulePolicy(full_sink),
+                                name="wmma load interleave")
     prog_info = ProgramInfo.from_sink(full_sink, renderer.target)
     if isinstance(renderer, ISARenderer):
       # Instruction selection replaces LOAD/STORE/ALU with INS, so estimate while their meaning is still available.
@@ -596,7 +604,8 @@ to_program_config = (NOOPT, EMULATED_DTYPES, USE_TC, IMAGE, DISABLE_FAST_IDIV, T
                      DEFAULT_FLOAT, DEFAULT_INT, TC_SELECT, TC_OPT, TC_MIN_GLOBALS)
 to_program_context = (*to_program_config, SPEC, DEBUG)
 def to_program_key(ast:UOp, renderer:Renderer) -> tuple:
-  return (ast.key, type(renderer), renderer.target, *[x.value for x in to_program_config])
+  return (ast.key, type(renderer), renderer.target, *[x.value for x in to_program_config],
+          getenv("AMD_WMMA_INTERLEAVE", 0), getenv("TC_LDS_AB", 0))
 
 @functools.cache
 def _program_source_paths() -> tuple[pathlib.Path, ...]:

@@ -75,3 +75,7 @@ uv.lock
 !.cursor/rules/no-tinygrad-prs.mdc
 notes/
 pi_session_window0.jsonl
+# RDNA3 baseline freeze outputs (scripts stay tracked; artifacts do not)
+extra/rdna3_baseline_freeze/
+extra/rdna3_structural_compare.json
+extra/rdna3_structural_compare_host.json

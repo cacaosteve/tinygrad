@@ -56,7 +56,11 @@ class _System:
   def write_sysfs(self, path:str, value:str, msg:str, expected:str|None=None):
     if FileIOInterface(path, os.O_RDONLY).read().splitlines()[0] != (expected or value):
       os.system(cmd:=f"sudo sh -c 'echo {value} > {path}'")
-      if FileIOInterface(path, os.O_RDONLY).read().splitlines()[0] != (expected or value): raise RuntimeError(f"{msg}. Please run {cmd} manually.")
+      if FileIOInterface(path, os.O_RDONLY).read().splitlines()[0] != (expected or value):
+        if getenv("AMD_SOFT_SYSFS", 0):
+          if DEBUG >= 1: print(f"WARNING: {msg} (AMD_SOFT_SYSFS=1 continuing)")
+        else:
+          raise RuntimeError(f"{msg}. Please run {cmd} manually.")
 
   @functools.cached_property
   def atomic_lib(self): return ctypes.CDLL(ctypes.util.find_library('atomic')) if sys.platform == "linux" else None

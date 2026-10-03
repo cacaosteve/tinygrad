@@ -1,0 +1,141 @@
+{
+  "configs": [
+    "base",
+    "promote",
+    "promote_remat",
+    "promote_remat_evict",
+    "base_remat"
+  ],
+  "compile": [
+    {
+      "name": "base",
+      "cfg": {
+        "AMD_FLASH_PREFILL_SKIP_SLOTS": "2",
+        "AMD_FLASH_ACC_WORK": "1",
+        "AMD_REMAT_CONST_MOV": "0",
+        "AMD_REMAT_ADDR": "0",
+        "AMD_SPILL_ON_EVICT": "0"
+      },
+      "use_acc_work": true,
+      "ninst": 1767,
+      "max_vgpr": 222,
+      "private_segment_size": 128,
+      "IR_SPILL": 0,
+      "IR_FILL": 0,
+      "IR_SCRATCH_SIZE": 2,
+      "v_mov": 418,
+      "scratch_store": 49,
+      "scratch_load": 8,
+      "v_wmma": 24,
+      "local_size": [
+        32,
+        2,
+        2
+      ]
+    },
+    {
+      "name": "promote",
+      "cfg": {
+        "AMD_FLASH_PREFILL_SKIP_SLOTS": "",
+        "AMD_FLASH_ACC_WORK": "0",
+        "AMD_REMAT_CONST_MOV": "0",
+        "AMD_REMAT_ADDR": "0",
+        "AMD_SPILL_ON_EVICT": "0"
+      },
+      "use_acc_work": 0,
+      "ninst": 2255,
+      "max_vgpr": 238,
+      "private_segment_size": 120,
+      "IR_SPILL": 118,
+      "IR_FILL": 51,
+      "IR_SCRATCH_SIZE": 2,
+      "v_mov": 667,
+      "scratch_store": 118,
+      "scratch_load": 51,
+      "v_wmma": 24,
+      "local_size": [
+        32,
+        2,
+        2
+      ]
+    },
+    {
+      "name": "promote_remat",
+      "cfg": {
+        "AMD_FLASH_PREFILL_SKIP_SLOTS": "",
+        "AMD_FLASH_ACC_WORK": "0",
+        "AMD_REMAT_CONST_MOV": "1",
+        "AMD_REMAT_ADDR": "0",
+        "AMD_SPILL_ON_EVICT": "0"
+      },
+      "use_acc_work": 0,
+      "ninst": 1847,
+      "max_vgpr": 238,
+      "private_segment_size": 28,
+      "IR_SPILL": 7,
+      "IR_FILL": 7,
+      "IR_SCRATCH_SIZE": 2,
+      "v_mov": 538,
+      "scratch_store": 7,
+      "scratch_load": 7,
+      "v_wmma": 24,
+      "local_size": [
+        32,
+        2,
+        2
+      ]
+    },
+    {
+      "name": "promote_remat_evict",
+      "cfg": {
+        "AMD_FLASH_PREFILL_SKIP_SLOTS": "",
+        "AMD_FLASH_ACC_WORK": "0",
+        "AMD_REMAT_CONST_MOV": "1",
+        "AMD_REMAT_ADDR": "0",
+        "AMD_SPILL_ON_EVICT": "1"
+      },
+      "use_acc_work": 0,
+      "ninst": 1870,
+      "max_vgpr": 238,
+      "private_segment_size": 28,
+      "IR_SPILL": 14,
+      "IR_FILL": 7,
+      "IR_SCRATCH_SIZE": 2,
+      "v_mov": 545,
+      "scratch_store": 14,
+      "scratch_load": 7,
+      "v_wmma": 24,
+      "local_size": [
+        32,
+        2,
+        2
+      ]
+    },
+    {
+      "name": "base_remat",
+      "cfg": {
+        "AMD_FLASH_PREFILL_SKIP_SLOTS": "2",
+        "AMD_FLASH_ACC_WORK": "1",
+        "AMD_REMAT_CONST_MOV": "1",
+        "AMD_REMAT_ADDR": "0",
+        "AMD_SPILL_ON_EVICT": "0"
+      },
+      "use_acc_work": true,
+      "ninst": 1783,
+      "max_vgpr": 222,
+      "private_segment_size": 128,
+      "IR_SPILL": 0,
+      "IR_FILL": 0,
+      "IR_SCRATCH_SIZE": 2,
+      "v_mov": 450,
+      "scratch_store": 49,
+      "scratch_load": 8,
+      "v_wmma": 24,
+      "local_size": [
+        32,
+        2,
+        2
+      ]
+    }
+  ]
+}

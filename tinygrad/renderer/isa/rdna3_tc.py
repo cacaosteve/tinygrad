@@ -14,6 +14,7 @@ def _range_size(r:UOp) -> int:
   return int(n) if (n:=const_value(r.src[0])) is not None else int(r.vmax) + 1
 
 def _linearize_ranges(axes:list[UOp]) -> UOp:
+  if not axes: return tconst(0, dtypes.int32)
   out = axes[0]
   for a in axes[1:]: out = out * _range_size(a) + a
   return out
@@ -183,7 +184,8 @@ def stage_wmma_ab_bounce(wmma:UOp, coop:list[UOp]) -> UOp|None:
     changed = True
   if not changed: return None
   _in0, _in1, out0 = wmma.arg[3]
-  return wmma.replace(src=(news[0], news[1], wmma.src[2]), arg=(*wmma.arg[:4], ((), (), out0)))
+  # A/B already contracted via STAGE; clear their upcast axes. Keep C/out0 for expand_wmma.
+  return wmma.replace(src=(news[0], news[1], wmma.src[2]), arg=(*wmma.arg[:3], ((), (), out0)))
 
 def stage_wmma_ab_tid(wmma:UOp, coop:list[UOp]) -> UOp|None:
   if (tid_axes := _tid_axes(coop)) is None: return None
@@ -253,7 +255,7 @@ def stage_wmma_ab_tid(wmma:UOp, coop:list[UOp]) -> UOp|None:
     changed = True
   if not changed: return None
   _in0, _in1, out0 = wmma.arg[3]
-  return wmma.replace(src=(news[0], news[1], wmma.src[2]), arg=(*wmma.arg[:4], ((), (), out0)))
+  return wmma.replace(src=(news[0], news[1], wmma.src[2]), arg=(*wmma.arg[:3], ((), (), out0)))
 
 def stage_wmma_ab_to_local(wmma:UOp) -> UOp|None:
   if wmma.op is not Ops.WMMA: return None
@@ -297,3 +299,6 @@ def expand_wmma_lds_tiles(u, a, b, c, done_arg, unroll_axis, out0, sizes):
     wmmas.extend(batch)
     prev_batch = UOp.stack(*batch)
   return unroll_axis(UOp.stack(*wmmas).reshape(ta, tb, c_stk.max_numel()), out0, sizes)
+
+# ***** TC hand schedule (bound from rdna3.py for prefetch / ACC pool side effects) *****
+

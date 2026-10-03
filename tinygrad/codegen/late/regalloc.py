@@ -1,7 +1,7 @@
 import itertools
 from bisect import bisect_left
 from tinygrad.device import CompileError
-from tinygrad.helpers import dedup, getenv
+from tinygrad.helpers import dedup
 from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat
 from tinygrad.renderer.isa import ISARenderer, Register, greg, rdef, LinearContext
 from tinygrad.dtype import dtypes, AddrSpace
@@ -44,6 +44,11 @@ class LinearScanRegallocContext:
     self.locals: dict[UOp, UOp] = {}
     self.spills: dict[Register, Any] = {} # mapping from virtual to architecture-specific spill slot
     self.remat: set[Register] = set()
+    # Populated lazily on WMMA/PACK/sinked-REG redefine (below). Eager ban of every
+    # two-address/PACK tag blocked remat of shared zero-init MOVs and forced them into
+    # spill slots under ACC promote (flash CAST/MOV const tax). After redefine, vdef
+    # still points at the zero-init — remat would poison — so ban then.
+    self.remat_banned: set[Register] = set()
     self.stack_size = 0
     self.reals: dict[int, dict[Register, Register]] = {} # mapping from virtual to real at each program point
     self.insert_before: dict[int, list[tuple[Register, Register]]] = {} # fills to be inserted at each program point
@@ -64,24 +69,9 @@ class LinearScanRegallocContext:
     def alloc(cons:tuple[Register, ...], i:int, v:Register|None=None, *, pin:bool=True, spill_at:int|None=None) -> Register:
       if self.wide:
         assert v is not None
-        victims: list[tuple[Register, Register]] = []
-        reg = wide_alloc(cons, i, slots(v), v.cons, live, lr, len(uops), slots, pinned if pin else frozenset(),
-                         spill_victims=victims if getenv("AMD_SPILL_ON_EVICT", 0) else None, remat=self.remat)
-        # Spill-on-evict: store victim phys before this insn overwrites it. Without this,
-        # loop-carried promoted REG (flash slot-2) loses values under pressure (pn>=64).
-        # Record at spill_at (the defining insn), not `i` — callers pass i+1 for next-use scoring.
-        at = spill_at if spill_at is not None else i
-        for vr, phys in victims:
-          if vr not in self.spills:
-            vd = self.vdef(vr)
-            # Match FILL/SPILL width: multi-slot VGPRs need register_slots*4 bytes, not dtype.itemsize.
-            sz = max(ren.spill_size(vd, vr), ren.register_slots(vd, vr) * 4)
-            if sz <= 0: sz = 4
-            offset = self.stack_size + (sz - self.stack_size % sz) % sz
-            self.spills[vr] = UOp.cconst(offset, dtypes.int32)
-            self.stack_size = offset + sz
-          self.spill_on_evict.setdefault(at, []).append((vr, phys))
-        return reg
+        # AMD_SPILL_ON_EVICT never shipped (hang/NaN lab) — always pass spill_victims=None.
+        return wide_alloc(cons, i, slots(v), v.cons, live, lr, len(uops), slots, pinned if pin else frozenset(),
+                         spill_victims=None, remat=self.remat)
       live_inv = {rv:k for k,rv in live.items()}
       reg,vreg = max(((r,live_inv.get(r)) for r in cons),
                     key=lambda rv: next((j-i for j in ([] if rv[1] is None else lr[rv[1]]) if j >= i), len(uops)))
@@ -89,14 +79,16 @@ class LinearScanRegallocContext:
 
     def fill(v:Register, i:int, cons:tuple[Register, ...]|None=None, *, pin:bool=True) -> Register:
       vd = self.vdef(v)
-      if self.wide and ren.rematerialize(vd):
+      if self.wide and ren.rematerialize(vd) and v not in self.remat_banned:
         self.remat.add(v)
-        for s in vd.src:
-          if s.op is Ops.CONST: continue
-          if isinstance(sv:=greg(s), Register):
-            if sv not in live: live[sv] = fill(sv, i, pin=pin)
-            self.reals.setdefault(i, {})[sv] = live[sv]
-            if pin: pinned.update(range(live[sv].index, live[sv].index + slots(sv)))
+        # Const MOV remat rebuilds from CONST/CAST(CONST) — no live src regs to restore.
+        if not (hasattr(ren, "_const_mov_leaf") and ren._const_mov_leaf(vd) is not None):
+          for s in vd.src:
+            if s.op is Ops.CONST: continue
+            if isinstance(sv:=greg(s), Register):
+              if sv not in live: live[sv] = fill(sv, i, pin=pin)
+              self.reals.setdefault(i, {})[sv] = live[sv]
+              if pin: pinned.update(range(live[sv].index, live[sv].index + slots(sv)))
       elif v not in self.spills:
         if self.wide:
           sz = ren.spill_size(vd, v)
@@ -135,13 +127,31 @@ class LinearScanRegallocContext:
             # shares the parked pack tag across unrolled flash tiles.
             is_acc_pack = (u.op is Ops.INS and isinstance(u.arg, tuple) and
                            "PACK" in str(u.arg[0]) and not str(u.arg[0]).endswith("PACK_F16"))
-            if j == 0 and getenv("AMD_WMMA_REDEF_ACC", 1) and (ren.is_two_address(u) or is_acc_pack):
+            is_sink_redef = hasattr(ren, "is_promoted_reg_redef") and ren.is_promoted_reg_redef(u)
+            # WMMA_REDEF_ACC hardcoded ON — required for flash ACC_SMALL two-address packs
+            if j == 0 and (ren.is_two_address(u) or is_acc_pack or is_sink_redef):
               if v in live:
                 self.reals.setdefault(i, {})[v] = live[v]
+                # WMMA/PACK/sinked-REG redefines the parked zero-init tag — no longer a const remat.
+                if self.wide and not ren.rematerialize(u):
+                  self.remat.discard(v)
+                  self.remat_banned.add(v)
                 continue
               # Not currently live (gap between unrolled WMMA). Treat as a fresh def
               # at this index so alloc can run; two-address coalesce uses cin below.
+              # Sinked ALU must NOT fall through to uses[0] coalesce (would steal src0).
               lr[v][0] = i
+              if is_sink_redef and not ren.is_two_address(u):
+                cons = v.cons
+                if pinned:
+                  filtered = tuple(r for r in cons if not (set(range(r.index, r.index + slots(v))) & pinned))
+                  if filtered: cons = filtered
+                live[v] = alloc(cons, i+1 if u.op is not Ops.RANGE else i, v, spill_at=i)
+                self.reals.setdefault(i, {})[v] = live[v]
+                if self.wide:
+                  self.remat.discard(v)
+                  self.remat_banned.add(v)
+                continue
             else:
               assert lr[v][0] == i
           cons = v.cons
@@ -150,12 +160,20 @@ class LinearScanRegallocContext:
             if self.wide and uses[0] is not None and uses[0] in cons:
               live[v] = uses[0]
               self.reals.setdefault(i, {})[v] = uses[0]
+              if not ren.rematerialize(u):
+                self.remat.discard(v)
+                self.remat_banned.add(v)
               continue
             cons = ((uses[0],) if uses[0] is not None and uses[0] in cons else ()) + tuple(r for r in cons if r not in uses)
           elif j == 0 and (pref:=ren.prefer_phys(u, [live.get(greg(s)) for s in u.src])) is not None and pref in cons:
             # Alias onto a src sub-register (e.g. EXTRACT → WMMA pack+lane) — skip pinned check.
             live[v] = pref
             self.reals.setdefault(i, {})[v] = pref
+            if self.wide:
+              if ren.rematerialize(u) and v not in self.remat_banned: self.remat.add(v)
+              else:
+                self.remat.discard(v)
+                if not ren.rematerialize(u): self.remat_banned.add(v)
             continue
           if pinned:
             filtered = tuple(r for r in cons if not (set(range(r.index, r.index + slots(v))) & pinned))
@@ -163,8 +181,29 @@ class LinearScanRegallocContext:
             elif len(cons) > 1:
               raise CompileError(f"no unpinned regs for {v}")
             # len==1: dest constrained to one phys (may alias a pinned src) — allow
+          # Bias const float MOV dests toward even/odd pairs (VOPD_PAIR_CONST hardcoded ON).
+          # PAIR_ALLOC / SRC1_RESERVE removed (fair regress / NaN).
+          if self.wide and hasattr(ren, "vopd_pair_bias_cons"):
+            cons = ren.vopd_pair_bias_cons(u, cons, getattr(self, "_vopd_last_idx", None),
+                                           getattr(self, "_vopd_src1_last_idx", None),
+                                           getattr(self, "_vopd_park_last_idx", None))
+          if self.wide and hasattr(ren, "pack_chain_bias_cons"):
+            cons = ren.pack_chain_bias_cons(u, cons, live)
           live[v] = alloc(cons, i+1 if u.op is not Ops.RANGE else i, v, spill_at=i)
           self.reals.setdefault(i, {})[v] = live[v]
+          if self.wide and hasattr(ren, "vopd_track_alloc"):
+            self._vopd_last_idx, self._vopd_src1_last_idx, self._vopd_park_last_idx = ren.vopd_track_alloc(
+              u, live[v], getattr(self, "_vopd_last_idx", None), getattr(self, "_vopd_src1_last_idx", None),
+              getattr(self, "_vopd_park_last_idx", None))
+          # Mark rematerializable defs immediately so they leave `live` at insn end
+          # and never acquire spill slots (flash MOV(0.0)/-inf across WMMA).
+          # Clear+ban on non-remat redefs: ACC packs reuse the zero-init vreg tag; vdef
+          # stays at first def so rematerialize(vdef) would otherwise re-poison as 0.
+          if self.wide:
+            if ren.rematerialize(u) and v not in self.remat_banned: self.remat.add(v)
+            else:
+              self.remat.discard(v)
+              if not ren.rematerialize(u): self.remat_banned.add(v)
 
       if self.wide:
         for rv in [rv for rv in live if rv in self.remat and not ren.keep_remat(self.vdef(rv))]: live.pop(rv, None)
@@ -241,13 +280,19 @@ def wide_alloc(cons, i, nslots, allowed, live, lr, uops_len, slots_fn, pinned=fr
   return reg
 
 def wide_restore(ctx, v, r, i):
-  if v in ctx.remat:
-    vd, src_regs = ctx.vdef(v), []  # type: ignore[var-annotated]
+  vd = ctx.vdef(v)
+  # Const leaf: remat even if a later WMMA/PACK ban removed v from `remat`. insert_before
+  # entries were planned while remat was legal; spilling takes precedence once a slot exists.
+  const_leaf = hasattr(ctx.ren, "_const_mov_leaf") and ctx.ren._const_mov_leaf(vd) is not None
+  if v in ctx.remat or (const_leaf and v not in ctx.spills):
+    if const_leaf:
+      return ctx.ren.remat(vd, r, [])
+    src_regs = []
     for su in vd.src:
       if su.op is Ops.CONST or not isinstance(sv:=greg(su), Register): src_regs.append(None)
       else: src_regs.append(ctx.reals[i][sv])
     return ctx.ren.remat(vd, r, src_regs)
-  return ctx.ren.fill(ctx.spills[v], ctx.vdef(v), r)
+  return ctx.ren.fill(ctx.spills[v], vd, r)
 
 def wide_regalloc_rewrite(ctx, x:UOp):
   i = ctx.regalloc_i

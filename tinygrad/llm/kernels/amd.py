@@ -43,7 +43,12 @@ def amd_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   if device is None or device.split(":")[0] != "AMD": return False
   # @function contexts set ALLOW_DEVICE_USAGE=0 (scheduling must not open devices); the device is always open here
   with Context(ALLOW_DEVICE_USAGE=1):
-    return (t:=getattr(Device[device], "target", None)) is not None and t[0] in (11, 12) and isinstance(Device[device].renderer, HIPRenderer)
+    d = Device[device]
+    t = getattr(d, "target", None)
+    if t is None or t[0] not in (11, 12): return False
+    # HIP C-style and DIRECT AMDRenderer both lower the amdgcn CUSTOM/CUSTOMI intrinsics.
+    r = d.renderer
+    return isinstance(r, HIPRenderer) or r.__class__.__name__ == "AMDRenderer"
 
 @functools.cache
 def amd_direct_isa(device:str|tuple[str, ...]|None) -> bool:
@@ -92,14 +97,9 @@ def warp_reduce_many(vals:list[UOp], maximum:bool=False, full_wave:bool=False) -
   chunk = list(vals)
   for i, v in enumerate(chunk):
     if v.op is Ops.INDEX and v.addrspace == AddrSpace.REG: chunk[i] = v.load()
-  no_park = bool(getenv("AMD_SWIZZLE_NO_PARK", 0))
   for offset in offsets:
     raw = [_peer16_f32(v) if offset == 16 else _swizzle_f32(v, offset) for v in chunk]
-    if no_park:
-      # HIP-like: ADD reads swizzle/permlane dests directly (no REG park MOVs).
-      # `_schedule_swizzle_mov_batches` still batches SW×N,ADD×N before regalloc.
-      chunk = [v.maximum(o) if maximum else v + o for v, o in zip(chunk, raw)]
-      continue
+    # Always REG-park peers (NO_PARK* removed — NaN / decode regress).
     tmp = UOp.placeholder((len(chunk),), dtypes.float, slot=_reg_swizzle_slot, addrspace=AddrSpace.REG)
     _reg_swizzle_slot += 1
     tmp = tmp.after(UOp.group(*[tmp[i].store(sw) for i, sw in enumerate(raw)]))
@@ -402,16 +402,13 @@ def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_wa
       global _reg_swizzle_slot
       own = tuple(acc.after(update)[i].load() for i in range(8))
       # Park peers in REG so emit sees PERMLANEX×8 or SWIZZLE×8 consecutive.
-      # AMD_WMMA_PEER_SWIZZLE=1: ds_swizzle ^16 (HIP-like) instead of permlanex16.
-      peer_op = (lambda v: _swizzle_f32(v, 16)) if getenv("AMD_WMMA_PEER_SWIZZLE", 1) else _peer16_f32
+      # ds_swizzle ^16 (HIP-like); permlanex / NOPARK lab knobs removed.
+      peer_op = lambda v: _swizzle_f32(v, 16)
       raw = [peer_op(own[i]) for i in range(8)]
-      if getenv("AMD_WMMA_PEER_NOPARK", 0):
-        peer = tuple(raw)
-      else:
-        tmp = UOp.placeholder((8,), dtypes.float, slot=_reg_swizzle_slot, addrspace=AddrSpace.REG)
-        _reg_swizzle_slot += 1
-        tmp = tmp.after(UOp.group(*[tmp[i].store(sw) for i, sw in enumerate(raw)]))
-        peer = tuple(tmp[i].load() for i in range(8))
+      tmp = UOp.placeholder((8,), dtypes.float, slot=_reg_swizzle_slot, addrspace=AddrSpace.REG)
+      _reg_swizzle_slot += 1
+      tmp = tmp.after(UOp.group(*[tmp[i].store(sw) for i, sw in enumerate(raw)]))
+      peer = tuple(tmp[i].load() for i in range(8))
       low = half.eq(0)
       return tuple(low.where(own[i], peer[i+4]) if j == 0 else low.where(peer[i], own[i+4]) for i in range(4) for j in range(2))
     return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
@@ -537,12 +534,8 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
   token_tile = 32 if out_features <= 1024 and out.shape[0] % 32 == 0 else 64 if out.shape[0] % 64 == 0 and \
     out_features <= 6144 else 128 if out.shape[0] % 128 == 0 else \
     32 if out.shape[0] % 32 == 0 else 16
-  # Dual output tiles (old default for 1024<out<=6144) inflated LUT dequant VGPR live
-  # ranges on some shapes. Single tile is default; AMD_IQ4_DUAL_OUT=1 restores.
-  if (t:=getenv("AMD_IQ4_OUTPUT_TILES", 0)): output_tiles = t
-  elif getenv("AMD_IQ4_DUAL_OUT", 0):
-    output_tiles = 1 if out_features <= 1024 else 2 if out_features <= 6144 else 1
-  else: output_tiles = 1
+  # Dual output tiles inflated LUT dequant VGPR live ranges — single tile only.
+  output_tiles = 1
   layout = _wmma_layout(out, out_features, token_tile, output_tiles)
   output_waves, _, _, lane, wave, half, _, _, _ = layout
   word_indices = (half, half+2) if rdna4 else tuple(range(4))
@@ -692,8 +685,19 @@ def _vec_load(ptr:UOp, lanes:int) -> tuple[UOp, ...]:
   vec = _amd_load(ptr, lanes)
   return tuple(vec[i].float() for i in range(lanes))
 
+def _vec_load_half(ptr:UOp, lanes:int) -> tuple[UOp, ...]:
+  """Keep V as half for v_fma_mix_f32 (HIP flash_decode); cast only at FMAC."""
+  if lanes == 1: return (ptr.load().cast(dtypes.half),) if ptr.dtype is not dtypes.half else (ptr.load(),)
+  vec = _amd_load(ptr, lanes)
+  return tuple(vec[i] if vec[i].dtype is dtypes.half else vec[i].cast(dtypes.half) for i in range(lanes))
+
 @functools.cache
-def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4):
+def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4,
+                                        v_serial:int=0):
+  # `v_serial` cache-key (opt-in): score without V prefetch, apply one key's V via REG
+  # checkpoints → vgpr~102 (not ≤96) +~5µs. Prefetch-V legacy ~112.
+  # Dead ends: online/head-batch/score_reg/SCORE_BATCH=2 hang; v_rescore sum0; dpl_split no cut.
+  # Shipping ≤96 lever: AMD_FLASH_WAVES=16 (SEC=4 → vgpr~80, fair ~+8µs).
   valid_kv_len = _unbind(valid_kv_len)
   _, B, H_KV, N, D = cast(tuple[int, int, int, int, int], cache_kv.shape)
   _, H, M, _ = cast(tuple[int, int, int, int], q.shape)
@@ -706,51 +710,91 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   block_bhkv, block_chunk = UOp.range(B*H_KV, 0, AxisType.GLOBAL), UOp.range(live_chunks, 1, AxisType.GLOBAL)
   lane, wave = UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(WAVES, 3, axis_type=AxisType.LOCAL)
   b, kv_head = block_bhkv // H_KV, block_bhkv % H_KV
-  # per-lane query fragments for every GQA head, kept packed in registers; unpacked at use
-  qf = tuple(_vec_load(q[b, kv_head*G+h, 0, lane*DPL], DPL) for h in range(G))
   zerof = UOp.const(0, dtypes.float)
+  zeroh = UOp.const(0, dtypes.half)
   # Each block scans every PARTIALS-th chunk, keeping an online softmax across rounds.
   chunk_round = UOp.range((total_chunks-1-block_chunk)//PARTIALS+1, 4, AxisType.REDUCE)
   chunk_id = block_chunk + chunk_round*PARTIALS
-  valids: list[UOp] = []
-  scores: list[list[UOp]] = [[zerof]*G for _ in range(SEC)]
-  vfrags: list[tuple[UOp, ...]] = [()]*SEC
   # Batch keys into one warp_reduce_many so swizzle/permlane stages share lgkm waits.
   # After decode-scoped slot-2 promote, batch=8 spills (priv 64, ~139µs e2e); batch=4 stays
   # priv 0 (~123µs). Override AMD_FLASH_SCORE_BATCH=8 for the old full-SEC batch.
-  score_batch = getenv("AMD_FLASH_SCORE_BATCH", 4)
-  for j0 in range(0, SEC, score_batch):
-    js = range(j0, min(j0 + score_batch, SEC))
-    dots: list[UOp] = []
-    for j in js:
-      key = chunk_id*CHUNK + wave*SEC + j
-      valid = key < valid_kv_len
-      valids.append(valid)
-      kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
-      # V is prefetched in the score pass so both streams are in flight together
-      vfrags[j] = tuple(valid.where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
-      dots.extend([sum((qf[h][i]*kfrag[i] for i in range(DPL)), zerof) for h in range(G)])
-    for t, s in enumerate(warp_reduce_many(dots, full_wave=True)):
-      j, h = j0 + t // G, t % G
-      scores[j][h] = valids[j].where(s * (1/math.sqrt(D)), UOp.const(-1e30, dtypes.float))
+  # V_HALF + FMA_MIX_ALL shipped on decode (fold consumer-rewrite fixed); SCORE_BATCH=4.
+  score_batch = 4  # SCORE_BATCH hardcoded
+  _v_half = True  # DECODE_V_HALF hardcoded ship
+  _v_serial = bool(v_serial)
   # A finite initial max keeps fully masked waves from computing exp(-inf - -inf).
   acc_reg, max_reg, sum_reg = _reg((G, DPL), 2, 0), _reg((G,), 3, -1e30), _reg((G,), 4, 0)
   prev_acc, prev_max, prev_sum = acc_reg.after(chunk_round), max_reg.after(chunk_round), sum_reg.after(chunk_round)
+  # Precompute key validity once (shared across heads).
+  valids: list[UOp] = [(chunk_id*CHUNK + wave*SEC + j) < valid_kv_len for j in range(SEC)]
+  qf = tuple(_vec_load(q[b, kv_head*G+h, 0, lane*DPL], DPL) for h in range(G))
+  scale = 1 / math.sqrt(D)
+  scores: list[list[UOp]] = [[zerof]*G for _ in range(SEC)]
+  vfrags: list[tuple[UOp, ...]] = [()]*SEC
+  for j0 in range(0, SEC, score_batch):
+    js = range(j0, min(j0 + score_batch, SEC))
+    dots = []
+    for j in js:
+      key = chunk_id*CHUNK + wave*SEC + j
+      kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
+      if not _v_serial:
+        if _v_half:
+          vfrags[j] = tuple(valids[j].where(v, zeroh) for v in _vec_load_half(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
+        else:
+          vfrags[j] = tuple(valids[j].where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
+      dots.extend([sum((qf[h][i]*kfrag[i] for i in range(DPL)), zerof) for h in range(G)])
+    for t, s in enumerate(warp_reduce_many(dots, full_wave=True)):
+      j, h = j0 + t // G, t % G
+      scores[j][h] = valids[j].where(s * scale, UOp.const(-1e30, dtypes.float))
   row_max = [functools.reduce(UOp.maximum, (scores[j][h] for j in range(SEC)), prev_max[h].load()) for h in range(G)]
-  # Rescale the previous rounds to the new max, then accumulate this round's keys.
   alpha = [((prev_max[h].load()-row_max[h])*LOG2E).exp2() for h in range(G)]
-  accs = [[alpha[h]*prev_acc[h, i].load() for i in range(DPL)] for h in range(G)]
-  row_sums = [alpha[h]*prev_sum[h].load() for h in range(G)]
-  for j in range(SEC):
-    for h in range(G):
-      beta = valids[j].where(((scores[j][h]-row_max[h])*LOG2E).exp2(), zerof)
-      accs[h] = [a + beta*v for a, v in zip(accs[h], vfrags[j])]
-      row_sums[h] = row_sums[h] + beta
+  if _v_serial:
+    # Slot 5/7: carry acc/sum across serial V keys so each V frag dies after its update.
+    work_acc = UOp.placeholder((G, DPL), dtypes.float, slot=5, addrspace=AddrSpace.REG)
+    work_sum = UOp.placeholder((G,), dtypes.float, slot=7, addrspace=AddrSpace.REG)
+    init = UOp.group(
+      work_acc.store(UOp.stack(*(alpha[h]*prev_acc[h, i].load() for h in range(G) for i in range(DPL))).reshape(G, DPL)),
+      work_sum.store(UOp.stack(*(alpha[h]*prev_sum[h].load() for h in range(G)))))
+    work_acc, work_sum = work_acc.after(init), work_sum.after(init)
+    for j in range(SEC):
+      key = chunk_id*CHUNK + wave*SEC + j
+      if _v_half:
+        vfrag = tuple(valids[j].where(v, zeroh) for v in _vec_load_half(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
+      else:
+        vfrag = tuple(valids[j].where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
+      accs = [[work_acc[h, i].load() for i in range(DPL)] for h in range(G)]
+      row_sums = [work_sum[h].load() for h in range(G)]
+      for h in range(G):
+        beta = valids[j].where(((scores[j][h]-row_max[h])*LOG2E).exp2(), zerof)
+        if _v_half:
+          accs[h] = [a + beta * v.cast(dtypes.float32) for a, v in zip(accs[h], vfrag)]
+        else:
+          accs[h] = [a + beta * v for a, v in zip(accs[h], vfrag)]
+        row_sums[h] = row_sums[h] + beta
+      st = UOp.group(
+        work_acc.store(UOp.stack(*(x for acc in accs for x in acc)).reshape(G, DPL)),
+        work_sum.store(UOp.stack(*row_sums)))
+      work_acc, work_sum = work_acc.after(st), work_sum.after(st)
+    accs = [[work_acc[h, i].load() for i in range(DPL)] for h in range(G)]
+    row_sums = [work_sum[h].load() for h in range(G)]
+  else:
+    accs = [[alpha[h]*prev_acc[h, i].load() for i in range(DPL)] for h in range(G)]
+    row_sums = [alpha[h]*prev_sum[h].load() for h in range(G)]
+    for j in range(SEC):
+      for h in range(G):
+        beta = valids[j].where(((scores[j][h]-row_max[h])*LOG2E).exp2(), zerof)
+        if _v_half:
+          accs[h] = [a + beta * v.cast(dtypes.float32) for a, v in zip(accs[h], vfrags[j])]
+        else:
+          accs[h] = [a + beta * v for a, v in zip(accs[h], vfrags[j])]
+        row_sums[h] = row_sums[h] + beta
   update = UOp.group(acc_reg.store(UOp.stack(*(x for acc in accs for x in acc)).reshape(G, DPL)),
                      max_reg.store(UOp.stack(*row_max)), sum_reg.store(UOp.stack(*row_sums))).end(chunk_round)
   acc_reg, max_reg, sum_reg = acc_reg.after(update), max_reg.after(update), sum_reg.after(update)
   # exchange across the block's waves through LDS (fp16 halves LDS so more blocks fit per CU)
   # Matching cache/LDS strides can reuse a loop-local cache index outside the loop. Pad that layout.
+  # Always pad when G==SEC (WAVES=16 @ block_n=64) — unpadded corrupts wave combine.
+  # Note: G==SEC sum drifts ~0.05 vs waves=8 from fp16 LDS×16-wave tree (maxabs ~1e-4), not alias.
   acc_lds = UOp.placeholder((WAVES, G, D + (LDS_PAD if G == SEC else 0)), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)[:, :, :D]
   # (WAVES, 2, G): avoid G==SEC stride alias that corrupts stats L on AMDRenderer.
   ml_lds = UOp.placeholder((WAVES, 2, G), dtypes.float, slot=1, addrspace=AddrSpace.LOCAL)
@@ -785,23 +829,29 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
   # one wave per (batch, head, 64-dim tile): every lane redundantly weights its chunks; no cross-lane traffic
   live = _unbind(live)
   B, H, C, D = cast(tuple[int, int, int, int], partial.shape)
-  DT = 64 if D % 64 == 0 else WARP_SIZE  # dims per block
-  assert D % DT == 0
+  # Dims per block: 64 when D%64==0 else WARP_SIZE (COMBINE_DT removed).
+  DT = 64 if D % 64 == 0 else WARP_SIZE
+  assert D % DT == 0 and DT % WARP_SIZE == 0
   block_bh, block_dt = UOp.range(B*H, 0, AxisType.GLOBAL), UOp.range(D//DT, 1, AxisType.GLOBAL)
   lane = UOp.range(WARP_SIZE, 2, axis_type=AxisType.LOCAL)
   b, h = block_bh // H, block_bh % H
   NPD = DT // WARP_SIZE  # output dims per lane
   dims = tuple(block_dt*DT + lane*NPD + i for i in range(NPD))
-  # Unroll short combines. live=32 (kv_len=2048) is ~138 VGPRs but closes the HIP decode gap
-  # (~54→51µs). Cap via AMD_COMBINE_UNROLL (larger live stays looped).
-  if isinstance(live, int) and live <= getenv("AMD_COMBINE_UNROLL", 32):
+  def _pload(ci, d):
+    v = partial[b, h, ci, d].load()
+    return v.cast(dtypes.float) if partial.dtype == dtypes.half else v
+  # Unroll short combines. live=32 (kv_len=2048) closes the HIP decode gap (~54→51µs).
+  # COMBINE_UNROLL=32 / COMBINE_TILE removed (tile wash/regress).
+  if isinstance(live, int) and live <= 32:
+    zerof = UOp.const(0, dtypes.float)
+    # Rematerialize stats M loads in the weight loop (keeping ms[] live → vgpr~169).
     chunk_max = functools.reduce(lambda m, ci: UOp.maximum(m, stats[b, h, ci, 0].load()),
                                  range(live), UOp.const(-math.inf, dtypes.float))
-    acc = [UOp.const(0, dtypes.float) for _ in range(NPD)]
-    weight_sum = UOp.const(0, dtypes.float)
+    acc = [zerof for _ in range(NPD)]
+    weight_sum = zerof
     for ci in range(live):
       w = ((stats[b, h, ci, 0].load() - chunk_max) * LOG2E).exp2()
-      acc = [a + w * partial[b, h, ci, d].load() for a, d in zip(acc, dims)]
+      acc = [a + w * _pload(ci, d) for a, d in zip(acc, dims)]
       weight_sum = weight_sum + w * stats[b, h, ci, 1].load()
     inv = 1 / weight_sum
     return UOp.group(*[o[b, h, 0, d].store(a * inv) for a, d in zip(acc, dims)]) \
@@ -817,40 +867,71 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
   weight_sum = UOp.alloc((1,), dtypes.float, addrspace=AddrSpace.REG)
   acc_i, weight_sum_i = acc.after(iloop(acc, 0)), weight_sum.after(iloop(weight_sum, 0))
   w = ((stats[b, h, chunk2, 0].load()-chunk_max)*LOG2E).exp2()
-  update1 = UOp.group(*[acc_i[i].store(acc_i.after(chunk2)[i].load() + w*partial[b, h, chunk2, d].load()) for i, d in enumerate(dims)],
+  update1 = UOp.group(*[acc_i[i].store(acc_i.after(chunk2)[i].load() + w*_pload(chunk2, d)) for i, d in enumerate(dims)],
                       weight_sum_i[0].store(weight_sum_i.after(chunk2)[0].load() + w*stats[b, h, chunk2, 1].load())).end(chunk2)
   acc, weight_sum = acc_i.after(update1), weight_sum_i.after(update1)
   inv = 1 / weight_sum[0].load()
   return UOp.group(*[o[b, h, 0, d].store(acc[i].load() * inv) for i, d in enumerate(dims)]) \
     .end(lane, block_dt, block_bh).sink(arg=KernelInfo(name="flash_decode_combine", opts_to_apply=()))
 
+# Proven flash DIRECT compile policy (HW-locked 2026-09). Applied every enter so TinyJit
+# recompiles see the right path; prefill clears decode-only keys. External AMD_* already
+# set in the environment are left alone (lab A/B). No KEEP_* / opt-in forest in this path.
+_FLASH_SHARED = {
+  "TC_LDS_AB": "0",              # TC_LDS_AB NaNs hand flash
+  "AMD_WMMA_ACC_BASE": "145",    # soft partition (matmul uses 96/128)
+  "AMD_WMMA_ACC_N": "48",
+  # AMD_LLOAD_POOL default 135 in rdna3_defs (matches ship)
+  # AMD_VOPD_PAIR_CONST hardcoded ON in renderer (const/±inf dual_mov bias)
+  # AMD_SWIZZLE_BATCH_MAX hardcoded 16 in schedule
+}
+_FLASH_PREFILL = {
+  **_FLASH_SHARED,
+  "AMD_FLASH_ACC_SMALL": "1",
+  "AMD_REMAT_ADDR": "1",
+  "ALLOW_UPCAST16": "0",
+  "AMD_WMMA_INTERLEAVE": "1",
+  # REMAT_CONST_MOV INF-only hardcoded in renderer; PACK_* / REG_PROMOTE_SKIP → ACC_SMALL
+  # AMD_WMMA_DELAY hardcoded ON in emit; PACK_LLOAD_ALIGN8 defaults OFF under ACC_SMALL
+}
+_FLASH_DECODE = {
+  **_FLASH_SHARED,
+  "ALLOW_UPCAST16": "1",
+  # SCHEDULE_VMEM_ALU / REG_PROMOTE_SKIP / PACK_* folded into VOPD_FMAC / ACC_SMALL
+  # MUL/FMAC_DELAY + MOV_ALIAS_SWIZZLE + FMA_MIX_ALL + SWIZZLE_VALU_GAP → VOPD_FMAC
+  # SCHEDULE_FMAC_ADD → VOPD_FMAC_ALU
+  "AMD_VOPD_FMAC": "1",
+  "AMD_VOPD_FMAC_ALU": "1",
+}
+_FLASH_DECODE_ONLY = (
+  "AMD_VOPD_FMAC", "AMD_VOPD_FMAC_ALU",
+)
+
+def _flash_apply_env(policy:dict[str, str]) -> None:
+  for k, v in policy.items():
+    if os.environ.get(k) is None: os.environ[k] = v
+
 @contextlib.contextmanager
 def _flash_direct_compile_env(*, flash_acc_small:bool=True):
-  """Flash-only compile envs for hand-kernel build+realize.
-
-  Prefill: ACC_SMALL remat + ALLOW_UPCAST16=0 + PACK_SLOAD_B128=1 (SPILL 0) + SKIP_SLOTS=2.
-  Decode: ALLOW_UPCAST16=1 + PACK_SLOAD off + SKIP_SLOTS= (promote slot 2; ~112µs vs ~134).
-  ALLOW_UPCAST16 / PACK_SLOAD / SKIP_SLOTS stay sticky for TinyJit capture after realize.
-  Each path re-applies its policy on enter — read those envs only *inside* this context
-  (reading SKIP_SLOTS before enter can see the other path's sticky value).
-  """
+  """Apply ship flash DIRECT compile policy for build+realize (sticky for TinyJit)."""
   prev = os.environ.get("AMD_FLASH_ACC_SMALL")
   prev_remat = os.environ.get("AMD_REMAT_ADDR")
-  prev_deep = os.environ.get("AMD_REMAT_ADDR_DEEP")
   if flash_acc_small:
-    os.environ["AMD_FLASH_ACC_SMALL"] = "1"
-    if prev_remat is None: os.environ["AMD_REMAT_ADDR"] = "1"
-    if prev_deep is None: os.environ["AMD_REMAT_ADDR_DEEP"] = "1"
-    os.environ["ALLOW_UPCAST16"] = "1" if getenv("AMD_FLASH_ALLOW_UPCAST16", 0) else "0"
-    os.environ["AMD_PACK_SLOAD_B128"] = "1" if getenv("AMD_FLASH_PACK_SLOAD_B128", 1) else "0"
-    # Prefill must keep slot-2 skipped (promoting it ~1.5ms). Re-assert after decode sticky.
-    os.environ["AMD_REG_PROMOTE_SKIP_SLOTS"] = os.environ.get("AMD_FLASH_PREFILL_SKIP_SLOTS", "2")
+    for k in _FLASH_DECODE_ONLY: os.environ.pop(k, None)
+    _flash_apply_env(_FLASH_PREFILL)
+    # Force path flips (must overwrite sticky decode / matmul / prior ACC_SMALL).
+    os.environ.update({
+      "TC_LDS_AB": "0", "AMD_FLASH_ACC_SMALL": "1",
+      "AMD_WMMA_ACC_BASE": "145", "AMD_WMMA_ACC_N": "48",
+      "ALLOW_UPCAST16": "0",  # flash prefill ship (ALLOW_UPCAST16 meta knobs removed)
+    })
   else:
-    os.environ["ALLOW_UPCAST16"] = "1" if getenv("AMD_FLASH_DECODE_ALLOW_UPCAST16", 1) else "0"
-    os.environ["AMD_PACK_SLOAD_B128"] = "1" if getenv("AMD_FLASH_DECODE_PACK_SLOAD", 0) else "0"
-    # Empty SKIP_SLOTS → promote slot 2 (decode FMAC scratch). Opt out: AMD_FLASH_DECODE_PROMOTE_SLOT2=0.
-    if getenv("AMD_FLASH_DECODE_PROMOTE_SLOT2", 1):
-      os.environ["AMD_REG_PROMOTE_SKIP_SLOTS"] = ""
+    _flash_apply_env(_FLASH_DECODE)
+    os.environ.update({
+      "TC_LDS_AB": "0",
+      "AMD_WMMA_ACC_BASE": "145", "AMD_WMMA_ACC_N": "48",
+      "ALLOW_UPCAST16": "1",  # flash decode ship
+    })
   getenv.cache_clear()  # type: ignore[attr-defined]
   try:
     yield
@@ -860,9 +941,6 @@ def _flash_direct_compile_env(*, flash_acc_small:bool=True):
       else: os.environ["AMD_FLASH_ACC_SMALL"] = prev
       if prev_remat is None: os.environ.pop("AMD_REMAT_ADDR", None)
       else: os.environ["AMD_REMAT_ADDR"] = prev_remat
-      if prev_deep is None: os.environ.pop("AMD_REMAT_ADDR_DEEP", None)
-      else: os.environ["AMD_REMAT_ADDR_DEEP"] = prev_deep
-    # Keep ALLOW_UPCAST16 / PACK_SLOAD / SKIP_SLOTS sticky for TinyJit; next flash path re-applies.
     getenv.cache_clear()  # type: ignore[attr-defined]
 
 def _flash_direct_realize(out:Tensor, *, flash_acc_small:bool=True) -> Tensor:
@@ -874,18 +952,27 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   # Carry length bindings even when the cache was populated independently of this call.
   if isinstance(valid_kv_len, UOp): cache_kv = Tensor(cache_kv.uop.after(valid_kv_len))
   B, H, D = cache_kv.shape[1], q.shape[1], cache_kv.shape[4]
-  chunks = min(48, max_kv_len // 64)
-  partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device)
+  # block_n=64 ship; 128 cuts combine live 32→16 (try AMD_FLASH_BLOCK_N=128).
+  block_n = 64  # BLOCK_N hardcoded
+  assert max_kv_len % block_n == 0, f"max_kv_len={max_kv_len} must divide block_n={block_n}"
+  chunks = min(48, max_kv_len // block_n)
+  # PARTIAL_HALF: store normalized partials as f16 (less combine BW); cast up in combine.
+  pdt = "float32"  # PARTIAL_HALF removed
+  partial = Tensor.empty(B, H, chunks, D, dtype=pdt, device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
   # ml_lds is (WAVES, 2, G) so G==SEC (e.g. 16-wave GQA) does not alias stats L on AMDRenderer.
-  # Default 8: ~135µs vs ~152µs @16 on 32h/2k decode; WAVES=4 fails decode_gqa (huge err).
-  waves, group = getenv("AMD_FLASH_WAVES", 8), H // cache_kv.shape[2]
-  assert 64 % waves == 0, f"AMD_FLASH_WAVES={waves} must divide block_n=64"
+  # Default 8 (~123µs). WAVES=16: SEC=4 → vgpr~80 (≤96) but fair e2e ~+8µs; fp16 LDS
+  # combine sum drifts ~0.05 (maxabs vs w8 ~1e-4). WAVES=4 fails decode_gqa.
+  waves, group = 8, H // cache_kv.shape[2]  # WAVES=8 ship (16=vgpr80/+8µs)
+  assert block_n % waves == 0, f"AMD_FLASH_WAVES={waves} must divide block_n={block_n}"
   while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
-  fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=64, waves=waves)
+  # v_serial opt-in: ~102 vgpr (not ≤96). Default OFF. WAVES=16 = shipping ≤96 lever.
+  _v_serial = 0  # DECODE_V_SERIAL removed (regress)
+  fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len,
+                          block_n=block_n, waves=waves, v_serial=_v_serial)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
-  live = (valid_kv_len+63)//64
+  live = (valid_kv_len + block_n - 1) // block_n
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)
   out = Tensor.empty(B, H, 1, D, dtype="float32", device=q.device)
   fxn = functools.partial(_amd_flash_decode_combine, live=live)
@@ -898,6 +985,7 @@ def _wmma_fragment(fragment:UOp, lane:UOp, rdna4:bool) -> UOp:
 def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None,
                          acc_small:bool=False, k_unroll:int=0, use_acc_work:bool=False,
                          k_hip_scope:str="all", k_midstore:int|None=None,
+                         acc_vgpr:bool=False, hoist_q:bool=False,
                          phase_dumps: tuple[tuple[str, UOp], ...]=()) -> UOp:
   """Hand flash-attn. Optional phase_dumps=(("qk", buf), ...) for diagnostics.
 
@@ -939,14 +1027,45 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   Q_ELEMS_PER_THREAD, KV_ELEMS_PER_THREAD = BLOCK_M * D // THREADS_PER_BLOCK, BLOCK_N * D // THREADS_PER_BLOCK
   Q_lds = UOp.placeholder((BLOCK_M, D + LDS_PAD), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)[:, :D]
   KV_lds = UOp.placeholder((BLOCK_N, D + LDS_PAD), dtypes.half, slot=1, addrspace=AddrSpace.LOCAL)[:, :D]
-  acc, m_i, l_i = _reg((TM, TD), 2, 0), _reg((TM,), 3, -math.inf), _reg((TM,), 4, 0)
+  # ACC_VGPR: park REDUCE ACC in promotable slot 19 (no scratch / no ACC_WORK).
+  # ACC_LDS removed (never shipped; REG slot 2 + SKIP=2 is the work path).
+  if acc_vgpr:
+    acc = _reg((TM, TD), 19, 0)
+  else:
+    acc = _reg((TM, TD), 2, 0)
+  m_i, l_i = _reg((TM,), 3, -math.inf), _reg((TM,), 4, 0)
+  # AMD_FLASH_HOIST_Q: Q LDS (slot 0) is never overwritten by K/V/P — load once before
+  # the n_tile REDUCE instead of reloading every KV tile (~64× for S=2048).
+  _hoist_q = bool(hoist_q)
+  Q_hoisted = None
+  if _hoist_q:
+    Q_hoisted = Q_lds.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid].store(
+      q.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid])
+    Q_lds = Q_lds.after(UOp.barrier(Q_hoisted))
   n_tile = UOp.range((q_base + (block_m + 1) * BLOCK_M + BLOCK_N - 1) // BLOCK_N, 100, AxisType.REDUCE)
-  Q_store = Q_lds.after(n_tile).reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid].store(q.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid])
-  load_k = UOp.range(KV_ELEMS_PER_THREAD, 90)
-  kval = k.reshape(physical_n*D)[n_tile*BLOCK_N*D + tid*KV_ELEMS_PER_THREAD + load_k].float()
-  K_store = KV_lds.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_k].store(kval).end(load_k)
-  qk_load_barrier = UOp.barrier(UOp.group(Q_store, K_store))
-  Q_lds, KV_lds_k = Q_lds.after(qk_load_barrier), KV_lds.after(qk_load_barrier)
+  if _hoist_q:
+    assert Q_hoisted is not None
+    # Unroll K global→LDS (HIP-like static gload count). Opt out: AMD_FLASH_UNROLL_KV=0.
+    k_flat = k.reshape(physical_n * D)
+    k_dst = KV_lds.after(n_tile).reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)
+    k_stores = []
+    for ei in range(KV_ELEMS_PER_THREAD):
+      kval = k_flat[n_tile * BLOCK_N * D + tid * KV_ELEMS_PER_THREAD + ei]
+      k_stores.append(k_dst[tid, ei].store(kval))
+    K_store = UOp.group(*k_stores)
+    qk_load_barrier = UOp.barrier(K_store)
+    Q_lds, KV_lds_k = Q_lds.after(qk_load_barrier), KV_lds.after(qk_load_barrier)
+  else:
+    Q_store = Q_lds.after(n_tile).reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid].store(q.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid])
+    k_flat = k.reshape(physical_n * D)
+    k_dst = KV_lds.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)
+    k_stores = []
+    for ei in range(KV_ELEMS_PER_THREAD):
+      kval = k_flat[n_tile * BLOCK_N * D + tid * KV_ELEMS_PER_THREAD + ei]
+      k_stores.append(k_dst[tid, ei].store(kval))
+    K_store = UOp.group(*k_stores)
+    qk_load_barrier = UOp.barrier(UOp.group(Q_store, K_store))
+    Q_lds, KV_lds_k = Q_lds.after(qk_load_barrier), KV_lds.after(qk_load_barrier)
   # Diagnostic: shared Q/K LDS after barrier (pre-WMMA inputs; expect exact across launches).
   if dumps and "q_lds" in dumps:
     dq = dumps["q_lds"]  # (BH, Nm, Ntiles, BLOCK_M, D) — unique (qrow, dcol) per thread
@@ -967,15 +1086,11 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   S_reg = _reg((TM, TN), 6, 0, n_tile)
   # AMD_FLASH_UNROLL: 0=off; 1 or 6=soft+corr python-unroll (const REG slots). WMMA stays ranged —
   # frag.after(store) cin was wrong; const_like(0) chains break direct-ISA emit (half2 LDS).
-  # AMD_FLASH_ACC_SEP: keep WMMA C in ACC; copy out to a const-indexed soft buffer before softmax.
-  # Default on: after soft vscnt + scratch addr CSE this is faster (~2.1ms vs ~2.7ms prefill).
-  _acc_sep = bool(getenv("AMD_FLASH_ACC_SEP", 1))
+  # ACC_SEP hardcoded: keep WMMA C in ACC; copy out to const-indexed soft before softmax.
   # Park one ACC pack per column (python-unrolled WMMA). Flash-only — AMD_WMMA_ACC_SMALL
   # also parks ≤64 quant tiles and breaks Q4/Q6; prefer AMD_FLASH_ACC_SMALL / acc_small arg.
   _acc_small = bool(acc_small or getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 0))
-  _fu = getenv("AMD_FLASH_UNROLL", 0)
-  if _fu == 1: _fu = 6
-  if _acc_sep: _fu |= 6  # soft/corr need const REG indices on the working buffer
+  _fu = 6  # FLASH_UNROLL hardcoded: soft+corr const REG indices
   S_view = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)
   Q_view = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)
   K_view = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)
@@ -984,20 +1099,18 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # AMD_FLASH_K_MIDSTORE=N: in full/hip QK|PV chains, store ACC every N WMMA (breaks MMU at N=4).
   _k_factor = int(k_unroll) if _acc_small else 0
   _k_hip = _k_factor == -1
-  _hip_scope = (k_hip_scope or getenv("AMD_FLASH_K_HIP_SCOPE", "all")).lower() if _k_hip or _k_factor >= 2 else ""
+  _hip_scope = (k_hip_scope or "all").lower() if _k_hip or _k_factor >= 2 else ""
   _k_hip_qk = _k_hip and _hip_scope in ("all", "qk", "q")
   _k_hip_pv = _k_hip and _hip_scope in ("all", "pv", "v")
   _k_unroll_full = _k_factor == 1
   _k_unroll_factor = _k_factor if _k_factor >= 2 and (D // WMMA_K) % _k_factor == 0 else 0
-  # Mid-store every 4 WMMA unlocks full K chain without MMU (~731µs vs ~768 @factor2).
-  # k_midstore is part of the functools.cache key — flash_attention always passes it.
-  # None keeps getenv for direct script calls (not cache-safe across env flips).
-  _mid_default = 4 if (_k_unroll_full or _k_hip or _k_factor >= 8) else 0
+  # Mid-store every 8 WMMA: after KV unroll, MIDSTORE=8 beats 4 (~434 vs ~450 best).
+  _mid_default = 8 if (_k_unroll_full or _k_hip or _k_factor >= 8) else 0
   if not _acc_small: _mid_every = 0
-  elif k_midstore is None: _mid_every = getenv("AMD_FLASH_K_MIDSTORE", _mid_default)
+  elif k_midstore is None: _mid_every = _mid_default
   else: _mid_every = k_midstore
   # Factor unroll can be scoped like hip: qk|pv|all (default all when scope unset).
-  _factor_scope = (k_hip_scope or getenv("AMD_FLASH_K_HIP_SCOPE", "all")).lower() if _k_unroll_factor else ""
+  _factor_scope = (k_hip_scope or "all").lower() if _k_unroll_factor else ""
   _factor_qk = bool(_k_unroll_factor) and _factor_scope in ("all", "qk", "q", "")
   _factor_pv = bool(_k_unroll_factor) and _factor_scope in ("all", "pv", "v", "")
   if not _k_unroll_factor: _factor_qk = _factor_pv = False
@@ -1068,27 +1181,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     q_frag = Q_view[wave_m, tm1, lane_n, k_qk]
     k_frag = K_view[tn1, lane_n, k_qk]
     qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk)
-  # Scale+mask: default on WMMA/scratch buffer first. Predicated where-stores into a
-  # REG-promoted const-index soft buffer were dropped (broke masked SDPA).
-  # AMD_FLASH_SOFT_SCALE=1: copy raw WMMA→soft first, then scale+mask on soft (VGPR).
-  _soft_scale = bool(_acc_sep and getenv("AMD_FLASH_SOFT_SCALE", 1))
-  if not _soft_scale:
-    S_reg = S_reg.after(qk_done, S_reg.store(S_reg * SCALE))
-    if _fu & 2:
-      mask_stores = []
-      for rm_i in range(TM):
-        for rn_i in range(TN):
-          q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
-          k_idx = n_tile * BLOCK_N + rn_i * LANES_PER_WAVE_N + lane_n
-          mask_stores.append(S_reg[rm_i, rn_i].store((k_idx <= q_idx).where(S_reg[rm_i, rn_i], S_reg[rm_i, rn_i].const_like(-math.inf))))
-      S_masked = S_reg.after(UOp.group(*mask_stores))
-    else:
-      rm, rn = UOp.range(TM, 250), UOp.range(TN, 251)
-      q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm * LANES_PER_WAVE_M + lane_m
-      k_idx = n_tile * BLOCK_N + rn * LANES_PER_WAVE_N + lane_n
-      S_masked = S_reg.after(S_reg[rm, rn].store((k_idx <= q_idx).where(S_reg[rm, rn], S_reg[rm, rn].const_like(-math.inf))).end(rm, rn))
-  else:
-    S_masked = S_reg.after(qk_done)
+  # Scale+mask: ACC_SEP + SOFT_SCALE + SOFT_FUSE hardcoded on (ship).
+  S_masked = S_reg.after(qk_done)
   # Diagnostic: raw QK WMMA C (slot 6) per wave_n, immediately after qk_done (before ACC→soft).
   if dumps and "qk_wmma" in dumps:
     dq = dumps["qk_wmma"]  # (BH, Nm, Ntiles, WAVES_N, BLOCK_M, BLOCK_N)
@@ -1099,48 +1193,16 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         kcol = rj * LANES_PER_WAVE_N + lane_n
         qk_wmma_stores.append(dq[block_bh, block_m, n_tile, wave_n, qrow, kcol].store(S_masked[ri, rj]))
     S_masked = S_masked.after(UOp.group(*qk_wmma_stores))
-  if _acc_sep:
-    # Copy into a const-index soft buffer (REG-promotable) for softmax.
-    # Skip zero-init: every slot is overwritten by the copy before any read.
-    S_soft = UOp.placeholder((TM, TN), dtypes.float, slot=16, addrspace=AddrSpace.REG)
-    if _soft_scale and getenv("AMD_FLASH_SOFT_FUSE", 1):
-      # Scale+mask while copying ACC→soft (one SSTORE wave; was copy then rewrite).
-      # AMD_FLASH_QIDX_REG / shared q_lane rewrites: correct? no — wrong tiles or ~250µs slower.
-      sm_stores = []
-      for rm_i in range(TM):
-        for rn_i in range(TN):
-          q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
-          k_idx = n_tile * BLOCK_N + rn_i * LANES_PER_WAVE_N + lane_n
-          scaled = S_masked[rm_i, rn_i] * SCALE
-          sm_stores.append(S_soft[rm_i, rn_i].store((k_idx <= q_idx).where(scaled, scaled.const_like(-math.inf))))
-      S_reg = S_soft.after(UOp.group(*sm_stores))
-    elif getenv("AMD_FLASH_VEC_COPY", 0) and (TM * TN) % 4 == 0:
-      # float4 shrink copies → vec SLOAD/SSTORE → scratch_*_b128 on the S_reg side.
-      src, dst = S_masked.reshape(TM * TN), S_soft.reshape(TM * TN)
-      S_reg = S_soft.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TN, 4)]))
-      if _soft_scale:
-        sm_stores = []
-        for rm_i in range(TM):
-          for rn_i in range(TN):
-            q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
-            k_idx = n_tile * BLOCK_N + rn_i * LANES_PER_WAVE_N + lane_n
-            scaled = S_reg[rm_i, rn_i] * SCALE
-            sm_stores.append(S_reg[rm_i, rn_i].store((k_idx <= q_idx).where(scaled, scaled.const_like(-math.inf))))
-        S_reg = S_reg.after(UOp.group(*sm_stores))
-    else:
-      S_reg = S_soft.after(UOp.group(*[S_soft[ri, rj].store(S_masked[ri, rj]) for ri in range(TM) for rj in range(TN)]))
-      if _soft_scale:
-        # Per-element scale+mask so REG promote sees scalar SSTOREs (bulk store desyncs slots).
-        sm_stores = []
-        for rm_i in range(TM):
-          for rn_i in range(TN):
-            q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
-            k_idx = n_tile * BLOCK_N + rn_i * LANES_PER_WAVE_N + lane_n
-            scaled = S_reg[rm_i, rn_i] * SCALE
-            sm_stores.append(S_reg[rm_i, rn_i].store((k_idx <= q_idx).where(scaled, scaled.const_like(-math.inf))))
-        S_reg = S_reg.after(UOp.group(*sm_stores))
-  else:
-    S_reg = S_masked
+  # Copy into const-index soft buffer; scale+mask in one SSTORE wave (SOFT_FUSE).
+  S_soft = UOp.placeholder((TM, TN), dtypes.float, slot=16, addrspace=AddrSpace.REG)
+  sm_stores = []
+  for rm_i in range(TM):
+    for rn_i in range(TN):
+      q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm_i * LANES_PER_WAVE_M + lane_m
+      k_idx = n_tile * BLOCK_N + rn_i * LANES_PER_WAVE_N + lane_n
+      scaled = S_masked[rm_i, rn_i] * SCALE
+      sm_stores.append(S_soft[rm_i, rn_i].store((k_idx <= q_idx).where(scaled, scaled.const_like(-math.inf))))
+  S_reg = S_soft.after(UOp.group(*sm_stores))
   # Diagnostic: S_soft (slot 16) after ACC→soft (+scale/mask); before max/sum/exp. Per wave_n.
   if dumps and "s_soft" in dumps:
     ds = dumps["s_soft"]  # (BH, Nm, Ntiles, WAVES_N, BLOCK_M, BLOCK_N)
@@ -1166,21 +1228,31 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     m_ij = _reg((TM,), 7, -math.inf, n_tile)
     for rn_i in range(TN):
       m_ij = m_ij.after(m_ij.store(m_ij.maximum(S_reg[:, rn_i])))
-    m_ij = m_ij.after(UOp.group(*[m_ij[ri].store(warp_reduce(m_ij[ri], maximum=True)) for ri in range(TM)]))
+    # Batch TM keys so same-stage ds_swizzle share one lgkm wait (HIP pattern).
+    _m_red = warp_reduce_many([m_ij[ri] for ri in range(TM)], maximum=True)
+    m_ij = m_ij.after(UOp.group(*[m_ij[ri].store(_m_red[ri]) for ri in range(TM)]))
     tile_max = m_ij.reshape(TM, 1).expand(TM, TN).maximum(-1e30)
     S_reg = S_reg.after(S_reg.store(((S_reg - tile_max) * LOG2E).exp2()))
     p_local = _reg((TM,), 8, 0, n_tile)
-    p_sum = p_local.after(UOp.group(*[p_local[ri].store(sum((warp_reduce(S_reg[ri, rn_i]) for rn_i in range(TN)), S_reg.const_like(0)))
-                                      for ri in range(TM)]))
+    _p_vals = [S_reg[ri, rn_i] for ri in range(TM) for rn_i in range(TN)]
+    _p_red = warp_reduce_many(_p_vals)
+    p_sum = p_local.after(UOp.group(*[
+      p_local[ri].store(sum((_p_red[ri * TN + rn_i] for rn_i in range(TN)), S_reg.const_like(0)))
+      for ri in range(TM)]))
   else:
     m_ij, rm2 = _reg((TM,), 7, -math.inf, n_tile), UOp.range(TN, 261, AxisType.REDUCE)
     m_ij = m_ij.after(m_ij.store(m_ij.after(rm2).maximum(S_reg[:, rm2])).end(rm2))
-    ri_w = UOp.range(TM, 270)
-    m_ij = m_ij.after(m_ij[ri_w].store(warp_reduce(m_ij[ri_w], maximum=True)).end(ri_w))
+    # Ranged soft path: still batch the TM max reduces when the range is unrolled away.
+    _m_red = warp_reduce_many([m_ij[ri] for ri in range(TM)], maximum=True)
+    m_ij = m_ij.after(UOp.group(*[m_ij[ri].store(_m_red[ri]) for ri in range(TM)]))
     tile_max = m_ij.reshape(TM, 1).expand(TM, TN).maximum(-1e30)
     S_reg = S_reg.after(S_reg.store(((S_reg - tile_max) * LOG2E).exp2()))
-    p_local, ri_ws = _reg((TM,), 8, 0, n_tile), UOp.range(TM, 295)
-    p_sum = p_local.after(p_local[ri_ws].store(sum((warp_reduce(S_reg[ri_ws, rn]) for rn in range(TN)), S_reg.const_like(0))).end(ri_ws))
+    p_local = _reg((TM,), 8, 0, n_tile)
+    _p_vals = [S_reg[ri, rn] for ri in range(TM) for rn in range(TN)]
+    _p_red = warp_reduce_many(_p_vals)
+    p_sum = p_local.after(UOp.group(*[
+      p_local[ri].store(sum((_p_red[ri * TN + rn] for rn in range(TN)), S_reg.const_like(0)))
+      for ri in range(TM)]))
   # Diagnostic: softmax max/sum → logical BLOCK_M rows. One writer per row (wave_n=0, lane_n=0).
   if dumps and any(k in dumps for k in ("soft_m", "soft_l")):
     soft_stores: list[UOp] = []
@@ -1213,12 +1285,35 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     .reshape(THREADS_PER_BLOCK, TM, TN)
   P_store = P_write[tid].store(S_reg.cast(dtypes.half))
   beta_i = UOp.placeholder((TM,), dtypes.float, slot=9, addrspace=AddrSpace.REG)
-  # Tile-local promotable working copy of REDUCE-carried acc when slot 2 stays scratch.
-  # Never combine with promoting slot 2 — both-promoted copy/writeback nans on gfx1100.
-  # One scratch load at tile start + one store at tile end; alpha*acc still runs before
+  # Tile-local promotable working copy of REDUCE-carried acc when slot 2 stays scratch
+  # (or ACC is in LDS). Never combine REG-promoted ACC with the work copy — wrong checksums.
+  # One scratch/LDS load at tile start + one store at tile end; alpha*acc still runs before
   # V load (keeps latency hiding). Soft/stats buffers already promote on their own.
+  # EARLY_V hardcoded on with ACC_SMALL (ship prefill).
+  _early_v = bool(_acc_small)
   _acc_work = bool(use_acc_work and (_fu & 4) and _acc_small)
   acc_work = UOp.placeholder((TM, TD), dtypes.float, slot=19, addrspace=AddrSpace.REG) if _acc_work else None
+  # Slot 1 reuses K's LDS after QK (OVERLAP_V dedicated slot-7 removed).
+  V_lds = UOp.placeholder((D, BLOCK_N + LDS_PAD), dtypes.half, slot=1,
+                          addrspace=AddrSpace.LOCAL)[:, :BLOCK_N]
+  V_store = None
+  def _kv_ld(idx:UOp) -> UOp:
+    return idx  # half→half LDS (KV_FLOAT_COPY removed)
+  def _kv_zero(sample:UOp) -> UOp:
+    return sample.const_like(0)
+  def _v_store_unrolled(v_lds_view:UOp) -> UOp:
+    # Unroll V global→LDS like K (AMD_FLASH_UNROLL_KV hardcoded on).
+    v_flat = v.reshape(physical_n * D)
+    v_dst = v_lds_view.permute(1, 0).reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)
+    stores = []
+    for ei in range(KV_ELEMS_PER_THREAD):
+      v_pos = n_tile * BLOCK_N + (tid * KV_ELEMS_PER_THREAD + ei) // D
+      vraw = v_flat[n_tile * BLOCK_N * D + tid * KV_ELEMS_PER_THREAD + ei]
+      vval = (v_pos < valid_kv_len).where(_kv_ld(vraw), _kv_zero(vraw))
+      stores.append(v_dst[tid, ei].store(vval))
+    return UOp.group(*stores)
+  if _early_v:
+    V_store = _v_store_unrolled(V_lds.after(lds_reuse_barrier))
   if _fu & 4:
     acc_c, l_c, m_c = acc.after(n_tile), l_i.after(n_tile), m_i.after(n_tile)
     if _acc_work:
@@ -1253,13 +1348,11 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
                            l_i[ri4].store(alpha_val * l_i[ri4] + beta_val * p_sum[ri4]),
                            m_i[ri4].store(m_new), beta_i[ri4].store(beta_val)).end(ri4)
     acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
-  V_lds = UOp.placeholder((D, BLOCK_N + LDS_PAD), dtypes.half, slot=1, addrspace=AddrSpace.LOCAL)[:, :BLOCK_N]
-  # after(qk_done) is per-wave only; lds_reuse_barrier syncs the workgroup so K is not
-  # overwritten by V while another wave is still in QK.
-  V_copy, load_v = V_lds.after(lds_reuse_barrier).permute(1, 0), UOp.range(KV_ELEMS_PER_THREAD, 390)
-  v_pos = n_tile*BLOCK_N + (tid*KV_ELEMS_PER_THREAD + load_v)//D
-  vval = (v_pos < valid_kv_len).where(v.reshape(physical_n*D)[n_tile*BLOCK_N*D + tid*KV_ELEMS_PER_THREAD + load_v].float(), 0)
-  V_store = V_copy.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_v].store(vval).end(load_v)
+  if not _early_v:
+    # after(qk_done) is per-wave only; lds_reuse_barrier syncs the workgroup so K is not
+    # overwritten by V while another wave is still in QK.
+    V_store = _v_store_unrolled(V_lds.after(lds_reuse_barrier))
+  assert V_store is not None
   pv_barrier = UOp.barrier(UOp.group(P_store, V_store))
   P_lds, V_lds = P_lds.after(pv_barrier), V_lds.after(pv_barrier)
   # Diagnostic: P/V LDS after barrier (pre-WMMA inputs).
@@ -1356,17 +1449,16 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # Pre-copy dump: slot-10 WMMA C / parked ACC result (before ACC→pv_soft).
   if dumps and "pv_wmma" in dumps:
     pv_acc = pv_acc.after(UOp.group(*_pv_logical_stores(dumps["pv_wmma"], pv_acc)))
-  if _acc_sep:
-    # Fully overwritten before read — skip REG zero-fill (same as S_soft).
-    # Keep soft copy even under ACC_SMALL: PV ACC→soft is faster than EXTRACT-at-use
-    # (~670 vs ~810µs). AMD_FLASH_PV_ACC_DIRECT=1 skips copy (slower on HW).
-    if not (_acc_small and getenv("AMD_FLASH_PV_ACC_DIRECT", 0)):
-      pv_soft = UOp.placeholder((TM, TD), dtypes.float, slot=17, addrspace=AddrSpace.REG)
-      if getenv("AMD_FLASH_VEC_COPY", 0) and (TM * TD) % 4 == 0:
-        src, dst = pv_acc.reshape(TM * TD), pv_soft.reshape(TM * TD)
-        pv_acc = pv_soft.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)]))
-      else:
-        pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
+  # Fully overwritten before read — skip REG zero-fill (same as S_soft).
+  # Keep soft copy even under ACC_SMALL: PV ACC→soft is faster than EXTRACT-at-use
+  # (~670 vs ~810µs). AMD_FLASH_PV_ACC_DIRECT=1 skips copy (slower on HW).
+  # PV ACC→soft (PV_ACC_DIRECT removed — was slower).
+  pv_soft = UOp.placeholder((TM, TD), dtypes.float, slot=17, addrspace=AddrSpace.REG)
+  if _acc_small and (TM * TD) % 4 == 0:  # VEC_COPY hardcoded on with ACC_SMALL
+    src, dst = pv_acc.reshape(TM * TD), pv_soft.reshape(TM * TD)
+    pv_acc = pv_soft.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)]))
+  else:
+    pv_acc = pv_soft.after(UOp.group(*[pv_soft[ri, rj].store(pv_acc[ri, rj]) for ri in range(TM) for rj in range(TD)]))
   # Post-copy dump: slot-17 soft buffer (or still slot-10 if PV_ACC_DIRECT).
   if dumps and "pv" in dumps:
     pv_acc = pv_acc.after(UOp.group(*_pv_logical_stores(dumps["pv"], pv_acc)))
@@ -1374,7 +1466,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # When ACC_WORK is on, normalize from the last tile's VGPR work copy so the epilogue
   # does not reload slot-2 scratch (writeback still feeds the next n_tile iter).
   acc_work_final: UOp|None = None
-  if _fu & 4 and getenv("AMD_FLASH_ACC_UNROLL", 1):
+  if _fu & 4:  # ACC_UNROLL hardcoded on with soft/corr
     # Const-index acc update. Slot 2 stays unpromoted (REDUCE-carried); soft/stats promote.
     acc_c = acc.after(n_tile)
     if _acc_work:
@@ -1445,21 +1537,23 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # AMD_FLASH_ACC_SMALL is set for this realize (not via FLASH_DIRECT process-wide —
   # that parked every matmul and broke eye/GEMM). ACC_SMALL defaults on for DIRECT;
   # AMD_FLASH_ACC_SMALL=0 disables; AMD_WMMA_ACC_SMALL=1 forces (unsafe for quant).
-  # K_UNROLL default 1 + MIDSTORE=4: full K chain with ACC checkpoints (~731µs serial vs
-  # ~768 @factor2). Override AMD_FLASH_K_UNROLL=2 for ranged-factor baseline; MIDSTORE=0 disables.
+  # K_UNROLL default 1 + MIDSTORE=8: full K chain with ACC checkpoints (~434µs best after KV unroll).
+  # Override AMD_FLASH_K_UNROLL=2 for ranged-factor baseline; MIDSTORE=0 disables.
   use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
-  use_k_unroll = getenv("AMD_FLASH_K_UNROLL", 1) if use_acc_small else 0
-  use_k_hip_scope = getenv("AMD_FLASH_K_HIP_SCOPE", "all") if (use_k_unroll == -1 or use_k_unroll >= 1) else "all"
+  use_k_unroll = 1 if use_acc_small else 0  # K_UNROLL hardcoded ship default
+  use_k_hip_scope = "all"  # K_HIP_SCOPE hardcoded
   # Mid-store belongs in the cache key (not a bare getenv inside the cached builder).
-  _mid_default = 4 if (use_k_unroll == -1 or use_k_unroll == 1 or use_k_unroll >= 8) else 0
-  use_k_midstore = int(getenv("AMD_FLASH_K_MIDSTORE", _mid_default)) if use_acc_small else 0
+  _mid_default = 8 if (use_k_unroll == 1 or use_k_unroll >= 8) else 0
+  use_k_midstore = _mid_default if use_acc_small else 0  # K_MIDSTORE follows factor default
   # Build+realize under ACC_SMALL remat + ALLOW_UPCAST16=0 (must wrap custom_kernel).
   # Read SKIP_SLOTS only after compile_env re-applies prefill policy (decode leaves sticky "").
   with _flash_direct_compile_env(flash_acc_small=use_acc_small):
-    # Work-copy (slot 19) only while slot 2 is in SKIP_SLOTS. Promoting slot 2 with the
-    # work-copy active nans; promoting slot 2 alone is the alternate path (see handoff).
-    _skip_reg = {int(s) for s in getenv("AMD_REG_PROMOTE_SKIP_SLOTS", "2").split(",") if s.strip()}
-    use_acc_work = bool(use_acc_small and (2 in _skip_reg) and getenv("AMD_FLASH_ACC_WORK", 1))
+    # Ship prefill: ACC_VGPR + HOIST_Q; SKIP clears slot 2 under ACC_VGPR.
+    use_acc_vgpr = bool(use_acc_small)  # ACC_VGPR hardcoded on with ACC_SMALL
+    # REG_PROMOTE_SKIP folded into ACC_SMALL/VOPD_FMAC in renderer (promote slot 2 under flash)
+    _skip_reg: set[int] = set() if use_acc_vgpr else {2}
+    use_acc_work = bool(use_acc_small and not use_acc_vgpr and 2 in _skip_reg)
+    use_hoist_q = bool(use_acc_small)  # HOIST_Q hardcoded on with ACC_SMALL
     if isinstance(T_real, UOp):
       # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
       T_pad = q.max_shape[2]
@@ -1469,7 +1563,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     out = Tensor.empty(B*H, T, D, dtype="float32", device=q.device)
     fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start,
                             acc_small=use_acc_small, k_unroll=use_k_unroll, use_acc_work=use_acc_work,
-                            k_hip_scope=use_k_hip_scope, k_midstore=use_k_midstore)
+                            k_hip_scope=use_k_hip_scope, k_midstore=use_k_midstore,
+                            acc_vgpr=use_acc_vgpr, hoist_q=use_hoist_q)
     out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
     if q_start is not None: out = out[:, :, :T_real]
     if not use_acc_small: return out

@@ -96,7 +96,7 @@ def main() -> None:
     base = {k: ctx[k] for k in ("case", "direct", "device", "renderer", "arch", "custom", "tokens", "physical_n")}
     print(json.dumps({"event": "setup", **base}), flush=True)
     if args.mode in ("fence", "all") and case == "prefill" and direct:
-      for b in (2, 50):
+      for b in (10, 50, 100):
         r = fence_probe(ctx, batch=b)
         print(json.dumps({"event": "fence", **base, **r}), flush=True)
     if args.mode in ("sync-each", "all"):
