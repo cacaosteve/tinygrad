@@ -2834,7 +2834,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_float4_global_memory_uses_b128_and_scalarized_alu(self):
     prg = _float4_add_program()
     _check_elf(self, prg)
-    self.assertFalse(any(u.op is not Ops.INS for u in _prg_lin(prg).src))
+    self.assertTrue(all(u.op in (Ops.INS, Ops.STACK) for u in _prg_lin(prg).src))
     linear_ops = _lin_ops(prg)
     self.assertEqual(linear_ops.count(AMDOps.LOAD), 2)
     self.assertEqual(linear_ops.count(AMDOps.STORE), 1)
@@ -2878,7 +2878,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_float4_lds_memory_uses_ds_b128(self):
     prg = _float4_lds_program()
     _check_elf(self, prg)
-    self.assertFalse(any(u.op is not Ops.INS for u in _prg_lin(prg).src))
+    self.assertTrue(all(u.op in (Ops.INS, Ops.STACK) for u in _prg_lin(prg).src))
     inst_names = _amd_inst_names(prg)
     self.assertIn("DS_STORE_B128", inst_names)
     self.assertIn("DS_LOAD_B128", inst_names)

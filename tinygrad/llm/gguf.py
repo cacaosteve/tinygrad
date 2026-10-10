@@ -2,6 +2,7 @@ import functools, io, pathlib, re, struct
 from typing import Any, Callable
 
 from tinygrad.tensor import Tensor
+from tinygrad.device import Device
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import prod, round_up
 from tinygrad.nn.state import TensorIO
@@ -43,8 +44,8 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
 
   def q_to_uint8(t: Tensor, b: int) -> Tensor:
     # TODO: rewrite with arange?
-    shift_tensor, bitmask = Tensor.const(tuple(i*b for i in range(8//b)), t.dtype), 0xff >> (8 - b)
-    return t.unsqueeze(-1).rshift(shift_tensor).bitwise_and(bitmask).transpose(-1, -2).flatten(-2)
+    shift_tensor, bitmask = Tensor.const(tuple(2**(i*b) for i in range(8//b)), t.dtype), 0xff >> (8 - b)
+    return t.unsqueeze(-1).div(shift_tensor, rounding_mode="trunc").bitwise_and(bitmask).transpose(-1, -2).flatten(-2)
 
   if (nelements_nbytes := _GGML_QUANT.get(ggml_type)) is not None:
     from tinygrad.runtime.autogen import ggml_common as _ggml
@@ -245,6 +246,27 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
   Packed weights are copied to the default device before constructing the lazy decoding expressions.
   """
   kv, entries = gguf_parse(fn)
-  packed = {name: data.to(None) for name, (data, _, _) in entries.items()}
-  if packed: Tensor.realize(*packed.values())
-  return kv, {name: ggml_data_to_tensor(packed[name], prod(shape), typ).reshape(shape) for name, (_, shape, typ) in entries.items()}
+  return kv, gguf_shard(entries, (Device.DEFAULT,))
+
+def gguf_shard(entries:dict[str, tuple[Tensor, tuple[int, ...], int]], devices:tuple[str, ...],
+               shard_map:dict[str, int]|None=None) -> dict[str, Tensor]:
+  """
+  Loads the parsed `entries` on `devices`: a tensor in `shard_map` is sharded on the given axis, the others are copied to every device.
+  """
+  n, packed, shard_map = len(devices), {}, shard_map or {}
+  for name, (data, shape, typ) in entries.items():
+    if (axis:=shard_map.get(name)) is None: packed[name] = data.shard(devices)
+    else:
+      if shape[axis] % n or (axis == len(shape)-1 and shape[axis]//n % _GGML_QUANT.get(typ, (1,))[0]):
+        raise ValueError(f"{name}: can't split {shape} on axis {axis} over {n} devices")
+      parts = (data.to("CPU") if prod(shape[:axis]) > 1 else data).reshape(*shape[:axis], n, -1)
+      packed[name] = parts.permute(axis, *range(axis), axis+1).shard(devices, 0)
+  # TODO: shard copies the full tensor to every device
+  for t in packed.values(): t.realize()
+  for d in devices: Device[d].allocator.free_cache()
+  def decode(name:str, shape:tuple[int, ...], typ:int) -> Tensor:
+    decoded = ggml_data_to_tensor(packed[name].flatten(), prod(shape), typ)
+    if (axis:=shard_map.get(name)) is None: return decoded.reshape(shape)
+    local = decoded.reshape(n, *shape[:axis], shape[axis]//n, *shape[axis+1:])
+    return local.permute(*range(1, axis+1), 0, *range(axis+1, local.ndim)).reshape(shape)
+  return {name: decode(name, shape, typ) for name, (_, shape, typ) in entries.items()}

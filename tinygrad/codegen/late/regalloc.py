@@ -8,7 +8,7 @@ from tinygrad.dtype import dtypes, AddrSpace
 from typing import Any
 from dataclasses import replace
 
-PSEUDO_OPS = {Ops.CONST, Ops.CAST, Ops.BITCAST, Ops.NOOP, Ops.AFTER, Ops.BARRIER, Ops.GROUP, Ops.STACK}
+PSEUDO_OPS = {Ops.CONST, Ops.CAST, Ops.BITCAST, Ops.NOOP, Ops.AFTER, Ops.BARRIER, Ops.STACK}
 
 class LinearScanRegallocContext:
   # returns the uop that defines the virtual register
@@ -302,7 +302,7 @@ def wide_restore(ctx, v, r, i):
 
 def wide_regalloc_rewrite(ctx, x:UOp):
   i = ctx.regalloc_i
-  if x.op in {Ops.CONST, Ops.NOOP, Ops.AFTER, Ops.BARRIER, Ops.GROUP, Ops.STACK}: return None
+  if x.op in {Ops.CONST, Ops.NOOP, Ops.AFTER, Ops.BARRIER, Ops.STACK}: return None
   if x.op in (Ops.LOAD, Ops.STORE) and not ctx.insert_before.get(i) and i not in ctx.spill_on_evict:
     spilled = any(i in ctx.reals and ((vr:=greg(ctx.uops[i].src[j])) in ctx.spills or vr in ctx.remat)
                   for j in range(len(x.src)))

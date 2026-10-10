@@ -20,7 +20,7 @@ def check(status:int):
 def as_int(handle) -> int: return unwrap(ctypes.cast(handle, ctypes.c_void_p).value)
 
 def host_stamp(slot:int): ctypes.c_uint64.from_address(slot).value = time.perf_counter_ns()
-def extern(ptr:int, meta=None) -> Buffer: return Buffer(HCQ_RUNTIME_DEV.value, 1, dtypes.uint64, opaque=BufferStorage(ptr, meta))
+def extern(ptr:int, meta=None) -> Buffer: return Buffer(HCQ_RUNTIME_DEV.device, 8, opaque=BufferStorage(ptr, meta))
 
 # *****************
 # queue
@@ -38,7 +38,7 @@ class CUDAQueue(HWQueue):
   def call(self, fn, *args): # the values go in the cmdbuf as words
     vals = [UOp.const(a, dtypes.uint64) if isinstance(a, int) else a for a in args]
     self.cmds.append((fn, *[a if a is None or isinstance(a, tuple) else self.q(a.cast(dtypes.uint64)) // 8 - 1 for a in vals]))
-  def extern(self, tag) -> UOp: return UOp.placeholder((1,), dtypes.uint64, 0, device=self.devs, tag=tag).getaddr(self.dev.host)
+  def extern(self, tag) -> UOp: return UOp.alloc((1,), dtypes.uint64, 0, device=self.devs[0]).rtag(tag).getaddr(self.dev.host)
 
   def exec(self, call:UOp, prg:UOp):
     obj, bufs, vals = prg.to_elf(), get_call_arg_uops(call), get_call_var_uops(call, prg)
@@ -56,7 +56,7 @@ class CUDAQueue(HWQueue):
 
   def encode(self) -> UOp:
     self.cmds:list[tuple] = []
-    rt_vars = UOp.placeholder((4,), dtypes.uint64, 0, device=self.devs, tag=self.dev.tag("cuda"))
+    rt_vars = UOp.alloc((4,), dtypes.uint64, 0, device=self.devs[0]).rtag(self.dev.tag("cuda"))
     return cuda_run(encode_cmdbuf(self, self.lin), rt_vars, tuple(self.cmds), self.queue.startswith("COPY"))
 
 # *****************
@@ -76,9 +76,7 @@ class CUDAAllocator(Allocator['CUDADevice']):
     check((cuda.cuMemFreeHost if options.host or options.cpu_access else cuda.cuMemFree_v2)(storage.buf))
 
   def _map(self, buf:Buffer) -> BufferStorage:
-    if buf.device.startswith("CUDA"):
-      if buf.get_storage().host is None: raise RuntimeError(f"{buf.device} device memory is only reachable through the host")
-      return BufferStorage(buf._buf)
+    if buf.device.startswith("CUDA"): return BufferStorage(buf._buf)
     if (host:=buf.get_storage().host) is None or host.addr % mmap.PAGESIZE: raise RuntimeError(f"{buf.device} memory is not page aligned host memory")
     check(cuda.cuCtxSetCurrent(self.dev.context))
     if (status:=cuda.cuMemHostRegister_v2(host.addr, buf.nbytes, 0)) != cuda.CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED:
@@ -103,13 +101,13 @@ class CUDADevice(Compiled):
     self.streams = [init_c_var(cuda.CUstream, lambda x: check(cuda.cuStreamCreate(ctypes.byref(x), cuda.CU_STREAM_NON_BLOCKING))) for _ in range(2)]
     super().__init__(device, CUDAAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer], None, arch=f"sm_{major.value}{minor.value}")
     Compiled.pm_bufferize += PatternMatcher([
-      (UPat(Ops.PARAM, tag=self.tag("cuda")), lambda d=self: d.handles),
-      (UPat(Ops.PARAM, tag=self.tag("stamp")), lambda d=self: d.stamp),
-      (UPat(Ops.PARAM, name="b"), lambda b, d=self: d.function(*b.tag[1:]) if isinstance(b.tag, tuple) and b.tag[0] == d.tag("function") else None)])
+      (UPat(Ops.ALLOC, tag=self.tag("cuda")), lambda d=self: d.handles),
+      (UPat(Ops.ALLOC, tag=self.tag("stamp")), lambda d=self: d.stamp),
+      (UPat(Ops.ALLOC, name="b"), lambda b, d=self: d.function(*b.tag[1:]) if isinstance(b.tag, tuple) and b.tag[0] == d.tag("function") else None)])
 
   @functools.cached_property
   def handles(self) -> Buffer:
-    return Buffer(HCQ_RUNTIME_DEV.value, 4, dtypes.uint64, initial_value=struct.pack("4Q", *[as_int(h) for h in (self.context, *self.streams)], 0))
+    return Buffer(HCQ_RUNTIME_DEV.device, 32, initial_value=struct.pack("4Q", *[as_int(h) for h in (self.context, *self.streams)], 0))
 
   @functools.cached_property
   def stamp(self) -> Buffer: return extern(as_int(fn:=cuda.CUhostFn(host_stamp)), fn)

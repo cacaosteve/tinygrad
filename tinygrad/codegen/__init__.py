@@ -5,7 +5,7 @@ from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ
 from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, TC_SELECT, TC_OPT, TC_MIN_GLOBALS, CCACHE, TracingKey, Context, panic, getenv
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
 from tinygrad.uop.weak import pm_lower_weak, pm_commit_weak, pm_cast_const
-from tinygrad.uop.render import pyrender
+from tinygrad.uop.render import render_uir
 from tinygrad.uop.spec import type_verify, spec_tensor, spec_program
 from tinygrad.renderer import Renderer, Estimates
 from tinygrad.renderer.isa import ISARenderer, IselContext, PreRegAllocContext
@@ -318,7 +318,7 @@ pm_implicit_barriers = PatternMatcher([
 ])
 
 def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
-  if DEBUG >= 5: print(pyrender(ast))
+  if DEBUG >= 5: print(render_uir(ast))
   if SPEC: type_verify(ast, spec_tensor)
 
   # resolve UNSHARDs (multi-device UNSHARDs are already resolved by the scheduler; this handles in-kernel shards, e.g. fragments)
@@ -533,8 +533,9 @@ def do_estimates(prg:UOp, sink:UOp, lin:UOp) -> UOp|None:
   if sink.arg.estimates is not None: return None
   return prg.replace(src=(sink.replace(arg=replace(sink.arg, estimates=Estimates.from_uops(lin.src, ignore_indexing=True))),)+prg.src[1:])
 
-def do_assemble(ctx:Renderer, prg:UOp, lin:UOp) -> UOp:
-  src = "\n".join(str(u.arg[0]) for u in lin.src)
+def do_assemble(ctx:Renderer, prg:UOp, lin:UOp) -> UOp|None:
+  if not isinstance(ctx, ISARenderer) or any(u.op not in (Ops.INS, Ops.STACK) for u in lin.src): return None
+  src = "\n".join(str(u.arg[0]) for u in lin.src if u.op is Ops.INS)
   if DEBUG >= 4: print(src)
   stage_st = time.perf_counter_ns()
   binary = ctx.asm(prg, lin)
@@ -554,7 +555,7 @@ def do_compile(ctx:Renderer, prg:UOp, source:UOp) -> UOp|None:
 pm_to_program = PatternMatcher([
   (UPat(Ops.PROGRAM, src=(UPat(Ops.SINK, name="sink"),), name="prg"), do_linearize),
   (UPat(Ops.PROGRAM, src=(UPat(Ops.SINK, name="sink"), UPat(Ops.LINEAR, name="lin")), name="prg"), do_estimates),
-  (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR, src=UPat(Ops.INS), name="lin")), name="prg"), do_assemble),
+  (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR, name="lin")), name="prg"), do_assemble),
   (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR, name="lin")), name="prg"), do_render),
   (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR), UPat(Ops.SOURCE, name="source")), name="prg"), do_compile),
 ])

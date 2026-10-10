@@ -2,13 +2,12 @@ from __future__ import annotations
 from typing import cast, Iterator, Any, Sequence
 import decimal
 from dataclasses import dataclass, replace, field
-from tinygrad.helpers import colored, DEBUG, GlobalCounters, ansipad, prod, flatten, Context, to_tuple, tqdm, dedup
-from tinygrad.helpers import diskcache_get, diskcache_put
+from tinygrad.helpers import CAPTURE_PROCESS_REPLAY, colored, DEBUG, GlobalCounters, ansipad, prod, flatten, Context, to_tuple, tqdm, unwrap
 from tinygrad.helpers import BEAM, size_to_str, time_to_str, VALIDATE_WITH_CPU, PROFILE, ProfilePointEvent, cpu_events, perf_counter_us, cpu_profile
-from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, AxisType, sym_infer, graph_rewrite, ProgramInfo, KernelInfo
-from tinygrad.device import Device, Buffer, MultiBuffer, ProfileGraphEntry
+from tinygrad.uop.ops import get_process_replay_loc, Ops, PatternMatcher, UOp, UPat, AxisType, sym_infer, graph_rewrite, ProgramInfo, KernelInfo
+from tinygrad.device import Device, Buffer, MultiBuffer, ProfileGraphEntry, DEV, HCQ_RUNTIME_DEV
 from tinygrad.renderer import Estimates, Renderer
-from tinygrad.codegen import to_program, to_program_cache, to_program_mem_key, to_program_disk_key, to_program_context
+from tinygrad.codegen import to_program, to_program_cache, to_program_key, to_program_context
 from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
 
 # **************** Helpers ****************
@@ -26,12 +25,6 @@ def get_call_outs_ins(call:UOp) -> tuple[tuple[int, ...], tuple[int, ...]]:
   if ast.op is Ops.STORE: return (0,), (1,)
   if ast.op is Ops.CUSTOM_FUNCTION and ast.arg.name == "encdec": return (0,), tuple(range(1, len(get_call_arg_uops(call))))
   return (), ()
-
-def get_call_written_bufs(call:UOp) -> list[UOp]:
-  if isinstance(call.arg.aux, HCQInfo): return list(call.arg.aux.written_bufs)
-  arg_uops, (outs, ins) = get_call_arg_uops(call), get_call_outs_ins(call)
-  bufs = [b.src[0].storage_base if (b:=arg_uops[k].storage_base).op is Ops.MSELECT else b for k in outs if k not in ins]
-  return dedup([b for b in bufs if b.op is Ops.BUFFER])
 
 def get_call_kernels(call:UOp) -> list[tuple[str, UOp, tuple|None]]:
   if isinstance(call.arg.aux, HCQInfo): # the submitter itself, then every kernel it enqueues
@@ -146,12 +139,7 @@ def unwrap_multi(call:UOp, resolved:list[UOp]) -> Iterator[tuple[list[Buffer], d
 def exec_copy(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
   for bufs, device_vars in unwrap_multi(call, resolve_params(call, ctx.input_uops)):
     dest, src = bufs[0].ensure_allocated(), bufs[1].ensure_allocated()
-    if hasattr(dest.allocator,'_transfer') and dest.allocator.supports_transfer and dest.device.split(":")[0] == src.device.split(":")[0]:
-      dest.allocator._transfer(dest._buf, src._buf, dest.nbytes, src_dev=src.allocator.dev, dest_dev=dest.allocator.dev)
-    elif src.device.startswith("DISK") and getattr(src.allocator.dev, 'fd', None) is not None \
-         and hasattr(dest.allocator, 'copy_from_disk') and src.nbytes >= 4096 and dest.allocator.supports_copy_from_disk:
-      dest.allocator.copy_from_disk(dest._buf, src._buf, src.nbytes)
-    elif dest.get_storage().host is not None and src.get_storage().host is not None:
+    if dest.get_storage().host is not None and src.get_storage().host is not None:
       for b in (dest, src): b.allocator.dev.synchronize()
       with cpu_profile(f"{src.device} -> {dest.device}", f"{src.device}:COPY"): dest.host[:] = src.host[:]
     elif dest._host_mv() is not None: src.allocator._copyout(dest.as_memoryview(allow_zero_copy=True), src._buf)
@@ -162,6 +150,7 @@ def exec_kernel(ctx:ExecContext, call:UOp, ast:UOp, devices=None) -> list[float|
   ets:list[float|None] = []
   resolved = resolve_params(call, ctx.input_uops)
   for device, (bufs, device_vars) in zip(devices or to_tuple(call.src[1].device), unwrap_multi(call, [resolved[i] for i in ast.arg.globals])):
+    if devices is None and device.split(":")[0] in HOST_DEVS: Device[device].synchronize(ctx.timeout)
     var_vals = {**ctx.var_vals, **device_vars}
     prg_bufs = [b.ensure_allocated() for b in bufs]
     rt = get_runtime(device, ast, cache=ctx.cache)
@@ -173,29 +162,27 @@ def exec_kernel(ctx:ExecContext, call:UOp, ast:UOp, devices=None) -> list[float|
 
 def exec_validate(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
   import numpy as np
-  for bufs, device_vars in unwrap_multi(call, resolve_params(call, ctx.input_uops)):
+  from tinygrad.dtype import _to_np_dtype
+  resolved = resolve_params(call, ctx.input_uops)
+  Device["CPU"].synchronize(ctx.timeout)
+  for bufs, device_vars in unwrap_multi(call, resolved):
     bufs, dev_bufs = bufs[:len(bufs)//2], bufs[len(bufs)//2:]
     var_vals = {**ctx.var_vals, **device_vars}
     cpu_rt = get_runtime("CPU", prg:=to_program(ast.src[0], Device["CPU"].renderer))
     global_size, local_size = prg.arg.launch_dims(var_vals)
     cpu_rt(*[bufs[i].ensure_allocated()._buf for i in prg.arg.globals], global_size=global_size, local_size=local_size, vals=prg.arg.vals(var_vals))
-    for i in prg.arg.outs: np.testing.assert_allclose(dev_bufs[i].ensure_allocated().numpy(), bufs[i].numpy(), rtol=1e-3, atol=1e-3)
+    for i in prg.arg.outs:
+      dt = _to_np_dtype(resolved[i].dtype)
+      assert dt is not None, f"no np dtype for {resolved[i].dtype}"
+      np.testing.assert_allclose(np.frombuffer(dev_bufs[i].ensure_allocated().as_memoryview(), dt),
+                                 np.frombuffer(bufs[i].as_memoryview(), dt), rtol=1e-3, atol=1e-3)
   return []
 
 def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
   info = call.arg.aux
   ctx = replace(ctx, wait=ctx.wait and not info.skip_wait,
                 var_vals={**ctx.var_vals, **{k: v for d in info.device for k, v in cast(Any, Device[d]).var_vals.items()}})
-  # Host fence persists the prior nxt in the sched slot and spins in a CPU kernel, but on
-  # long TinyJit multi-submit (flash prefill) that spin still races: dual submit leaves
-  # timeline [n, n+1] and the second kernel never completes. Sleep between submits works;
-  # a real Python wait for the prior expected value before re-arm does too.
-  for device in info.device:
-    d = cast(Any, Device[device])
-    tl = d.timeline.host.view(fmt='Q')
-    d._wait_signal(tl, int(tl[1]))
   ets = exec_kernel(ctx, call, ast, devices=(Device[info.device[0]].host,))
-  for host, dev in info.host_deps: Device[host].pending[Device[dev]] = Device[dev].timeline.host.view(fmt='Q')[1]
   if not (ctx.wait or PROFILE): return ets
 
   slots = {d: cast(Buffer, call.src[1 + i].buffer) for d, i in info.slots}
@@ -237,7 +224,7 @@ def _get_call_to_compile(c:UOp) -> tuple[UOp, Renderer]|None:
   # a PROGRAM with a ProgramInfo and a BINARY is already compiled
   if (ast.op is Ops.SINK and isinstance(ast.arg, KernelInfo)) or \
      (ast.op is Ops.PROGRAM and not (isinstance(ast.arg, ProgramInfo) and ast.src[-1].op is Ops.BINARY)):
-    return ast, Device[c.device if isinstance(c.device, str) else c.device[0]].renderer
+    return ast, Device[to_tuple(c.device)[0]]._select_renderer(HCQ_RUNTIME_DEV if isinstance(c.arg.aux, HCQInfo) else DEV)
   return None
 
 def lower_and_compile(linear:UOp, verbose=True) -> UOp:
@@ -245,43 +232,30 @@ def lower_and_compile(linear:UOp, verbose=True) -> UOp:
   if not len(ar:={c: a for c in linear.toposort() if c.op is Ops.CALL and (a:=_get_call_to_compile(c)) is not None}): return linear
 
   # lower and compile what's not cached, in parallel if there's a worker pool
-  keys = {c: to_program_mem_key(*a) for c, a in ar.items()}
-  uncached = {keys[c]: a for c, a in ar.items() if keys[c] not in to_program_cache}
-  disk_keys: dict[tuple, str] = {}
-  todo = []
-  for key, ast_ren in uncached.items():
-    if (disk_key:=to_program_disk_key(*ast_ren)) is not None: disk_keys[key] = disk_key
-    cached = diskcache_get("isa_program", disk_key) if disk_key is not None else None
-    if not (isinstance(cached, tuple) and len(cached) == 2 and isinstance(prg:=cached[0], UOp) and isinstance(cached[1], bytes) and
-            prg.op is Ops.PROGRAM and prg.src[-1].op is Ops.BINARY):
-      todo.append((key, ast_ren))
-    else:
-      # UOp.__reduce__ intentionally omits recursive-property caches. Preserve the root key separately so loading a
-      # PROGRAM with large symbolic launch dimensions does not rebuild the key by pretty-printing its entire graph.
-      prg.__dict__["program_key"] = cached[1]
-      to_program_cache[key] = prg
+  keys = {c: to_program_key(*a) for c, a in ar.items()}
+  todo = list({keys[c]: a for c, a in ar.items() if keys[c] not in to_program_cache}.items())
   if len(todo):
     # kernels that beam search must compile in the parent, beam needs device access to time candidates
 
     pool = None if len(todo) == 1 or any(getattr(c.body.arg, "beam", 0) for c in ar) else get_worker_pool()
     ctx = {v.key: v.value for v in to_program_context}
+    if CAPTURE_PROCESS_REPLAY: ctx["PROCESS_REPLAY_LOC"] = get_process_replay_loc()
     tasks = ((i, ast_ren, ctx) for i, (_, ast_ren) in enumerate(todo))
     try:
       with tqdm(total=len(todo), desc="compiling", disable=DEBUG<1 or not verbose) as pbar:
         for i, prg in (map if pool is None else pool.imap_unordered)(_compile_kernel, tasks):
           pbar.set_description(f"compiling {ansipad(prg.src[0].arg.name, 40)}")
           to_program_cache[todo[i][0]] = prg
-          if (disk_key:=disk_keys.get(todo[i][0])) is not None: diskcache_put("isa_program", disk_key, (prg, prg.program_key))
           pbar.update(1)
     except KeyboardInterrupt:
       if pool is not None: terminate_worker_pool()
       raise
 
   # swap the compiled PROGRAMs into the calls
-  return linear.substitute({c: c.replace(src=(c.body.substitute({a[0]: to_program_cache[keys[c]]}), *c.src[1:])) for c, a in ar.items()},
+  return linear.substitute({c: c.replace(src=(to_program_cache[keys[c]], *c.src[1:])) for c in ar},
                            name="precompile kernels")
 
-from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link, HCQInfo # noqa: E402 # down here, hcq2 imports realize
+from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link, HCQInfo, HOST_DEVS # noqa: E402 # down here, hcq2 imports realize
 
 pm_exec = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.STORE, name="ast"),), name="call", allow_any_len=True), exec_copy),
@@ -317,4 +291,4 @@ def time_call(call:UOp, var_vals:dict[str, int]|None=None, timeout:int|None=None
       else:
         from tinygrad.tensor import Tensor
         with Context(DEBUG=0, BEAM=0, CAPTURING=0, TRACK_MATCH_STATS=0): Tensor.ones(1024, 1024).contiguous().realize(do_update_stats=False)
-    yield max(pm_exec.rewrite(linear.src[0].without_after, ctx) or [0.0])
+    yield max(map(unwrap, pm_exec.rewrite(c:=linear.src[0].without_after, ctx)[isinstance(c.arg.aux, HCQInfo):]))

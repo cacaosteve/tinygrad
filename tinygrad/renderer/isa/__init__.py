@@ -3,8 +3,16 @@ import itertools
 from dataclasses import dataclass, field
 from tinygrad.dtype import DType
 from tinygrad.renderer import Renderer
-from tinygrad.uop.ops import PatternMatcher, UOp, Ops, consumer_map_from_toposort
+from tinygrad.uop.ops import PatternMatcher, UOp, Ops
 from typing import Any
+
+def consumer_map_from_toposort(lst:list[UOp]):
+  ret: dict[UOp, dict[UOp, None]] = {}
+  for u in lst:
+    ret[u] = {}
+    for s in u.src:
+      if s in ret: ret[s][u] = None
+  return ret
 
 @dataclass(frozen=True)
 class Register:
@@ -22,7 +30,7 @@ class Register:
 
 class IselContext:
   def __init__(self, sink:UOp):
-    self.uses = consumer_map_from_toposort(sink.toposort())
+    self.uses = consumer_map_from_toposort(list(sink.toposort()))
     self.reg_n = itertools.count()
     self.scratch: dict = {}
     def arg_key(u:UOp):

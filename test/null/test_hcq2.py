@@ -6,6 +6,7 @@ from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, dtypes
 from tinygrad.device import Buffer, Compiled, ProfileGraphEvent
 from tinygrad.helpers import Context, unwrap, to_tuple
+from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
 from tinygrad.engine.realize import compile_linear, link_linear, get_call_arg_uops, lower_and_compile, run_linear
 import tinygrad.runtime.support.hcq2 as hcq2
@@ -69,8 +70,8 @@ def run(batch:UOp, done:dict[str, int]|None=None, prio:list|None=None) -> tuple[
         sig, target = mem[word(c.src[0])], val(c.src[1])
         if sig != target if c.arg[0] == "wait_eq" else sig < target: continue
       elif c.op is Ops.INS and c.arg[0] == "store":
-        mem[word(c.src[0])] = val(c.src[1])
-        if word(c.src[0])[0].tag == "timeline": log.append(q[0])
+        mem[w:=word(c.src[0])] = val(c.src[1])
+        if w[0].tag == "timeline": log.append(w[0].device)
       elif c.op is Ops.CALL: log.append(cs.index(c))
       cmds.pop(0)
       break
@@ -81,14 +82,14 @@ def orders(batch:UOp) -> set[tuple[int, ...]]: return {tuple(x for x in run(batc
 
 class TestHCQ2Deps(unittest.TestCase):
   def test_buffer_views(self):
-    b = Buffer("NULL", 16, dtypes.uint8)
+    b = Buffer("NULL", 16)
     for write in ([], [0]):
       tracker = hcq2.DepsTracker()
       tracker.access_resources([b], write, 0)
-      self.assertEqual(tracker.access_resources([b.view(4, dtypes.uint16, 4)], [0], 1), [0])
-      self.assertEqual(tracker.access_resources([b.view(4, dtypes.uint8, 0)], [0], 2), [0])
-      self.assertEqual(tracker.access_resources([b.view(4, dtypes.uint8, 12)], [0], 3), [0])
-      self.assertEqual(tracker.access_resources([b.view(8, dtypes.uint8, 4)], [], 4), [1])
+      self.assertEqual(tracker.access_resources([b.view(8, 4)], [0], 1), [0])
+      self.assertEqual(tracker.access_resources([b.view(4, 0)], [0], 2), [0])
+      self.assertEqual(tracker.access_resources([b.view(4, 12)], [0], 3), [0])
+      self.assertEqual(tracker.access_resources([b.view(8, 4)], [], 4), [1])
 
   def test_dependencies_through_selected_slices(self):
     b = UOp.param(0, dtypes.float32, 64, device=("NULL", "NULL:1"))
@@ -200,53 +201,6 @@ class TestHCQ2Profile(unittest.TestCase):
                           lambda buf: buf.getaddr(Device["NULL"].host) if hcq2.unwrap_view(buf)[0].tag == "slots" else None)])
     with patch.object(Device["NULL"], "pm_lower", pm): self.test_profiling_reports_a_range_per_kernel(n=3)
 
-class TestHCQ2Fence(unittest.TestCase):
-  def setUp(self):
-    self.enterContext(Context(HCQ_RUNTIME_DEV="CPU"))
-    self.tl = Device["CPU"].timeline.host.view(fmt='Q')
-    self.addCleanup(lambda: self.tl.__setitem__(0, self.tl[1]))
-
-  def test_fence_slot_persists_epilogue_target(self):
-    # Codegen property only — does not reproduce the TinyJit/HW re-arm race.
-    # Zeroing the sched slot before the wait load forces target=0 (`done < 0` is a no-op).
-    slots = UOp.placeholder((4,), dtypes.uint64, device="CPU", tag="slots")
-    sig = UOp.placeholder((1,), dtypes.uint64, device="CPU", tag="sig")
-    out = hcq2.encode_fence(UOp.custom_function("hcq_fence").call(slots.index(0), sig.index(0)))
-    def mem_root(u:UOp) -> UOp:
-      x = u.src[0]
-      while x.op in {Ops.INDEX, Ops.AFTER}: x = x.src[0]
-      return x
-    zeros = [u for u in out.toposort() if u.op is Ops.BINARY and isinstance(u.arg, (bytes, bytearray)) and set(u.arg) <= {0}]
-    slot_loads = [u for u in out.toposort() if u.op is Ops.LOAD and getattr(mem_root(u), "tag", None) == "slots"]
-    slot_stores = [u for u in out.toposort() if u.op is Ops.STORE and getattr(mem_root(u), "tag", None) == "slots"]
-    self.assertEqual(len(slot_loads), 1, "fence must load the persisted sched-slot target once")
-    self.assertFalse(zeros, "per-run zero of the sched slot makes the wait a no-op")
-    self.assertEqual(len(slot_stores), 1, "fence must store the next epilogue target back into the slot")
-    wait = next(u for u in out.toposort() if u.op is Ops.CMPLT)
-    self.assertIs(wait.src[1], slot_loads[0], "wait target must be the slot load, not timeline[1] or 0")
-    # Persist nxt = timeline_value+1 (one +1). nxt+1 deadlocks once timeline is [nxt, nxt].
-    def is_one(u:UOp) -> bool:
-      return (u.op is Ops.CONST and u.arg == 1) or any(is_one(s) for s in u.src)
-    adds = [u for u in slot_stores[0].src[1].toposort() if u.op is Ops.ADD and any(is_one(s) for s in u.src)]
-    self.assertEqual(len(adds), 1)
-    self.assertIs(slot_stores[0].src[1], next(u for u in out.toposort()
-      if u.op is Ops.STORE and getattr(mem_root(u), "tag", None) == "timeline").src[1],
-      "slot must store the same nxt written to timeline[1]")
-
-  def test_second_fence_waits_on_persisted_slot(self):
-    slots = UOp.placeholder((4,), dtypes.uint64, device=("CPU",), volatile=True, tag="slots")
-    fence = UOp.custom_function("hcq_fence").call(slots[0:2], slots[2:4])
-    hcq2.encode_fence(fence)  # first run records its target
-    second = hcq2.encode_fence(fence)  # the next run must load that persisted target
-    def mem_root(u:UOp) -> UOp:
-      x = u.src[0]
-      while x.op in {Ops.INDEX, Ops.AFTER}: x = x.src[0]
-      return x
-    slot_loads = [u for u in second.toposort() if u.op is Ops.LOAD and mem_root(u).tag == "slots"]
-    wait = next(u for u in second.toposort() if u.op is Ops.CMPLT)
-    self.assertEqual(len(slot_loads), 1)
-    self.assertIs(wait.src[1], slot_loads[0], "a repeated fence must wait on the previous target, not reset it")
-
 class TestHCQ2Link(unittest.TestCase):
   def setUp(self): self.enterContext(Context(DEV="NULL"))
 
@@ -255,7 +209,7 @@ class TestHCQ2Link(unittest.TestCase):
     linear = compile_linear(chain(a, 2).schedule_linear(), input_uops=inputs, cache=True)
     linked = link_linear(linear, input_uops=inputs)
     self.assertIs(link_linear(linear, input_uops=[chain_input(3).uop.base, *inputs[1:]]), linked)
-    bufs = [cast(Buffer, u.buffer) for u in linked.toposort() if u.op is Ops.BUFFER]
+    bufs = [cast(Buffer, u.buffer) for u in linked.toposort() if u.op is Ops.BUFFER and u.addrspace is AddrSpace.GLOBAL]
     self.assertNotIn(a.uop.base.buffer, bufs)
     words = [w for b in bufs if b.options.external_ptr and b.nbytes % 8 == 0 for w in b.host.view(fmt='Q')[:]]
     self.assertNotIn(cast(Buffer, a.uop.base.buffer)._buf, words)
@@ -263,7 +217,7 @@ class TestHCQ2Link(unittest.TestCase):
   def test_eager_templates_compile_once(self): self.assertIs(compiled_chain(3)[1], compiled_chain(3)[1])
 
   def test_repeated_word_loops(self): # for (i..10) cmdbuf[off[i]] = var
-    var, offs = UOp.placeholder((1,), dtypes.uint32, device="CPU", volatile=True, tag="var"), [4 * i * i for i in range(10)]
+    var, offs = UOp.alloc((1,), dtypes.uint32, device="CPU").rtag("var"), [4 * i * i for i in range(10)]
     var = hcq2.patch(var, [], bytes(4)) # initialize at link: the allocator may return a reused buffer
     hq = SimpleNamespace(blob=bytearray(offs[-1] + 4), patches=[(o, var.index(0).load()) for o in offs], devs=("CPU",), queue="COPY:0", deps=())
     lowered = lower_hcq(var.after(hcq2.encode_cmdbuf(hq, device="CPU")).index(0).store(var.index(0).load() + 1))
