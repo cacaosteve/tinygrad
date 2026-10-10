@@ -1,6 +1,7 @@
 import math, functools
 from typing import Any
-from tinygrad.uop.ops import PatternMatcher, UPat, GroupOp, Ops, UOp, AxisType, KernelInfo, ParamArg, CallInfo, OPAQUE_CALL_BODIES
+from tinygrad.uop.ops import PatternMatcher, UPat, GroupOp, Ops, UOp, AxisType, KernelInfo, ParamArg, CallInfo, OPAQUE_CALL_BODIES, \
+  CustomFunction
 from tinygrad.uop.render import print_uops, pyrender
 from tinygrad.dtype import DType, dtypes, AddrSpace, Invalid, ConstFloat
 from tinygrad.helpers import DEBUG, Context, SPEC, Metadata, panic, CHECK_OOB, all_same, is_image_shape
@@ -25,6 +26,12 @@ def validate_index(uidx:UOp, gate:UOp|None=None):
   # if all is good and CHECK_OOB=1, validate with z3
   from tinygrad.uop.validate import validate_index_with_z3
   return validate_index_with_z3(sz, idx, gate)
+
+def valid_device_range(device:str|tuple[str, ...]|None, src:tuple[UOp, ...]) -> bool:
+  if not isinstance(device, tuple): return len(src) == 0
+  if len(src) != 1: return False
+  rng = src[0]
+  return rng.op is Ops.RANGE and rng.axis_type is AxisType.DEVICE and int(rng.vmax)+1 == len(device)
 
 def type_verify(ast:UOp|list[UOp], check_spec:PatternMatcher, enter_calls=True):
   lst = list(ast.toposort(enter_calls=enter_calls)) if isinstance(ast, UOp) else ast
@@ -73,7 +80,7 @@ spec_shared = PatternMatcher([
 
   # RANGE can be in the big graph now. a void RANGE is a bound-less loop header, the arg is an axis id like RANGE
   (UPat(Ops.RANGE, src=(UPat(),), allow_any_len=True, name="rng"), lambda rng: isinstance(rng.arg, tuple) and len(rng.arg) >= 2 and \
-      all(isinstance(ra, int) for ra in rng.arg[0:-1]) and isinstance(rng.arg[-1], AxisType)),
+      isinstance(rng.arg[0], AxisType) and all(isinstance(ra, int) for ra in rng.arg[1:])),
   (UPat(Ops.INDEX, name="x"), lambda x: len(x.src)>0 and all(dtypes.is_int(y.dtype) or y.base.is_invalid for y in x.src[1:]) or None),
   # END closes bounded RANGEs around a void effect; it does not discard a value. Conditional loops use BACKEDGE.
   (UPat(Ops.END, src=(UPat(dtype=dtypes.void),), allow_any_len=True, name="x"),
@@ -85,6 +92,8 @@ spec_shared = PatternMatcher([
   # PARAM/BUFFER have a size in the arg, no shape input
   (UPat(Ops.PARAM, src=(), name="x"), lambda x: isinstance(x.arg, ParamArg)),
   (UPat(Ops.BUFFER, src=(), name="x"), lambda x: isinstance(x.arg, ParamArg) and x.addrspace in (AddrSpace.REG, AddrSpace.LOCAL)),
+
+  (UPat(Ops.BINARY, dtypes.uint8, src=(), name="x"), lambda x: isinstance(x.arg, bytes)),
 
   # GROUP combines void effects, not values.
   (UPat(Ops.GROUP, dtypes.void, src=UPat(dtype=dtypes.void)), lambda: True),
@@ -98,11 +107,10 @@ spec_shared = PatternMatcher([
   (UPat((Ops.CUSTOMI, Ops.CUSTOM), name="x"),
    lambda x: isinstance(x.arg, tuple) and len(x.arg) == 2 and isinstance(x.arg[0], str) and isinstance(x.arg[1], DType)),
 
-  # a CUSTOM_FUNCTION with srcs is the body of an external call, holding the callee (a function pointer)
-  (UPat(Ops.CUSTOM_FUNCTION, name="x", allow_any_len=True), lambda x: isinstance(x.arg, str)),
-  # CALL: the body is always an opaque body, the arg is a CallInfo stating the (possibly void) dtype
-  (UPat(Ops.CALL, src=(UPat(tuple(OPAQUE_CALL_BODIES)),), allow_any_len=True, name="x"),
-   lambda x: isinstance(x.arg, CallInfo) and x.dtype is x.arg.dtype),
+  # a CUSTOM_FUNCTION names an external function: the arg is a CustomFunction stating the return dtype
+  (UPat(Ops.CUSTOM_FUNCTION, name="x", allow_any_len=True), lambda x: isinstance(x.arg, CustomFunction)),
+  # CALL: the body is always an opaque body stating the dtype, the arg is a CallInfo
+  (UPat(Ops.CALL, src=(UPat(tuple(OPAQUE_CALL_BODIES)),), allow_any_len=True, name="x"), lambda x: isinstance(x.arg, CallInfo)),
 
   # pattern compiler IR ops (not in tensor/program graphs, but spec-compliant)
   (UPat(Ops.PYLITERAL), lambda: True),
@@ -137,19 +145,17 @@ spec_tensor = PatternMatcher([
    lambda u: dtypes.is_float(u.dtype) or u.src[0].base.is_invalid),
 
   # BUFFER has bound storage; ALLOC declares storage without a runtime buffer
-  (UPat(Ops.BUFFER, src=(), name="buf"), lambda buf:
+  (UPat(Ops.BUFFER, name="buf"), lambda buf:
    isinstance(buf.dtype, DType) and isinstance(buf.arg.size, int) and is_device(buf.arg.device) and buf.arg.buffer is not None
-   if isinstance(buf.arg, ParamArg) and buf.addrspace is AddrSpace.GLOBAL else None),
-  (UPat(Ops.ALLOC, src=(), name="buf"), lambda buf: isinstance(buf.arg, ParamArg)
+   and valid_device_range(buf.arg.device, buf.src) if isinstance(buf.arg, ParamArg) and buf.addrspace is AddrSpace.GLOBAL else None),
+  (UPat(Ops.ALLOC, name="buf"), lambda buf: isinstance(buf.arg, ParamArg)
    and buf.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL, AddrSpace.REG)
    and buf.arg.buffer is None and (buf.arg.size is None or isinstance(buf.arg.size, int))
-   and (buf.arg.device is None or (buf.addrspace is AddrSpace.GLOBAL and is_device(buf.arg.device)))),
+   and (buf.arg.device is None or (buf.addrspace is AddrSpace.GLOBAL and is_device(buf.arg.device)))
+   and valid_device_range(buf.arg.device, buf.src)),
 
   # a Variable is a scalar ALU PARAM with a value range and no device
   (UPat(Ops.PARAM, src=(), name="buf"), lambda buf: buf.arg.device is None if buf.is_variable else None),
-
-  # custom function
-  (UPat(Ops.CUSTOM_FUNCTION, name="x"), lambda x: isinstance(x.arg, str)),
 
   # SPECIAL is index before index lowering. custom_kernel currently has this
   (UPat(Ops.SPECIAL, src=(UPat(dtype=dtypes.weakint),), name="s"), lambda s: isinstance(s.arg, str)),
@@ -164,8 +170,9 @@ spec_tensor = PatternMatcher([
    lambda x: isinstance(x.arg, tuple) and len(x.arg) == 2 and x.arg[0] in GroupOp.Reduce
    and isinstance(x.arg[1], int) and all(y.dtype in (dtypes.weakint, dtypes.int) for y in x.src[1:])),
 
-  # COPY
-  (UPat(Ops.COPY, name="copy", src=(UPat(),)), lambda copy: is_device(copy.arg) and not is_disk_device(copy.arg)),
+  # COPY carries the DEVICE range as src[1] when the target is multi-device
+  (UPat(Ops.COPY, name="copy", src=(UPat(),), allow_any_len=True), lambda copy:
+   is_device(copy.arg) and not is_disk_device(copy.arg) and valid_device_range(copy.arg, copy.src[1:])),
   (UPat(Ops.ALLREDUCE, name="red", src=(UPat(),)),
    lambda red: isinstance(red.arg, tuple) and len(red.arg) == 2 and red.arg[0] in GroupOp.Reduce and is_device(red.arg[1])),
 
@@ -185,7 +192,6 @@ spec_tensor = PatternMatcher([
   # codegen: PROGRAM with progressive sources through the pipeline (SINK, LINEAR?, SOURCE?, BINARY?)
   (UPat(Ops.LINEAR, dtypes.void), lambda: True),
   (UPat(Ops.SOURCE, dtypes.void, src=()), lambda: True),
-  (UPat(Ops.BINARY, dtypes.uint8, src=(), name="x"), lambda x: isinstance(x.arg, bytes)),
   (UPat(Ops.PROGRAM, dtypes.void, src=(UPat(Ops.SINK),)), lambda: True),
   (UPat(Ops.PROGRAM, dtypes.void, src=(UPat(Ops.SINK), UPat(Ops.LINEAR))), lambda: True),
   (UPat(Ops.PROGRAM, dtypes.void, src=(UPat(Ops.SINK), UPat(Ops.LINEAR), UPat(Ops.SOURCE))), lambda: True),
@@ -253,14 +259,16 @@ spec_kernel_graph = PatternMatcher([
   #(UPat(Ops.LINEAR), lambda: True),
   # PARAM is caller-provided storage (or a Variable in the ALU addrspace), ALLOC is call-local storage; size is in the arg, no shape input
   (UPat(Ops.PARAM, src=(), name="x"), lambda x: isinstance(x.arg, ParamArg)),
-  (UPat(Ops.BUFFER, name="x"), lambda x: isinstance(x.arg, ParamArg) and
+  (UPat(Ops.BUFFER, name="x"), lambda x: isinstance(x.arg, ParamArg) and valid_device_range(x.arg.device, x.src) and
    (x.arg.buffer is not None if x.addrspace is AddrSpace.GLOBAL else x.addrspace in (AddrSpace.LOCAL, AddrSpace.REG))),
-  (UPat(Ops.ALLOC, src=(), name="x"), lambda x:
-   isinstance(x.arg, ParamArg) and x.addrspace is AddrSpace.GLOBAL and x.arg.buffer is None),
+  (UPat(Ops.ALLOC, name="x"), lambda x:
+   isinstance(x.arg, ParamArg) and x.addrspace is AddrSpace.GLOBAL and x.arg.buffer is None and valid_device_range(x.arg.device, x.src)),
   (UPat(Ops.BITCAST), lambda: True),
   # mstack/mselect
   (UPat(Ops.MSTACK, name="x"), lambda x: all(isinstance(s.device, str) for s in x.src) or (all_same(x.src) and x.src[0].device is None)),
   (UPat(Ops.MSELECT, name="x"), lambda x: isinstance(x.src[0].device, tuple) and x.arg < len(x.src[0].device)),
+  # open DEVICE ranges are bound per device at launch (e.g. the range on a multi-device BUFFER/ALLOC)
+  (UPat(Ops.RANGE, name="r"), lambda r: r.axis_type is AxisType.DEVICE),
   # all calls are on opaque bodies
   (UPat(Ops.CALL, src=(UPat(tuple(OPAQUE_CALL_BODIES)),), allow_any_len=True), lambda: True),
   # after on PARAM or AFTER
@@ -279,7 +287,7 @@ def pyrender_globals() -> dict[str, Any]:
   return {"inf": math.inf, "nan": math.nan, "KernelInfo": KernelInfo, "Metadata": Metadata,
           "UOp": UOp, "dtypes": dtypes, "Ops": Ops, "AxisType": AxisType, "Invalid": Invalid,
           "Opt": Opt, "OptOps": OptOps, "BufferizeOpts": BufferizeOpts, "AddrSpace": AddrSpace, "panic": panic,
-          "ConstFloat": ConstFloat, "ParamArg": ParamArg, "Estimates": Estimates, "CallInfo": CallInfo}
+          "ConstFloat": ConstFloat, "ParamArg": ParamArg, "Estimates": Estimates, "CallInfo": CallInfo, "CustomFunction": CustomFunction}
 def eval_pyrender(code:str) -> UOp:
   lcls:dict[str, Any] = {}
   exec(code, pyrender_globals(), lcls)

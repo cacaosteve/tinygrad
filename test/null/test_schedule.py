@@ -3,7 +3,8 @@ import unittest, time, gc
 from typing import cast
 from tinygrad import nn, dtypes, Device, Tensor, getenv
 from tinygrad.helpers import GlobalCounters, Context, all_same
-from tinygrad.uop.ops import UOp, Ops, GroupOp, UPat, KernelInfo, AxisType
+from tinygrad.uop.ops import UOp, Ops, GroupOp, UPat, KernelInfo
+from tinygrad.dtype import AddrSpace
 from tinygrad.engine.realize import run_linear, compile_linear
 from tinygrad.codegen import to_program, full_rewrite_to_sink
 from test.helpers import check_schedule, assert_kernel_count, KernelCountException, jit_cache_count
@@ -96,6 +97,7 @@ class TestContiguous(unittest.TestCase):
     a = Tensor.empty(4)
     b = a.contiguous()
     check_schedule(b, 0)
+    self.assertIs(b, a)
 
   def test_contiguous_buffer_view(self):
     a = Tensor.empty(4)
@@ -720,7 +722,7 @@ class TestSchedule(unittest.TestCase):
       for call in linear.src:
         if call.src[0].op is not Ops.SINK: continue
         sink = full_rewrite_to_sink(call.src[0], Device[call.device].renderer)
-        reduce_kernels += any(u.op is Ops.RANGE and u.arg[-1] is AxisType.REDUCE for u in sink.toposort())
+        reduce_kernels += any(u.op is Ops.STORE and u.addrspace is AddrSpace.REG and u.ranges for u in sink.toposort())
       self.assertEqual(reduce_kernels, 1)
 
   def test_push_through_reshape(self):
@@ -796,7 +798,7 @@ class TestSchedule(unittest.TestCase):
     b = Tensor(2) * 4
     self.assertIsNone(b.uop.device)
     run_linear(*check_schedule(b, 0, filter_sink=False))
-    assert b.item() == 8
+    assert b.uop.ssimplify() == 8
 
   def test_mnist_val(self):
     # from tinygrad.nn.datasets import mnist
@@ -849,17 +851,15 @@ class TestSchedule(unittest.TestCase):
     self.assertLess(names.index("kb"), names.index("kc"))
     self.assertLess(names.index("kd"), names.index("kc"))
 
-  @unittest.skipIf(Device.DEFAULT == "CPU", "devices must mismatch")
   def test_error_on_device_mismatch(self):
-    a = Tensor.empty(10)
-    b = Tensor.empty(10, device="CPU")
+    a = Tensor.empty(10, device="NULL")
+    b = Tensor.empty(10, device="NULL:1")
     c = a+b
     with self.assertRaisesRegex(RuntimeError, "all buffers must be on the same device"): check_schedule(c, 1)
 
-  @unittest.skipIf(Device.DEFAULT == "CPU", "devices must mismatch")
   def test_error_on_device_mismatch_alt(self):
-    a = Tensor.empty(10)
-    b = Tensor.empty((1,), device="CPU").expand(10).contiguous()
+    a = Tensor.empty(10, device="NULL")
+    b = Tensor.empty((1,), device="NULL:1").expand(10).contiguous()
     c = a+b
     with self.assertRaisesRegex(RuntimeError, "all buffers must be on the same device"): check_schedule(c, 2)
 
@@ -2087,16 +2087,15 @@ class TestLimitBufs(unittest.TestCase):
     t1, t2 = min(sched_time(400) for _ in range(3)), min(sched_time(1600) for _ in range(3))
     self.assertLess(t2/t1, 8, f"{t1*1e3:.1f}ms -> {t2*1e3:.1f}ms")
 
-@unittest.skipIf(Device.DEFAULT == "CPU", "tests copy from another device to cpu")
 class TestCopyFolding(unittest.TestCase):
   def test_one_hot_with_copy(self):
-    y = Tensor([1, 2, 3]).to("CPU")
+    y = Tensor([1, 2, 3], device="NULL").to("NULL:1")
     x = y.one_hot(10).int()
     check_schedule(x, 3, filter_sink=False)
 
   def test_alu_after_copy(self):
-    a = Tensor.ones((4,)).to("CPU")
-    b = Tensor.empty(4, device="CPU")
+    a = Tensor.ones((4,), device="NULL").to("NULL:1")
+    b = Tensor.empty(4, device="NULL:1")
     add = a+b
     assert all_same([x.device for x in add.uop.src]), f"ALU has different devices! {[x.device for x in add.src]}"
     add.schedule_linear()

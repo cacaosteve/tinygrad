@@ -5,7 +5,7 @@ from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.llm.kernels.amd import (Linear, _amd_flash_attention, amd_custom_kernels_supported, q8_quantize, flash_attention, gated_delta_prefill,
                                       QUANT_SIZES, HALFWORD_QUANTS, _wmma_rdna4)
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.helpers import Context, DEV, OSX
+from tinygrad.helpers import DEV, OSX
 from test.runtime.test_llm_quantized import QuantLinearMixin
 
 class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
@@ -85,9 +85,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     scales = np.array([0, 2**-24, -2**-24, 2**-14, -0.00035, .001, .0037, -.125, 1, -4, 8], np.float16)
     identity = Tensor(np.eye(768, dtype=np.float16)).realize()
     for typ, size in QUANT_SIZES.items():
-      # TODO: z3 cannot model the integer ORs in IQ3_S/IQ2_S lookup indices.
-      # Compile locally so the CHECK_OOB override also applies to compilation.
-      with self.subTest(ggml_type=typ), Context(**({"CHECK_OOB": 0, "PARALLEL": 0} if typ in (21, 22) else {})):
+      with self.subTest(ggml_type=typ):
         packed = rng.integers(0, 256, (48*3, size), dtype=np.uint8)
         blocks = packed.reshape(-1, 18) if typ == 20 else packed
         offset = size-2 if typ in (11, 14) else 80 if typ == 10 else 0
@@ -128,6 +126,13 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     for typ in (10, 11, 17, 18, 20, 21, 22):
       with self.subTest(ggml_type=typ):
         self._test_quant_linear(typ, QUANT_SIZES[typ], in_features=1280, out_features=3, token_counts=(1,))
+
+  def test_quant_linear_decode_row_groups(self):
+    # One, two, and four waves per workgroup; ragged split-K and multiple tokens must stay independent.
+    for typ in (12, 13, 14, 23):
+      for outputs in (3, 6, 12):
+        with self.subTest(ggml_type=typ, out_features=outputs):
+          self._test_quant_linear(typ, QUANT_SIZES[typ], in_features=1280, out_features=outputs, token_counts=(1, 3))
 
   def test_quant_linear_bias(self):
     for typ in (12, 21, 23):
@@ -261,7 +266,8 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     for i in range(blocks): packed[i*210+208:i*210+210] = np.array([0.01], dtype=np.float16).view(np.uint8)
     raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
     decoded = ggml_data_to_tensor(raw, 16*in_features, 14).reshape(16, in_features)
-    weight = decoded.numpy()
+    raw_ref = Tensor(np.pad(packed, (4, 0)), device="CPU").contiguous().realize()[4:]
+    weight = ggml_data_to_tensor(raw_ref, 16*in_features, 14).reshape(16, in_features).numpy()
     linear = Linear(in_features, 16, bias=False)
     nn.state.load_state_dict(linear, {"weight":decoded}, verbose=False, realize=False)
     x = rng.normal(size=(3, in_features)).astype(np.float32)
@@ -289,6 +295,21 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         q = Tensor.zeros(1, 2, tokens, dim, dtype=dtypes.half)
         expected = np.broadcast_to(np.arange(valid-tokens, valid)[None, None, :, None]/2, q.shape)
         np.testing.assert_allclose(flash_attention(q, Tensor(cache), valid).numpy(), expected, rtol=1e-3, atol=1e-3)
+
+  def test_prefill_attention_fallback_random_gqa(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    batch, heads, kv_heads, tokens, dim, valid, capacity = 2, 4, 2, 32, 64, 45, 64
+    q = rng.normal(size=(batch, heads, tokens, dim)).astype(np.float16)
+    cache = rng.normal(size=(2, batch, kv_heads, capacity, dim)).astype(np.float16)
+    cache[:, :, :, valid:] = np.nan
+    k, v = (np.repeat(c[:, :, :valid].astype(np.float32), heads//kv_heads, axis=1) for c in cache)
+    scores = q.astype(np.float32) @ k.swapaxes(-1, -2) / np.sqrt(dim)
+    scores = np.where(np.arange(valid)[None, :] <= np.arange(valid-tokens, valid)[:, None], scores, -np.inf)
+    probs = np.exp(scores - scores.max(-1, keepdims=True))
+    expected = (probs / probs.sum(-1, keepdims=True)) @ v
+    actual = flash_attention(Tensor(q), Tensor(cache).realize(), valid).numpy()
+    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
 
   def test_attention_uses_physical_cache_length(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
@@ -458,27 +479,27 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     expected = np.stack([values[:start_pos+i+1].mean(0) for i in range(32)])[None, None].repeat(8, axis=1)
     np.testing.assert_allclose(out.numpy(), expected, rtol=2e-3, atol=2e-3)
 
-  def test_prefill_acc_work_ignores_decode_sticky_skip(self):
-    """Decode leaves AMD_REG_PROMOTE_SKIP_SLOTS=""; prefill must still enable work-copy."""
+  def test_prefill_compile_policy_overrides_sticky_decode(self):
+    """Prefill reasserts ACC_SMALL and clears decode-only scheduling even with a stale skip env."""
     from tinygrad.helpers import getenv
     from tinygrad.llm.kernels import amd as amd_mod
-    keys = ("AMD_REG_PROMOTE_SKIP_SLOTS", "AMD_FLASH_PREFILL_SKIP_SLOTS", "AMD_FLASH_ACC_WORK",
-            "AMD_FLASH_ACC_SMALL", "AMD_WMMA_ACC_SMALL")
+    keys = ("AMD_REG_PROMOTE_SKIP_SLOTS", "AMD_FLASH_PREFILL_SKIP_SLOTS", "AMD_FLASH_ACC_SMALL", "AMD_WMMA_ACC_SMALL",
+            "AMD_VOPD_FMAC", "AMD_VOPD_FMAC_ALU")
     old = {k: os.environ.get(k) for k in keys}
     try:
-      # Simulate decode sticky empty SKIP before prefill policy decision.
+      # Decode leaves sticky skip and schedule settings; ACC_SMALL now selects the promotion policy.
       os.environ["AMD_REG_PROMOTE_SKIP_SLOTS"] = ""
       os.environ.pop("AMD_FLASH_PREFILL_SKIP_SLOTS", None)
-      os.environ["AMD_FLASH_ACC_WORK"] = "1"
-      os.environ["AMD_FLASH_ACC_SMALL"] = "1"
+      os.environ["AMD_FLASH_ACC_SMALL"] = "0"
       os.environ["AMD_WMMA_ACC_SMALL"] = "0"
+      os.environ["AMD_VOPD_FMAC"] = "1"
+      os.environ["AMD_VOPD_FMAC_ALU"] = "1"
       getenv.cache_clear()
-      use_acc_small = True
-      with amd_mod._flash_direct_compile_env(flash_acc_small=use_acc_small):
-        _skip_reg = {int(s) for s in getenv("AMD_REG_PROMOTE_SKIP_SLOTS", "2").split(",") if s.strip()}
-        use_acc_work = bool(use_acc_small and (2 in _skip_reg) and getenv("AMD_FLASH_ACC_WORK", 1))
-      self.assertEqual(os.environ.get("AMD_REG_PROMOTE_SKIP_SLOTS"), "2")
-      self.assertTrue(use_acc_work)
+      with amd_mod._flash_direct_compile_env():
+        self.assertEqual(getenv("AMD_FLASH_ACC_SMALL", 0), 1)
+        self.assertEqual(os.environ.get("AMD_REG_PROMOTE_SKIP_SLOTS"), "")
+        self.assertNotIn("AMD_VOPD_FMAC", os.environ)
+        self.assertNotIn("AMD_VOPD_FMAC_ALU", os.environ)
     finally:
       for k, v in old.items():
         if v is None: os.environ.pop(k, None)

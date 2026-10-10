@@ -22,8 +22,8 @@ def _linearize_ranges(axes:list[UOp]) -> UOp:
 def _tid_axes(coop:list[UOp]) -> list[UOp]|None:
   # LOCALs by range id, WARP last in the product. gpudims maps WARP→lidx0 so
   # tid == hardware linear id when local_size is (32, …).
-  locals_ = sorted([u for u in coop if u.arg[1] is AxisType.LOCAL], key=lambda u: u.arg[0])
-  warps = [u for u in coop if u.arg[1] is AxisType.WARP]
+  locals_ = sorted([u for u in coop if u.axis_type is AxisType.LOCAL], key=lambda u: u.axis_id)
+  warps = [u for u in coop if u.axis_type is AxisType.WARP]
   if len(locals_) < 2 or len(warps) != 1: return None
   if _range_size(warps[0]) != 32: return None
   return locals_ + warps
@@ -56,8 +56,8 @@ def _bounce_a_shared(ab:UOp, i:int, coop:list[UOp], frag:list[UOp], tile:list[UO
   tid, lane16 = _linearize_ranges(tid_axes), warp % 16
   buf, stride = ab.src[0], _index_row_stride(ab)
   if stride is None: return None
-  reds = [u for u in ab.toposort() if u.op is Ops.RANGE and u.arg[1] is AxisType.REDUCE]
-  grids = [u for u in ab.toposort() if u.op is Ops.RANGE and u.arg[1] in (AxisType.WEAK, AxisType.GLOBAL)]
+  reds = [u for u in ab.toposort() if u.op is Ops.RANGE and u.axis_type is AxisType.LOOP]
+  grids = [u for u in ab.toposort() if u.op is Ops.RANGE and u.axis_type in (AxisType.WEAK, AxisType.GLOBAL) and u not in reds]
   if len(reds) != 1 or len(grids) != 1: return None
   k_tile, g_wg = reds[0], grids[0]
   op_local = next((u for u in tid_axes[:-1] if any(x is u for x in ab.toposort())), None)
@@ -84,15 +84,15 @@ def _bounce_frag_wide(ab:UOp, i:int, coop:list[UOp], frag:list[UOp], tile:list[U
   # N-local write the same cells (A independent of ln) → ~2× smaller A LDS.
   fsz, vec = prod(_range_size(f) for f in frag), 8
   if not frag or fsz % vec: return None
-  tile_w = [r.replace(arg=(r.arg[0] + _WMMA_LDS_LOOP_BASE + i * 50 + n, AxisType.WEAK)) for n, r in enumerate(tile)]
+  tile_w = [r.replace(arg=(AxisType.WEAK, r.axis_id[0] + _WMMA_LDS_LOOP_BASE + i * 50 + n)) for n, r in enumerate(tile)]
   chunk = UOp.range(fsz // vec, _WMMA_LDS_LOOP_BASE + i * 50 + 40, AxisType.WEAK)
   elems = []
   for j in range(vec):
     sub = dict(zip(tile, tile_w))
     sub.update(_delinearize_ranges(chunk * vec + j, frag))
     elems.append(ab.substitute(sub))
-  ab_locals = [u for u in coop if u.arg[1] is AxisType.LOCAL and any(x is u for x in ab.toposort())]
-  write_coop = [u for u in coop if u.arg[1] is not AxisType.LOCAL or u in ab_locals]
+  ab_locals = [u for u in coop if u.axis_type is AxisType.LOCAL and any(x is u for x in ab.toposort())]
+  write_coop = [u for u in coop if u.axis_type is not AxisType.LOCAL or u in ab_locals]
   staged = UOp.stack(*elems).bufferize(*write_coop, *tile_w, chunk, arg=BufferizeOpts(None, AddrSpace.LOCAL))
   flat = staged.reshape(*[_range_size(x) for x in write_coop + tile_w], fsz)
   frag_lin = _linearize_ranges(as_up_frag) if len(as_up_frag) > 1 else as_up_frag[0]
@@ -110,9 +110,9 @@ def _bounce_tid_wide(ab:UOp, i:int, coop:list[UOp], frag:list[UOp], tile:list[UO
   tid, lane16 = _linearize_ranges(tid_axes), warp % 16
   buf, stride = ab.src[0], _index_row_stride(ab)
   if stride is None: return None
-  reds = [u for u in ab.toposort() if u.op is Ops.RANGE and u.arg[1] is AxisType.REDUCE]
-  # WEAK = former LOOP (#17283). GLOBAL covers workgroup tiles after TC.
-  grids = [u for u in ab.toposort() if u.op is Ops.RANGE and u.arg[1] in (AxisType.WEAK, AxisType.GLOBAL)]
+  reds = [u for u in ab.toposort() if u.op is Ops.RANGE and u.axis_type is AxisType.LOOP]
+  # GLOBAL covers workgroup tiles after TC; WEAK covers non-reduction loops.
+  grids = [u for u in ab.toposort() if u.op is Ops.RANGE and u.axis_type in (AxisType.WEAK, AxisType.GLOBAL)]
   if len(reds) != 1 or len(grids) != 1: return None
   k_tile, g_wg = reds[0], grids[0]
   op_local = next((u for u in tid_axes[:-1] if any(x is u for x in ab.toposort())), None)
@@ -162,11 +162,11 @@ def stage_wmma_ab_bounce(wmma:UOp, coop:list[UOp]) -> UOp|None:
     if ab.op is not Ops.INDEX or ab.addrspace != AddrSpace.GLOBAL: return None
     if not any(u in coop for u in ab.toposort() if u.op is Ops.RANGE): return None
     frag_rns = {rn for rn, _ in wmma.arg[3][i]}
-    frag = list(dict.fromkeys(u for u in ab.toposort() if u.op is Ops.RANGE and u.arg[0] in frag_rns))
+    frag = list(dict.fromkeys(u for u in ab.toposort() if u.op is Ops.RANGE and u.arg in frag_rns))
     tile = list(dict.fromkeys(u for u in ab.toposort()
-      if u.op is Ops.RANGE and u.arg[1] in (AxisType.UPCAST, AxisType.UNROLL) and u.arg[0] not in frag_rns))
-    as_up_tile = [r.replace(arg=(r.arg[0], AxisType.UPCAST)) if r.arg[1] is not AxisType.UPCAST else r for r in tile]
-    as_up_frag = [r.replace(arg=(r.arg[0], AxisType.UPCAST)) if r.arg[1] is not AxisType.UPCAST else r for r in frag]
+      if u.op is Ops.RANGE and u.axis_type is AxisType.UPCAST and u.arg not in frag_rns))
+    as_up_tile = [r.replace(arg=(AxisType.UPCAST, *r.axis_id)) if r.axis_type is not AxisType.UPCAST else r for r in tile]
+    as_up_frag = [r.replace(arg=(AxisType.UPCAST, *r.axis_id)) if r.axis_type is not AxisType.UPCAST else r for r in frag]
     as_up = as_up_tile + as_up_frag
     if i == 0 and (ret := _bounce_a_shared(ab, i, coop, frag, tile, as_up_tile, as_up_frag, as_up)) is not None:
       news.append(ret)
@@ -176,7 +176,7 @@ def stage_wmma_ab_bounce(wmma:UOp, coop:list[UOp]) -> UOp|None:
       news.append(ret)
     else:
       read_axes = tile + frag
-      write_axes = [r.replace(arg=(r.arg[0] + _WMMA_LDS_LOOP_BASE + i * 50 + (25 if n < len(tile) else 0), AxisType.WEAK))
+      write_axes = [r.replace(arg=(AxisType.WEAK, r.axis_id[0] + _WMMA_LDS_LOOP_BASE + i * 50 + (25 if n < len(tile) else 0)))
                     for n, r in enumerate(read_axes)]
       sval = ab.substitute(dict(zip(read_axes, write_axes))) if write_axes else ab
       staged = sval.bufferize(*coop, *write_axes, arg=BufferizeOpts(None, AddrSpace.LOCAL)).index(*coop, *as_up)
@@ -204,12 +204,12 @@ def stage_wmma_ab_tid(wmma:UOp, coop:list[UOp]) -> UOp|None:
     buf, stride = ab.src[0], _index_row_stride(ab)
     if stride is None: return None
     frag_rns = {rn for rn, _ in wmma.arg[3][i]}
-    frag = list(dict.fromkeys(u for u in ab.toposort() if u.op is Ops.RANGE and u.arg[0] in frag_rns))
+    frag = list(dict.fromkeys(u for u in ab.toposort() if u.op is Ops.RANGE and u.arg in frag_rns))
     tile = list(dict.fromkeys(u for u in ab.toposort()
-      if u.op is Ops.RANGE and u.arg[1] in (AxisType.UPCAST, AxisType.UNROLL) and u.arg[0] not in frag_rns))
+      if u.op is Ops.RANGE and u.axis_type is AxisType.UPCAST and u.arg not in frag_rns))
     if not frag or prod(_range_size(f) for f in frag) != _WMMA_TC: return None
-    reds = [u for u in ab.toposort() if u.op is Ops.RANGE and u.arg[1] is AxisType.REDUCE]
-    grids = [u for u in ab.toposort() if u.op is Ops.RANGE and u.arg[1] in (AxisType.WEAK, AxisType.GLOBAL)]
+    reds = [u for u in ab.toposort() if u.op is Ops.RANGE and u.axis_type is AxisType.LOOP]
+    grids = [u for u in ab.toposort() if u.op is Ops.RANGE and u.axis_type in (AxisType.WEAK, AxisType.GLOBAL) and u not in reds]
     if len(reds) != 1 or len(grids) != 1: return None
     k_tile, g_wg = reds[0], grids[0]
     op_local = next((u for u in tid_axes[:-1] if any(x is u for x in ab.toposort())), None)
@@ -219,8 +219,8 @@ def stage_wmma_ab_tid(wmma:UOp, coop:list[UOp]) -> UOp|None:
     ept_n = (block * _WMMA_TC) // threads if i == 0 else (_WMMA_TC * block) // threads
     if ept_n < 1 or (block * _WMMA_TC if i == 0 else _WMMA_TC * block) != threads * ept_n: return None
     ept = UOp.range(ept_n, _WMMA_LDS_LOOP_BASE + i * 50, AxisType.WEAK)
-    as_up_tile = [r.replace(arg=(r.arg[0], AxisType.UPCAST)) if r.arg[1] is not AxisType.UPCAST else r for r in tile]
-    as_up_frag = [r.replace(arg=(r.arg[0], AxisType.UPCAST)) if r.arg[1] is not AxisType.UPCAST else r for r in frag]
+    as_up_tile = [r.replace(arg=(AxisType.UPCAST, *r.axis_id)) if r.axis_type is not AxisType.UPCAST else r for r in tile]
+    as_up_frag = [r.replace(arg=(AxisType.UPCAST, *r.axis_id)) if r.axis_type is not AxisType.UPCAST else r for r in frag]
     as_up = as_up_tile + as_up_frag
     major = _linearize_ranges(as_up_tile + [op_local]) * _WMMA_TC + lane16 if as_up_tile else op_local * _WMMA_TC + lane16
     k_r = _linearize_ranges(as_up_frag)
@@ -259,8 +259,8 @@ def stage_wmma_ab_tid(wmma:UOp, coop:list[UOp]) -> UOp|None:
 
 def stage_wmma_ab_to_local(wmma:UOp) -> UOp|None:
   if wmma.op is not Ops.WMMA: return None
-  coop = list(dict.fromkeys(u for u in wmma.toposort() if u.op is Ops.RANGE and u.arg[1] in _WMMA_LDS_AXES))
-  if not any(u.arg[1] == AxisType.LOCAL for u in coop): return None
+  coop = list(dict.fromkeys(u for u in wmma.toposort() if u.op is Ops.RANGE and u.axis_type in _WMMA_LDS_AXES))
+  if not any(u.axis_type == AxisType.LOCAL for u in coop): return None
   if getenv("TC_LDS_TID", 0):
     if (ret := stage_wmma_ab_tid(wmma, coop)) is not None: return ret
   return stage_wmma_ab_bounce(wmma, coop)
@@ -301,4 +301,3 @@ def expand_wmma_lds_tiles(u, a, b, c, done_arg, unroll_axis, out0, sizes):
   return unroll_axis(UOp.stack(*wmmas).reshape(ta, tb, c_stk.max_numel()), out0, sizes)
 
 # ***** TC hand schedule (bound from rdna3.py for prefetch / ACC pool side effects) *****
-

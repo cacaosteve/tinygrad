@@ -176,7 +176,9 @@ class LinearScanRegallocContext:
                 if not ren.rematerialize(u): self.remat_banned.add(v)
             continue
           if pinned:
-            filtered = tuple(r for r in cons if not (set(range(r.index, r.index + slots(v))) & pinned))
+            nslots = slots(v)
+            filtered = tuple(r for r in cons if r.index not in pinned) if nslots == 1 else \
+                       tuple(r for r in cons if not any(idx in pinned for idx in range(r.index, r.index + nslots)))
             if filtered: cons = filtered
             elif len(cons) > 1:
               raise CompileError(f"no unpinned regs for {v}")
@@ -240,6 +242,7 @@ def wide_alloc(cons, i, nslots, allowed, live, lr, uops_len, slots_fn, pinned=fr
   for vr, r in live.items():
     for idx in range(r.index, r.index + slots_fn(vr)): occupied.setdefault(idx, []).append(vr)
   def blockers(reg):
+    if nslots == 1: return tuple(occupied.get(reg.index, ()))
     return tuple(dict.fromkeys(vr for idx in range(reg.index, reg.index+nslots) for vr in occupied.get(idx, ())))
   def next_use(vr):
     uses = lr[vr]
@@ -253,8 +256,11 @@ def wide_alloc(cons, i, nslots, allowed, live, lr, uops_len, slots_fn, pinned=fr
   def get_candidates(check_pinned:bool):
     candidates = []
     for r in cons:
-      indices = range(r.index, r.index+nslots)
-      if not all(x in allowed_idxs for x in indices) or (check_pinned and any(x in pinned for x in indices)): continue
+      if nslots == 1:
+        if r.index not in allowed_idxs or (check_pinned and r.index in pinned): continue
+      else:
+        indices = range(r.index, r.index+nslots)
+        if not all(x in allowed_idxs for x in indices) or (check_pinned and any(x in pinned for x in indices)): continue
       blocked = blockers(r)
       score = min((next_use(vr) for vr in blocked), default=uops_len)
       # uops_len is the largest possible score. Returning its first occurrence is exactly

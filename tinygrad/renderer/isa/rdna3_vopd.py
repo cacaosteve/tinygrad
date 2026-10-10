@@ -38,6 +38,12 @@ def _vopd_src1_ok(b0:Reg, b1:Reg) -> bool:
   bn0, bn1 = _vgpr_num(b0), _vgpr_num(b1)
   return bn0 is not None and bn1 == bn0 + 1 and bn0 % 2 == 0
 
+def depends(u:UOp, dep:UOp) -> bool:
+  return dep is u or dep in u.backward_slice
+
+def independent(u0:UOp, u1:UOp) -> bool:
+  return not depends(u0, u1) and not depends(u1, u0)
+
 def _add_operands(u:UOp) -> tuple[object, object]|None:
   if u.dtype is not dtypes.float32 or len(u.src) < 2: return None
   return _src(u.src[0]), _src(u.src[1])
@@ -48,7 +54,7 @@ def try_vopd_fmac_pair(u0:UOp, u1:UOp) -> list|None:
   if not getenv("AMD_VOPD_FMAC", 0): return None
   if u0.op is not Ops.INS or u1.op is not Ops.INS: return None
   if _iop(u0) is not AMDOps.FMAC or _iop(u1) is not AMDOps.FMAC: return None
-  if u1 in u0.toposort() or u0 in u1.toposort(): return None
+  if not independent(u0, u1): return None
   ch0, ch1 = _fmac_mul_operand_choices(u0), _fmac_mul_operand_choices(u1)
   if not ch0 or not ch1: return None
   d0, d1 = _dst(u0), _dst(u1)
@@ -75,7 +81,7 @@ def try_vopd_fmac_alu_pair(u0:UOp, u1:UOp) -> list|None:
   alu_ops_ok = (AMDOps.ADD, AMDOps.SUB)
   alu_op = next((o for o in ops if o in alu_ops_ok), None)
   if alu_op is None or len(ops) != 2: return None
-  if u1 in u0.toposort() or u0 in u1.toposort(): return None
+  if not independent(u0, u1): return None
   fmac_u, alu_u = (u0, u1) if _iop(u0) is AMDOps.FMAC else (u1, u0)
   if fmac_u.dtype is not dtypes.float32 or alu_u.dtype is not dtypes.float32: return None
   ch = _fmac_mul_operand_choices(fmac_u)
@@ -99,7 +105,7 @@ def try_vopd_add_pair(u0:UOp, u1:UOp) -> list|None:
   if u0.op is not Ops.INS or u1.op is not Ops.INS: return None
   if _iop(u0) is not AMDOps.ADD or _iop(u1) is not AMDOps.ADD: return None
   if u0.dtype is not dtypes.float32 or u1.dtype is not dtypes.float32: return None
-  if u0 in u1.toposort() or u1 in u0.toposort(): return None
+  if not independent(u0, u1): return None
   ops0, ops1 = _add_operands(u0), _add_operands(u1)
   if ops0 is None or ops1 is None: return None
   d0, d1 = _dst(u0), _dst(u1)
@@ -201,7 +207,7 @@ def try_vopd_mov_pair(u0:UOp, u1:UOp) -> list|None:
   if not u0.src or not u1.src: return None
   if u0.src[0].op is Ops.SPECIAL or u1.src[0].op is Ops.SPECIAL: return None
   if _reg_slots(u0) != 1 or _reg_slots(u1) != 1: return None
-  if u1 in u0.toposort() or u0 in u1.toposort(): return None
+  if not independent(u0, u1): return None
   d0, d1 = _dst(u0), _dst(u1)
   n0, n1 = _vgpr_num(d0), _vgpr_num(d1)
   if n0 is not None and n1 is not None and n1 % 2 == 0 and n0 == n1 + 1:

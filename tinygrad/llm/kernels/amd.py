@@ -435,7 +435,7 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
   accs = tuple(tuple(UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG)
                      for tile in range(token_tile // 16)) for ot in range(output_tiles))
   accs = tuple(tuple(acc.after(acc.store(acc.const_like(0))) for acc in output_accs) for output_accs in accs)
-  group = UOp.range(in_features // Q8_GROUP_SIZE, 4, AxisType.REDUCE)
+  group = UOp.range(in_features // Q8_GROUP_SIZE, 4, AxisType.LOOP)
   block, subgroup = group // 8, group % 8
   wmma_accs = [list(output_accs) for output_accs in accs]
   # gfx12 moves k2 from the element index to lane bit 4: each lane supplies two groups of four.
@@ -462,7 +462,10 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
 @functools.cache
 def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, ggml_type:int,
                                direct_isa:bool=False, rdna4:bool=False) -> UOp:
-  token_tile, output_tiles = (64, 1 if out_features <= 1024 else 2) if out.shape[0] % 64 == 0 else     (32 if out.shape[0] % 32 == 0 else 16, 2)
+  # The direct RDNA3 renderer miscompiles the wider token/output tilings for Q4/Q5 WMMA.
+  # Keep the ISA path on the validated 32x1 tile until those layouts are fixed.
+  token_tile, output_tiles = ((32 if out.shape[0] % 32 == 0 else 16), 1) if direct_isa else \
+    ((64, 1 if out_features <= 1024 else 2) if out.shape[0] % 64 == 0 else (32 if out.shape[0] % 32 == 0 else 16, 2))
   layout = _wmma_layout(out, out_features, token_tile, output_tiles)
   word_indices = (layout[5], layout[5]+2) if rdna4 else tuple(range(4))
   def dequant(base:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
@@ -472,7 +475,7 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
     hwords = _amd_load(raw[base+4+half*4], 4, packed_u32=direct_isa) if ggml_type == Q5_K else None
     words = tuple((qwords[i] >> ((subgroup&1)*4).cast(dtypes.uint32) & 0x0f0f0f0f) |
       (((hwords[i] >> subgroup.cast(dtypes.uint32) & 0x01010101) << 4) if hwords is not None else 0) for i in word_indices)
-    if direct_isa:
+    if direct_isa and ggml_type == Q4_K:
       scaled, bias = d*scale, dmin*minimum*-1
       return tuple(_amd_fma_to_f16((word >> (byte*8) & 255).float(), scaled, bias) for word in words for byte in range(4))
     return tuple(((word >> (byte*8) & 255).float()*d*scale-dmin*minimum).cast(dtypes.float16) for word in words for byte in range(4))
@@ -576,9 +579,11 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
 
 @functools.cache
 def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
-                                  out_features:int, in_features:int, ggml_type:int, rdna4:bool=False) -> UOp:
+                                  out_features:int, in_features:int, ggml_type:int, direct_isa:bool=False,
+                                  rdna4:bool=False) -> UOp:
   token_tile = 64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
-  layout = _wmma_layout(out, out_features, token_tile, 2)
+  output_tiles = 1 if direct_isa and ggml_type in (IQ2_S, IQ3_XXS, IQ4_NL, IQ3_S) else 2
+  layout = _wmma_layout(out, out_features, token_tile, output_tiles)
   output_waves, _, _, lane, wave, physical_half, _, _, _ = layout
   word_indices = (physical_half, physical_half+2) if rdna4 else tuple(range(4))
   grid = None
@@ -610,7 +615,7 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
     return tuple((((word >> (b*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float()-zero)*scale-minimum).cast(dtypes.half)
                  for word in words for b in range(4))
   return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[ggml_type]//raw.dtype.itemsize,
-                            layout, dequant, f"linear_{QUANT_NAMES[ggml_type]}_f16_wmma", rdna4=rdna4)
+                            layout, dequant, f"linear_{QUANT_NAMES[ggml_type]}_f16_wmma", swizzle_stores=direct_isa, rdna4=rdna4)
 
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in QUANT_SIZES
@@ -628,7 +633,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     elif layer.ggml_type in (Q4_K, Q5_K):
       fxn = functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type, direct_isa=direct, rdna4=rdna4)
     else:
-      fxn = functools.partial(_quant_linear_f16_wmma_kernel, ggml_type=layer.ggml_type, rdna4=rdna4)
+      fxn = functools.partial(_quant_linear_f16_wmma_kernel, ggml_type=layer.ggml_type, direct_isa=direct, rdna4=rdna4)
     srcs = (x.cast(dtypes.float16).contiguous(), *extra)
   else:
     fxn = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)
@@ -658,21 +663,20 @@ def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_
     for j in range(val_chunk):
       acc = acc + w[out_row, i, lane*val_chunk + j].load().float() * x[token, i, lane*val_chunk + j].load().float()
   total = warp_reduce(acc, full_wave=True)
-  if bias is not None: total = total + bias[token, out_row].load().float()
+  if bias is not None: total = total + bias[out_row].load().float()
   return out[token, out_row.valid(lane.eq(0))].store(total).end(token, out_row, lane).sink(arg=KernelInfo(name="linear_f16_gemv", opts_to_apply=()))
 
 def _view_back(t:Tensor) -> Tensor:
-  """strip top-of-chain CAST(s) from a lazy weight: reading the raw file bytes in the kernel instead of
-  materializing the cast into a fresh buffer every step"""
+  """Strip only float-to-float casts from a lazy weight, which can be applied by the kernel load."""
   uop = t.uop
-  while uop.op is Ops.CAST: uop = uop.src[0]
+  while uop.op is Ops.CAST and dtypes.is_float(uop.dtype) and dtypes.is_float(uop.src[0].dtype): uop = uop.src[0]
   return Tensor(uop).reshape(t.shape)
 
 def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
   tokens = prod(x.shape[:-1])
   assert isinstance(tokens, int)
   weight = _view_back(layer.weight)
-  x = x.contiguous() if x.dtype == dtypes.half else x.cast(dtypes.half).contiguous()
+  x = x.contiguous() if x.dtype in (dtypes.half, dtypes.bfloat16, dtypes.float) else x.cast(dtypes.half).contiguous()
   out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
   srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
@@ -713,7 +717,7 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   zerof = UOp.const(0, dtypes.float)
   zeroh = UOp.const(0, dtypes.half)
   # Each block scans every PARTIALS-th chunk, keeping an online softmax across rounds.
-  chunk_round = UOp.range((total_chunks-1-block_chunk)//PARTIALS+1, 4, AxisType.REDUCE)
+  chunk_round = UOp.range((total_chunks-1-block_chunk)//PARTIALS+1, 4, AxisType.LOOP)
   chunk_id = block_chunk + chunk_round*PARTIALS
   # Batch keys into one warp_reduce_many so swizzle/permlane stages share lgkm waits.
   # After decode-scoped slot-2 promote, batch=8 spills (priv 64, ~139µs e2e); batch=4 stays
@@ -856,13 +860,13 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
     inv = 1 / weight_sum
     return UOp.group(*[o[b, h, 0, d].store(a * inv) for a, d in zip(acc, dims)]) \
       .end(lane, block_dt, block_bh).sink(arg=KernelInfo(name="flash_decode_combine", opts_to_apply=()))
-  chunk = UOp.range(live, 100, AxisType.REDUCE)
+  chunk = UOp.range(live, 100, AxisType.LOOP)
   def iloop(ph, val): return ph.store(ph.const_like(val))
   chunk_max = UOp.alloc((1,), dtypes.float, addrspace=AddrSpace.REG)
   chunk_max_i = chunk_max.after(iloop(chunk_max, -math.inf))
   update0 = chunk_max_i.store(chunk_max_i.after(chunk).maximum(stats[b, h, chunk, 0].load())).end(chunk)
   chunk_max = chunk_max_i.after(update0)
-  chunk2 = UOp.range(live, 101, AxisType.REDUCE)
+  chunk2 = UOp.range(live, 101, AxisType.LOOP)
   acc = UOp.alloc((NPD,), dtypes.float, addrspace=AddrSpace.REG)
   weight_sum = UOp.alloc((1,), dtypes.float, addrspace=AddrSpace.REG)
   acc_i, weight_sum_i = acc.after(iloop(acc, 0)), weight_sum.after(iloop(weight_sum, 0))
@@ -1042,7 +1046,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     Q_hoisted = Q_lds.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid].store(
       q.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid])
     Q_lds = Q_lds.after(UOp.barrier(Q_hoisted))
-  n_tile = UOp.range((q_base + (block_m + 1) * BLOCK_M + BLOCK_N - 1) // BLOCK_N, 100, AxisType.REDUCE)
+  n_tile = UOp.range((q_base + (block_m + 1) * BLOCK_M + BLOCK_N - 1) // BLOCK_N, 100, AxisType.LOOP)
   if _hoist_q:
     assert Q_hoisted is not None
     # Unroll K global→LDS (HIP-like static gload count). Opt out: AMD_FLASH_UNROLL_KV=0.
@@ -1152,7 +1156,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         qk_stores.append(S_frag.store(wmma_c))
     qk_done = UOp.group(*qk_stores)
   elif _acc_small and _factor_qk:
-    k_outer = UOp.range((D // WMMA_K) // _k_unroll_factor, 101, AxisType.REDUCE)
+    k_outer = UOp.range((D // WMMA_K) // _k_unroll_factor, 101, AxisType.LOOP)
     qk_stores = []
     for tn_i in range(TN):
       for tm_i in range(TM // WMMA_ACC):
@@ -1166,7 +1170,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         qk_stores.append(S_frag.store(wmma_c))
     qk_done = UOp.group(*qk_stores).end(k_outer)
   elif _acc_small:
-    k_qk = UOp.range(D//WMMA_K, 101, AxisType.REDUCE)
+    k_qk = UOp.range(D//WMMA_K, 101, AxisType.LOOP)
     qk_stores = []
     for tn_i in range(TN):
       for tm_i in range(TM // WMMA_ACC):
@@ -1176,7 +1180,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         qk_stores.append(S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)))
     qk_done = UOp.group(*qk_stores).end(k_qk)
   else:
-    k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
+    k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101, AxisType.LOOP), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
     S_frag = S_view[tm1, tn1]
     q_frag = Q_view[wave_m, tm1, lane_n, k_qk]
     k_frag = K_view[tn1, lane_n, k_qk]
@@ -1240,7 +1244,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
       p_local[ri].store(sum((_p_red[ri * TN + rn_i] for rn_i in range(TN)), S_reg.const_like(0)))
       for ri in range(TM)]))
   else:
-    m_ij, rm2 = _reg((TM,), 7, -math.inf, n_tile), UOp.range(TN, 261, AxisType.REDUCE)
+    m_ij, rm2 = _reg((TM,), 7, -math.inf, n_tile), UOp.range(TN, 261, AxisType.LOOP)
     m_ij = m_ij.after(m_ij.store(m_ij.after(rm2).maximum(S_reg[:, rm2])).end(rm2))
     # Ranged soft path: still batch the TM max reduces when the range is unrolled away.
     _m_red = warp_reduce_many([m_ij[ri] for ri in range(TM)], maximum=True)
@@ -1407,7 +1411,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         pv_stores.append(pv_frag.store(wmma_c))
     pv_done = UOp.group(*pv_stores)
   elif _acc_small and _factor_pv and (BLOCK_N // WMMA_K) % _k_unroll_factor == 0:
-    k_outer = UOp.range((BLOCK_N // WMMA_K) // _k_unroll_factor, 400, AxisType.REDUCE)
+    k_outer = UOp.range((BLOCK_N // WMMA_K) // _k_unroll_factor, 400, AxisType.LOOP)
     pv_stores = []
     for td_i in range(TD):
       for tm_i in range(TM // WMMA_ACC):
@@ -1421,7 +1425,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         pv_stores.append(pv_frag.store(wmma_c))
     pv_done = UOp.group(*pv_stores).end(k_outer)
   elif _acc_small:
-    k_pv = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE)
+    k_pv = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.LOOP)
     pv_stores = []
     for td_i in range(TD):
       for tm_i in range(TM // WMMA_ACC):
@@ -1431,7 +1435,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         pv_stores.append(pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)))
     pv_done = UOp.group(*pv_stores).end(k_pv)
   else:
-    k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.REDUCE), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
+    k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.LOOP), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
     pv_frag = pv_view[tm2, tn2]
     p_frag = P_view[wave_m, tm2, lane_n, k_pv]
     v_frag = V_view[wave_n, tn2, lane_n, k_pv]
@@ -1531,7 +1535,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # Do NOT set AMD_WMMA_ACC_SMALL globally — parks ≤64 quant tiles and breaks Q4/Q6.
   if amd_direct_isa(q.device) and not getenv("AMD_FLASH_DIRECT", 0):
     k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
-    mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=q.dtype, device=q.device, buffer=False).triu(valid_end-T_real+1)
+    mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=dtypes.float32, device=q.device, buffer=False).triu(valid_end-T_real+1)
     return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   # Flash-only ACC residency via python-unrolled WMMA. Renderer parks ≤64 only while
   # AMD_FLASH_ACC_SMALL is set for this realize (not via FLASH_DIRECT process-wide —
@@ -1595,7 +1599,7 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   current = current.after(current.store(UOp.stack(*(valid.where(
     state[bh, row, col].float() if initial is None else initial.where(0, state[bh, row, col].float()), UOp.const(0, dtypes.float32))
     for row in rows for col,valid in zip(cols, col_valids)))))
-  token = UOp.range(tokens, 2, AxisType.REDUCE)
+  token = UOp.range(tokens, 2, AxisType.LOOP)
   keys = tuple(valid.where(k[bh, token, col].load(), UOp.const(0, dtypes.float32)) for col,valid in zip(cols, col_valids))
   queries = tuple(valid.where(q[bh, token, col].load(), UOp.const(0, dtypes.float32)) for col,valid in zip(cols, col_valids))
   updates, stores = [], []
@@ -1626,6 +1630,7 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
   assert start_pos.uop.is_bound_var
-  # the bound start_pos reaches the graph through the state AFTER chain, like the flash kernels' valid_end
-  call = _gated_delta_prefill_kernel(*params, kernel_var(start_pos.uop.src[0])).call(*contig)
+  # Bound variables carry their value on ParamArg in current UOps, rather than as a source node.
+  _, start_pos_val = start_pos.uop.unbind()
+  call = _gated_delta_prefill_kernel(*params, UOp.const(start_pos_val, start_pos.uop.dtype)).call(*contig)
   return Tensor(contig[0].after(call))

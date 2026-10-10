@@ -12,7 +12,7 @@ from tinygrad.renderer.isa import ISARenderer, IselContext, PreRegAllocContext
 from tinygrad.dtype import dtypes, AddrSpace
 
 # import all pattern matchers here
-from tinygrad.codegen.gpudims import pm_add_gpudims
+from tinygrad.codegen.gpudims import pm_group_gpudims, pm_range_to_special
 from tinygrad.uop.symbolic import sym, symbolic_simple, symbolic, pm_move_where_on_load, pm_clean_up_group_sink, pm_remove_invalid, invalid_gate
 from tinygrad.uop.movement import mop_cleanup
 from tinygrad.codegen.late.index_mops import pm_index_mops
@@ -33,24 +33,22 @@ from tinygrad.codegen.late.linearizer import CFGContext, pm_split_ends, pm_add_c
 from tinygrad.codegen.late.regalloc import LinearScanRegallocContext, pm_regalloc_rewrite
 from tinygrad.codegen.late.coalesce import memory_coalescing, pm_simplify_add_image
 from tinygrad.codegen.late.interleave import WMMASchedulePolicy, pm_schedule_interleave_wmma
-from tinygrad.helpers import all_same, all_int, argsort, partition
+from tinygrad.helpers import all_same, all_int, argsort, partition, to_function_name
 from tinygrad.uop.ops import _broadcast_shape, identity_element
 from tinygrad.schedule.rangeify import BufferizeOpts
 
-def do_number_param(ctx:list[int], x:UOp):
-  if x.arg.slot != -1: return None
-  ctx[0] += 1
-  return x.replace(arg=replace(x.arg, slot=ctx[0]-1))
+def do_number_param(ctx:tuple[int, dict[str, int]], x:UOp): # after the params, one slot per name
+  if x.is_variable: return x.replace(arg=replace(x.arg, slot=ctx[0] + ctx[1].setdefault(x.arg.name, len(ctx[1]))))
 
 pm_number_params = PatternMatcher([
   (UPat(Ops.PARAM, name="x"), do_number_param),
 ])
 
-def build_range_map(sink:UOp) -> dict[tuple[int, ...], int]:
-  ctx: dict[tuple[int, ...], int] = {}
+def build_range_map(sink:UOp) -> dict[tuple, int]:
+  ctx: dict[tuple, int] = {}
   for x in sink.toposort():
-    if x.op is Ops.RANGE and x.axis_type in {AxisType.UNROLL, AxisType.UPCAST}:
-      ctx[x.axis_id] = len(ctx)
+    if x.op is Ops.RANGE and x.axis_type is AxisType.UPCAST:
+      ctx[x.arg] = len(ctx)
   return ctx
 
 def expand_reduce(r:UOp):
@@ -77,7 +75,7 @@ def unroll_axis(u:UOp, dims:list[int], sizes:list[int]) -> UOp:
   out = u.unflatten(-1, tuple(sizes))
   return out.permute(argsort([i for i in range(out.ndim) if i not in dims]+dims))
 
-def expand_wmma(ctx:dict[tuple[int, ...], int], u:UOp):
+def expand_wmma(ctx:dict[tuple, int], u:UOp):
   if u.arg[3] is None: return None
   # Skip axes absent from the expand map (e.g. size-1 TC pads dropped after TC_LDS_AB staging).
   in0, in1, out0 = [[ctx[rn] for rn,_ in upcast_axes if rn in ctx] for upcast_axes in u.arg[3]]
@@ -91,7 +89,7 @@ expander = PatternMatcher([
   (UPat(Ops.REDUCE, name="r"), expand_reduce),
   (UPat(Ops.RANGE, name="r"),
    lambda ctx, r: UOp.const(tuple(range(r.vmax+1)), r.dtype) \
-    .reshape(tuple([r.vmax+1 if i == ctx[r.axis_id] else 1 for i in range(len(ctx))])) if r.axis_id in ctx else None),
+    .reshape(tuple([r.vmax+1 if i == ctx[r.arg] else 1 for i in range(len(ctx))])) if r.arg in ctx else None),
   (UPat(Ops.WMMA, name="u"), expand_wmma),
 ])+pm_flatten_range+codegen_mops
 
@@ -189,7 +187,7 @@ def fix_group_for_reduce(x:UOp):
 
   # do only the non grouped reduces early
   ret = x.replace(src=(x.src[0],)+tuple(reduce_r))
-  reduce_loop = [x.replace(arg=(x.arg[0]+100, *x.arg[1:-1], AxisType.REDUCE)) for x in reduce_gfr]
+  reduce_loop = [x.replace(arg=(AxisType.WEAK, x.axis_id[0]+100, *x.axis_id[1:])) for x in reduce_gfr]
   buf = ret.bufferize(*upstream_locals, *reduce_gfr, arg=BufferizeOpts(None, AddrSpace.LOCAL)).index(*upstream_locals, *reduce_loop)
 
   # do the final reduce (if/barrier are added in gpudims step)
@@ -203,13 +201,13 @@ def merge_reduce_ends(sink:UOp):
   for u in sink.backward_slice:
     if u.op is Ops.END and u.tag == "mergeable": range_to_ends.setdefault(u.src[1:], []).append(u)
   subs: dict[UOp, UOp] = {}
-  next_axis = max((u.arg[0] for u in sink.backward_slice if u.op is Ops.RANGE), default=-1) + 1
+  next_axis = max((u.axis_id[0] for u in sink.backward_slice if u.op is Ops.RANGE), default=-1) + 1
   for r, ends in range_to_ends.items():
     if len(ends) <= 1: continue
     by_ctx: dict[frozenset[UOp], list[UOp]] = {}
     for e in ends: by_ctx.setdefault(frozenset(e.ranges), []).append(e)
     for i, group in enumerate(by_ctx.values()):
-      tr = r if i == 0 else tuple(rr.replace(arg=(next_axis + j, *rr.arg[1:])) for j, rr in enumerate(r))
+      tr = r if i == 0 else tuple(rr.replace(arg=(rr.axis_type, next_axis + j, *rr.axis_id[1:])) for j, rr in enumerate(r))
       if i > 0: next_axis += len(r)
       mapped = [e.substitute(dict(zip(r, tr))) if i > 0 else e for e in group]
       merged = mapped[0] if len(mapped) == 1 else UOp.group(*(e.src[0] for e in mapped)).end(*tr)
@@ -305,7 +303,7 @@ def add_raw_barrier(ctx, after:UOp):
 
 def add_war_barrier(end:UOp):
   # a LOCAL buffer stored and loaded in the same loop needs a barrier at the end of the loop body
-  rngs = [r for r in end.ended_ranges if r.axis_type in (AxisType.REDUCE, AxisType.WEAK, AxisType.LOOP) and r.vmax > 0]
+  rngs = [r for r in end.ended_ranges if r.axis_type in (AxisType.WEAK, AxisType.LOOP) and r.vmax > 0]
   if not rngs or end.src[0].op is Ops.BARRIER: return None
   sl = end.src[0].backward_slice_with_self
   # only stores that are inside this loop body (not in the backward slice through AFTER chains from other loops)
@@ -320,7 +318,6 @@ pm_implicit_barriers = PatternMatcher([
 ])
 
 def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
-  if VIZ: graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
   if DEBUG >= 5: print(pyrender(ast))
   if SPEC: type_verify(ast, spec_tensor)
 
@@ -372,8 +369,8 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   # add locals
   sink = graph_rewrite(sink, pm_add_local_buffers, ctx=slots, name="add local buffers")
 
-  # add gpu dims (late). this works after devectorize, but it's faster here
-  sink = graph_rewrite(sink, pm_add_gpudims, ctx=ren, name="add gpudims")
+  # group GPU dimensions early so their index arithmetic goes through normal lowering
+  sink = graph_rewrite(sink, pm_group_gpudims, ctx=ren, name="group gpudims", walk=True)
 
   # **** optimizations are done, now we lower to actual code ****
 
@@ -399,7 +396,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   # the boundary: required compute dtypes settle here; derivable const edges may stay bare
   # NOTE: we need indexing_simplify to remove the cast to long using the Invalid
   # NOTE: symbolic must NOT be composed here -- pm_data_invalid pushes the weak result CAST into a gated WHERE, remaking the weak node, and it cycles
-  sink = graph_rewrite(sink, pm_lower_weak+indexing_simplify, name="lower all index dtypes", enter_calls=True)
+  sink = graph_rewrite(sink, pm_lower_weak+indexing_simplify, name="lower all index dtypes")
 
   # final symbolic before decomp
   sink = graph_rewrite(sink, symbolic, name="final symbolic")
@@ -435,12 +432,15 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   # add implicit barriers (stores/loads through LOCAL memory ordered by AFTER or across loop iterations need workgroup barriers)
   sink = graph_rewrite(sink, pm_implicit_barriers, ctx=local_afters_covered_by_nested(sink), name="add implicit barriers")
 
+  # hardware ranges are no longer loops; preserve their already lowered bounds
+  sink = graph_rewrite(sink, pm_range_to_special, name="range to special")
+
   # this was the linearizer
   sink = graph_rewrite(sink, pm_add_control_flow, ctx=CFGContext(sink), name="add control flow", bottom_up=True)
 
-  # put unnumbered variable PARAMs in slots
-  num_params = len([x for x in sink.toposort() if x.op is Ops.PARAM and x.arg.slot != -1])
-  sink = graph_rewrite(sink, pm_number_params, ctx=[num_params], name="number params with -1", walk=True)
+  # put the variables in slots
+  num_params = max([x.arg.slot + 1 for x in sink.toposort() if x.op is Ops.PARAM and not x.is_variable], default=0)
+  sink = graph_rewrite(sink, pm_number_params, ctx=(num_params, {}), name="number variables", walk=True)
 
   if VIZ: graph_rewrite(sink, PatternMatcher([]), name="View Output AST")
   if SPEC:
@@ -484,9 +484,21 @@ def _print_compile_stage(prg:UOp, stage:str, st:int, uops:int) -> None:
     print("COMPILE_STAGE "+json.dumps({"name": prg.src[0].arg.function_name, "stage": stage,
       "ms": (time.perf_counter_ns() - st) / 1e6, "uops": uops}), flush=True)
 
+pm_lower_calls = PatternMatcher([
+  (UPat(Ops.CALL, src=(UPat(Ops.SINK),), allow_any_len=True, name="call"),
+   lambda ctx,call: call.replace(src=(full_rewrite_to_sink(call.body, ctx, optimize=False),)+call.src[1:])),
+])
+
+pm_call_fixup = PatternMatcher([
+  (UPat(Ops.CALL, src=(UPat(Ops.SINK, name="sink"),), allow_any_len=True, name="call"),
+   lambda call,sink: call.replace(src=(UOp(Ops.LINEAR, src=tuple(line_rewrite(linearize(sink), pm_linearize_cleanups+pm_alloc_to_buf)),
+                                           arg=to_function_name(call.arg.name)),)+call.src[1:])),
+])
+
 def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:
   if DEBUG >= 3 and sink.arg.applied_opts: print(f"{sink.arg.function_name:<25} opts: {sink.arg.applied_opts}")
   stage_st = time.perf_counter_ns()
+  sink = graph_rewrite(sink, pm_call_fixup, name="call fixup", enter_calls=True)
   lst = line_rewrite(linearize(sink), pm_linearize_cleanups+pm_alloc_to_buf)
   _print_compile_stage(prg, "linearize", stage_st, len(lst))
   prg = prg.replace(src=(lst[-1],))
@@ -567,6 +579,8 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   elif ast.op is Ops.SINK:
     assert isinstance(ast.arg, KernelInfo), "requires KernelInfo on arg to to_program"
     stage_st = time.perf_counter_ns()
+    if VIZ: graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
+    ast = graph_rewrite(ast, pm_lower_calls, ctx=renderer, name="lower calls", walk=True, enter_calls=True)
     full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.tag is None)
     if compile_timing: timings["rewrite_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
     # Opt-in: schedule later WMMA groups' loads after prior WMMA (flash latency hide).

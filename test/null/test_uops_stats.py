@@ -71,12 +71,11 @@ class TestMemoryCount(unittest.TestCase):
     _, mem = get_stats(a.assign(a+a))
     self.assertEqual(mem, 1024*1024*2)  # 1 read + 1 write
 
-  @unittest.skipIf(Device.DEFAULT == "CPU", "test copy to CPU from other device")
   def test_copyout(self):
-    a = Tensor.empty(32, dtype=dtypes.uint8).to("CPU")
+    a = Tensor.empty(32, dtype=dtypes.uint8, device="NULL").to("NULL:1")
     _, mem = get_stats(a)
     self.assertEqual(mem, 32*1)
-    a = Tensor.empty(32, dtype=dtypes.uint32).to("CPU")
+    a = Tensor.empty(32, dtype=dtypes.uint32, device="NULL").to("NULL:1")
     _, mem = get_stats(a)
     self.assertEqual(mem, 32*4)
 
@@ -197,7 +196,7 @@ class TestStatsOptimized(unittest.TestCase):
   @unittest.skip("fails locally on AMD")
   def test_gemm_tc_unroll_half(self):
     try:
-      p = to_program(replace_opts(self.ast_gemm_half, [Opt(OptOps.TC, 0, (-1, 0, 1)), Opt(OptOps.SPLIT, 4, (2, AxisType.UNROLL))]),
+      p = to_program(replace_opts(self.ast_gemm_half, [Opt(OptOps.TC, 0, (-1, 0, 1)), Opt(OptOps.SPLIT, 4, (2, AxisType.UPCAST))]),
                       renderer=Device[Device.DEFAULT].renderer)
     except KernelOptError:
       raise unittest.SkipTest("no tensor cores")
@@ -206,7 +205,7 @@ class TestStatsOptimized(unittest.TestCase):
 
   def test_gemm_tc_unroll(self):
     try:
-      p = to_program(replace_opts(self.ast_gemm, [Opt(OptOps.TC, 0, (-1, 0, 1)), Opt(OptOps.SPLIT, 4, (2, AxisType.UNROLL))]),
+      p = to_program(replace_opts(self.ast_gemm, [Opt(OptOps.TC, 0, (-1, 0, 1)), Opt(OptOps.SPLIT, 4, (2, AxisType.UPCAST))]),
                       renderer=Device[Device.DEFAULT].renderer)
     except KernelOptError:
       raise unittest.SkipTest("no tensor cores")
@@ -222,7 +221,7 @@ class TestStatsOptimized(unittest.TestCase):
 
   def test_gemm_upcasted(self):
     p = to_program(replace_opts(self.ast_gemm, [Opt(OptOps.SPLIT, 0, (4, AxisType.UPCAST)), Opt(OptOps.SPLIT, 1, (4, AxisType.UPCAST)),
-                                                Opt(OptOps.SPLIT, 4, (4, AxisType.UNROLL))]),
+                                                Opt(OptOps.SPLIT, 4, (4, AxisType.UPCAST))]),
                     renderer=Device[Device.DEFAULT].renderer)
     self.check_gemm(p)
     self.assertEqual(p.src[0].arg.estimates.lds, 2*N*N*N*4//4 + 4*N*N)

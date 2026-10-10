@@ -21,6 +21,7 @@ BASEDIR = pathlib.Path(__file__).parent
 if WIN: os.system("")
 
 def dedup(x:Iterable[T]): return list(dict.fromkeys(x))   # retains list order
+def to_name(*parts:str) -> str: return "_".join(parts).replace(":", "_").lower()
 def argfix(*x):
   if x and x[0].__class__ in (tuple, list):
     if len(x) != 1: raise ValueError(f"bad arg {x}")
@@ -282,7 +283,7 @@ TUPLE_ORDER = ContextVar("TUPLE_ORDER", 1)
 CCACHE = ContextVar("CCACHE", 1)
 # allow tf32 to be used on NVIDIA GPUs
 ALLOW_TF32 = ContextVar("ALLOW_TF32", 0)
-# set to 0 to disable the scheduler cache
+# set to 0 to disable the scheduler cache, 2 to also persist it to disk
 SCACHE = ContextVar("SCACHE", 1)
 # allow use of atomics for embedding backward
 USE_ATOMICS = ContextVar("USE_ATOMICS", 0)

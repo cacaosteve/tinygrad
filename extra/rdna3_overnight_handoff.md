@@ -954,3 +954,20 @@ HIP: **32 MOV**, **0 scratch**, **119 delay_alu**, ~103 VOPD, priv **0**, ninst 
 2. Prefill: attack MOV tax or per-tile scratch (not env sweeps). Decode = validation.
 3. One Llama/GGUF health check per prefill milestone.
 4. Freeze performance, then split renderer. Fork-only; no upstream PRs.
+
+## Post-master paired validation (2026-10-02)
+
+Hardware: RX 7900 XTX / gfx1100. Same `rdna3_backend_matrix.py` harness on the merged staging snapshot and pre-merge snapshot; serial DIRECT/HIP, 100 synchronized samples/case. The early 30-sample pass had timing outliers; use the 100-sample results below.
+
+| Workload | Merged DIRECT | Merged HIP | DIRECT/HIP | Pre-merge DIRECT/HIP |
+|---|---:|---:|---:|---:|
+| Flash prefill, 32 tokens | 323.5 µs | 321.9 µs | 1.005× | 1.004× |
+| Flash decode | 116.3 µs | 116.1 µs | 1.001× | 1.029× |
+| FP16 matmul, 2048² | 305.1 µs | 301.7 µs | 1.011× | 1.008× |
+| Q4_K GEMV, 8192×2048 | 102.9 µs | 100.3 µs | 1.026× | 1.029× |
+
+Flash checksums are finite and match prior locks (`-3.37886` prefill, `-17.2830` decode); matmul matches both paths (`max_err_vs_numpy_f32=0.00781`). Q4_K DIRECT/HIP agree and are within `1.3e-4` of the expected Q8-activation reference. The LLVM Q4_K fallback is ~372 µs but uses full-precision activations, so its output is not directly comparable to the Q8-activation custom path. AMDLLVM FP16 matmul was 297.4 µs (~2.6% faster than DIRECT).
+
+Conclusion: no measured post-merge regression; these four DIRECT workloads remain within ~3% of HIP, and ordinary matmul is within ~3% of AMDLLVM. Three fresh-process repetitions confirm a separate cold first-call gap: flash prefill ~2.18–2.20 s DIRECT vs ~1.64–1.65 s HIP; decode ~2.42–2.55 s vs ~1.29–1.31 s. `DEBUG=2` compile progress points to the two custom flash kernels taking about 2× longer to compile through DIRECT. This is kernel-level TinyJit compile+first-run time, not a full-model compile result; next measure a complete GGUF model and profile per-kernel compile time before attempting compiler optimization.
+
+Validation: renderer suite 221 passed / 34 skipped / 74 subtests; targeted CPU/UOp suite 165 passed / 19 skipped / 8 xfailed / 6 subtests (`DEV=CPU`, `-n12`). LLM hardware tests must be serial: 40 passed / 9 known baseline-failing tests deselected / 150 subtests. Known baseline failures were reproduced on pre-merge, including symbolic/custom-function attention, gated-delta per-channel scan, quantized partial output tiles, WMMA quantization basis/symbolic cases, and the exact Q8 scale-rounding assertion. Ruff/mypy unavailable in gaming-PC venv. No commit, push, or PR.

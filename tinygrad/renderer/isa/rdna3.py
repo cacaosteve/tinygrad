@@ -1275,13 +1275,13 @@ AMD_PERMLANEX16 = ("__builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__bui
 
 def _warp_group_reduce(x:UOp) -> UOp|None:
   """Use a wave32 butterfly for an isolated f32 ADD group reduction."""
-  grouped = [r for r in x.src[1:] if r.op is Ops.RANGE and r.arg[-1] is AxisType.LOCAL]
+  grouped = [r for r in x.src[1:] if r.op is Ops.RANGE and r.axis_type is AxisType.LOCAL]
   if x.dtype is not dtypes.float32 or not 1 <= x.max_numel() <= 4 or x.arg[0] is not Ops.ADD or len(grouped) != 1 or \
      _const_value(grouped[0].src[0]) != 32: return None
   group = grouped[0]
   # The group must map directly to hardware lane id. Mixed local/group layouts retain
   # the generic LDS reduction, whose addressing and barriers cover those cases.
-  if any(r is not group and r.op is Ops.RANGE and r.arg[-1] in (AxisType.WARP, AxisType.LOCAL)
+  if any(r is not group and r.op is Ops.RANGE and r.axis_type in (AxisType.WARP, AxisType.LOCAL)
          for r in x.src[0].toposort()): return None
   remaining = tuple(r for r in x.src[1:] if r is not group)
   val = x.replace(src=(x.src[0],)+remaining) if remaining or x.arg[1] else x.src[0]
@@ -1772,7 +1772,7 @@ def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Regis
 
 isel_matcher = make_isel_matcher()
 
-def _loop_label(x:UOp) -> str: return "_".join(str(i) for i in x.arg[:-1])
+def _loop_label(x:UOp) -> str: return "_".join(str(i) for i in x.axis_id)
 
 def _lower_range(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
   loop_label = _loop_label(x)
@@ -3215,7 +3215,7 @@ def insts_from_linear(lin:UOp):
         if pair is None: continue
         # Emit cand early with u only if cand does not depend on intervening ops
         # (those would still be pending). Mid depending on u is fine — u writes first.
-        if any(scheduled[m] in cand.toposort() for m in range(oi + 1, k)):
+        if any(_vopd.depends(cand, scheduled[m]) for m in range(oi + 1, k)):
           continue
         partner_i, vopd = k, pair
         break
@@ -3236,7 +3236,7 @@ def insts_from_linear(lin:UOp):
         cand = scheduled[k]
         if _iop(cand) is not AMDOps.FMAC: continue
         if (pair:=_try_vopd_fmac_alu_pair(u, cand)) is None: continue
-        if any(scheduled[m] in cand.toposort() for m in range(oi + 1, k)):
+        if any(_vopd.depends(cand, scheduled[m]) for m in range(oi + 1, k)):
           continue
         partner_i, vopd = k, pair
         break
@@ -3256,7 +3256,7 @@ def insts_from_linear(lin:UOp):
         cand = scheduled[k]
         if (pair:=_try_vopd_add_pair(u, cand)) is None: continue
         # Refuse if anything between produces a cand src or consumes cand (early emit).
-        if any(scheduled[m] in cand.toposort() or cand in scheduled[m].toposort()
+        if any(_vopd.depends(cand, scheduled[m]) or _vopd.depends(scheduled[m], cand)
                for m in range(oi + 1, k)):
           continue
         partner_i, vopd = k, pair
@@ -3355,7 +3355,7 @@ def insts_from_linear(lin:UOp):
         cand = scheduled[k]
         if (pair:=_try_vopd_mov_pair(u, cand)) is None: continue
         # Only reject if cand depends on an intervening def (dual emits cand at u).
-        if any(scheduled[m] in cand.toposort() for m in range(oi + 1, k)):
+        if any(_vopd.depends(cand, scheduled[m]) for m in range(oi + 1, k)):
           continue
         partner_i, vopd = k, pair
         break
@@ -3442,6 +3442,9 @@ def insts_from_linear(lin:UOp):
       # AMD_SINK_VALU_SWIZZLE removed (checksum). VMEM-only sink kept (ship default ON).
       k, moved = oi + 2, 0
       max_moved = 6
+      # This sink is post-regalloc: don't move a load's assigned destination over any register
+      # still live at the intervening ADD/MAX (the allocator saw the load after that consumer).
+      add_regs = _reg_idxs(add) | set().union(*(_reg_idxs(s) for s in add.src))
       while k < len(scheduled) and moved < max_moved:
         if k in early_emitted or scheduled[k] in skip:
           k += 1
@@ -3449,6 +3452,7 @@ def insts_from_linear(lin:UOp):
         cand = scheduled[k]
         if cand.op is Ops.INS and _iop(cand) is AMDOps.LOAD and _vmem_schedulable_load(cand) and \
            u not in cand.toposort() and add not in cand.toposort() and \
+           not (_reg_idxs(cand) & add_regs) and \
            not any(cand in scheduled[m].toposort() for m in range(oi + 2, k)):
           src_regs = set().union(*(_reg_idxs(s) for s in cand.src))
           if src_regs and _pending_src(src_regs): flush_regs(src_regs)
@@ -3923,8 +3927,8 @@ def apply_tc_hand_opts(tk, rngs):
     tiles = do_upcast()
     # UNROLL multiplies WMMA STACK tiles; past max_tiles expand soft-fails then unroll_axis
     # IndexErrors. Only apply when the upcast×unroll product still fits the LDS expand budget.
-    if (ku := getenv("TC_LDS_UNROLL", 0)) and tk.unrollable_dims and tiles * ku <= max_tiles:
-      try: tk.apply_opt(Opt(OptOps.SPLIT, tk.unrollable_dims[0], (ku, AxisType.UNROLL)))
+    if (ku := getenv("TC_LDS_UNROLL", 0)) and tk.upcastable_dims(reduce=True) and tiles * ku <= max_tiles:
+      try: tk.apply_opt(Opt(OptOps.SPLIT, tk.upcastable_dims(reduce=True)[0], (ku, AxisType.UPCAST)))
       except KernelOptError: pass
   else:
     do_upcast()
@@ -4138,8 +4142,8 @@ class AMDRenderer(ISARenderer):
     unroll, ast_uops = 8, k.ast.toposort()  # AMD_GROUPED_REDUCE_UNROLL hardcoded
     if not unroll or k.reduceop is None or k.reduceop.arg[0] not in (Ops.ADD, Ops.MAX) or \
        (k.reduceop.arg[0] is Ops.ADD and len(ast_uops) > 32) or \
-       any(u.op is Ops.PARAM and u.dtype is dtypes.uint8 for u in ast_uops) or not k.unrollable_dims: return None
-    size = k.full_shape[k.unrollable_dims[-1]]
+       any(u.op is Ops.PARAM and u.dtype is dtypes.uint8 for u in ast_uops) or not k.upcastable_dims(reduce=True): return None
+    size = k.full_shape[k.upcastable_dims(reduce=True)[-1]]
     if not isinstance(size, int): return None
     if size >= unroll and size % unroll == 0: return unroll
     return self.get_large_reduce_unroll(size, k.ast)
@@ -4148,7 +4152,7 @@ class AMDRenderer(ISARenderer):
     # Large packed-quant projections amortize the activation reads across two rows.
     # Below this threshold the extra code/register pressure only increases cold latency.
     # output elems = non-reduce axes (Scheduler.output_shape was removed in #18090)
-    output_size = prod((1 if i in k.reduce_axes else s) for i,s in enumerate(k.full_shape))
+    output_size = prod((1 if k.rngs[i] in k.reduce_ranges else s) for i,s in enumerate(k.full_shape))
     if not isinstance(output_size, int) or output_size < 16384: return 1
     if not any(u.op is Ops.PARAM and u.dtype is dtypes.uchar for u in k.ast.toposort()): return 1
     return 2
@@ -4156,16 +4160,16 @@ class AMDRenderer(ISARenderer):
   def apply_quant_matvec_opts(self, k) -> bool:
     """Expose memory-level parallelism that LLVM's loop optimizer otherwise supplies for Q8_0/IQ4_XS GEMV."""
     from tinygrad.codegen.opt import Opt, OptOps
-    output_size = prod((1 if i in k.reduce_axes else s) for i,s in enumerate(k.full_shape))
+    output_size = prod((1 if k.rngs[i] in k.reduce_ranges else s) for i,s in enumerate(k.full_shape))
     if k.reduceop is None or k.reduceop.arg[0] is not Ops.ADD or not isinstance(output_size, int) or output_size < 1024:
       return False
     if not any(u.op is Ops.PARAM and u.dtype is dtypes.uchar for u in k.ast.toposort()): return False
-    reduce_sizes = tuple(k.full_shape[a] for a in k.axes_of(AxisType.REDUCE))
+    reduce_sizes = tuple(k.full_shape[a] for a in k.axes_of(reduce=True))
 
     # Q8_0: use 16 lanes on the outer block loop and expose eight packed values per iteration.
     if len(reduce_sizes) == 2 and reduce_sizes[-1] == 32 and isinstance(reduce_sizes[0], int) and reduce_sizes[0] % 16 == 0:
-      k.apply_opt(Opt(OptOps.SPLIT, k.axes_of(AxisType.REDUCE)[0], (16, AxisType.LOCAL)))
-      k.apply_opt(Opt(OptOps.SPLIT, k.unrollable_dims[2], (8, AxisType.UNROLL)))
+      k.apply_opt(Opt(OptOps.SPLIT, k.axes_of(reduce=True)[0], (16, AxisType.LOCAL)))
+      k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[2], (8, AxisType.UPCAST)))
       return True
 
     # IQ4_XS: the dequantized reduction is [blocks, 4, 2, 2, 16]. Use a 2-D 32-128 lane group
@@ -4175,8 +4179,10 @@ class AMDRenderer(ISARenderer):
     if len(reduce_sizes) == 5 and reduce_sizes[1:] == (4, 2, 2, 16) and isinstance(reduce_sizes[0], int) and \
        2 <= reduce_sizes[0] <= 32 and output_size % 4 == 0:
       for _ in range(2):
-        k.apply_opt(Opt(OptOps.SPLIT, k.axes_of(AxisType.REDUCE)[0], (0, AxisType.LOCAL)))
-      k.apply_opt(Opt(OptOps.SPLIT, k.unrollable_dims[3], (0, AxisType.UNROLL)))
+        localizable = [a for a in k.axes_of(reduce=True) if k.rngs[a].axis_type in (AxisType.GLOBAL, AxisType.WEAK)]
+        if not localizable: return False
+        k.apply_opt(Opt(OptOps.SPLIT, localizable[0], (0, AxisType.LOCAL)))
+      k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[3], (0, AxisType.UPCAST)))
       return True
     return False
 
@@ -4451,7 +4457,7 @@ class AMDRenderer(ISARenderer):
             return base
     # WHERE/cndmask: alias onto true VGPR only when false arm is a literal (mask→0/-inf).
     # Unrestricted WHERE_ALIAS removed (quant / serial checksum breaks).
-    if x.op is Ops.INS and _iop(x) is AMDOps.WHERE and len(x.src) > 2 and _unwrap_const(x.src[2]) is not None:
+    if x.op is Ops.INS and _iop(x) is AMDOps.WHERE and x.dtype is dtypes.float32 and len(x.src) > 2 and _unwrap_const(x.src[2]) is not None:
       if len(src_phys) > 1 and src_phys[1] is not None and isinstance(x.tag, tuple):
         if src_phys[1] in x.tag[0].cons: return src_phys[1]
     # Redundant u32→u16 CAST after &0xffff / >>16: alias onto src (no mov).

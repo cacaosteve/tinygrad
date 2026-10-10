@@ -117,7 +117,7 @@ class TestArgOrder(unittest.TestCase):
 
 class TestCallCodegen(unittest.TestCase):
   def test_compiled_scalar_slots_are_not_call_slots(self):
-    out = UOp.new_buffer("CPU", 1, dtypes.int)
+    out = UOp.placeholder((1,), dtypes.int)
     p = out.param_like(0)
     v = UOp.variable("external", 1, 8, dtype=dtypes.int)
     prg = to_program(p.index(0).store(v).sink(arg=KernelInfo("scalar")),
@@ -130,7 +130,7 @@ class TestCallCodegen(unittest.TestCase):
 
   def test_call_stack_pointer(self):
     slot = UOp.placeholder((1,), dtypes.uint32, addrspace=AddrSpace.REG)
-    call = UOp.custom_function("callback", UOp.const(0, dtypes.uint64)).call(slot[0], ret_dtype=dtypes.void)
+    call = UOp.custom_function("callback").call(slot[0])
     prg = to_program(call.sink(arg=KernelInfo("call_stack")), ClangRenderer(Target("CPU", arch="x86_64,x86-64")))
     self.assertIn("(unsigned int*)((buf", prg.src[2].arg)
 

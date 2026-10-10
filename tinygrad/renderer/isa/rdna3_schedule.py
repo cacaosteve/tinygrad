@@ -60,6 +60,10 @@ def schedule_fmac_add_pairs(ops:list[UOp]) -> list[UOp]:
   max_scan = 64
   alu_ok = (AMDOps.ADD, AMDOps.SUB)
   out = list(ops)
+  topo_cache: dict[UOp, dict[UOp, None]] = {}
+  def topo(u:UOp) -> dict[UOp, None]:
+    if u not in topo_cache: topo_cache[u] = u.toposort()
+    return topo_cache[u]
   i = 0
   while i < len(out):
     u = out[i]
@@ -70,9 +74,9 @@ def schedule_fmac_add_pairs(ops:list[UOp]) -> list[UOp]:
         if not (cand.op is Ops.INS and _iop(cand) in alu_ok and
                 cand.dtype is dtypes.float32):
           continue
-        if u in cand.toposort() or cand in u.toposort(): continue
-        if any(out[m] in cand.toposort() for m in range(i + 1, j)): continue
-        if any(cand in out[m].toposort() for m in range(i + 1, j)): continue
+        if u in topo(cand) or cand in topo(u): continue
+        if any(out[m] in topo(cand) for m in range(i + 1, j)): continue
+        if any(cand in topo(out[m]) for m in range(i + 1, j)): continue
         out.pop(j)
         out.insert(i + 1, cand)
         placed = True
@@ -83,9 +87,9 @@ def schedule_fmac_add_pairs(ops:list[UOp]) -> list[UOp]:
           if not (cand.op is Ops.INS and _iop(cand) in alu_ok and
                   cand.dtype is dtypes.float32):
             continue
-          if u in cand.toposort() or cand in u.toposort(): continue
-          if any(cand in out[m].toposort() for m in range(j + 1, i + 1)): continue
-          if any(out[m] in cand.toposort() for m in range(j + 1, i)): continue
+          if u in topo(cand) or cand in topo(u): continue
+          if any(cand in topo(out[m]) for m in range(j + 1, i + 1)): continue
+          if any(out[m] in topo(cand) for m in range(j + 1, i)): continue
           out.pop(j)
           fi = i - 1
           out.insert(fi + 1, cand)
@@ -1341,4 +1345,3 @@ def sink_alu_into_reg_store(ops: list[UOp]) -> list[UOp]:
     else:
       out.append(u)
   return out
-

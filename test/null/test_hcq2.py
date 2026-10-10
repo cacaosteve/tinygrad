@@ -1,17 +1,18 @@
-import unittest, ctypes, threading
+import unittest
 from typing import cast
+from types import SimpleNamespace
 from collections import defaultdict
 from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, dtypes
 from tinygrad.device import Buffer, Compiled, ProfileGraphEvent
 from tinygrad.helpers import Context, unwrap, to_tuple
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
-from tinygrad.engine.realize import compile_linear, link_linear, lower_and_compile, run_linear, get_call_arg_uops
-from tinygrad.renderer.cstyle import CStyleLanguage
-from tinygrad.runtime.autogen import libc
-from tinygrad.runtime.support.c import init_c_struct_t
+from tinygrad.engine.realize import compile_linear, link_linear, get_call_arg_uops, lower_and_compile, run_linear
 import tinygrad.runtime.support.hcq2 as hcq2
 from tinygrad.runtime.support.hcq2 import HCQInfo
+
+def lower_hcq(*body:UOp) -> UOp: # body through lower_call, as a linear
+  return UOp(Ops.LINEAR, src=(unwrap(hcq2.lower_call(UOp.sink(*body, arg=KernelInfo("test"), tag=1).call(aux=HCQInfo(("CPU",))))),))
 
 def chain(x:Tensor, n:int) -> Tensor:
   for _ in range(n): x = (x + 1).contiguous()
@@ -28,13 +29,8 @@ def compiled_chain(n:int, jit=False, device="NULL") -> tuple[Tensor, UOp, list[U
   out = chain(x, n)
   return out, compile_linear(out.schedule_linear(), input_uops=inputs, cache=True), inputs
 
-def cpu_buf(size:int=1, dtype=dtypes.uint8, **kwargs) -> UOp: return UOp.placeholder((size,), dtype, device="CPU", **kwargs)
-
-def lower_hcq(body:UOp) -> UOp:
-  return unwrap(hcq2.lower_call(UOp.sink(body, arg=KernelInfo("test")).call(aux=hcq2.HCQInfo(("CPU",)))))
-
 # NULL never runs a batch, so the scheduler is tested on the commands it hands each queue, run by a small executor with symbolic
-# signals and timelines. the fence, the link and the ffi are tested by running them on CPU.
+# signals and timelines. the fence and the ffi are tested by running them on CPU, see test/runtime/test_hcq2.py.
 
 def scheduled(*ts:Tensor, **kwargs) -> list[UOp]:
   batches, orig = list[UOp](), hcq2.sched_batches
@@ -46,7 +42,7 @@ def scheduled(*ts:Tensor, **kwargs) -> list[UOp]:
   return batches
 
 def queues(batch:UOp) -> dict[tuple[str, str], list[UOp]]:
-  return {(lin.arg[0][0], lin.arg[1]): list(lin.src) for lin in (s.without_after.src[0] for s in batch.body.src)}
+  return {(lin.arg[0][0], lin.arg[1]): list(lin.src) for lin in (s.src[1].without_after for s in batch.body.src)}
 def calls(batch:UOp) -> list[UOp]: return [c for cmds in queues(batch).values() for c in cmds if c.op is Ops.CALL]
 def devices_of(call:UOp) -> set[str]: return {to_tuple(a.device)[0] for a in get_call_arg_uops(call)}
 
@@ -177,7 +173,7 @@ class TestHCQ2Schedule(unittest.TestCase):
     self.assertEqual(orders(b), {(0, 1)})
 
   def test_a_host_kernel_splits_the_batch(self):
-    self.assertEqual(len(self.scheduled(((self.x + 1).contiguous().to("CPU") + 2).contiguous().to("NULL") + 3)), 2)
+    self.assertEqual(len(self.scheduled(((self.x + 1).contiguous().to("PYTHON") + 2).contiguous().to("NULL") + 3)), 2)
 
   def test_batches_of_real_workloads_are_well_formed(self):
     t = Tensor.ones(6).contiguous().realize().shard(("NULL", "NULL:1", "NULL:2"), axis=0)
@@ -215,7 +211,7 @@ class TestHCQ2Fence(unittest.TestCase):
     # Zeroing the sched slot before the wait load forces target=0 (`done < 0` is a no-op).
     slots = UOp.placeholder((4,), dtypes.uint64, device="CPU", tag="slots")
     sig = UOp.placeholder((1,), dtypes.uint64, device="CPU", tag="sig")
-    out = hcq2.hcq_fence(UOp.custom_function("hcq_fence", slots.index(0), sig.index(0)))
+    out = hcq2.encode_fence(UOp.custom_function("hcq_fence").call(slots.index(0), sig.index(0)))
     def mem_root(u:UOp) -> UOp:
       x = u.src[0]
       while x.op in {Ops.INDEX, Ops.AFTER}: x = x.src[0]
@@ -237,25 +233,19 @@ class TestHCQ2Fence(unittest.TestCase):
       if u.op is Ops.STORE and getattr(mem_root(u), "tag", None) == "timeline").src[1],
       "slot must store the same nxt written to timeline[1]")
 
-  def test_a_schedule_waits_for_its_previous_run(self):
+  def test_second_fence_waits_on_persisted_slot(self):
     slots = UOp.placeholder((4,), dtypes.uint64, device=("CPU",), volatile=True, tag="slots")
-    program = lower_and_compile(UOp(Ops.LINEAR, src=(lower_hcq(UOp.custom_function("hcq_fence", slots[0:2], slots[2:4])),)))
-    linked = hcq2.hcq_link(program, allow_cache=False)
-    (i,) = [i for i, p in enumerate(program.src[0].without_after.src[1:]) if p.arg.name == "slots"]
-    slots_mv = linked.src[0].without_after.src[1 + i].buffer.host.view(fmt='Q')
-    slots_mv[2], base = 7, self.tl[1]
-
-    run_linear(linked, jit=True)
-    self.assertEqual((self.tl[1], slots_mv[0], slots_mv[2]), (base + 1, base + 1, 0), "the run is announced, recorded, the signal re-armed")
-
-    t = threading.Thread(target=run_linear, args=(linked,), kwargs={"jit": True}, daemon=True)
-    t.start()
-    t.join(0.2)
-    self.assertTrue(t.is_alive(), "the second run must wait for the first to finish")
-    self.tl[0] = base + 1
-    t.join(5)
-    self.assertFalse(t.is_alive())
-    self.assertEqual(self.tl[1], base + 2)
+    fence = UOp.custom_function("hcq_fence").call(slots[0:2], slots[2:4])
+    hcq2.encode_fence(fence)  # first run records its target
+    second = hcq2.encode_fence(fence)  # the next run must load that persisted target
+    def mem_root(u:UOp) -> UOp:
+      x = u.src[0]
+      while x.op in {Ops.INDEX, Ops.AFTER}: x = x.src[0]
+      return x
+    slot_loads = [u for u in second.toposort() if u.op is Ops.LOAD and mem_root(u).tag == "slots"]
+    wait = next(u for u in second.toposort() if u.op is Ops.CMPLT)
+    self.assertEqual(len(slot_loads), 1)
+    self.assertIs(wait.src[1], slot_loads[0], "a repeated fence must wait on the previous target, not reset it")
 
 class TestHCQ2Link(unittest.TestCase):
   def setUp(self): self.enterContext(Context(DEV="NULL"))
@@ -272,38 +262,18 @@ class TestHCQ2Link(unittest.TestCase):
 
   def test_eager_templates_compile_once(self): self.assertIs(compiled_chain(3)[1], compiled_chain(3)[1])
 
-@unittest.skipUnless(isinstance(Device["CPU"].renderer, CStyleLanguage), "CALL is rendered in C style only")
-class TestHCQ2FFI(unittest.TestCase):
-  @staticmethod
-  def _run(body:UOp) -> list[Buffer]:
-    linear = hcq2.hcq_link(lower_and_compile(UOp(Ops.LINEAR, src=(lower_hcq(body),))), allow_cache=False)
-    run_linear(linear, jit=True)
-    return [u.buffer for u in linear.src[0].without_after.src[1:] if u.op is Ops.BUFFER]
-
-  def test_ffi_ccall(self):
-    with Context(HCQ_RUNTIME_DEV="CPU"):
-      out = cpu_buf(dtype=dtypes.int32, slot=1, volatile=True, tag="ffi_result")
-      bufs = self._run(out.index(0).store(hcq2.ccall(libc.dll.ffs, 0x10)))
-    self.assertEqual(next(b for b in bufs if b.dtype is dtypes.int).host.view(fmt='i')[0], 5)
-
-  def test_ffi_cstruct(self):
-    struct_t = init_c_struct_t(16, (("u8", ctypes.c_uint8, 0), ("u16", ctypes.c_uint16, 2),
-                                  ("u32", ctypes.c_uint32, 4), ("u64", ctypes.c_uint64, 8)))
-    cpu_buf() # reserve slot zero for device-owned placeholders
-    with Context(HCQ_RUNTIME_DEV="CPU"):
-      s = hcq2.cstruct(struct_t, u8=0x12, u16=UOp.const(0x3456, dtypes.uint16), u32=0x789ABCDE, u64=0xFEDCBA9876543210)
-      bufs = self._run(s.index(0).load())
-    got = struct_t.from_buffer_copy(bytes(next(b for b in bufs if b.nbytes == ctypes.sizeof(struct_t)).host.view(fmt='B')))
-    self.assertEqual((got.u8, got.u16, got.u32, got.u64), (0x12, 0x3456, 0x789ABCDE, 0xFEDCBA9876543210))
-
-  def test_nested_cstruct_patches(self):
-    with Context(HCQ_RUNTIME_DEV="CPU"):
-      inner = hcq2.cstruct(init_c_struct_t(8, (("pad", ctypes.c_uint32, 0), ("value", ctypes.c_uint32, 4))), value=42)
-      outer = hcq2.cstruct(init_c_struct_t(8, (("ptr", ctypes.c_uint64, 0),)), ptr=inner[4:8].getaddr("CPU"))
-      out = cpu_buf(dtype=dtypes.uint32, tag="result")
-      copied = hcq2.ccall(libc.memcpy, out.index(0), outer.bitcast(dtypes.uint64).index(0).load(), 4)
-      bufs = self._run(out.after(copied).index(0).load())
-    self.assertEqual(next(b for b in bufs if b.dtype is dtypes.uint32).host.view(fmt='I')[0], 42)
+  def test_repeated_word_loops(self): # for (i..10) cmdbuf[off[i]] = var
+    var, offs = UOp.placeholder((1,), dtypes.uint32, device="CPU", volatile=True, tag="var"), [4 * i * i for i in range(10)]
+    var = hcq2.patch(var, [], bytes(4)) # initialize at link: the allocator may return a reused buffer
+    hq = SimpleNamespace(blob=bytearray(offs[-1] + 4), patches=[(o, var.index(0).load()) for o in offs], devs=("CPU",), queue="COPY:0", deps=())
+    lowered = lower_hcq(var.after(hcq2.encode_cmdbuf(hq, device="CPU")).index(0).store(var.index(0).load() + 1))
+    self.assertEqual(len([u for u in lowered.src[0].without_after.src[0].toposort() if u.op is Ops.RANGE]), 1)
+    linked = hcq2.hcq_link(lower_and_compile(lowered), allow_cache=False)
+    args = zip(lowered.src[0].without_after.src[1:], linked.src[0].without_after.src[1:])
+    cmdbuf = next(b.buffer for p, b in args if p.without_after.tag == "cmdbuf_copy_0")
+    for step in range(3):
+      run_linear(linked, jit=True)
+      self.assertEqual([cmdbuf.host.view(fmt="I")[o // 4] for o in offs], [step] * 10)
 
 if __name__ == "__main__":
   unittest.main()

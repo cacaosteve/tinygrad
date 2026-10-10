@@ -126,7 +126,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
 
   # collect
   memory: defaultdict[tuple[Ops, UOp, UOp|str, UOp, object], dict[int, list[UOp]]] = defaultdict(dict)
-  for u in uops:
+  for u in sink.toposort(enter_calls=False):
     # TODO: this should handle images too, it's just memory coalescing
     if u.op in {Ops.LOAD, Ops.STORE}:
       if u.op is Ops.LOAD and u.dtype is dtypes.half and u.src[0].op is Ops.SHRINK: continue
