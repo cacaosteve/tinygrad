@@ -893,7 +893,7 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
 # lab A/B. No KEEP_* / opt-in forest in this path.
 _FLASH_SHARED = {
   "TC_LDS_AB": "0",              # TC_LDS_AB NaNs hand flash
-  "AMD_WMMA_ACC_BASE": "145",    # soft partition (matmul uses 96/128)
+  "AMD_WMMA_ACC_BASE": "145",    # soft partition (matmul uses 121/128)
   "AMD_WMMA_ACC_N": "48",
   # AMD_LLOAD_POOL default 135 in rdna3_defs (matches ship)
   # AMD_VOPD_PAIR_CONST hardcoded ON in renderer (const/±inf dual_mov bias)

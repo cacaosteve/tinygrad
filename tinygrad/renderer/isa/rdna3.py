@@ -3886,15 +3886,15 @@ def apply_tc_hand_opts(tk, rngs):
   # separate half.realize() then ah@bh is fine. Refuse TC so ALU path runs (HIP/LLVM OK).
   if _wmma_has_fused_float_to_half_cast(tk):
     raise KernelOptError("RDNA3 DIRECT: fused float→half CAST into WMMA MMU-faults")
-  # Default TC_LDS_AB=0: register product-16 + ACC_BASE=96 ≈1.02× HIP (2026-09-27).
-  # ACC_BASE=128 ≈1.13× (vgpr 254); base≤88 spills ACC (wrong). LDS_AB+UPCAST2 ≈1.9×.
+  # Default TC_LDS_AB=0: register product-16 uses ACC_BASE=121; Q6_K spills fall 15→8
+  # and 2048² half matmul stays within noise of the previous base 96. base≤88 spills ACC.
   # Flash forces TC_LDS_AB=0 + ACC_BASE=145 and clears AMD_WMMA_DELAY.
   if not getenv("TC_LDS_AB", 0):
-    # Register TC path. Product-16 needs ACC_BASE=96 + UP16 PACK pools; ALLOW_UPCAST16=0
-    # clamps expand to product≤8 and must not soft-partition ACC at 96 (PACK window only
-    # 7 VGPRs → wide_alloc OOM on 8-slot packs; ACC=-1 or flash's 145 is fine).
+    # Register TC path. Product-16 uses ACC_BASE=121 + UP16 PACK pools; ALLOW_UPCAST16=0
+    # clamps expand to product≤8 and must not use the product soft partition (PACK window too
+    # small → wide_alloc OOM on 8-slot packs; ACC=-1 or flash's 145 is fine).
     if allow_upcast16():
-      if os.environ.get("AMD_WMMA_ACC_BASE") is None: os.environ["AMD_WMMA_ACC_BASE"] = "96"
+      if os.environ.get("AMD_WMMA_ACC_BASE") is None: os.environ["AMD_WMMA_ACC_BASE"] = "121"
       if os.environ.get("AMD_WMMA_ACC_N") is None: os.environ["AMD_WMMA_ACC_N"] = "128"
       # Prefetch-A only applies on LDS_AB path below; product-16 returns early.
       # Post-WMMA s_delay_alu hardcoded 1 in emit (was AMD_WMMA_DELAY=1).

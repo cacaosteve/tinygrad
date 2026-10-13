@@ -23,8 +23,9 @@ VGPR = tuple(Register(f"v{i}", 256+i, size=4) for i in range(5, 254))
 # AMD_VGPR_CAP lab path removed (never shipped; occupancy experiments via fork only).
 
 # Soft partition: ACC packs live in a high VGPR band so LinearScan does not spill them.
-# Default AMD_WMMA_ACC_BASE=-1 (no partition): flash ACC_BASE=145 taxes generic half matmul
-# ~20%+ (2026-09-27 HW). Flash prefill compile_env sets 145 + LLOAD_POOL=135; call
+# Default product ACC_BASE=121: gives Q6_K WMMA a wider quant-ACC pool (8 vs 15 spills,
+# ~15% faster at 4096x4096x32) without regressing the 2048² half-matmul check. Flash prefill
+# compile_env sets 145 + LLOAD_POOL=135; call
 # refresh_vgpr_pools() at render entry so sticky env applies after import.
 WMMA_ACC_VGPR: tuple[Register, ...] = VGPR
 WMMA_ACC_QUANT_VGPR: tuple[Register, ...] = VGPR
@@ -36,10 +37,10 @@ LLOAD_VGPR_UP16: tuple[Register, ...] = VGPR[:59]
 def refresh_vgpr_pools() -> None:
   """Re-bind soft-partition pools from current env (flash sets ACC_BASE after import)."""
   global WMMA_ACC_VGPR, WMMA_ACC_QUANT_VGPR, LLOAD_VGPR, PACK_F16_VGPR, PACK_F16_VGPR_UP16, LLOAD_VGPR_UP16
-  # Default 96 for product-16 (vgpr~229 ≈ HIP; ACC_BASE=128 was ~1.13×). Q4K/flash override
+  # Default 121 for product-16. Q4K/flash override
   # (-1 / 145+N=48). Setting only via os.environ after getenv misses cache — callers must
   # getenv.cache_clear().
-  acc_base_env = int(getenv("AMD_WMMA_ACC_BASE", 96))
+  acc_base_env = int(getenv("AMD_WMMA_ACC_BASE", 121))
   if acc_base_env < 0:
     WMMA_ACC_VGPR = VGPR
     WMMA_ACC_QUANT_VGPR = VGPR
@@ -70,7 +71,7 @@ TMP_SDATA0, TMP_SDATA1 = s[20], s[21]
 TMP_BRANCH = s[22:23]
 
 def allow_upcast16() -> bool:
-  # Default ON: product-16 register path is correct with AMD_WMMA_ACC_BASE=96 (2026-09-27 HW).
+  # Default ON: product-16 register path is correct with AMD_WMMA_ACC_BASE=121 (2026-09-27 HW).
   # Was wrong at ACC_BASE=-1 (ACC packs spilled → zero 16×16 tiles). Flash prefill forces 0.
   return bool(getenv("ALLOW_UPCAST16", 1))
 
