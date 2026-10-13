@@ -249,11 +249,11 @@ def _packed_ubyte_to_float_program():
   stores = tuple(out.index(byte).store(((word >> (byte*8)) & 0xff).cast(dtypes.float32)) for byte in range(4))
   return _to_prg(UOp.sink(*stores, arg=KernelInfo(name="amd_asm_packed_ubyte_to_float")))
 
-def _implicit_float_to_half_store_program():
+def _float_to_half_store_program():
   out = UOp.placeholder((16,), dtypes.float16, 0)
   inp = UOp.placeholder((16,), dtypes.float32, 1)
   idx = UOp.special(16, "lidx0")
-  return _to_prg(out.index(idx).store(inp.index(idx).load()).sink(idx, arg=KernelInfo(name="amd_asm_implicit_f32_to_f16_store")))
+  return _to_prg(out.index(idx).store(inp.index(idx).load().cast(dtypes.float16)).sink(idx, arg=KernelInfo(name="amd_asm_f32_to_f16_store")))
 
 def _where_sgpr_true_program():
   out = UOp.placeholder((16,), dtypes.uint32, 0)
@@ -1493,7 +1493,7 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertNotIn("V_PACK_B32_F16", [getattr(i, "op_name", "") for i in insts])
 
   def test_store_uses_destination_dtype(self):
-    prg = _implicit_float_to_half_store_program()
+    prg = _float_to_half_store_program()
     _check_asm(self, prg, AMDOps.CAST, AMDOps.STORE, insts=("V_CVT_F16_F32_E32", "GLOBAL_STORE_B16"))
     self.assertNotIn("GLOBAL_STORE_B32", _amd_inst_names(prg))
 
