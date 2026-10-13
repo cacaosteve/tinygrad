@@ -90,6 +90,7 @@ def payne_hanek_reduction(d:UOp) -> tuple[UOp, UOp]:
     if count+offset < len(two_over_pi_f) - 1:
       an = i.ne(count).where(_take(an, offset, count=count+1), an.const_like(two_over_pi_f[count+offset]))
     return an
+  # shift via SHL/SHR — not *///pow2if — so backends that emulate i64 don't expand bit-by-bit CDIV
   def _shl_lazy(x:UOp, y:UOp): return (x.cast(dtypes.uint64) << y.cast(dtypes.uint64)).cast(dtypes.uint32)
   def _shr_lazy(x:UOp, y:UOp): return (x.cast(dtypes.uint64) >> y.cast(dtypes.uint64)).cast(dtypes.uint32)
 

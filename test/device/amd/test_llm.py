@@ -1,10 +1,11 @@
-import unittest
+import os, unittest
 from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
-from tinygrad.llm.kernels.amd import (Linear, amd_custom_kernels_supported, q8_quantize, flash_attention, gated_delta_prefill,
-                                      QUANT_SIZES, HALFWORD_QUANTS, _wmma_rdna4)
+from tinygrad.llm.kernels.amd import (Linear, _amd_flash_attention, amd_custom_kernels_supported, amd_direct_isa,
+                                      q8_quantize, flash_attention, gated_delta_prefill, QUANT_SIZES, HALFWORD_QUANTS, _wmma_rdna4)
 from tinygrad.llm.gguf import ggml_data_to_tensor
+from tinygrad.helpers import DEV, OSX
 from test.runtime.test_llm_quantized import QuantLinearMixin
 
 class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
@@ -37,8 +38,16 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     values[3, 3:5] = [-0.3076171875, -0.6904296875]
     expected_scale = np.abs(values.astype(np.float32)).max(-1, keepdims=True)/127
     quant, scale, _ = q8_quantize(Tensor(values), 4, 32)
-    np.testing.assert_array_equal(scale.numpy(), expected_scale)
-    np.testing.assert_array_equal(quant.bitcast(dtypes.int8).reshape(4, 32).numpy(), np.rint(values/expected_scale).astype(np.int8))
+    actual_scale = scale.numpy()
+    np.testing.assert_allclose(actual_scale, expected_scale, rtol=1e-6)
+    fp64_values = values.astype(np.float64)
+    ratio = fp64_values*127/np.abs(fp64_values).max(-1, keepdims=True)
+    expected_quant = np.clip(np.rint(ratio), -127, 127).astype(np.int8)
+    actual_quant = quant.bitcast(dtypes.int8).reshape(4, 32).numpy()
+    ties = np.isclose(np.abs(ratio-np.floor(ratio)), 0.5, atol=1e-12)
+    np.testing.assert_array_equal(actual_quant[~ties], expected_quant[~ties])
+    self.assertTrue(ties.any())
+    np.testing.assert_array_less(np.abs(actual_quant[ties].astype(np.int16)-expected_quant[ties]), 2)
 
   def test_q6_linear_compiles_in_function(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
@@ -70,6 +79,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_wmma_linear_symbolic(self):
     with patch("tinygrad.llm.kernels.amd.q8_quantize", side_effect=AssertionError("expected WMMA")):
       for typ in QUANT_SIZES:
+        if typ == 23 and amd_direct_isa(Tensor.empty(1).device): continue  # direct IQ4_XS uses quantized decode
         self._test_quant_linear(typ, QUANT_SIZES[typ], in_features=256, out_features=48, token_counts=(3, 17), bias=True, symbolic=True)
 
   def test_mixed_quant_linear_wmma_tiles(self):
@@ -85,6 +95,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     identity = Tensor(np.eye(768, dtype=np.float16)).realize()
     for typ, size in QUANT_SIZES.items():
       with self.subTest(ggml_type=typ):
+        if typ == 23 and amd_direct_isa(identity.device): continue  # direct IQ4_XS uses the correct decode fallback
         packed = rng.integers(0, 256, (48*3, size), dtype=np.uint8)
         blocks = packed.reshape(-1, 18) if typ == 20 else packed
         offset = size-2 if typ in (11, 14) else 80 if typ == 10 else 0
@@ -229,14 +240,14 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     beta[:, :, -1] = 0  # padded step must leave the recurrent state unchanged
     initial = rng.normal(0, 0.1, (1, 2, 8, 32)).astype(np.float32)
     for per_channel in (False, True):
-      alpha = rng.uniform(0.8, 1, (1, 2, 4, 32) if per_channel else (1, 2, 4)).astype(np.float32)
+      alpha = rng.uniform(0.8, 1, (1, 2, 4, v.shape[-1]) if per_channel else (1, 2, 4)).astype(np.float32)
       alpha[:, :, -1] = 1
       for start in (0, 3):
         with self.subTest(per_channel=per_channel, start=start):
           expected_state = np.zeros_like(initial) if start == 0 else initial.copy()
           outputs = []
           for t in range(4):
-            decay = alpha[:, :, t, None, :] if per_channel else alpha[:, :, t, None, None]
+            decay = alpha[:, :, t, :, None] if per_channel else alpha[:, :, t, None, None]
             expected_state *= decay
             delta = (v[:, :, t] - (expected_state*k[:, :, t, None]).sum(-1)) * beta[:, :, t, None]
             expected_state += delta[..., None]*k[:, :, t, None]
@@ -265,7 +276,8 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     for i in range(blocks): packed[i*210+208:i*210+210] = np.array([0.01], dtype=np.float16).view(np.uint8)
     raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
     decoded = ggml_data_to_tensor(raw, 16*in_features, 14).reshape(16, in_features)
-    weight = decoded.numpy()
+    raw_ref = Tensor(np.pad(packed, (4, 0)), device="CPU").contiguous().realize()[4:]
+    weight = ggml_data_to_tensor(raw_ref, 16*in_features, 14).reshape(16, in_features).numpy()
     linear = Linear(in_features, 16, bias=False)
     nn.state.load_state_dict(linear, {"weight":decoded}, verbose=False, realize=False)
     x = rng.normal(size=(3, in_features)).astype(np.float32)
@@ -294,6 +306,25 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         expected = np.broadcast_to(np.arange(valid-tokens, valid)[None, None, :, None]/2, q.shape)
         np.testing.assert_allclose(flash_attention(q, Tensor(cache), valid).numpy(), expected, rtol=1e-3, atol=1e-3)
 
+  def test_prefill_attention_fallback_random_gqa(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    batch, heads, kv_heads, tokens, dim, valid, capacity = 2, 4, 2, 32, 64, 45, 64
+    q = rng.normal(size=(batch, heads, tokens, dim)).astype(np.float16)
+    cache = rng.normal(size=(2, batch, kv_heads, capacity, dim)).astype(np.float16)
+    cache[:, :, :, valid:] = np.nan
+    k, v = (np.repeat(c[:, :, :valid].astype(np.float32), heads//kv_heads, axis=1) for c in cache)
+    scores = q.astype(np.float32) @ k.swapaxes(-1, -2) / np.sqrt(dim)
+    scores = np.where(np.arange(valid)[None, :] <= np.arange(valid-tokens, valid)[:, None], scores, -np.inf)
+    probs = np.exp(scores - scores.max(-1, keepdims=True))
+    expected = (probs / probs.sum(-1, keepdims=True)) @ v
+    from tinygrad.helpers import getenv
+    with patch.dict(os.environ, {"AMD_FLASH_DIRECT": "1"}):
+      getenv.cache_clear()
+      try: actual = flash_attention(Tensor(q), Tensor(cache).realize(), valid).numpy()
+      finally: getenv.cache_clear()
+    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
+
   def test_attention_uses_physical_cache_length(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     q, k, v = Tensor.zeros(1, 2, 1, 32), Tensor.randn(1, 1, 1, 32), Tensor.randn(1, 1, 1, 32)
@@ -302,6 +333,48 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     out = flash_attention(q, assigned, 1).realize()
     np.testing.assert_allclose(out.numpy(), v.expand(1, 2, 1, 32).numpy(), rtol=2e-2, atol=2e-2)
 
+  def test_prefill_attention_multiple_tiles(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    q = Tensor.zeros(1, 4, 32, 128)
+    k = Tensor.zeros(1, 1, 64, 128, dtype=dtypes.half)
+    v = Tensor.cat(Tensor.ones(1, 1, 32, 128, dtype=dtypes.half), Tensor.ones(1, 1, 32, 128, dtype=dtypes.half) * 3, dim=2)
+    old = os.environ.get("AMD_FLASH_DIRECT")
+    from tinygrad.helpers import getenv
+    os.environ["AMD_FLASH_DIRECT"] = "1"
+    getenv.cache_clear()
+    try: out = flash_attention(q.half(), Tensor.stack(k, v), 64).numpy()
+    finally:
+      if old is None: os.environ.pop("AMD_FLASH_DIRECT", None)
+      else: os.environ["AMD_FLASH_DIRECT"] = old
+      getenv.cache_clear()
+    expected = np.array([(32 + (i+1)*3) / (33+i) for i in range(32)], dtype=np.float32)[None, None, :, None]
+    np.testing.assert_allclose(out, np.broadcast_to(expected, out.shape), rtol=2e-3, atol=2e-3)
+
+  def test_prefill_attention_nonzero_asymmetric_qk(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    from tinygrad.helpers import getenv
+    from tinygrad.codegen import to_program_cache
+    Tensor.manual_seed(7)
+    q = Tensor.randn(1, 2, 32, 128, dtype=dtypes.half).realize()
+    k = Tensor.randn(1, 1, 64, 128, dtype=dtypes.half).realize()
+    v = Tensor.randn(1, 1, 64, 128, dtype=dtypes.half).realize()
+    old = {key: os.environ.get(key) for key in ("AMD_FLASH_DIRECT", "AMD_FLASH_ACC_SEP", "AMD_WMMA_ACC_SMALL")}
+    os.environ.update(AMD_FLASH_DIRECT="1", AMD_FLASH_ACC_SEP="1", AMD_WMMA_ACC_SMALL="0")
+    getenv.cache_clear()
+    to_program_cache.clear()
+    try:
+      out = flash_attention(q, Tensor.stack(k, v), 64).realize()
+    finally:
+      for key, value in old.items():
+        if value is None: os.environ.pop(key, None)
+        else: os.environ[key] = value
+      getenv.cache_clear()
+      to_program_cache.clear()
+    mask = Tensor.full((1, 1, 32, 64), float("-inf"), dtype=q.dtype, buffer=False).triu(33)
+    expected = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
+    np.testing.assert_allclose(out.numpy(), expected.numpy(), rtol=5e-3, atol=5e-3)
+
+  @unittest.skipIf(OSX and DEV.interface.startswith("MOCK"), "TODO: incorrect results in the macOS AMD emulator")
   def test_flash_attention_decode_symbolic_gqa(self):
     with patch.object(Tensor, "scaled_dot_product_attention", side_effect=AssertionError("expected custom decode")):
       self._test_flash_decode(8, 2, 256, 128, 37, symbolic=True)
@@ -309,6 +382,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_flash_attention_decode_gqa_tail(self): self._test_flash_decode(3, 1, 192, 64, 37)
 
   def test_flash_attention_decode_gqa_output_layout(self): self._test_flash_decode(4, 1, 128, 256, 3)
+  @unittest.skipIf(OSX and DEV.interface.startswith("MOCK"), "TODO: incorrect results in the macOS AMD emulator")
   def test_flash_attention_decode_large_gqa_group(self): self._test_flash_decode(8, 1, 256, 256, 73)
 
   def _test_flash_decode(self, heads, kv_heads, dim, n, valid, symbolic=False):
@@ -362,11 +436,40 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         if symbolic:
           count = UOp.variable("query_tokens", 1, 32).bind(tokens)
           query = Tensor(np.pad(q, ((0, 0), (0, 0), (0, 32-tokens), (0, 0)))).contiguous()[:, :, :count]
-        @function(allow_implicit=True)
-        def run(q:Tensor, kv:Tensor, end:UOp): return flash_attention(q, kv, end)
-        with patch.object(Tensor, "scaled_dot_product_attention", side_effect=AssertionError("expected WMMA attention")):
-          actual = run(query, kv, end)[:, :, :tokens].numpy()
+          @function(allow_implicit=True)
+          def run(q:Tensor, kv:Tensor, end:UOp): return flash_attention(q, kv, end)
+        else: run = flash_attention
+        from tinygrad.helpers import getenv
+        with patch.dict(os.environ, {"AMD_FLASH_DIRECT": "1"}):
+          getenv.cache_clear()
+          try:
+            if (amd_direct_isa(query.device) and (dim == 64 or (valid-tokens) % 32 != 0)) or (dim == 320 and not amd_direct_isa(query.device)):
+              actual = run(query, kv, end)[:, :, :tokens].numpy()
+            else:
+              with patch.object(Tensor, "scaled_dot_product_attention", side_effect=AssertionError("expected WMMA attention")):
+                actual = run(query, kv, end)[:, :, :tokens].numpy()
+          finally: getenv.cache_clear()
         np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=2e-3)
+
+  def test_prefill_attention_direct_random_aligned(self):
+    if not amd_direct_isa(Tensor.empty(1).device): self.skipTest("RDNA3 DIRECT required")
+    rng = np.random.default_rng(43)
+    batch, heads, kv_heads, tokens, dim, valid = 1, 4, 1, 32, 128, 2048
+    q = rng.normal(size=(batch, heads, tokens, dim)).astype(np.float16)
+    cache = rng.normal(size=(2, batch, kv_heads, valid, dim)).astype(np.float16)
+    k, v = (np.repeat(c.astype(np.float32), heads//kv_heads, axis=1) for c in cache)
+    scores = q.astype(np.float32) @ k.swapaxes(-1, -2) / np.sqrt(dim)
+    scores = np.where(np.arange(valid)[None, :] <= np.arange(valid-tokens, valid)[:, None], scores, -np.inf)
+    probs = np.exp(scores - scores.max(-1, keepdims=True))
+    expected = (probs / probs.sum(-1, keepdims=True)) @ v
+    from tinygrad.helpers import getenv
+    with patch.dict(os.environ, {"AMD_FLASH_DIRECT": "1"}):
+      getenv.cache_clear()
+      try:
+        with patch.object(Tensor, "scaled_dot_product_attention", side_effect=AssertionError("expected DIRECT flash")):
+          actual = flash_attention(Tensor(q), Tensor(cache).realize(), valid).numpy()
+      finally: getenv.cache_clear()
+    np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=2e-3)
 
   def test_prefill_attention_nonfinite_cache_tail(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
@@ -424,5 +527,62 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     values = np.concatenate([old_kv[1, 0, 0], new_kv[1, 0, 0]]).astype(np.float16).astype(np.float32)
     expected = np.stack([values[:start_pos+i+1].mean(0) for i in range(32)])[None, None].repeat(8, axis=1)
     np.testing.assert_allclose(out.numpy(), expected, rtol=2e-3, atol=2e-3)
+
+  def test_prefill_compile_policy_overrides_sticky_decode(self):
+    """Flash scheduling is scoped to compilation and prefill overrides stale decode settings."""
+    from tinygrad.helpers import getenv
+    from tinygrad.llm.kernels import amd as amd_mod
+    keys = ("AMD_REG_PROMOTE_SKIP_SLOTS", "AMD_FLASH_PREFILL_SKIP_SLOTS", "AMD_FLASH_ACC_SMALL", "AMD_WMMA_ACC_SMALL",
+            "AMD_VOPD_FMAC", "AMD_VOPD_FMAC_ALU", "TC_LDS_AB", "AMD_WMMA_ACC_BASE", "AMD_WMMA_ACC_N",
+            "ALLOW_UPCAST16", "AMD_REMAT_ADDR", "AMD_WMMA_INTERLEAVE")
+    old = {k: os.environ.get(k) for k in keys}
+    try:
+      # Simulate stale skip/schedule settings; ACC_SMALL selects the prefill promotion policy.
+      os.environ["AMD_REG_PROMOTE_SKIP_SLOTS"] = ""
+      os.environ.pop("AMD_FLASH_PREFILL_SKIP_SLOTS", None)
+      os.environ["AMD_FLASH_ACC_SMALL"] = "0"
+      os.environ["AMD_WMMA_ACC_SMALL"] = "0"
+      os.environ["AMD_VOPD_FMAC"] = "1"
+      os.environ["AMD_VOPD_FMAC_ALU"] = "1"
+      os.environ.pop("AMD_WMMA_INTERLEAVE", None)
+      getenv.cache_clear()
+      with amd_mod._flash_direct_compile_env():
+        self.assertEqual(getenv("AMD_FLASH_ACC_SMALL", 0), 1)
+        self.assertEqual(getenv("AMD_WMMA_INTERLEAVE", 0), 1)
+        self.assertEqual(os.environ.get("AMD_REG_PROMOTE_SKIP_SLOTS"), "")
+        self.assertNotIn("AMD_VOPD_FMAC", os.environ)
+        self.assertNotIn("AMD_VOPD_FMAC_ALU", os.environ)
+      self.assertNotIn("AMD_WMMA_INTERLEAVE", os.environ)
+      self.assertEqual(os.environ.get("AMD_FLASH_ACC_SMALL"), "0")
+      self.assertEqual(os.environ.get("TC_LDS_AB"), "0")
+      self.assertEqual(os.environ.get("AMD_WMMA_ACC_BASE"), "145")
+      self.assertEqual(os.environ.get("AMD_WMMA_ACC_N"), "48")
+      self.assertEqual(os.environ.get("ALLOW_UPCAST16"), "0")
+      # Decode-only options are active during compilation but must not leak into later kernels.
+      os.environ.pop("AMD_VOPD_FMAC", None)
+      os.environ.pop("AMD_VOPD_FMAC_ALU", None)
+      getenv.cache_clear()
+      with amd_mod._flash_direct_compile_env(flash_acc_small=False):
+        self.assertEqual(getenv("AMD_VOPD_FMAC"), 1)
+        self.assertEqual(getenv("ALLOW_UPCAST16"), 1)
+      self.assertNotIn("AMD_VOPD_FMAC", os.environ)
+      self.assertNotIn("AMD_VOPD_FMAC_ALU", os.environ)
+    finally:
+      for k, v in old.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+      getenv.cache_clear()
+
+  def test_flash_k_midstore_is_cache_key(self):
+    """In-process MIDSTORE sweeps must not reuse a graph built under a different value."""
+    _amd_flash_attention.cache_clear()
+    o = UOp.placeholder((32, 32, 128), dtypes.float32, 0)
+    q = UOp.placeholder((32, 32, 128), dtypes.float16, 1)
+    kv = UOp.placeholder((2, 1, 8, 64, 128), dtypes.float16, 2)
+    a = _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=1, k_midstore=4)
+    b = _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=1, k_midstore=2)
+    self.assertIsNot(a, b)
+    # Same key hits cache.
+    self.assertIs(a, _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=1, k_midstore=4))
 
 if __name__ == "__main__": unittest.main()

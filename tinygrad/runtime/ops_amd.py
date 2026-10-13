@@ -12,6 +12,7 @@ from tinygrad.helpers import getenv, round_up, data64_le, DEBUG, PROFILE, Profil
 from tinygrad.helpers import ceildiv, unwrap, pluralize, ContextVar, VIZ, DEV
 from tinygrad.renderer.cstyle import HIPRenderer, HIPCCRenderer
 from tinygrad.renderer.llvmir import AMDLLVMRenderer
+from tinygrad.renderer.isa.rdna3 import AMDRenderer
 from tinygrad.runtime.autogen import kfd, hsa, amdgpu_kd, amdgpu_drm
 from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.elf import elf_loader
@@ -863,7 +864,7 @@ class AMDDevice(Compiled):
     self.sdma_queues:dict = {}
 
     allocator = USBAllocator(self) if self.is_usb else AMDAllocator(self)
-    super().__init__(device, allocator, [HIPRenderer, AMDLLVMRenderer, HIPCCRenderer], None, arch=self.arch)
+    super().__init__(device, allocator, [HIPRenderer, AMDLLVMRenderer, HIPCCRenderer, AMDRenderer], None, arch=self.arch)
 
     # Scratch setup
     self.max_private_segment_size = 0

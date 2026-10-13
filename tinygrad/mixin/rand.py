@@ -2,9 +2,9 @@ from __future__ import annotations
 import math
 from typing import Self, cast
 from tinygrad.dtype import DType, DTypeLike, dtypes, least_upper_dtype, to_dtype, bitcast
-from tinygrad.helpers import all_int, argfix, ceildiv, prod, TRAINING
+from tinygrad.helpers import all_int, argfix, ceildiv, prod, TRAINING, Context
 from tinygrad.mixin.op import OpMixin
-from tinygrad.device import canonicalize_device
+from tinygrad.device import Device, canonicalize_device
 
 
 class RandMixin(OpMixin):
@@ -314,6 +314,16 @@ class RandMixin(OpMixin):
     if enable_gqa:
       key = key.repeat_interleave(int(self.shape[-3] // key.shape[-3]), dim=-3)
       value = value.repeat_interleave(int(self.shape[-3] // value.shape[-3]), dim=-3)
+      # AMD direct-ISA TC matmul is wrong on the strided expanded K/V view for even
+      # query-head counts (odd heads diverge). Contiguous only on AMDRenderer with static
+      # shapes — applying it everywhere adds two kernels and breaks test_gemm_qkv fusion.
+      # Forcing it on symbolic KV lengths can hit "compact B needs VGPR idx".
+      # Gate on device name first so unit/NULL jobs (ALLOW_DEVICE_USAGE=0) never open Device.
+      dev = key.device[0] if isinstance(key.device, tuple) else key.device
+      if isinstance(dev, str) and dev.split(":")[0] == "AMD" and all(isinstance(s, int) for s in (*key.shape, *value.shape)):
+        with Context(ALLOW_DEVICE_USAGE=1):
+          if Device[dev].renderer.__class__.__name__ == "AMDRenderer":
+            key, value = key.contiguous(), value.contiguous()
 
     q = self
     qk = q.matmul(key.transpose(-2,-1), dtype=least_upper_dtype(q.dtype, key.dtype, dtypes.float32)) / math.sqrt(q.shape[-1])

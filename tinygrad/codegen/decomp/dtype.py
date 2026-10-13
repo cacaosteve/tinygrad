@@ -149,6 +149,13 @@ def f2f_rewrite(ctx:tuple, x:UOp) -> UOp: return graph_rewrite(x, pm_float_decom
 pm_long_decomp: PatternMatcher = PatternMatcher([
   # the decomp's own bottom-up rewrite can mint bare consts mid-flight: word splitting commits them at the long sibling's dtype
   (UPat(GroupOp.All, name='x'), lambda x: commit_weak_consts(x, next((s.dtype for s in x.src if s.dtype in l2i_dt), None))),
+  (UPat((Ops.CDIV, Ops.CMOD), tuple(l2i_dt.keys()), src=(UPat.var("a", tuple(l2i_dt.keys())), UPat.var("b")), name="x"),
+   lambda a,b,x: x.replace(src=(a, b.cast(x.dtype))) if b.dtype not in l2i_dt else None),
+  (UPat(Ops.WHERE, tuple(l2i_dt.keys()), src=(UPat.var("c", dtypes.bool), UPat.var("a"), UPat.var("b")), name="x"),
+   lambda c,a,b,x: x.replace(src=(c, a if a.dtype in l2i_dt else a.cast(x.dtype), b if b.dtype in l2i_dt else b.cast(x.dtype)))
+   if a.dtype not in l2i_dt or b.dtype not in l2i_dt else None),
+  (UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("idx", tuple(l2i_dt.keys()))), name="x"),
+   lambda buf,idx,x: x.replace(src=(buf, idx.cast(dt))) if (dt:=l2i_dt[idx.dtype]).min <= idx.vmin and idx.vmax <= dt.max else None),
   (UPat(GroupOp.Defines, tuple(l2i_dt.keys()), name="x"), l2i_define),
   (UPat(Ops.INDEX, tuple(l2i_dt.keys()), name='x'), lambda x:
    reindex(x, x.tag[0]).replace(tag=None) if x.tag is not None else None),

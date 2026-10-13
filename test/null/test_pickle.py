@@ -1,6 +1,8 @@
 import unittest, pickle, types
 from tinygrad import Tensor, dtypes
 from tinygrad.helpers import ContextVar, Context
+from tinygrad.renderer.isa.rdna3_defs import AMDOps
+from tinygrad.uop import Ops
 from tinygrad.uop.ops import PatternMatcher, UPat, UOp, deconstruct_function
 
 class TestPickle(unittest.TestCase):
@@ -9,6 +11,12 @@ class TestPickle(unittest.TestCase):
     code_str = pickle.dumps(y.__code__)
     fxn = types.FunctionType(pickle.loads(code_str), globals())
     self.assertEqual(fxn(2), 4)
+
+  def test_pickle_fast_enum(self):
+    for op in (Ops.CALL, AMDOps.REG_STORE):
+      restore, args = op.__reduce_ex__(pickle.HIGHEST_PROTOCOL)
+      self.assertEqual(args, (type(op), op.name))
+      self.assertIs(pickle.loads(pickle.dumps(op)), restore(*args))
 
   def test_deconstruct_function_nested_comprehension(self):
     # pre PEP 709, each comprehension is its own code object, so dtypes here is referenced two code objects deep

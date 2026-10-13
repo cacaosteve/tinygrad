@@ -1,4 +1,5 @@
 import multiprocessing, multiprocessing.util, atexit, signal, sys, os, threading, contextlib, subprocess
+from multiprocessing.pool import Pool
 from multiprocessing.context import SpawnContext, SpawnProcess
 from tinygrad.helpers import Context, getenv, PARALLEL
 
@@ -39,17 +40,22 @@ class _WorkerProcess(SpawnProcess):
 
 class _WorkerContext(SpawnContext): Process = _WorkerProcess
 
-worker_pool = None
-def get_worker_pool():
-  global worker_pool
+worker_pool: Pool|None = None
+worker_pool_env: tuple[tuple[str, str|None], ...]|None = None
+def get_worker_pool(compile_env:dict[str, str|None]|None=None):
+  global worker_pool, worker_pool_env
   if multiprocessing.current_process().daemon or PARALLEL == 0: return None
+  env_key = tuple(sorted((compile_env or {}).items())) if compile_env is not None else None
+  # Spawned workers can retain renderer state. Recreate the pool when compiler knobs change.
+  if worker_pool is not None and worker_pool_env != env_key: terminate_worker_pool()
   if worker_pool is None:
     worker_pool = _WorkerContext().Pool(PARALLEL.value, _init_worker, (), getenv("BEAM_MAX_TASKS_PER_CHILD", 16))
+    worker_pool_env = env_key
     @atexit.register
     def close_pool(pool=worker_pool): pool.close()
   return worker_pool
 
 def terminate_worker_pool():
-  global worker_pool
+  global worker_pool, worker_pool_env
   if worker_pool is not None: worker_pool.terminate()
-  worker_pool = None
+  worker_pool, worker_pool_env = None, None

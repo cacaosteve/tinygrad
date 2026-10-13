@@ -127,13 +127,13 @@ class TestTinygradKernelRoundtrip(unittest.TestCase):
 
     kernels, _, _ = get_kernels_from_tinygrad(op_fn)
     # rendered source can be C or llvmir
-    compiler = (AMDLLVMCompiler if DEV.renderer == "LLVM" else HIPCompiler)(get_target(arch))
+    compiler = None if DEV.renderer == "AMD" else (AMDLLVMCompiler if DEV.renderer == "LLVM" else HIPCompiler)(get_target(arch))
 
     # First pass: decode all instructions and collect info
     decoded_instrs: list[tuple] = []  # list of (ki, offset, orig_bytes, decoded, our_disasm, decode_ok, decode_err)
     for ki, kernel in enumerate(kernels):
       offset = 0
-      code = next((s.content for s in elf_loader(compiler.compile(kernel.src))[1] if s.name == ".text"))
+      code = kernel.code if compiler is None else next((s.content for s in elf_loader(compiler.compile(kernel.src))[1] if s.name == ".text"))
       while offset < len(code):
         remaining = code[offset:]
         fmt = detect_format(remaining, arch)
@@ -159,12 +159,15 @@ class TestTinygradKernelRoundtrip(unittest.TestCase):
     # Collect disasm strings for batched LLVM calls - skip unknown opcodes (op_X) that LLVM can't compile
     asm_test_instrs: list[tuple[int, str, bytes]] = []  # (idx, our_disasm, orig_bytes) for asm test
     disasm_test_instrs: list[tuple[int, str]] = []  # (idx, our_disasm) for disasm comparison test
+    # Direct ISA binaries can use legal aliases LLVM canonicalizes to different bytes (e.g. a
+    # literal zero vs inline zero). Their byte fidelity is covered by decode/re-encode above.
+    direct_backend = DEV.renderer == "AMD"
 
     for idx, (ki, offset, orig_bytes, decoded, our_disasm, decode_ok, decode_err) in enumerate(decoded_instrs):
       if our_disasm is None: continue
       # Skip unknown opcodes and malformed instructions
       if our_disasm.startswith('op_') or re.search(r', \d+, \d+, \d+,', our_disasm): continue
-      asm_test_instrs.append((idx, our_disasm, orig_bytes))
+      if not direct_backend: asm_test_instrs.append((idx, our_disasm, orig_bytes))
       disasm_test_instrs.append((idx, our_disasm))
 
     # Batch compile for asm test (our disasm -> LLVM asm -> bytes)
@@ -271,6 +274,7 @@ class TestTinygradKernelRoundtrip(unittest.TestCase):
   # Fused ops
   def test_fma(self): self._test_kernel_roundtrip(lambda T: (T([1.0, 2.0]) * T([3.0, 4.0]) + T([5.0, 6.0])))
 
+@unittest.skipUnless(Device.DEFAULT == "AMD" and Device["AMD"].arch.startswith("gfx12"), "requires RDNA4 device")
 class TestTinygradKernelRoundtripRDNA4(TestTinygradKernelRoundtrip): arch = 'rdna4'
 
 @unittest.skip("CDNA decode roundtrip not yet supported")

@@ -5,6 +5,14 @@ from tinygrad.uop.ops import Ops, resolve, AxisType
 from tinygrad.codegen.late.coalesce import image_valid_dims
 from tinygrad.codegen.opt.postrange import Scheduler
 
+def _unroll_small_inner_reduces(k:Scheduler, max_product:int=8) -> None:
+  unroll_product = 1
+  while k.upcastable_dims(reduce=True):
+    inner_size = k.full_shape[k.upcastable_dims(reduce=True)[-1]]
+    if inner_size > 3 or unroll_product * inner_size > max_product: break
+    k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (0, AxisType.UPCAST)))
+    unroll_product *= inner_size
+
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # first try the tensor cores
   """ Attempts to apply a tensor core optimization to the kernel. If one exists and applies properly, return true, otherwise return false.
@@ -31,6 +39,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       # check TC first and apply hand-coded opts if successful
       try: rngs = tk.apply_opt(Opt(OptOps.TC, axis, (TC_SELECT.value, TC_OPT.value, USE_TC.value)))
       except KernelOptError: continue
+      if (fn:=getattr(tk.ren, "apply_tc_hand_opts", None)) is not None:
+        # Renderer may refuse after TC shape is applied (e.g. RDNA3 fused float→half CAST).
+        try: return fn(tk, rngs) or tk
+        except KernelOptError: continue
       def split(idx, size, atype): rngs[idx] = tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[idx]), (size, atype)))[0]
       if TC_MIN_GLOBALS: # attempt to upcast M, local N, upcast N, skipping upcast N if we'd end up with too few globals
         if (size:=next(filter(lambda sz: rngs[1].src[0].divides(sz) is not None, [5,4,3,2]), None)) is not None: split(1, size, AxisType.UPCAST)
@@ -46,6 +58,24 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # make a copy so it does not mutate the input
   k = k.copy()
 
+  # Experimental fixed reduction mapping for backend-to-backend GEMV comparisons.
+  if (force_group:=getenv("MV_FORCE_GROUP", 0)) and k.ren.has_local:
+    force_axis = getenv("MV_FORCE_GROUP_AXIS", -1)
+    reduce_axes = k.axes_of(reduce=True)
+    if force_axis < 0: force_axis = reduce_axes[-1]
+    else: force_axis = reduce_axes[force_axis]
+    if DEBUG >= 3: print(f"FORCE_GROUP: {k.full_shape=} {k.colored_shape()=} {force_axis=} {force_group=}")
+    k.apply_opt(Opt(OptOps.SPLIT, force_axis, (force_group, AxisType.LOCAL)))
+    force_unroll = getenv("MV_FORCE_UNROLL_INNER", 0)
+    if force_unroll < 0: _unroll_small_inner_reduces(k)
+    else:
+      for _ in range(force_unroll): k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (0, AxisType.UPCAST)))
+    return k
+
+  # Direct-ISA renderers can provide a narrow, structurally matched quantized-matvec schedule.
+  # Keep this behind a renderer hook: native backends may need explicit unrolling that LLVM performs itself.
+  if (quant_mv:=getattr(k.ren, "apply_quant_matvec_opts", None)) is not None and quant_mv(k): return k
+
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
   if IMAGE:
     for buf_index,buf in enumerate(k.bufs):
@@ -57,13 +87,49 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         if unit_stride_axes_mul_4 and (axis:=unit_stride_axes_mul_4[0]) in k.upcastable_dims(reduce=None):
           k.apply_opt(Opt(OptOps.SPLIT, axis, (4, AxisType.UPCAST)))
 
+  # Quantized weights leave the vector load as an INDEX but wrap the matrix load in dequantization ALU.
+  # ISAs can opt into a one-wave-per-row mapping for these complex matvecs without broadening the generic rule below.
+  complex_mv_group = getattr(k.ren, "preferred_complex_matvec_group", None)
+  if complex_mv_group is not None and getenv("MV", 1) != 0 and k.ren.has_local and k.ren.has_shared and k.reduceop is not None and \
+     k.reduceop.arg[0] is Ops.ADD and \
+     resolve(prod((1 if k.rngs[i] in k.reduce_ranges else s) for i,s in enumerate(k.full_shape)) >= 1024, False):
+    reduce_term = k.reduceop.src[0]
+    simple_matvec = reduce_term.op is Ops.MUL and all(x.op is Ops.INDEX for x in reduce_term.src)
+    indexes = [u for u in reduce_term.toposort() if u.op is Ops.INDEX]
+    reduce_ranges = k.reduce_ranges
+    for vector_load in (() if simple_matvec else indexes):
+      vector_idx = vector_load.src[1].get_idx()
+      vector_ranges = set(vector_idx.ranges)
+      if not vector_ranges or not vector_ranges.issubset(reduce_ranges): continue
+      matrix_indexes = [u.src[1].get_idx() for u in indexes if u is not vector_load]
+      matrix_ranges = set().union(*(idx.ranges for idx in matrix_indexes))
+      is_matrix_vector = vector_ranges.issubset(matrix_ranges) and any(any(r.axis_type is AxisType.GLOBAL for r in idx.ranges)
+                                                                       for idx in matrix_indexes)
+      unit_reduce_ranges = [r for r in k.reduce_ranges if r in vector_idx.split_uop(Ops.ADD) and
+                            r.src[0].divides(complex_mv_group) is not None]
+      if is_matrix_vector and unit_reduce_ranges:
+        group_rng = unit_reduce_ranges[-1]
+        group_axis = k.rngs.index(group_rng)
+        if DEBUG >= 3: print(f"COMPLEX MATVEC: {k.full_shape=} {group_axis=} {complex_mv_group=}")
+        try: k.apply_opt(Opt(OptOps.SPLIT, group_axis, (complex_mv_group, AxisType.LOCAL)))
+        except KernelOptError: pass
+        else:
+          _unroll_small_inner_reduces(k)
+          rows_policy = getattr(k.ren, "get_complex_matvec_rows", None)
+          rows_per_wave = rows_policy(k) if rows_policy is not None else getattr(k.ren, "preferred_complex_matvec_rows", 1)
+          if rows_per_wave > 1:
+            global_axes = k.axes_of(AxisType.GLOBAL)
+            if global_axes and k.full_shape[global_axes[0]] % rows_per_wave == 0:
+              k.apply_opt(Opt(OptOps.SPLIT, global_axes[0], (rows_per_wave, AxisType.UPCAST)))
+          return k
+
   # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
   MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)
   if k.ren.has_local and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) and  \
     k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and len(k.full_shape) >= 2 and k.ren.has_shared and \
     (mulop:=k.reduceop.src[0]).op is Ops.MUL and mulop.src[0].op is Ops.INDEX and mulop.src[1].op is Ops.INDEX:
     idx0, idx1 = mulop.src[0].src[1].get_idx(), mulop.src[1].src[1].get_idx()
-    if reduce_axes:=k.axes_of(AxisType.WEAK, reduce=True):
+    if reduce_axes:=k.axes_of(reduce=True):
       first_reduce_rng = k.rngs[reduce_axes[0]]
       if any(u is first_reduce_rng for u in idx0.split_uop(Ops.ADD)) and all(r in idx1.ranges for r in idx0.ranges):
         for global_idx in k.axes_of(AxisType.GLOBAL):
@@ -77,16 +143,32 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.SPLIT, global_idx, (MV_ROWS_PER_THREAD, AxisType.UPCAST)))
             return k
 
+  if k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and (pg:=getattr(k.ren, 'preferred_reduce_group', None)) is not None and \
+     len(k.axes_of(reduce=True)) == 1 and k.reduceop.src[0].op is Ops.INDEX and \
+     resolve(prod((1 if k.rngs[i] in k.reduce_ranges else s) for i,s in enumerate(k.full_shape)) > 1, False):
+    try: k.apply_opt(Opt(OptOps.SPLIT, k.axes_of(reduce=True)[0], (pg, AxisType.LOCAL)))
+    except KernelOptError: pass
+    else: return k
+
   # are we grouping? (requires local shape support)
-  if resolve(prod(k.full_shape[i] for i in k.upcastable_dims()) <= (240 if k.ren.target.device == "QCOM" else 2048), False):
-    for axis in k.axes_of(AxisType.WEAK, reduce=True)[:3]:
+  kernel_name = getattr(getattr(k.ast, "arg", None), "name", None)
+  group_limit = 240 if k.ren.target.device == "QCOM" else 2048
+  if kernel_name != "flash_decode_combine" and resolve(prod(k.full_shape[i] for i in k.upcastable_dims()) <= group_limit, False):
+    for axis, sz in itertools.product(k.axes_of(reduce=True)[:3], (16,)):
       try:
         k.apply_opt(Opt(OptOps.SPLIT, axis, (16, AxisType.LOCAL, True)))
         break
       except KernelOptError: pass
 
   # no more opt if we are grouping
-  if k.group_for_reduces: return k
+  if k.group_for_reduces:
+    # Native ISA renderers can expose a short vectorizable inner loop before lowering. Outsourced compilers
+    # normally recover this themselves with a loop-vectorization pass after the shared scheduler has run.
+    if (grouped_unroll:=getattr(k.ren, "get_grouped_reduce_unroll", None)) is not None and \
+       (unroll:=grouped_unroll(k)) is not None and k.upcastable_dims(reduce=True):
+      try: k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (unroll, AxisType.UPCAST)))
+      except KernelOptError: pass
+    return k
 
   # **** below this line need to be optional and benchmarked ****
 
@@ -139,14 +221,27 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # if last reduce dim is small(ish), loop unroll the reduce
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
-    if (axes:=k.upcastable_dims(reduce=True)) and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UPCAST, reduce=True)) and k.upcast_size() < 64:
+    if (axes:=k.upcastable_dims(reduce=True)) and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UPCAST, reduce=True)) and (k.upcast_size() < 64):
       if (s:=k.full_shape[axes[-1]]) <= 32:
-        k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (0, AxisType.UPCAST)))
-        # if it's small, upcast a second reduce dimension too
-        if (axes:=k.upcastable_dims(reduce=True)) and s <= 3 and k.full_shape[axes[-1]] <= 3:
-          k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (0, AxisType.UPCAST)))
-      elif k.full_shape[axes[-1]] % 4 == 0:
-        k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (4, AxisType.UPCAST)))
+        unroll = k.ren.get_reduce_unroll(s, k.ast)
+        if unroll is not None:
+          k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (unroll, AxisType.UPCAST)))
+          # flash decode combine: unroll both chunk passes (max + weighted sum).
+          if kernel_name == "flash_decode_combine" and unroll == 0:
+            for dim in axes[:-1]:
+              if k.full_shape[dim] == s: k.apply_opt(Opt(OptOps.SPLIT, dim, (0, AxisType.UPCAST)))
+          # if it's small, upcast a second reduce dimension too
+          if unroll == 0 and k.upcastable_dims(reduce=True) and s <= 3 and k.full_shape[k.upcastable_dims(reduce=True)[-1]] <= 3:
+            k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (0, AxisType.UPCAST)))
+      else:
+        split_choices = [4]
+        if (large_unroll:=getattr(k.ren, "get_large_reduce_unroll", None)) is not None and \
+           (extra_split:=large_unroll(s, k.ast)) is not None and extra_split not in split_choices:
+          split_choices.append(extra_split)
+        for splits in split_choices:
+          if k.full_shape[axis:=k.upcastable_dims(reduce=True)[-1]]%splits == 0:
+            k.apply_opt(Opt(OptOps.SPLIT, axis, (splits, AxisType.UPCAST)))
+            break
   except KernelOptError: pass
 
   # if nothing at all is upcasted and it's easy to, do an upcast

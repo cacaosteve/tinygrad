@@ -340,9 +340,19 @@ class Inst:
         raise TypeError(f"{name} expects {expected} register(s), got {val.sz}")
 
   @property
-  def op_name(self) -> str: return getattr(self, 'op').name
+  def op_name(self) -> str:
+    if hasattr(self, 'op'): return self.op.name
+    # VOPD: dual-issue uses opx/opy instead of a single op field.
+    if hasattr(self, 'opx'):
+      opx, opy = self.opx, getattr(self, 'opy', None)
+      return opx.name if opy is None or opy == opx else f"{opx.name}/{opy.name}"
+    raise AttributeError(f"{type(self).__name__} has no op/opx")
   @property
-  def operands(self) -> dict: return OPERANDS.get(getattr(self, 'op'), {}) if hasattr(self, 'op') else {}
+  def operands(self) -> dict:
+    if hasattr(self, 'op'): return OPERANDS.get(self.op, {})
+    # VOPD operands keyed by opx (Y-side fields live on the same Inst).
+    if hasattr(self, 'opx'): return OPERANDS.get(self.opx, {})
+    return {}
   def _is_cdna(self) -> bool: return 'cdna' in type(self).__module__
 
   @functools.cached_property

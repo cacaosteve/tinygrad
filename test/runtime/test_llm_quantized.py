@@ -1,7 +1,7 @@
 import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, amd_direct_isa, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
@@ -20,7 +20,10 @@ class QuantLinearMixin:
     if ggml_type in (12, 13): packed[:, 2:4] = np.array([0.0002], dtype=np.float16).view(np.uint8)
     raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
     decoded = ggml_data_to_tensor(raw, out_features*in_features, ggml_type).reshape(out_features, in_features)
-    weight = decoded.numpy()
+    # Keep the reference independent of the backend under test. In particular, a renderer bug in
+    # generic GGUF dequantization must not contaminate the expected values for the custom kernel.
+    raw_ref = Tensor(np.pad(packed.flatten(), (4, 0)), device="CPU").contiguous().realize()[4:]
+    weight = ggml_data_to_tensor(raw_ref, out_features*in_features, ggml_type).reshape(out_features, in_features).numpy()
     linear = Linear(in_features, out_features, bias=False)
     linear.weight = decoded
     bias_value = rng.normal(size=out_features).astype(np.float32) if bias else 0
@@ -31,7 +34,8 @@ class QuantLinearMixin:
       with self.subTest(tokens=tokens):
         x = rng.normal(size=(tokens, in_features)).astype(np.float32 if tokens == 3 else np.float16)
         reference_x = x.astype(np.float32)
-        wmma = custom and (32 if symbolic else tokens) % 16 == 0 and out_features % 16 == 0
+        wmma = custom and (32 if symbolic else tokens) % 16 == 0 and out_features % 16 == 0 and \
+          not (ggml_type == 23 and amd_direct_isa(Tensor.empty(1).device))
         if wmma: reference_x = x.astype(np.float16).astype(np.float32)
         if custom and not wmma:
           grouped = reference_x.reshape(tokens, -1, 32)
@@ -42,7 +46,9 @@ class QuantLinearMixin:
           UOp.variable("wmma_tokens", 1, 32).bind(tokens)]
         actual = (run if tokens == 1 or symbolic else linear)(inp)[:tokens].numpy()
         self.assertEqual(linear.ggml_type, ggml_type if custom else None)
-        np.testing.assert_allclose(actual, reference_x @ reference_w.T + bias_value, rtol=3e-3, atol=2e-2)
+        # IQ4_XS Q8 activation quantization can differ by one level at a float32 half-way point.
+        tol = (1e-2, 1e-1) if custom and ggml_type == 23 else (3e-3, 2e-2)
+        np.testing.assert_allclose(actual, reference_x @ reference_w.T + bias_value, rtol=tol[0], atol=tol[1])
         if not symbolic and tokens == 3 and ggml_type not in (12, 13, 14, 23):
           sym = Tensor(np.pad(x, ((0, 1), (0, 0)))).contiguous()[:UOp.variable("tokens", 1, 4).bind(3)]
           np.testing.assert_allclose(linear(sym)[:3].numpy(), reference_x @ reference_w.T + bias_value, rtol=3e-3, atol=2e-2)

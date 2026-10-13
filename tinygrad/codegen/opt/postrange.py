@@ -108,11 +108,15 @@ class Scheduler:
         upcast_local_sz = prod([self.full_shape[a] for a in self.axes_of(AxisType.UPCAST, reduce=False)+self.axes_of(AxisType.WARP, AxisType.LOCAL)])
         smem_sz = amt*upcast_local_sz*self.reduceop.dtype.itemsize
         check(smem_sz <= self.ren.shared_max, f"exceeds maximum shared memory size: needs {smem_sz}, max {self.ren.shared_max}")
-      if is_reduce and new_type is AxisType.LOCAL:
+      if is_reduce:
         reduces = [u for u in self.reduceops if rng in u.src[1:]]
-        # We currently don't support a group within another reduce, TODO: fix if-contexts
-        check(not any(u in self.reduce_ranges and u.axis_type is AxisType.WEAK for u in reduces[0].ranges),
-              "cannot have a group inside another reduce")
+        check(len(reduces) > 0, f"cannot {new_type.name} an axis that's not in a REDUCE")
+        if is_reduce and new_type is AxisType.LOCAL:
+          check(not any(u in self.reduce_ranges and u.axis_type is AxisType.WEAK for u in reduces[0].ranges),
+            "cannot have a group inside another reduce")
+      if new_type is AxisType.LOCAL and (lpm:=getattr(self.ren, 'local_prod_max', None)) is not None:
+        local_sz = prod([self.full_shape[a] for a in self.axes_of(AxisType.WARP, AxisType.LOCAL)]) * amt
+        check(local_sz <= lpm, f"exceeds maximum local workgroup size: needs {local_sz}, max {lpm}")
       ret = self.shift_to(rng, amt, new_type, top=top)
     elif opt.op is OptOps.TC:
       check(len(self.applied_opts) == 0, "tensor core opts must be first") # TODO: remove the need for this by having warps
@@ -234,7 +238,7 @@ class Scheduler:
 
 def args_from_ast(ast:UOp, dname:str) -> tuple[list[Buffer], dict[str, int]]:
   glbls = sorted([x for x in ast.backward_slice if x.op is Ops.PARAM and x.arg.slot >= 0], key=lambda x: x.arg.slot)
-  return [Buffer(dname, x.max_numel() * x.dtype.itemsize) for x in glbls], {k.expr:int(k.vmax+k.vmin)//2 for k in ast.variables()}
+  return [Buffer(dname, x.max_numel(), x.dtype) for x in glbls], {k.expr:int(k.vmax+k.vmin)//2 for k in ast.variables()}
 
 def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
   if ast.tag is not None: return ast
