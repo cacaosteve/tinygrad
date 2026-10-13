@@ -1589,11 +1589,10 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # AMD_FLASH_ACC_SMALL is set for this realize (not via FLASH_DIRECT process-wide —
   # that parked every matmul and broke eye/GEMM). ACC_SMALL defaults on for DIRECT;
   # AMD_FLASH_ACC_SMALL=0 disables; AMD_WMMA_ACC_SMALL=1 forces (unsafe for quant).
-  # K_UNROLL=0 keeps QK WMMA in the ranged form; unrolled chains corrupt some multi-row kernels.
-  # Override AMD_FLASH_K_UNROLL=2 for ranged-factor baseline; MIDSTORE=0 disables.
+  # Keep the partial K unroll on direct ISA; HIP retains its ranged QK mapping.
   use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
-  use_k_unroll = 0  # ranged QK WMMA is the correctness-tested path
-  use_k_hip_scope = "all"  # K_HIP_SCOPE hardcoded
+  use_k_unroll = 2 if direct_isa else 0
+  use_k_hip_scope = "all"
   # Mid-store belongs in the cache key (not a bare getenv inside the cached builder).
   _mid_default = 4 if (use_k_unroll == 1 or use_k_unroll >= 8) else 0
   use_k_midstore = _mid_default if use_acc_small else 0  # K_MIDSTORE follows factor default

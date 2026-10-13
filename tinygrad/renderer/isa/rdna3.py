@@ -220,21 +220,24 @@ def _global_load_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
   slots, sc = _reg_slots(u), u.dtype
   saddr = _src(u.src[0])
   off_kw = {"offset": byte_off} if 0 < byte_off <= 0xfff else {}
+  # Volatile loads mark their count operand in _load_ins: by emit, the PARAM has
+  # already become a KERNARG. The count is internal LOAD metadata, not an input value.
+  cache_kw = {"glc": 1, "dlc": 1} if len(u.src) > 2 and u.src[2].tag == "volatile" else {}
   if slots == 1:
     if (load:=_global_load(u.dtype, _elem_count(u))) is None: raise CompileError(f"no global load {u.dtype}")
-    return [load(_dst(u), addr, saddr=saddr, **off_kw)]
+    return [load(_dst(u), addr, saddr=saddr, **off_kw, **cache_kw)]
   # multi-VGPR by byte width: float×2/×4, half×4/×8, or byte×8/×16 → B64/B128.
   if sc not in (dtypes.uint8, dtypes.float16, dtypes.float32, dtypes.int32, dtypes.uint32):
     raise CompileError(f"no vec global load {u.dtype}")
   if not isinstance(greg(u), Register): raise CompileError(f"expected reg dst {u}")
-  if slots == 2: return [r3.global_load_b64(_dst(u), addr, saddr=saddr)]
-  if slots == 3: return [r3.global_load_b96(_dst(u), addr, saddr=saddr)]
-  if slots == 4: return [r3.global_load_b128(_dst(u), addr, saddr=saddr)]
+  if slots == 2: return [r3.global_load_b64(_dst(u), addr, saddr=saddr, **cache_kw)]
+  if slots == 3: return [r3.global_load_b96(_dst(u), addr, saddr=saddr, **cache_kw)]
+  if slots == 4: return [r3.global_load_b128(_dst(u), addr, saddr=saddr, **cache_kw)]
   if slots == 8:
     # offset+16 keeps addr live (no TMP bump). Emit clusters consecutive B128s into one
     # s_clause (LLVM-style burst); nested per-tile s_clause(1) would split that.
-    return [r3.global_load_b128(_reg_chunk(greg(u), 0, 4), addr, saddr=saddr),
-            r3.global_load_b128(_reg_chunk(greg(u), 4, 4), addr, saddr=saddr, offset=16)]
+    return [r3.global_load_b128(_reg_chunk(greg(u), 0, 4), addr, saddr=saddr, **cache_kw),
+            r3.global_load_b128(_reg_chunk(greg(u), 4, 4), addr, saddr=saddr, offset=16, **cache_kw)]
   raise CompileError(f"no global load {u.dtype}")
 
 # CSE per-k B gather bases (elem idx = base + k*(4096/itemsize)). Cleared each linear emit.
@@ -957,6 +960,11 @@ def _lds_byte_off(u:UOp) -> int:
 
 def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
   n = x.max_numel()
+  param = a.src[0].buf_uop
+  volatile = param.op is Ops.PARAM and param.arg.volatile
+  def global_load(src:tuple[UOp, ...]) -> UOp:
+    if volatile: src = (src[0], src[1], src[2].rtag("volatile"), *src[3:])
+    return x.ins(AMDOps.LOAD, dtype=x.dtype, src=src)
   if alt is not None and gate is not None:
     raw = UOp(Ops.LOAD, src=(a,))
     if n == 1: return gate.where(raw, alt)
@@ -991,7 +999,7 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
       idx = _b_page_idx(base, page, itemsize)
       # Always attach rem (incl. 0) tagged so emit can in-place <<1 safely.
       src = (a.src[0], idx, count, _tconst(rem, dtypes.int32).rtag("b_compact"))
-      return x.ins(AMDOps.LOAD, dtype=x.dtype, src=src)
+      return global_load(src)
   # Scalar global gathers: keep one shared byte-address base and use GLOBAL's 12-bit offset.
   # LLVM performs this fold for quantized GEMV; without it every adjacent load repeats ADD+LSHL.
   if n == 1 and _mem_itemsize(x.dtype) in (1, 4):
@@ -1001,9 +1009,8 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
     # instruction selection, which ISA lowering cannot encode (notably in spill-heavy kernels).
     if off > 0 and idx.dtype.itemsize <= 4:
       if itemsize == 4: idx = idx << _tconst(2, idx.dtype)
-      return x.ins(AMDOps.LOAD, dtype=x.dtype,
-                   src=(a.src[0], idx, count, _tconst(off, dtypes.int32).rtag("byte_addr")))
-  return x.ins(AMDOps.LOAD, dtype=x.dtype, src=(a.src[0], a.src[1], count))
+      return global_load((a.src[0], idx, count, _tconst(off, dtypes.int32).rtag("byte_addr")))
+  return global_load((a.src[0], a.src[1], count))
 
 def _store_ins(x:UOp, a:UOp, val:UOp) -> UOp:
   # Bottom-up isel can match STORE before INDEX→EXTRACT on vec/WMMA values. Defer (return None)
@@ -1646,7 +1653,9 @@ def _fused_mulacc(ctx:IselContext, a:UOp, b:UOp, c:UOp) -> UOp|None:
   if not _is_foldable(ctx, c, a): return None
   # Single-use addends can be overwritten in place with compact VOP2 FMAC. Keep
   # VOP3 FMA when the addend remains live elsewhere.
-  return a.ins(AMDOps.FMAC, src=(b, *a.src)) if _is_foldable(ctx, c, b) else a.ins(AMDOps.MULACC, src=(*a.src, b))
+  # FMAC is a two-address op: the accumulator must already be in its destination. A
+  # literal addend has no VGPR to tie, so keep it as a three-source FMA instead.
+  return a.ins(AMDOps.FMAC, src=(b, *a.src)) if _const_value(b) is None and _is_foldable(ctx, c, b) else a.ins(AMDOps.MULACC, src=(*a.src, b))
 
 def _protect_loop_invariant_fmac(lst:list[UOp]) -> list[UOp]:
   return _sched.protect_loop_invariant_fmac(lst)

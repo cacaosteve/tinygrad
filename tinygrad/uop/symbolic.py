@@ -3,7 +3,7 @@ import math
 from collections import defaultdict
 from tinygrad.uop.ops import Ops, PatternMatcher, UPat, UOp, GroupOp, exec_alu, promo_dtype
 from tinygrad.dtype import PyConst, ConstFloat, dtypes, can_lossless_cast, Invalid, bitcast, truncate
-from tinygrad.helpers import partition, all_same, prod, flatten, unwrap, IMAGE, dedup, ceildiv
+from tinygrad.helpers import partition, all_same, prod, flatten, IMAGE, dedup, ceildiv
 from tinygrad.uop.divandmod import affine_int_bounds, div_and_mod_symbolic
 from tinygrad.uop.movement import mop_cleanup
 from tinygrad.uop.weak import pm_uncast_const

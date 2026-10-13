@@ -15,7 +15,7 @@ from tinygrad.renderer.isa.rdna3 import _loop_label
 from tinygrad.runtime.autogen import amdgpu_kd
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.uop import Ops
-from tinygrad.uop.ops import AxisType, KernelInfo, UOp, graph_rewrite
+from tinygrad.uop.ops import AxisType, CallInfo, KernelInfo, UOp, graph_rewrite
 import tinygrad.renderer.isa.amd as amd_lib
 from tinygrad.renderer.isa.amd import AMDRenderer, AMDOps
 
@@ -69,7 +69,17 @@ class OneSGPRAMDRenderer(AMDRenderer):
 def _prg_lin(prg): return prg.src[1]
 def _prg_src(prg): return prg.src[2]
 def _prg_bin(prg): return prg.src[3]
-def _amd_rt(prg): return Device["AMD"].runtime(prg.to_elf())
+def _amd_rt(prg):
+  from tinygrad.engine.realize import run_linear
+  def run(*bufs, global_size, local_size, vals, wait):
+    assert len(bufs) == len(prg.arg.globals)
+    args = [UOp.from_buffer(buf, dtypes.uint8) for buf in bufs]
+    var_vals = {var.expr: val for var, val in zip(prg.arg.vars, vals) if var.is_variable}
+    # These hardware fixtures intentionally contain low-level weak RANGE nodes inside
+    # the PROGRAM body, so construct the opaque CALL directly instead of using UOp.call.
+    call = UOp(Ops.CALL, src=(prg, *args), arg=CallInfo())
+    run_linear(UOp(Ops.LINEAR, src=(call,)), var_vals=var_vals, wait=wait)
+  return run
 
 def _amd_desc(prg):
   _, sections, _ = elf_loader(_prg_bin(prg).arg)
@@ -2466,6 +2476,18 @@ class TestAMDRenderer(unittest.TestCase):
       getenv.cache_clear()
       to_program_cache.clear()
 
+  def test_loop_cmp_precedes_destructive_update(self):
+    reg = _uop(Ops.INS, dtypes.int32, (), AMDOps.MOV, (Register("loop", 0, _cons=amd_lib.VGPR),))
+    one, limit = UOp.const(1, dtypes.int32), UOp.const(9, dtypes.int32)
+    update = _uop(Ops.INS, dtypes.int32, (reg, one), AMDOps.ADD, (Register("next", 1, _cons=amd_lib.VGPR),))
+    store = _uop(Ops.INS, dtypes.void, (reg, update), AMDOps.REG_STORE, (greg(reg),))
+    loop = UOp(Ops.RANGE, src=(UOp(Ops.NOOP),), arg=(AxisType.WEAK, 0))
+    loop_cmp = _uop(Ops.INS, dtypes.bool, (reg, limit, reg, loop), AMDOps.LOOP_CMP, Ops.CMPLT)
+
+    scheduled = amd_lib._schedule_loop_cmps([reg, update, store, loop_cmp])
+    cmp = next(u for u in scheduled if u.op is Ops.INS and _iop(u) is AMDOps.CMPLT)
+    self.assertLess(scheduled.index(cmp), scheduled.index(update))
+
   def test_reg_store_spill_falls_back_to_scratch(self):
     disp = UOp.const(128, dtypes.int32)
     acc = _uop(Ops.INS, dtypes.float32, (disp,), AMDOps.FILL, (Register("v10", 266),))
@@ -3475,7 +3497,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_mulacc_assembles(self):
     raw, fused = _mulacc_program(), _fused_mulacc_program()
     _check_asm(self, raw, AMDOps.MULACC, insts=("V_FMA_F32",))
-    _check_asm(self, fused, AMDOps.FMAC, insts=("V_FMAC_F32_E32",))
+    _check_asm(self, fused, AMDOps.MULACC, insts=("V_FMA_F32",))
 
   def test_single_use_accumulator_uses_compact_fmac(self):
     out = UOp.placeholder((16,), dtypes.float32, 0)
@@ -3489,7 +3511,7 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertNotIn(Ops.MULACC, AMDRenderer.code_for_op)
     prg = _fused_mulacc_program()
     linear_ops = _lin_ops(prg)
-    self.assertIn(AMDOps.FMAC, linear_ops)
+    self.assertIn(AMDOps.MULACC, linear_ops)
     self.assertNotIn(AMDOps.MUL, linear_ops)
     self.assertNotIn(AMDOps.ADD, linear_ops)
 
@@ -3497,11 +3519,11 @@ class TestAMDRenderer(unittest.TestCase):
     prg = _float16_fused_mulacc_program()
     _check_elf(self, prg)
     linear_ops = _lin_ops(prg)
-    self.assertIn(AMDOps.FMAC, linear_ops)
+    self.assertIn(AMDOps.MULACC, linear_ops)
     self.assertNotIn(AMDOps.MUL, linear_ops)
     self.assertNotIn(AMDOps.ADD, linear_ops)
     inst_names = _amd_inst_names(prg)
-    self.assertIn("V_FMAC_F16_E32", inst_names)
+    self.assertIn("V_FMA_F16", inst_names)
 
   def test_sgpr_sub_uses_scalar_instruction(self):
     src = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.MOV, tag=(Register("s8", 8),))
@@ -3722,15 +3744,15 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertNotIn("S_CBRANCH_SCC1", names)
 
   def test_boundless_loop_preserves_old_accumulator_condition(self):
-    # wait_loop cond is `inc < N` (new value): ADD updates the ACC, then CMPLT, then branch.
+    # wait_loop cond simplifies to `old_acc < N-1`; compare before an aliased update clobbers it.
     prg = _boundless_loop_program("wait")
     _check_elf(self, prg)
     lin = _prg_lin(prg).src
     cmp_i = next(i for i,u in enumerate(lin) if u.op is Ops.INS and _iop(u) is AMDOps.CMPLT)
     branch_i = next(i for i,u in enumerate(lin) if u.op is Ops.INS and _iop(u) is AMDOps.CBRANCH_VCCNZ)
     acc = greg(lin[cmp_i].src[0])
-    update_i = next(i for i in range(0, cmp_i) if lin[i].op is Ops.INS and _iop(lin[i]) is AMDOps.ADD and greg(lin[i]) == acc)
-    self.assertLess(update_i, cmp_i)
+    update_i = next(i for i in range(cmp_i+1, branch_i) if lin[i].op is Ops.INS and _iop(lin[i]) is AMDOps.ADD and greg(lin[i]) == acc)
+    self.assertLess(cmp_i, update_i)
     self.assertLess(cmp_i, branch_i)
     self.assertIn("S_CBRANCH_VCCNZ", _amd_inst_names(prg))
 
@@ -4048,7 +4070,7 @@ class TestAMDRenderer(unittest.TestCase):
     inp = Tensor(list(range(64)), dtype=dtypes.uint8, device="AMD").contiguous().realize()
     out = Tensor.empty(16, dtype=dtypes.uint8, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _offset_u8_vector_load_program(4)
-    _amd_rt(prg)(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    _amd_rt(prg)(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), list(range(4, 20)))
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4063,14 +4085,14 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(8, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     buf, prg = out._buffer().ensure_allocated(), _range_program()
     rt = _amd_rt(prg)
-    rt(buf.get_buf("AMD"), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    rt(buf, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), list(range(1, 9)))
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_long_branches(self):
     out = Tensor.empty(8, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     buf, prg = out._buffer().ensure_allocated(), _long_branch_program()
-    _amd_rt(prg)(buf.get_buf("AMD"), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    _amd_rt(prg)(buf, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), list(range(1, 9)))
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4079,7 +4101,7 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(16, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _two_uint_var_program()
     rt = _amd_rt(prg)
-    rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(2, 3), wait=True)
+    rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(2, 3), wait=True)
     self.assertEqual(out.tolist(), [i + 5 for i in range(16)])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4087,7 +4109,7 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(16, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     buf, prg = out._buffer().ensure_allocated(), _reg_buffer_program()
     rt = _amd_rt(prg)
-    rt(buf.get_buf("AMD"), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    rt(buf, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [i + 6 for i in range(16)])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4097,7 +4119,7 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(16, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp0, inp1)], _gated_load_program()
     rt = _amd_rt(prg)
-    rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [100 + 2*i if i < 4 else i if i < 8 else 0 for i in range(16)])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4133,7 +4155,7 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(4, dtype=dtypes.float16, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp0, inp1, mask)], _float16_where_program()
     rt = _amd_rt(prg)
-    rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [1.5, -2.0, 3.5, -4.0])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4143,7 +4165,7 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(4, dtype=dtypes.float16, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _float16_unary_program()
     rt = _amd_rt(prg)
-    rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     expected = [math.sqrt(x) + math.log2(x) + math.trunc(x + 0.75) - math.trunc(x) + 1.0 / x + math.sin(x) for x in vals]
     for got, exp in zip(out.tolist(), expected):
       self.assertAlmostEqual(got, exp, places=2)
@@ -4155,7 +4177,7 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(4, dtype=dtypes.float16, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp0, inp1)], _float16_fused_mulacc_program()
     rt = _amd_rt(prg)
-    rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [3.0, 7.0, 13.0, 21.0])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4188,7 +4210,7 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(4, dtype=dtypes.int32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp, div)], _var_divmod_program()
     rt = _amd_rt(prg)
-    rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [-21, 19, 21, -19])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4200,7 +4222,7 @@ class TestAMDRenderer(unittest.TestCase):
     cases = ((0, 1), (0, 3), (1, 7), (255, 255), (65521, 257), (2**20-128, 1009),
              (2**30-256, 2**16-1), (2**31-256, 2**31-1))
     for base, div in cases:
-      rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size,
+      rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size,
          vals=(base, div), wait=True)
       values = range(base, base+256)
       self.assertEqual(out_q.tolist(), [x // div for x in values])
@@ -4213,7 +4235,7 @@ class TestAMDRenderer(unittest.TestCase):
     bufs, prg = [x._buffer().ensure_allocated() for x in (out_q, out_r)], _positive_var_divmod_program(dtypes.uint32)
     rt = _amd_rt(prg)
     for base, div in ((0, 3), (2**31, 65537), (2**32-256, 3), (2**32-256, 2**32-1)):
-      rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size,
+      rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size,
          vals=(base, div), wait=True)
       values = range(base, base+256)
       self.assertEqual(out_q.tolist(), [x // div for x in values])
@@ -4226,7 +4248,7 @@ class TestAMDRenderer(unittest.TestCase):
     bufs, prg = [x._buffer().ensure_allocated() for x in (out_q, out_r)], _uniform_positive_var_divmod_program()
     rt = _amd_rt(prg)
     for value, div in ((0, 3), (65521, 257), (2**31, 65537), (2**32-1, 2**32-1)):
-      rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size,
+      rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size,
          vals=(value, div), wait=True)
       self.assertEqual(out_q.tolist(), [value // div] * 256)
       self.assertEqual(out_r.tolist(), [value % div] * 256)
@@ -4237,7 +4259,7 @@ class TestAMDRenderer(unittest.TestCase):
     buf, prg = out._buffer().ensure_allocated(), _bounded_negative_divmod_program()
     rt = _amd_rt(prg)
     for n in (1, 2, 4127):
-      rt(buf.get_buf("AMD"), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(n,), wait=True)
+      rt(buf, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(n,), wait=True)
       self.assertEqual(out.tolist(), [0, n-1])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4246,7 +4268,7 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(4, dtype=dtypes.float32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _exp2_program()
     rt = _amd_rt(prg)
-    rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [1.0, 2.0, 4.0, 8.0])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4255,7 +4277,7 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(4, dtype=dtypes.float32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _unary_math_program()
     rt = _amd_rt(prg)
-    rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [1.0, 4.0, 8.0, 14.0])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4264,7 +4286,7 @@ class TestAMDRenderer(unittest.TestCase):
     out = Tensor.empty(4, dtype=dtypes.float32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _sin_program()
     rt = _amd_rt(prg)
-    rt(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     for got, expected in zip(out.tolist(), [math.sin(x) for x in [-2.0, 0.0, 1.0, math.pi / 2]]):
       self.assertAlmostEqual(got, expected, places=5)
 
@@ -4288,7 +4310,7 @@ class TestAMDRenderer(unittest.TestCase):
             for base in (0, 100, 200)]
     out = Tensor.empty(16, dtype=dtypes.uint32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, *inps)], _sgpr_spill_program()
-    _amd_rt(prg)(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    _amd_rt(prg)(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [300 + 3*i for i in range(16)])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4297,7 +4319,7 @@ class TestAMDRenderer(unittest.TestCase):
     inp = Tensor(raw, dtype=dtypes.uint16, device="AMD").contiguous().realize()
     out = Tensor.empty(64, dtype=dtypes.float32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _paged_bitcast_spill_program()
-    _amd_rt(prg)(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    _amd_rt(prg)(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [1.0] * 16 + [-2.0] * 16 + [0.5] * 16 + [3.0] * 16)
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
@@ -4313,7 +4335,7 @@ class TestAMDRenderer(unittest.TestCase):
       with self.subTest(name=name):
         out = Tensor.empty(1, dtype=dtypes.int32, device="AMD").contiguous().realize()
         prg = _boundless_loop_program(name, OneVGPRAMDRenderer(Target("AMD", arch=Device["AMD"].arch)))
-        _amd_rt(prg)(out._buffer().ensure_allocated().get_buf("AMD"), global_size=prg.arg.global_size,
+        _amd_rt(prg)(out._buffer().ensure_allocated(), global_size=prg.arg.global_size,
                      local_size=prg.arg.local_size, vals=(), wait=True)
         self.assertEqual(out.item(), expected)
 
@@ -4323,7 +4345,7 @@ class TestAMDRenderer(unittest.TestCase):
     inp = Tensor(raw, dtype=dtypes.uint16, device="AMD").contiguous().realize()
     out = Tensor.empty(64, dtype=dtypes.float32, device="AMD").contiguous().realize()
     bufs, prg = [x._buffer().ensure_allocated() for x in (out, inp)], _bitcast_spill_program()
-    _amd_rt(prg)(*(b.get_buf("AMD") for b in bufs), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    _amd_rt(prg)(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [1.0] * 16 + [-2.0] * 16 + [0.5] * 16 + [3.0] * 16)
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")

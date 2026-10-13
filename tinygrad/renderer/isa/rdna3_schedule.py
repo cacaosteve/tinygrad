@@ -1200,8 +1200,20 @@ def schedule_loop_cmps(lst:list[UOp]) -> list[UOp]:
     cmp = UOp(Ops.INS, src=u.src[:2], arg=(cmp_ops[u.tag], dtypes.bool))
     cond_regs = {r for s in u.src[:2] if isinstance((r:=greg(s)), Register)}
     dep_reg = greg(u.src[2])
-    insert = next((i for i in range(len(out)-1, -1, -1) if isinstance(dep_reg, Register) and
-                   out[i].op is Ops.INS and _iop(out[i]) is AMDOps.REG_STORE and greg(out[i].src[0]) == dep_reg and dep_reg in cond_regs), len(out))
+    insert = len(out)
+    if isinstance(dep_reg, Register) and dep_reg in cond_regs:
+      for i in range(len(out)-1, -1, -1):
+        if out[i].op is not Ops.INS or _iop(out[i]) is not AMDOps.REG_STORE or greg(out[i].src[0]) != dep_reg: continue
+        # The update feeding REG_STORE can be allocated onto dep_reg (e.g. v_add v5, 1, v5).
+        # Comparing before only the final MOV is too late: the update already clobbered the old
+        # loop value. Move the compare before that producer when its operands are available.
+        update = out[i].src[1]
+        def index_of(target:UOp) -> int|None: return next((j for j, op in enumerate(out) if op is target), None)
+        update_idx = index_of(update)
+        cond_defs = [j for s in u.src[:2] if (j:=index_of(s)) is not None]
+        update_idx = i if update_idx is None else update_idx
+        insert = update_idx if max(cond_defs, default=-1) < update_idx else i
+        break
     out.insert(insert, cmp)
     out.append(u.replace(src=(cmp, u.src[2], u.src[3])))
   return out
