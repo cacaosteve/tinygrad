@@ -484,7 +484,7 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
     hwords = _amd_load(raw[base+4+half*4], 4, packed_u32=direct_isa) if ggml_type == Q5_K else None
     words = tuple((qwords[i] >> ((subgroup&1)*4).cast(dtypes.uint32) & 0x0f0f0f0f) |
       (((hwords[i] >> subgroup.cast(dtypes.uint32) & 0x01010101) << 4) if hwords is not None else 0) for i in word_indices)
-    if direct_isa and ggml_type == Q4_K:
+    if direct_isa:
       scaled, bias = d*scale, dmin*minimum*-1
       return tuple(_amd_fma_to_f16((word >> (byte*8) & 255).float(), scaled, bias) for word in words for byte in range(4))
     return tuple(((word >> (byte*8) & 255).float()*d*scale-dmin*minimum).cast(dtypes.float16) for word in words for byte in range(4))
