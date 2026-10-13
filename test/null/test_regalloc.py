@@ -11,7 +11,7 @@ class TestRegalloc(unittest.TestCase):
   def test_stack_dealloc_emits_before_sink(self):
     renderer = X86Renderer(Target("CPU", arch="x86_64"))
     out = UOp.placeholder((1,), dtypes.float32, 0)
-    local = UOp.placeholder((1,), dtypes.float32, 1, addrspace=AddrSpace.REG)
+    local = UOp.placeholder((1,), dtypes.float32, 1, addrspace=AddrSpace.LOCAL)
     idx = UOp.const(0, dtypes.int32)
     store_local = local.index(idx).store(UOp.const(3.0, dtypes.float32))
     store_out = out.index(idx).store(local.index(idx).load())

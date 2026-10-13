@@ -5,6 +5,7 @@ Bound from `rdna3.py` after `_iop` exists — keeps schedule reviewable without 
 from __future__ import annotations
 
 import itertools
+from typing import Any
 
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import getenv
@@ -13,17 +14,17 @@ from tinygrad.renderer.isa.rdna3_defs import AMDOps, VGPR
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import UOp
 
-_iop = None  # type: ignore[assignment]
-_reg_idxs = None  # type: ignore[assignment]
-_elem_count = None  # type: ignore[assignment]
-_pack_f16_is_vec_load = None  # type: ignore[assignment]
-_pack_f16_half2_load = None  # type: ignore[assignment]
-_pack_f16_is_half2_lo_only = None  # type: ignore[assignment]
-_reg_slots = None  # type: ignore[assignment]
-_const_int = None  # type: ignore[assignment]
-_lds_byte_off = None  # type: ignore[assignment]
-_load_count_src = None  # type: ignore[assignment]
-_tconst = None  # type: ignore[assignment]
+_iop: Any = None
+_reg_idxs: Any = None
+_elem_count: Any = None
+_pack_f16_is_vec_load: Any = None
+_pack_f16_half2_load: Any = None
+_pack_f16_is_half2_lo_only: Any = None
+_reg_slots: Any = None
+_const_int: Any = None
+_lds_byte_off: Any = None
+_load_count_src: Any = None
+_tconst: Any = None
 
 def bind_schedule(*, iop, reg_idxs=None, elem_count=None, pack_f16_is_vec_load=None, reg_slots=None,
                    pack_f16_half2_load=None, pack_f16_is_half2_lo_only=None, const_int=None,
@@ -1317,8 +1318,7 @@ def sink_alu_into_reg_store(ops: list[UOp]) -> list[UOp]:
     if u.op is not Ops.INS or _iop(u) is not AMDOps.REG_STORE or len(u.src) < 2: continue
     acc, val = u.src[0], u.src[1]
     while (val.op is Ops.INS and _iop(val) is AMDOps.MOV and uses.get(val, 0) == 1 and val.src and
-           val.src[0].op is Ops.INS and _iop(val.src[0]) is not AMDOps.MOV and
-           val.src[0].op is not Ops.SPECIAL):
+           val.src[0].op is Ops.INS and _iop(val.src[0]) is not AMDOps.MOV):
       val = val.src[0]
     if val.op is not Ops.INS or _iop(val) not in _REG_STORE_SINK_ALU_OPS: continue
     if uses.get(val, 0) != 1: continue

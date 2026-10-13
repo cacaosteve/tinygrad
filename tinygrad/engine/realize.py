@@ -1,13 +1,14 @@
 from __future__ import annotations
 from typing import cast, Iterator, Any, Sequence
-import decimal
+import decimal, os
 from dataclasses import dataclass, replace, field
-from tinygrad.helpers import CAPTURE_PROCESS_REPLAY, colored, DEBUG, GlobalCounters, ansipad, prod, flatten, Context, to_tuple, tqdm, unwrap
+from tinygrad.helpers import CAPTURE_PROCESS_REPLAY, colored, DEBUG, GlobalCounters, ansipad, prod, flatten, Context, to_tuple, tqdm, unwrap, getenv
 from tinygrad.helpers import BEAM, size_to_str, time_to_str, VALIDATE_WITH_CPU, PROFILE, ProfilePointEvent, cpu_events, perf_counter_us, cpu_profile
-from tinygrad.uop.ops import get_process_replay_loc, Ops, PatternMatcher, UOp, UPat, AxisType, sym_infer, graph_rewrite, ProgramInfo, KernelInfo
+from tinygrad.uop.ops import (get_process_replay_loc, Ops, PatternMatcher, UOp, UPat, AxisType, sym_infer,
+                              graph_rewrite, ProgramInfo, KernelInfo)
 from tinygrad.device import Device, Buffer, MultiBuffer, ProfileGraphEntry, DEV, HCQ_RUNTIME_DEV
 from tinygrad.renderer import Estimates, Renderer
-from tinygrad.codegen import to_program, to_program_cache, to_program_key, to_program_context
+from tinygrad.codegen import to_program, to_program_cache, to_program_mem_key, to_program_context, _program_cache_env_names
 from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
 
 # **************** Helpers ****************
@@ -219,8 +220,21 @@ pm_beam = PatternMatcher([
 
 # **************** parallel lowering + compilation ****************
 
-def _compile_kernel(x:tuple[int, tuple[UOp, Renderer], dict]) -> tuple[int, UOp]:
-  with Context(**x[2]): return x[0], to_program(*x[1])
+def _compile_kernel(x:tuple[int, tuple[UOp, Renderer], dict, dict[str, str|None]]) -> tuple[int, UOp]:
+  # Workers are long-lived, but getenv-driven renderer settings belong to each compile task.
+  # In particular, a caller can change AMD_* settings after the pool has already started.
+  prev_env = {k:os.environ.get(k) for k in x[3]}
+  for k,v in x[3].items():
+    if v is None: os.environ.pop(k, None)
+    else: os.environ[k] = v
+  getenv.cache_clear()  # type: ignore[attr-defined]
+  try:
+    with Context(**x[2]): return x[0], to_program(*x[1])
+  finally:
+    for k,v in prev_env.items():
+      if v is None: os.environ.pop(k, None)
+      else: os.environ[k] = v
+    getenv.cache_clear()  # type: ignore[attr-defined]
 
 def _get_call_to_compile(c:UOp) -> tuple[UOp, Renderer]|None:
   ast = c.body
@@ -235,15 +249,17 @@ def lower_and_compile(linear:UOp, verbose=True) -> UOp:
   if not len(ar:={c: a for c in linear.toposort() if c.op is Ops.CALL and (a:=_get_call_to_compile(c)) is not None}): return linear
 
   # lower and compile what's not cached, in parallel if there's a worker pool
-  keys = {c: to_program_key(*a) for c, a in ar.items()}
+  keys = {c: to_program_mem_key(*a) for c, a in ar.items()}
   todo = list({keys[c]: a for c, a in ar.items() if keys[c] not in to_program_cache}.items())
   if len(todo):
     # kernels that beam search must compile in the parent, beam needs device access to time candidates
 
-    pool = None if len(todo) == 1 or any(getattr(c.body.arg, "beam", 0) for c in ar) else get_worker_pool()
+    compile_env = {name:os.environ.get(name) for name in _program_cache_env_names()}
+    pool = None if len(todo) == 1 or any(getattr(c.body.arg, "beam", 0) for c in ar) else get_worker_pool(compile_env)
     ctx = {v.key: v.value for v in to_program_context}
     if CAPTURE_PROCESS_REPLAY: ctx["PROCESS_REPLAY_LOC"] = get_process_replay_loc()
-    tasks = ((i, ast_ren, ctx) for i, (_, ast_ren) in enumerate(todo))
+    # Forward the current compile environment: persistent workers don't inherit later os.environ changes.
+    tasks = ((i, ast_ren, ctx, compile_env) for i, (_, ast_ren) in enumerate(todo))
     try:
       with tqdm(total=len(todo), desc="compiling", disable=DEBUG<1 or not verbose) as pbar:
         for i, prg in (map if pool is None else pool.imap_unordered)(_compile_kernel, tasks):

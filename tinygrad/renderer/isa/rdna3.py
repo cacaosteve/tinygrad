@@ -1,5 +1,4 @@
 from __future__ import annotations
-import itertools
 import math
 import os
 import struct
@@ -15,7 +14,7 @@ from tinygrad.codegen.decomp.op import fast_idiv
 from tinygrad.renderer import tc
 from tinygrad.uop import Ops, GroupOp
 from tinygrad.uop.divandmod import affine_int_bounds
-from tinygrad.uop.ops import AxisType, KernelInfo, PatternMatcher, UOp, UPat
+from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
 from tinygrad.renderer.isa import rdna3_defs as _defs
 from tinygrad.renderer.isa.rdna3_defs import (AMDOps, KERNARG_REG, WGID, LID, SGPR, SGPR32, VGPR,
   TMP_VDATA, TMP_VADDR, TMP_BRANCH, TMP_SDATA0, TMP_SDATA1, refresh_vgpr_pools,
@@ -141,7 +140,9 @@ def _fmac_mul_operand_choices(u:UOp) -> list[tuple[object, Reg]]:
   seen: set[tuple[object, int]] = set()
   for src0, src1 in ((a, b), (b, a)):
     if not (isinstance(src1, Reg) and src1.offset >= 256): continue
-    key = (src0 if not isinstance(src0, Reg) else _vgpr_num(src0), _vgpr_num(src1))
+    num1 = _vgpr_num(src1)
+    if num1 is None: continue
+    key: tuple[object, int] = (src0 if not isinstance(src0, Reg) else _vgpr_num(src0), num1)
     if key in seen: continue
     seen.add(key)
     out.append((src0, src1))
@@ -330,6 +331,16 @@ def _reg_idxs(x:UOp) -> set[int]:
   if x.op is Ops.AFTER: return set().union(*(_reg_idxs(s) for s in x.src))
   if not isinstance(greg(x), Register): return set()
   return set(range(greg(x).index, greg(x).index + _reg_slots(x)))
+
+def _vopd_mov_scan_safe(candidate:UOp, between:list[UOp]) -> bool:
+  """A scanned MOV can move to the current instruction only if its registers stay untouched."""
+  dst, src = _reg_idxs(candidate), set().union(*(_reg_idxs(s) for s in candidate.src))
+  for mid in between:
+    if mid.op is Ops.INS and _iop(mid) in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ,
+                                          AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER): return False
+    reads = set().union(*(_reg_idxs(s) for s in mid.src)) if mid.src else set()
+    if dst & (_reg_idxs(mid) | reads) or src & _reg_idxs(mid): return False
+  return True
 
 def _wait_for_domain(domain:str, cnt:int=0):
   if domain == "vm": return r3.s_waitcnt_vmcnt(sdst=NULL, simm16=cnt)
@@ -554,7 +565,7 @@ def _scratch_addr(base:UOp, idx:UOp, itemsize:int) -> tuple[list, Reg]:
 def _reg_buffer_base(x:UOp) -> UOp|None:
   if x.op is Ops.AFTER: return _reg_buffer_base(x.src[0])
   # Placeholders are RESHAPE(BUFFER); peel so promote/skip see the REG BUFFER.
-  if x.op in (Ops.RESHAPE, Ops.PERMUTE, Ops.EXPAND, Ops.SHRINK, Ops.FLIP, Ops.PAD) and x.src:
+  if x.op in (Ops.RESHAPE, Ops.PERMUTE, Ops.EXPAND, Ops.SHRINK, Ops.PAD) and x.src:
     return _reg_buffer_base(x.src[0])
   return x if x.op in (Ops.BUFFER, Ops.ALLOC) and x.addrspace is AddrSpace.REG else None
 
@@ -1058,9 +1069,9 @@ def _pack_f16_is_vec_load(u:UOp) -> bool:
 def _pack_f16_is_half2_lo_only(u:UOp) -> bool:
   """PACK_F16 after _rewrite_half2_global_packs: each src is even-lane EXTRACT (full half2 word)."""
   if not u.src or _pack_f16_is_vec_load(u): return False
-  for s in u.src:
-    if not (s.op is Ops.INS and _iop(s) is AMDOps.EXTRACT and s.dtype is dtypes.float16): return False
-    if (lane := _const_int(s.src[1])) is None or lane % 2: return False
+  for src in u.src:
+    if not (src.op is Ops.INS and _iop(src) is AMDOps.EXTRACT and src.dtype is dtypes.float16): return False
+    if (lane := _const_int(src.src[1])) is None or lane % 2: return False
   return True
 
 def _wmma_ab_from_lds(wmma:UOp) -> bool:
@@ -1200,15 +1211,15 @@ def _pack_f16_insts(u:UOp, fma_hi_lo:dict[UOp, UOp]|None=None, fma_pair_dst:dict
     off = 0
     for src in u.src:
       for j in range(_reg_slots(src)):
-        s, d = _reg_lane(greg(src), j), _reg_lane(greg(u), off + j)
-        if s != d: moves.append((d, s))
+        src_lane, d = _reg_lane(greg(src), j), _reg_lane(greg(u), off + j)
+        if src_lane != d: moves.append((d, src_lane))
       off += _reg_slots(src)
     return _parallel_vmov(moves)
   # Lo-only HALF2 rewrite: each src is an even EXTRACT holding a full half2 word.
   if _pack_f16_is_half2_lo_only(u):
     moves = []
-    for i, s in enumerate(u.src):
-      src_slot, dst_slot = _dst(s), _reg_lane(greg(u), i)
+    for i, src_item in enumerate(u.src):
+      src_slot, dst_slot = _dst(src_item), _reg_lane(greg(u), i)
       if src_slot != dst_slot: moves.append((dst_slot, src_slot))
     return _parallel_vmov(moves)
   # Regalloc remat may replace a vec-load PACK src with a scalar MOV bind (same phys).
@@ -1225,7 +1236,8 @@ def _pack_f16_insts(u:UOp, fma_hi_lo:dict[UOp, UOp]|None=None, fma_pair_dst:dict
     # Flush pending MOVs before any v_pack so dual packing stays contiguous.
     def _flush() -> None:
       nonlocal moves
-      if moves: ret.extend(_parallel_vmov(moves)); moves = []
+      if moves: ret.extend(_parallel_vmov(moves))
+      moves = []
     # A paired mixhi has already written the high half into lo's VGPR. Move that
     # packed word into the WMMA fragment instead of executing a separate v_pack.
     if (fma_hi_lo or {}).get(hi) is lo:
@@ -1238,15 +1250,16 @@ def _pack_f16_insts(u:UOp, fma_hi_lo:dict[UOp, UOp]|None=None, fma_pair_dst:dict
       # Even-lane EXTRACT MOVs the full half2 word into lo's dest. Prefer that over the
       # LOAD VGPR: flash reuses global_load_b128 dests for the next tile before PACK
       # emits, so greg(base) can already hold a different vector (HALF2_GLOBAL sum −22.3).
+      pack_src_slot: Reg|None
       if isinstance(greg(lo), Register) and _dst(lo) != base_slot:
-        src_slot = _dst(lo)
+        pack_src_slot = _dst(lo)
       elif _iop(base) is AMDOps.LLOAD:
-        src_slot = base_slot
+        pack_src_slot = base_slot
       else:
-        src_slot = None  # global LOAD phys may be dead — fall through to v_pack
-      if src_slot is not None:
+        pack_src_slot = None  # global LOAD phys may be dead — fall through to v_pack
+      if pack_src_slot is not None:
         dst_slot = _reg_lane(greg(u), i)
-        if src_slot != dst_slot: moves.append((dst_slot, src_slot))
+        if pack_src_slot != dst_slot: moves.append((dst_slot, pack_src_slot))
         continue
     # Always v_pack from lo/hi. Do not shortcut through the half2 load VGPR: EXTRACT(hi)
     # may LSHR that load in place, so a later mov from the load reg sees [hi,0] (2026-07-20).
@@ -1739,7 +1752,7 @@ def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Regis
     (UPat(Ops.STACK, name="x"), _pack_vec),
     # Int/bool CONST stay as CONST (_src inlines / _vgpr_data temps at use). Avoids
     # long-lived VGPR MOVs that dominate UPCAST4 spill. Float still needs a MOV VGPR.
-    (UPat.cvar().cast((dtypes.float16, dtypes.float32), name="x"), lambda x:
+    (UPat.cvar().cast(dtypes.float32, name="x"), lambda x:
      x.ins(AMDOps.MOV, src=(x.rtag(),)) if not x.tag else None),
     ((UPat(Ops.MUL, (dtypes.float16, dtypes.float32), name="a") + UPat.var("b")).named("c"), _fused_mulacc),
     ((UPat(dtype=dtypes.ints+(dtypes.bool, dtypes.float16, dtypes.float32)) + UPat()).named("x"), lambda x: x.ins(AMDOps.ADD)),
@@ -1767,7 +1780,8 @@ def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Regis
     (UPat(Ops.CUSTOM, name="x"), _atomic_add_ins),
     (UPat(Ops.BARRIER, name="x"), lambda x: x.ins(AMDOps.BARRIER)),
     (UPat(Ops.WMMA, name="x"), lambda ctx,x: _isel_wmma(ctx, x)),
-    (UPat((Ops.INS, Ops.BUFFER, Ops.ALLOC), name="x"), lambda ctx,x,sgpr_pool=sgpr_pool,vgpr_pool=vgpr_pool: _alloc_vregs(ctx, x, sgpr_pool, vgpr_pool)),
+    (UPat((Ops.INS, Ops.BUFFER, Ops.ALLOC), name="x"),
+     lambda ctx,x,sgpr_pool=sgpr_pool,vgpr_pool=vgpr_pool: _alloc_vregs(ctx, x, sgpr_pool, vgpr_pool)),
   ])
 
 isel_matcher = make_isel_matcher()
@@ -2333,15 +2347,16 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
                              d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst)
       # AMD_D16_HI emit path removed.
       itemsize, byte_off = (1 if _is_byte_addr_load(u) else _mem_itemsize(u.dtype)), _mem_byte_off(u)
+      compact_idx = _src(u.src[1])
       # Compact B: in-place <<1 on page-idx UOp once (track by UOp id, not phys VGPR —
       # regalloc may reuse the VGPR for a later unscaled page idx).
       if byte_scaled is not None and _is_b_compact_load(u) and _reg_slots(u) == 1 and not masked and itemsize == 2:
-        idx_uop, idx = u.src[1], _src(u.src[1])
-        if not isinstance(idx, Reg) or idx.offset < 256: raise CompileError("compact B needs VGPR idx")
-        key = id(idx_uop)
-        scale = [] if key in byte_scaled else [r3.v_lshlrev_b32_e64(idx, 1, idx)]
-        byte_scaled.add(key)
-        return scale + _global_load_insts(u, idx, byte_off)
+        idx_uop, idx = u.src[1], compact_idx
+        if isinstance(idx, Reg) and idx.offset >= 256:
+          key = id(idx_uop)
+          scale = [] if key in byte_scaled else [r3.v_lshlrev_b32_e64(idx, 1, idx)]
+          byte_scaled.add(key)
+          return scale + _global_load_insts(u, idx, byte_off)
       # Peeled B gather: (base<<1)+byte_off into dest — one VALU, still dest-as-addr for s_clause.
       if byte_off > 0 and _reg_slots(u) == 1 and not masked and itemsize == 2:
         dst = _dst(u)
@@ -3354,8 +3369,9 @@ def insts_from_linear(lin:UOp):
         if k in early_emitted: continue
         cand = scheduled[k]
         if (pair:=_try_vopd_mov_pair(u, cand)) is None: continue
-        # Only reject if cand depends on an intervening def (dual emits cand at u).
-        if any(_vopd.depends(cand, scheduled[m]) for m in range(oi + 1, k)):
+        # Dual emits cand at u. Preserve its value across every intervening read/write/control-flow.
+        between = scheduled[oi + 1:k]
+        if any(_vopd.depends(cand, mid) for mid in between) or not _vopd_mov_scan_safe(cand, between):
           continue
         partner_i, vopd = k, pair
         break
@@ -3549,7 +3565,7 @@ def insts_from_linear(lin:UOp):
                                   for start in range(oi, j - 3)) and \
          not any(_fused_scratch_contig_load_b64(scheduled, start, None) is not None
                  for start in range(oi, j - 1)):
-        cache_snap = (store_addr_cache.key, store_addr_cache.page, store_addr_cache._bcast_src, store_addr_cache.lds_key)
+        scratch_cache_snap = (store_addr_cache.key, store_addr_cache.page, store_addr_cache._bcast_src, store_addr_cache.lds_key)
         parts = [_emit_uop(scheduled[k], with_store_cache=True) for k in range(oi, j)]
         if all(_vm_load_count(p) >= 1 for p in parts):
           scales, loads = [], []
@@ -3566,7 +3582,7 @@ def insts_from_linear(lin:UOp):
             note_vm(set().union(*(_reg_idxs(scheduled[k]) for k in range(oi, j))), loads)
             oi = j
             continue
-        store_addr_cache.key, store_addr_cache.page, store_addr_cache._bcast_src, store_addr_cache.lds_key = cache_snap
+        store_addr_cache.key, store_addr_cache.page, store_addr_cache._bcast_src, store_addr_cache.lds_key = scratch_cache_snap
     if mask_depth == 0 and (fused_load:=_fused_lds_pack_load(scheduled, oi)) is not None:
       count, emitted, deps = fused_load
       if deps and _pending_src(deps): flush_regs(deps)
@@ -3846,8 +3862,8 @@ def _wmma_has_fused_float_to_half_cast(tk) -> bool:
   """True if a WMMA operand still contains float→half CAST (not a realized half buffer)."""
   for u in tk.ast.toposort():
     if u.op is not Ops.WMMA: continue
-    for s in u.src[:2]:
-      for x in s.toposort():
+    for src in u.src[:2]:
+      for x in src.toposort():
         if x.op is Ops.CAST and x.dtype is dtypes.half and x.src and x.src[0].dtype != dtypes.half:
           return True
   return False
@@ -4341,19 +4357,21 @@ class AMDRenderer(ISARenderer):
           if not all(_pack_f16_half2_load(lo, hi) is not None for lo, hi in pairs): continue
           for lane, (lo, _) in enumerate(pairs):
             idx[lo] = (pu, lane)
-        self._pack_half2_lo_index = idx
+        self._pack_half2_lo_index: dict[UOp, tuple[UOp, int]] = idx
       got = idx.get(u)
       if got is not None:
         pack, lane = got
-        bases = getattr(self, "_pack_half2_bases", None)
-        if bases is None: bases = self._pack_half2_bases = {}
+        bases: dict[int, int] | None = getattr(self, "_pack_half2_bases", None)
+        if bases is None:
+          self._pack_half2_bases: dict[int, int] = {}
+          bases = self._pack_half2_bases
         need = len(pack.src) if _pack_f16_is_half2_lo_only(pack) else len(pack.src) // 2
         occupied: set[int] = set()
         for p in live.values():
           if isinstance(p, Register): occupied.add(p.index)
         if lane == 0:
           pool_idxs = {r.index for r in u.tag[0].cons}
-          ranked = [r for r in cons
+          ranked: list[Register] = [r for r in cons
                     if not any((r.index + k) in occupied for k in range(need))
                     and all((r.index + k) in pool_idxs for k in range(need))]
           if ranked:
@@ -4376,41 +4394,43 @@ class AMDRenderer(ISARenderer):
         if pu.op is Ops.INS and _iop(pu) is AMDOps.PACK_F16 and _pack_f16_is_vec_load(pu) and len(pu.src) >= 2:
           for si, s in enumerate(pu.src):
             idx[s] = (pu, si)
-      self._pack_lload_index = idx
+      self._pack_lload_index: dict[UOp, tuple[UOp, int]] = idx
     got = idx.get(u)
     if got is None: return cons
     pack, si = got
-    bases = getattr(self, "_pack_chain_bases", None)
-    if bases is None: bases = self._pack_chain_bases = {}
+    chain_bases: dict[int, int] | None = getattr(self, "_pack_chain_bases", None)
+    if chain_bases is None:
+      self._pack_chain_bases: dict[int, int] = {}
+      chain_bases = self._pack_chain_bases
     need = sum(_reg_slots(s) for s in pack.src)
-    occupied: set[int] = set()
+    chain_occupied: set[int] = set()
     for p in live.values():
-      if isinstance(p, Register): occupied.add(p.index)
+      if isinstance(p, Register): chain_occupied.add(p.index)
     if si == 0:
       # Prefer a base where the full pack span is free and in this UOp's cons pool.
       pool_idxs = {r.index for r in u.tag[0].cons}
-      ranked: list = []
+      chain_ranked: list[Register] = []
       for r in cons:
         base = r.index
-        if any((base + k) in occupied for k in range(need)): continue
+        if any((base + k) in chain_occupied for k in range(need)): continue
         if not all((base + k) in pool_idxs for k in range(need)): continue
-        ranked.append(r)
-      if not ranked:
+        chain_ranked.append(r)
+      if not chain_ranked:
         # Soft full-span reserve (AMD_PACK_LLOAD_SOFT) removed — scrambled fragment order.
         return cons
       # Prefer WMMA-aligned bases (mod 8) — A/B matrices want 8-VGPR alignment; reduces evacuate.
       # Then lowest index (earlier free space) so later pack srcs can chain before the band fills.
       if need >= 8 and not getenv("AMD_FLASH_ACC_SMALL", 0):
-        ranked = sorted(ranked, key=lambda r: (0 if r.index % 8 == 0 else 1, r.index))
+        chain_ranked = sorted(chain_ranked, key=lambda r: (0 if r.index % 8 == 0 else 1, r.index))
       elif need >= 4:
-        ranked = sorted(ranked, key=lambda r: (0 if r.index % 4 == 0 else 1, r.index))
+        chain_ranked = sorted(chain_ranked, key=lambda r: (0 if r.index % 4 == 0 else 1, r.index))
       else:
-        ranked = sorted(ranked, key=lambda r: r.index)
-      bases[id(pack)] = ranked[0].index
-      return tuple(ranked) + tuple(r for r in cons if r not in ranked)
+        chain_ranked = sorted(chain_ranked, key=lambda r: r.index)
+      chain_bases[id(pack)] = chain_ranked[0].index
+      return tuple(chain_ranked) + tuple(r for r in cons if r not in chain_ranked)
     # si > 0: prefer reserved base+offset, else prev+slots.
     off = sum(_reg_slots(s) for s in pack.src[:si])
-    want = bases.get(id(pack))
+    want = chain_bases.get(id(pack))
     if want is not None: want = want + off
     else:
       prev = pack.src[si - 1]
@@ -4441,9 +4461,11 @@ class AMDRenderer(ISARenderer):
        isinstance(x.tag, tuple):
       base = src_phys[0]
       off, ok = 0, True
-      for s, p in zip(x.src, src_phys):
-        n = _reg_slots(s)
-        if p.index != base.index + off: ok = False; break
+      for src, p in zip(x.src, src_phys):
+        n = _reg_slots(src)
+        if p.index != base.index + off:
+          ok = False
+          break
         off += n
       if ok and off == _reg_slots(x) and base in x.tag[0].cons: return base
       # HALF2_GLOBAL: even-lane EXTRACT dests hold full half2 words — alias PACK onto those.
@@ -4545,7 +4567,7 @@ class AMDRenderer(ISARenderer):
         if u in store_cast: out.append(store_cast[u])
         out.append(u)
       lst = out
-    d16_hi_lo = {}  # AMD_D16_HI removed
+    d16_hi_lo: dict[UOp, UOp] = {}  # AMD_D16_HI removed
     # _order_d16_lo_before_hi no-op under empty map
     lst = _hoist_gated_fmac_loads(lst)
     lst = _schedule_scalar_vmem(lst, d16_hi_lo)
@@ -4575,10 +4597,10 @@ class AMDRenderer(ISARenderer):
     # ADD↔ADD hoist removed (AMD_SCHEDULE_ADD_ADD): NaN root; dual_add not worth it.
     lst = _schedule_fmac_add_pairs(lst)
     # Snapshot for pack_chain_bias_cons (contiguous multi-src PACK_F16 LLOAD coloring).
-    self._pack_chain_uops = lst
-    self._pack_lload_index = None
+    self._pack_chain_uops: list[UOp] = lst
+    self._pack_lload_index = {}
     self._pack_chain_bases = {}
-    self._pack_half2_lo_index = None
+    self._pack_half2_lo_index = {}
     self._pack_half2_bases = {}
     return lst
   def _pure_addr(self, x:UOp) -> bool:

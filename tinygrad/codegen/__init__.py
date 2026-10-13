@@ -1,4 +1,4 @@
-from dataclasses import replace, dataclass
+from dataclasses import replace
 import itertools, functools, hashlib, json, os, pathlib, pickle, re, sys, time
 from typing import Callable
 from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, USE_TC
@@ -448,8 +448,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
     if os.environ.get("DBGTV"):
       try: type_verify(sink, spec_program)
       except RuntimeError:
-        from tinygrad.uop.render import print_uops
-        print_uops(list(sink.toposort()))
+        print(render_uir(list(sink.toposort())))
         raise
     else: type_verify(sink, spec_program)
 
@@ -559,7 +558,7 @@ pm_to_program = PatternMatcher([
 ])
 
 @rewrite_group(name=lambda ast,renderer,ret,**_: TracingKey(
-  (k:=ret.src[0].arg).name, (k.function_name, ast, ret.key, ret.program_key), ret=renderer), replay=True)
+  (k:=ret.src[0].arg).name, (k.function_name, ast, ret.key, to_program_key(ast, renderer)), ret=renderer), replay=True)
 @Context(ALLOW_DEVICE_USAGE=0)
 def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   """

@@ -21,8 +21,8 @@ class WMMASchedulePolicy:
     for u in sink.toposort():
       if u.op is Ops.WMMA:
         for s in u.src:
-          deps = {l for l in s.toposort() if l.op is Ops.LOAD and l.src[0].addrspace is not AddrSpace.REG}
-          wmma_deps.setdefault(u, []).append(deps)
+          load_deps = {l for l in s.toposort() if l.op is Ops.LOAD and l.src[0].addrspace is not AddrSpace.REG}
+          wmma_deps.setdefault(u, []).append(load_deps)
       if u.op is Ops.STORE and len(u.src) > 1 and u.src[1].op is Ops.INDEX:
         w = u.src[1].src[0]
         if w.op is Ops.WMMA: wmma_consumers.setdefault(w, []).append(u)
@@ -37,7 +37,7 @@ class WMMASchedulePolicy:
     for i, g in enumerate(sched_groups.values()):
       deps: set[UOp] = set()
       for w in g:
-        for ls in wmma_deps[w]: deps.update(ls)
+        for loads in wmma_deps[w]: deps.update(loads)
       if i > 0:
         for l in deps:
           if l not in scheduled: self.schedule_past[l] = tuple(carry)

@@ -5,6 +5,8 @@ exist — keeps emit pairing reviewable without a circular import.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import getenv
 from tinygrad.renderer.amd.dsl import Reg
@@ -15,8 +17,13 @@ from tinygrad.uop import Ops
 from tinygrad.uop.ops import UOp
 
 # Patched by rdna3.bind_vopd() after helpers are defined.
-_iop = _dst = _src = _vgpr_num = _fmac_mul_operand_choices = None  # type: ignore[assignment]
-_mov_imm_or_src = _reg_slots = None  # type: ignore[assignment]
+_iop: Any = None
+_dst: Any = None
+_src: Any = None
+_vgpr_num: Any = None
+_fmac_mul_operand_choices: Any = None
+_mov_imm_or_src: Any = None
+_reg_slots: Any = None
 
 def bind_vopd(*, iop, dst, src, vgpr_num, fmac_mul_operand_choices, mov_imm_or_src=None, reg_slots=None) -> None:
   global _iop, _dst, _src, _vgpr_num, _fmac_mul_operand_choices, _mov_imm_or_src, _reg_slots

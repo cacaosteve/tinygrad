@@ -293,7 +293,7 @@ def wide_restore(ctx, v, r, i):
   if v in ctx.remat or (const_leaf and v not in ctx.spills):
     if const_leaf:
       return ctx.ren.remat(vd, r, [])
-    src_regs = []
+    src_regs: list[Any] = []
     for su in vd.src:
       if su.op is Ops.CONST or not isinstance(sv:=greg(su), Register): src_regs.append(None)
       else: src_regs.append(ctx.reals[i][sv])

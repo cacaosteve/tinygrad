@@ -6,6 +6,7 @@ from enum import auto, IntEnum, Enum
 class FastEnum(IntEnum):
   def __str__(self): return Enum.__str__(self)
   def __repr__(x): return str(x)
+  def __reduce_ex__(self, proto): return getattr, (type(self), self.name)
   @staticmethod
   def _generate_next_value_(_, __, ___, last_values): return 1 + max([0, *last_values, *[max(c) for c in FastEnum.__subclasses__()]])
 
