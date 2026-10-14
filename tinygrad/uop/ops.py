@@ -1339,6 +1339,7 @@ class KernelInfo:
   opts_to_apply: tuple|None = None
   estimates: Estimates|None = None
   beam: int = 0
+  schedule_hints: tuple[str, ...] = tuple()
   @property
   def function_name(self): return to_function_name(self.name)
 

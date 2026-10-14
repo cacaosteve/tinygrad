@@ -47,7 +47,8 @@ class Scheduler:
       special_uops = sorted([x for x in self.ast.backward_slice if x.op is Ops.SPECIAL], key=lambda x: x.arg)
       special_ops = [colored(str(x.vmax+1), "blue" if x.arg[0] == "g" else "cyan") for x in special_uops]
       name = k_type + colored('_', 'BLACK').join(['']+special_ops+[colored(x.src[0].render(), color) for x,color in zip(self.rngs, self.colors())])
-    return self.ast.replace(arg=KernelInfo(name=name, applied_opts=tuple(self.applied_opts)), tag=1)
+    hints = self.ast.arg.schedule_hints if self.ast.arg is not None else ()
+    return self.ast.replace(arg=KernelInfo(name=name, applied_opts=tuple(self.applied_opts), schedule_hints=hints), tag=1)
 
   def convert_loop_to_global(self) -> None:
     if not self.ren.has_local: return

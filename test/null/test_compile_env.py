@@ -3,8 +3,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from tinygrad.engine.realize import _compile_kernel
 from tinygrad.codegen import to_program_mem_key
+from tinygrad.codegen.opt.postrange import Scheduler
+from tinygrad.renderer import Renderer
+from tinygrad.helpers import Target
 import tinygrad.engine.worker as worker
 from tinygrad.helpers import getenv
+from tinygrad.uop.ops import KernelInfo, UOp
 
 class TestCompileEnv(unittest.TestCase):
   def test_worker_compile_env_is_scoped(self):
@@ -31,6 +35,11 @@ class TestCompileEnv(unittest.TestCase):
       with patch.dict(os.environ, {key:"first"}): first = to_program_mem_key(None, None)
       with patch.dict(os.environ, {key:"second"}): second = to_program_mem_key(None, None)
     self.assertNotEqual(first, second)
+
+  def test_kernel_schedule_hints_survive_optimization(self):
+    ast = UOp.sink(UOp.const(0), arg=KernelInfo(opts_to_apply=(), schedule_hints=("wmma_interleave",)))
+    optimized = Scheduler(ast, Renderer(Target())).get_optimized_ast("hint_test")
+    self.assertEqual(optimized.arg.schedule_hints, ("wmma_interleave",))
 
   def test_worker_pool_restarts_for_new_compile_environment(self):
     class FakePool:
