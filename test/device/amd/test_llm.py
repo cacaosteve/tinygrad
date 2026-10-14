@@ -471,6 +471,21 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
       finally: getenv.cache_clear()
     np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=2e-3)
 
+  def test_direct_flash_jit_repeated_submit(self):
+    if not amd_direct_isa(Tensor.empty(1).device): self.skipTest("RDNA3 DIRECT required")
+    from tinygrad.helpers import getenv
+    rng = np.random.default_rng(71)
+    q = Tensor(rng.normal(size=(1, 32, 32, 128)).astype(np.float16)).realize()
+    cache = Tensor(rng.normal(size=(2, 1, 8, 2048, 128)).astype(np.float16)).realize()
+    with patch.dict(os.environ, {"AMD_FLASH_DIRECT": "1"}):
+      getenv.cache_clear()
+      try:
+        run = TinyJit(lambda qq: flash_attention(qq, cache, 2048).realize())
+        for _ in range(3): reference = run(q).numpy()
+        for _ in range(3): out = run(q)
+        np.testing.assert_allclose(out.numpy(), reference, rtol=0, atol=0)
+      finally: getenv.cache_clear()
+
   def test_prefill_attention_nonfinite_cache_tail(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     rng = np.random.default_rng(42)

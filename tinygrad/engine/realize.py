@@ -189,6 +189,12 @@ def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
                 var_vals={**ctx.var_vals, **{k: v for d in info.device for k, v in cast(Any, Device[d]).var_vals.items()}})
   slots = {d: cast(Buffer, call.src[1 + i].buffer) for d, i in info.slots}
   for d in {d for devs, _, _, prof, *_ in info.kernels for d in devs if prof and (slots[d], prof[0]) in Device[d].prof_ents}: Device[d].synchronize()
+  # Wait for the prior batch before re-arming the HCQ fence. Long flash kernels can
+  # otherwise race the next submit's host-side timeline/slot update.
+  for device in info.device:
+    d = cast(Any, Device[device])
+    tl = d.timeline.host.view(fmt='Q')
+    d._wait_signal(tl, int(tl[1]))
   ets = exec_kernel(ctx, call, ast, devices=(Device[info.device[0]].host,))
   if not (ctx.wait or PROFILE): return ets
 
