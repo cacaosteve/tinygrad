@@ -2,13 +2,14 @@
 """Paired DIRECT | LLVM | HIP scorecard on one machine.
 
 Flash: DIRECT/HIP use hand kernels (CUSTOM); LLVM cannot render those — column uses
-SDPA (documented). Matmul/GEMV compare same Tensor graphs.
+SDPA (documented). Matmul and Q4_K/Q5_K/Q6_K/IQ4_XS GEMV compare the same Tensor graphs.
+The matrix reports checksums as a smoke signal; correctness gates are the device tests.
 
 Usage:
   AMD_SOFT_SYSFS=1 PYTHONPATH=. python extra/rdna3_backend_matrix.py
 """
 from __future__ import annotations
-import json, os, statistics, subprocess, sys, time
+import json, os, subprocess, sys
 
 PY = sys.executable
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -134,12 +135,19 @@ from tinygrad.llm.kernels.amd import Linear
 getenv.cache_clear(); to_program_cache.clear()
 DEV.value = os.environ["DEV"]
 rows, cols, tokens = 8192, 2048, 1
-QK, block_bytes, ggml_type = 256, 144, 12
+qtype = os.environ["QTYPE"]
+ggml_type, QK, block_bytes, scale_fields = {
+  "Q4_K": (12, 256, 144, ((0, 0.03125), (2, 0.015625))),
+  "Q5_K": (13, 256, 176, ((0, 0.03125), (2, 0.015625))),
+  "Q6_K": (14, 256, 210, ((208, 0.03125),)),
+  "IQ4_XS": (23, 256, 136, ((0, 0.03125),)),
+}[qtype]
 blocks = rows * cols // QK
 idx = np.arange(blocks * block_bytes, dtype=np.uint32)
 qdata = ((idx * 37 + 13 + (idx >> 8) * 17) & 0xff).astype(np.uint8)
 qblocks = qdata.reshape(blocks, block_bytes)
-qblocks[:, :4] = np.array([0.03125, 0.015625], dtype=np.float16).view(np.uint8)
+for offset, value in scale_fields:
+  qblocks[:, offset:offset+2] = np.array([value], dtype=np.float16).view(np.uint8)
 x_np = (((np.arange(tokens * cols, dtype=np.int32) % 31) - 15) / 16.0).astype(np.float32).reshape(tokens, cols)
 raw = Tensor(np.pad(qdata, (4, 0)), device=Device.DEFAULT).contiguous().realize()[4:]
 decoded = ggml_data_to_tensor(raw, rows * cols, ggml_type).reshape(rows, cols)
@@ -161,7 +169,7 @@ for _ in range(int(os.environ.get("NREP", "60"))):
   xs.append((time.perf_counter_ns() - t0) / 1e3)
 xs = sorted(xs)
 print(json.dumps({
-  "workload": "q4k_gemv_8192x2048", "backend": os.environ["BACKEND"],
+  "workload": f"{qtype.lower()}_gemv_8192x2048", "qtype": qtype, "backend": os.environ["BACKEND"],
   "dev": os.environ["DEV"], "renderer": type(Device[Device.DEFAULT].renderer).__name__,
   "sum": float(arr.astype("float64").sum()) if np.isfinite(arr).all() else None,
   "finite": bool(np.isfinite(arr).all()),
@@ -207,10 +215,12 @@ def main() -> None:
   for be, dev, extra in BACKENDS:
     print(f"… matmul {be}", flush=True)
     rows.append(run_child(be, dev, extra, MATMUL_CHILD, {"N": "2048", "NREP": "40"}))
-  for be, dev, extra in BACKENDS:
-    print(f"… gemv {be}", flush=True)
-    # Q4K wants full VGPR (product-16 ACC_BASE=96 taxes GEMV if sticky).
-    rows.append(run_child(be, dev, extra, GEMV_CHILD, {"NREP": "60", "AMD_WMMA_ACC_BASE": "-1"}))
+  for qtype in ("Q4_K", "Q5_K", "Q6_K", "IQ4_XS"):
+    for be, dev, extra in BACKENDS:
+      print(f"… {qtype} gemv {be}", flush=True)
+      env_extra = {"QTYPE": qtype, "NREP": "60"}
+      if qtype == "Q4_K": env_extra["AMD_WMMA_ACC_BASE"] = "-1"
+      rows.append(run_child(be, dev, extra, GEMV_CHILD, env_extra))
 
   print("=== MATRIX ===", flush=True)
   for r in rows:
@@ -245,6 +255,8 @@ def main() -> None:
       print(json.dumps({
         "workload": wl, "backend": be,
         "median_us": med, "vs_hip": round(med / base, 3),
+        "sum_delta_vs_hip": m[be].get("sum") - m["hip"].get("sum") if m[be].get("sum") is not None and
+                             m["hip"].get("sum") is not None else None,
       }), flush=True)
 
 
