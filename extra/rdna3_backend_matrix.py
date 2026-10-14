@@ -2,7 +2,7 @@
 """Paired DIRECT | LLVM | HIP scorecard on one machine.
 
 Flash: DIRECT/HIP use hand kernels (CUSTOM); LLVM cannot render those — column uses
-SDPA (documented). Matmul and Q4_K/Q5_K/Q6_K/IQ4_XS GEMV compare the same Tensor graphs.
+SDPA (documented). Matmul and Q4_K/Q5_K/Q6_K/IQ4_XS/Q8_0 GEMV compare the same Tensor graphs.
 The matrix reports checksums as a smoke signal; correctness gates are the device tests.
 
 Usage:
@@ -141,6 +141,7 @@ ggml_type, QK, block_bytes, scale_fields = {
   "Q5_K": (13, 256, 176, ((0, 0.03125), (2, 0.015625))),
   "Q6_K": (14, 256, 210, ((208, 0.03125),)),
   "IQ4_XS": (23, 256, 136, ((0, 0.03125),)),
+  "Q8_0": (8, 32, 34, ((0, 0.03125),)),
 }[qtype]
 blocks = rows * cols // QK
 idx = np.arange(blocks * block_bytes, dtype=np.uint32)
@@ -215,7 +216,7 @@ def main() -> None:
   for be, dev, extra in BACKENDS:
     print(f"… matmul {be}", flush=True)
     rows.append(run_child(be, dev, extra, MATMUL_CHILD, {"N": "2048", "NREP": "40"}))
-  for qtype in ("Q4_K", "Q5_K", "Q6_K", "IQ4_XS"):
+  for qtype in ("Q4_K", "Q5_K", "Q6_K", "IQ4_XS", "Q8_0"):
     for be, dev, extra in BACKENDS:
       print(f"… {qtype} gemv {be}", flush=True)
       env_extra = {"QTYPE": qtype, "NREP": "60"}
