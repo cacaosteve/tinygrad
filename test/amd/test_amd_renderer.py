@@ -15,7 +15,7 @@ from tinygrad.renderer.isa.rdna3 import _loop_label
 from tinygrad.runtime.autogen import amdgpu_kd
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.uop import Ops
-from tinygrad.uop.ops import AxisType, CallInfo, KernelInfo, UOp, graph_rewrite
+from tinygrad.uop.ops import AxisType, KernelInfo, UOp, graph_rewrite
 import tinygrad.renderer.isa.amd as amd_lib
 from tinygrad.renderer.isa.amd import AMDRenderer, AMDOps
 
@@ -74,10 +74,8 @@ def _amd_rt(prg):
   def run(*bufs, global_size, local_size, vals, wait):
     assert len(bufs) == len(prg.arg.globals)
     args = [UOp.from_buffer(buf, dtypes.uint8) for buf in bufs]
-    var_vals = {var.expr: val for var, val in zip(prg.arg.vars, vals) if var.is_variable}
-    # These hardware fixtures intentionally contain low-level weak RANGE nodes inside
-    # the PROGRAM body, so construct the opaque CALL directly instead of using UOp.call.
-    call = UOp(Ops.CALL, src=(prg, *args), arg=CallInfo())
+    var_vals = {var.expr: val for var, val in zip((p for p in prg.arg.params if p.is_variable), vals)}
+    call = prg.call(*args)
     run_linear(UOp(Ops.LINEAR, src=(call,)), var_vals=var_vals, wait=wait)
   return run
 
@@ -1005,8 +1003,8 @@ class TestAMDRenderer(unittest.TestCase):
           self.assertEqual(opts[0], Opt(OptOps.SPLIT, 1, (16, AxisType.LOCAL)))
           self.assertEqual(opts[1], Opt(OptOps.SPLIT, opts[1].axis, (8, AxisType.UPCAST)))
         elif name == "IQ4_XS":
-          self.assertEqual(opts[:2], (Opt(OptOps.SPLIT, 1, (0, AxisType.LOCAL)), Opt(OptOps.SPLIT, 2, (0, AxisType.LOCAL))))
-          self.assertEqual(opts[2], Opt(OptOps.SPLIT, opts[2].axis, (0, AxisType.UPCAST)))
+          # The current scheduler keeps a 4-way reduction upcast and maps output rows to one 32-lane wave.
+          self.assertEqual(opts, (Opt(OptOps.SPLIT, 0, (4, AxisType.UPCAST)), Opt(OptOps.SPLIT, 0, (32, AxisType.LOCAL))))
         else:
           self.assertEqual(opts[0], Opt(OptOps.SPLIT, 5, (32, AxisType.LOCAL)))
           self.assertTrue(all(o.op is OptOps.SPLIT and isinstance(o.arg, tuple) and o.arg[0] == 0 and o.arg[1] is AxisType.UPCAST for o in opts[1:]))

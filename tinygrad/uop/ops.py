@@ -476,6 +476,11 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   @property
   def ranges(self) -> dict[UOp, None]:
     if self.op is Ops.RANGE: return {self:None} | self._ranges
+    # Local ranges in a compiled program are owned by the kernel body, not its caller.
+    if self.op is Ops.CALL and self.src[0].op is Ops.PROGRAM:
+      device_ranges = {r:None for r in self.src[0].ranges if r.axis_type is AxisType.DEVICE}
+      arg_ranges = {r:None for s in self.src[1:] for r in s.ranges}
+      return device_ranges | arg_ranges
     return self._ranges
 
   @property
@@ -1246,9 +1251,11 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     """call a body with the given args: a plain CallInfo CALL. all inputs must be ready (buffers/params), this never
     creates ALLOCs: use call_with_outputs for calls that produce values"""
     assert self.op in OPAQUE_CALL_BODIES, f"cannot call a {self.op} body, use call_with_outputs for value-producing bodies"
-    # calls are launched per device, so an open DEVICE range is allowed to cross the call boundary
-    assert all(r.axis_type is AxisType.DEVICE for r in self.ranges), \
-      f"ranges {self.ranges} are leaking out of the call in {self.render_uir()}"
+    # calls are launched per device, so only DEVICE ranges can cross the call boundary. Local ranges in a compiled
+    # program are already inside the kernel body and don't leak to its caller.
+    ranges = {r for r in self.ranges if self.op is not Ops.PROGRAM or r.axis_type is AxisType.DEVICE}
+    assert all(r.axis_type is AxisType.DEVICE for r in ranges), \
+      f"ranges {ranges} are leaking out of the call in {self.render_uir()}"
     # an external C call is a CALL on a CUSTOM_FUNCTION body stating the (possibly void) return dtype, the callee
     # (a function pointer) in source, rendered as an indirect call
     return UOp(Ops.CALL, src=(self,)+srcs, arg=CallInfo(grad_fxn, name, precompile, precompile_backward, aux))

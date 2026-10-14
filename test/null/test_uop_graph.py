@@ -1,7 +1,7 @@
 import unittest, pytest, weakref
 from tinygrad import dtypes, Variable
 from tinygrad.dtype import AddrSpace
-from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, graph_rewrite, GroupOp, AxisType, broadcast_axes, KernelInfo
+from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, graph_rewrite, GroupOp, AxisType, broadcast_axes, KernelInfo, ProgramInfo
 from tinygrad.uop.symbolic import sym
 from tinygrad.codegen.simplify import pm_reduce_unparented
 from test.helpers import full_rewrite, to_uops_list
@@ -438,6 +438,12 @@ class TestUOpGraph(unittest.TestCase):
     fn = UOp.custom_function("external", dtype=dtypes.int)
     call = fn.call(UOp.const(0, dtypes.uint64), r + 1)
     self.assertEqual(set(call.ranges), {r})
+
+  def test_program_call_hides_local_ranges(self):
+    local, device = UOp.range(4, 0, AxisType.WEAK), UOp.range(4, 1, AxisType.DEVICE)
+    program = UOp(Ops.PROGRAM, src=(UOp.sink(local, device),), arg=ProgramInfo())
+    self.assertEqual(set(program.ranges), {local, device})
+    self.assertEqual(set(program.call().ranges), {device})
 
   def test_backedge_preserves_outer_range(self):
     outer, inner = UOp.range(4, 0), UOp.loop(1)
