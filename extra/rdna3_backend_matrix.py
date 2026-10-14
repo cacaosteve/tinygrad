@@ -134,7 +134,9 @@ from tinygrad.llm.kernels.amd import Linear
 
 getenv.cache_clear(); to_program_cache.clear()
 DEV.value = os.environ["DEV"]
-rows, cols, tokens = 8192, 2048, 1
+rows = int(os.environ.get("ROWS", "8192"))
+cols = int(os.environ.get("COLS", "2048"))
+tokens = int(os.environ.get("TOKENS", "1"))
 qtype = os.environ["QTYPE"]
 ggml_type, QK, block_bytes, scale_fields = {
   "Q4_K": (12, 256, 144, ((0, 0.03125), (2, 0.015625))),
@@ -170,7 +172,7 @@ for _ in range(int(os.environ.get("NREP", "60"))):
   xs.append((time.perf_counter_ns() - t0) / 1e3)
 xs = sorted(xs)
 print(json.dumps({
-  "workload": f"{qtype.lower()}_gemv_8192x2048", "qtype": qtype, "backend": os.environ["BACKEND"],
+  "workload": f"{qtype.lower()}_gemv_{rows}x{cols}_t{tokens}", "qtype": qtype, "backend": os.environ["BACKEND"],
   "dev": os.environ["DEV"], "renderer": type(Device[Device.DEFAULT].renderer).__name__,
   "sum": float(arr.astype("float64").sum()) if np.isfinite(arr).all() else None,
   "finite": bool(np.isfinite(arr).all()),
@@ -222,6 +224,14 @@ def main() -> None:
       env_extra = {"QTYPE": qtype, "NREP": "60"}
       if qtype == "Q4_K": env_extra["AMD_WMMA_ACC_BASE"] = "-1"
       rows.append(run_child(be, dev, extra, GEMV_CHILD, env_extra))
+
+  # Multitoken quantized GEMV exercises the WMMA path; keep it opt-in so the quick matrix stays quick.
+  if os.getenv("RDNA3_MATRIX_Q6_T32") == "1":
+    for be, dev, extra in BACKENDS:
+      print(f"… Q6_K gemv t32 {be}", flush=True)
+      rows.append(run_child(be, dev, extra, GEMV_CHILD, {
+        "QTYPE": "Q6_K", "ROWS": "4096", "COLS": "4096", "TOKENS": "32", "NREP": "60",
+      }))
 
   print("=== MATRIX ===", flush=True)
   for r in rows:
