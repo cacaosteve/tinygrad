@@ -437,7 +437,7 @@ def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_wa
 
 def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, dequant, name, swizzle_stores:bool=False,
                        dequant_halves:Callable[[UOp, UOp], tuple[tuple[UOp, ...], tuple[UOp, ...]]]|None=None, rdna4:bool=False,
-                       interleave_wmma:bool=False):
+                       interleave_wmma:bool=False, reverse_interleave_wmma:bool=False):
   x = x.reshape(out.shape[0], in_features)
   output_waves, token_block, output_block, lane, wave, physical_half, outputs, input_tokens, tokens = layout
   token_tile, output_tiles = len(tokens)*16, len(outputs)
@@ -468,7 +468,7 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
   stores = _wmma_stores(out, outputs, tokens, accs, update, physical_half, lane, wave, output_waves,
                         swizzle_stores=swizzle_stores, rdna4=rdna4)
   return UOp.group(*stores).end(token_block, output_block, lane, wave).sink(arg=KernelInfo(name=name, opts_to_apply=(),
-    schedule_hints=("wmma_interleave",) if interleave_wmma else ()))
+    schedule_hints=("wmma_interleave_reverse",) if reverse_interleave_wmma else ("wmma_interleave",) if interleave_wmma else ()))
 
 @functools.cache
 def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, ggml_type:int,
@@ -627,7 +627,8 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
                  for word in words for b in range(4))
   return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[ggml_type]//raw.dtype.itemsize,
                             layout, dequant, f"linear_{QUANT_NAMES[ggml_type]}_f16_wmma", swizzle_stores=direct_isa,
-                            rdna4=rdna4, interleave_wmma=direct_isa and ggml_type == Q6_K)
+                            rdna4=rdna4, interleave_wmma=direct_isa and ggml_type == Q6_K,
+                            reverse_interleave_wmma=direct_isa and ggml_type == Q6_K and out.shape[0] == 32)
 
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in QUANT_SIZES
