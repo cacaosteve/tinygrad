@@ -949,8 +949,8 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   partial = Tensor.empty(B, H, chunks, D, dtype=pdt, device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
   # ml_lds is (WAVES, 2, G) so G==SEC (e.g. 16-wave GQA) does not alias stats L on AMDRenderer.
-  # Eight waves provide parallel context scans while keeping per-wave key state bounded.
-  waves, group = 8, H // cache_kv.shape[2]
+  # More waves parallelize context scans; reduce when their shared LDS footprint is too large.
+  waves, group = 16, H // cache_kv.shape[2]
   assert block_n % waves == 0
   while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
