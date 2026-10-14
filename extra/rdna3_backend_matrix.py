@@ -225,12 +225,13 @@ def main() -> None:
       if qtype == "Q4_K": env_extra["AMD_WMMA_ACC_BASE"] = "-1"
       rows.append(run_child(be, dev, extra, GEMV_CHILD, env_extra))
 
-  # Multitoken quantized GEMV exercises the WMMA path; keep it opt-in so the quick matrix stays quick.
-  if os.getenv("RDNA3_MATRIX_Q6_T32") == "1":
+  # Multitoken Q6 GEMV exercises the WMMA path; keep it opt-in so the quick matrix stays quick.
+  q6_tokens = (16, 32, 64) if os.getenv("RDNA3_MATRIX_Q6_MULTI") == "1" else (32,) if os.getenv("RDNA3_MATRIX_Q6_T32") == "1" else ()
+  for tokens in q6_tokens:
     for be, dev, extra in BACKENDS:
-      print(f"… Q6_K gemv t32 {be}", flush=True)
+      print(f"… Q6_K gemv t{tokens} {be}", flush=True)
       rows.append(run_child(be, dev, extra, GEMV_CHILD, {
-        "QTYPE": "Q6_K", "ROWS": "4096", "COLS": "4096", "TOKENS": "32", "NREP": "60",
+        "QTYPE": "Q6_K", "ROWS": "4096", "COLS": "4096", "TOKENS": str(tokens), "NREP": "60",
       }))
 
   print("=== MATRIX ===", flush=True)
