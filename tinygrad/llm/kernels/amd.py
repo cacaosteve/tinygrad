@@ -706,12 +706,7 @@ def _vec_load_half(ptr:UOp, lanes:int) -> tuple[UOp, ...]:
   return tuple(vec[i] if vec[i].dtype is dtypes.half else vec[i].cast(dtypes.half) for i in range(lanes))
 
 @functools.cache
-def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4,
-                                        v_serial:int=0):
-  # `v_serial` cache-key (opt-in): score without V prefetch, apply one key's V via REG
-  # checkpoints → vgpr~102 (not ≤96) +~5µs. Prefetch-V legacy ~112.
-  # Dead ends: online/head-batch/score_reg/SCORE_BATCH=2 hang; v_rescore sum0; dpl_split no cut.
-  # Shipping ≤96 lever: AMD_FLASH_WAVES=16 (SEC=4 → vgpr~80, fair ~+8µs).
+def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4):
   valid_kv_len = _unbind(valid_kv_len)
   _, B, H_KV, N, D = cast(tuple[int, int, int, int, int], cache_kv.shape)
   _, H, M, _ = cast(tuple[int, int, int, int], q.shape)
@@ -729,13 +724,8 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   # Each block scans every PARTIALS-th chunk, keeping an online softmax across rounds.
   chunk_round = UOp.range((total_chunks-1-block_chunk)//PARTIALS+1, 4, AxisType.LOOP)
   chunk_id = block_chunk + chunk_round*PARTIALS
-  # Batch keys into one warp_reduce_many so swizzle/permlane stages share lgkm waits.
-  # After decode-scoped slot-2 promote, batch=8 spills (priv 64, ~139µs e2e); batch=4 stays
-  # priv 0 (~123µs). Override AMD_FLASH_SCORE_BATCH=8 for the old full-SEC batch.
-  # V_HALF + FMA_MIX_ALL shipped on decode (fold consumer-rewrite fixed); SCORE_BATCH=4.
-  score_batch = 4  # SCORE_BATCH hardcoded
-  _v_half = True  # DECODE_V_HALF hardcoded ship
-  _v_serial = bool(v_serial)
+  # Batch four keys so independent reductions share swizzle/permlane stages without over-expanding live state.
+  score_batch = 4
   # A finite initial max keeps fully masked waves from computing exp(-inf - -inf).
   acc_reg, max_reg, sum_reg = _reg((G, DPL), 2, 0), _reg((G,), 3, -1e30), _reg((G,), 4, 0)
   prev_acc, prev_max, prev_sum = acc_reg.after(chunk_round), max_reg.after(chunk_round), sum_reg.after(chunk_round)
@@ -751,57 +741,20 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
     for j in js:
       key = chunk_id*CHUNK + wave*SEC + j
       kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
-      if not _v_serial:
-        if _v_half:
-          vfrags[j] = tuple(valids[j].where(v, zeroh) for v in _vec_load_half(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
-        else:
-          vfrags[j] = tuple(valids[j].where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
+      vfrags[j] = tuple(valids[j].where(v, zeroh) for v in _vec_load_half(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
       dots.extend([sum((qf[h][i]*kfrag[i] for i in range(DPL)), zerof) for h in range(G)])
     for t, s in enumerate(warp_reduce_many(dots, full_wave=True)):
       j, h = j0 + t // G, t % G
       scores[j][h] = valids[j].where(s * scale, UOp.const(-1e30, dtypes.float))
   row_max = [functools.reduce(UOp.maximum, (scores[j][h] for j in range(SEC)), prev_max[h].load()) for h in range(G)]
   alpha = [((prev_max[h].load()-row_max[h])*LOG2E).exp2() for h in range(G)]
-  if _v_serial:
-    # Slot 5/7: carry acc/sum across serial V keys so each V frag dies after its update.
-    work_acc = UOp.placeholder((G, DPL), dtypes.float, slot=5, addrspace=AddrSpace.REG)
-    work_sum = UOp.placeholder((G,), dtypes.float, slot=7, addrspace=AddrSpace.REG)
-    init = UOp.group(
-      work_acc.store(UOp.stack(*(alpha[h]*prev_acc[h, i].load() for h in range(G) for i in range(DPL))).reshape(G, DPL)),
-      work_sum.store(UOp.stack(*(alpha[h]*prev_sum[h].load() for h in range(G)))))
-    work_acc, work_sum = work_acc.after(init), work_sum.after(init)
-    for j in range(SEC):
-      key = chunk_id*CHUNK + wave*SEC + j
-      if _v_half:
-        vfrag = tuple(valids[j].where(v, zeroh) for v in _vec_load_half(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
-      else:
-        vfrag = tuple(valids[j].where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
-      accs = [[work_acc[h, i].load() for i in range(DPL)] for h in range(G)]
-      row_sums = [work_sum[h].load() for h in range(G)]
-      for h in range(G):
-        beta = valids[j].where(((scores[j][h]-row_max[h])*LOG2E).exp2(), zerof)
-        if _v_half:
-          accs[h] = [a + beta * v.cast(dtypes.float32) for a, v in zip(accs[h], vfrag)]
-        else:
-          accs[h] = [a + beta * v for a, v in zip(accs[h], vfrag)]
-        row_sums[h] = row_sums[h] + beta
-      st = UOp.group(
-        work_acc.store(UOp.stack(*(x for acc in accs for x in acc)).reshape(G, DPL)),
-        work_sum.store(UOp.stack(*row_sums)))
-      work_acc, work_sum = work_acc.after(st), work_sum.after(st)
-    accs = [[work_acc[h, i].load() for i in range(DPL)] for h in range(G)]
-    row_sums = [work_sum[h].load() for h in range(G)]
-  else:
-    accs = [[alpha[h]*prev_acc[h, i].load() for i in range(DPL)] for h in range(G)]
-    row_sums = [alpha[h]*prev_sum[h].load() for h in range(G)]
-    for j in range(SEC):
-      for h in range(G):
-        beta = valids[j].where(((scores[j][h]-row_max[h])*LOG2E).exp2(), zerof)
-        if _v_half:
-          accs[h] = [a + beta * v.cast(dtypes.float32) for a, v in zip(accs[h], vfrags[j])]
-        else:
-          accs[h] = [a + beta * v for a, v in zip(accs[h], vfrags[j])]
-        row_sums[h] = row_sums[h] + beta
+  accs = [[alpha[h]*prev_acc[h, i].load() for i in range(DPL)] for h in range(G)]
+  row_sums = [alpha[h]*prev_sum[h].load() for h in range(G)]
+  for j in range(SEC):
+    for h in range(G):
+      beta = valids[j].where(((scores[j][h]-row_max[h])*LOG2E).exp2(), zerof)
+      accs[h] = [a + beta * v.cast(dtypes.float32) for a, v in zip(accs[h], vfrags[j])]
+      row_sums[h] = row_sums[h] + beta
   update = UOp.group(acc_reg.store(UOp.stack(*(x for acc in accs for x in acc)).reshape(G, DPL)),
                      max_reg.store(UOp.stack(*row_max)), sum_reg.store(UOp.stack(*row_sums))).end(chunk_round)
   acc_reg, max_reg, sum_reg = acc_reg.after(update), max_reg.after(update), sum_reg.after(update)
@@ -854,8 +807,7 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
   def _pload(ci, d):
     v = partial[b, h, ci, d].load()
     return v.cast(dtypes.float) if partial.dtype == dtypes.half else v
-  # Unroll short combines. live=32 (kv_len=2048) closes the HIP decode gap (~54→51µs).
-  # COMBINE_UNROLL=32 / COMBINE_TILE removed (tile wash/regress).
+  # Unroll short combines to avoid a loop over the small set of partials.
   if isinstance(live, int) and live <= 32:
     zerof = UOp.const(0, dtypes.float)
     # Rematerialize stats M loads in the weight loop (keeping ms[] live → vgpr~169).
@@ -985,25 +937,22 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
     first = amd_flash_attention_decode(q[:, :1], cache_kv[:, :, :1], valid_kv_len, max_kv_len)
     return first.cat(*(amd_flash_attention_decode(q[:, h:h+1], cache_kv[:, :, h//group:h//group+1],
                          valid_kv_len, max_kv_len) for h in range(1, H)), dim=1)
-  # block_n=64 ship; 128 cuts combine live 32→16 (try AMD_FLASH_BLOCK_N=128).
+  # Split key/value context into 64-token chunks.
   block_n = 64  # BLOCK_N hardcoded
   assert max_kv_len % block_n == 0, f"max_kv_len={max_kv_len} must divide block_n={block_n}"
   chunks = max_kv_len // block_n
   # PARTIAL_HALF: store normalized partials as f16 (less combine BW); cast up in combine.
-  pdt = "float32"  # PARTIAL_HALF removed
+  pdt = "float32"
   partial = Tensor.empty(B, H, chunks, D, dtype=pdt, device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
   # ml_lds is (WAVES, 2, G) so G==SEC (e.g. 16-wave GQA) does not alias stats L on AMDRenderer.
-  # Default 8 (~123µs). WAVES=16: SEC=4 → vgpr~80 (≤96) but fair e2e ~+8µs; fp16 LDS
-  # combine sum drifts ~0.05 (maxabs vs w8 ~1e-4). WAVES=4 fails decode_gqa.
-  waves, group = 8, H // cache_kv.shape[2]  # WAVES=8 ship (16=vgpr80/+8µs)
-  assert block_n % waves == 0, f"AMD_FLASH_WAVES={waves} must divide block_n={block_n}"
+  # Eight waves provide parallel context scans while keeping per-wave key state bounded.
+  waves, group = 8, H // cache_kv.shape[2]
+  assert block_n % waves == 0
   while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
-  # v_serial opt-in: ~102 vgpr (not ≤96). Default OFF. WAVES=16 = shipping ≤96 lever.
-  _v_serial = 0  # DECODE_V_SERIAL removed (regress)
   fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len,
-                          block_n=block_n, waves=waves, v_serial=_v_serial)
+                          block_n=block_n, waves=waves)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len + block_n - 1) // block_n
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)
@@ -1572,10 +1521,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     # ALLOW_UPCAST16=0 for whole decode build+realize (see _flash_direct_compile_env).
     with _flash_direct_compile_env(flash_acc_small=False):
       return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N)).realize()
-  # Direct ISA can render the hand WMMA prefill correctly, but still trails HIP and
-  # often SDPA. With AMD_FLASH_ACC_SMALL (default on for DIRECT): ~670µs vs ~1030µs
-  # scratch ACC; HIP ~268µs. SDPA fallback ~306µs remains the non-DIRECT default.
-  # Do NOT set AMD_WMMA_ACC_SMALL globally — parks ≤64 quant tiles and breaks Q4/Q6.
+  # Keep hand WMMA prefill opt-in and restricted to aligned static starts; other cases use SDPA.
+  # ACC_SMALL stays scoped to flash because global WMMA accumulator parking changes quantized GEMV behavior.
   q_tokens = _bound_int(T_real)
   aligned_causal_start = isinstance(valid_end, int) and q_tokens is not None and (valid_end-q_tokens) % BLOCK_M == 0
   # The hand PV path is wrong for partial query/KV-tile overlaps. Keep it to aligned,
