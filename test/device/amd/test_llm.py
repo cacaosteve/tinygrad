@@ -382,6 +382,28 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_flash_attention_decode_gqa_tail(self): self._test_flash_decode(3, 1, 192, 64, 37)
 
   def test_flash_attention_decode_gqa_output_layout(self): self._test_flash_decode(4, 1, 128, 256, 3)
+
+  def test_flash_attention_decode_gqa4_long_jit(self):
+    if not amd_direct_isa(Tensor.empty(1).device): self.skipTest("RDNA3 DIRECT required")
+    from tinygrad.helpers import getenv
+    def patterned(shape, dtype=np.float32):
+      size = int(np.prod(shape))
+      return (((np.arange(size, dtype=np.int32) % 127) - 63) / 64.0).astype(dtype).reshape(shape)
+    q_np, cache_np = patterned((1, 32, 1, 128), np.float16), patterned((2, 1, 8, 2048, 128), np.float16)
+    k = np.repeat(cache_np[0, 0].astype(np.float32), 4, axis=0)
+    v = np.repeat(cache_np[1, 0].astype(np.float32), 4, axis=0)
+    scores = np.einsum("hd,hnd->hn", q_np[0, :, 0].astype(np.float32), k) / np.sqrt(128)
+    probs = np.exp(scores - scores.max(-1, keepdims=True))
+    expected = np.einsum("hn,hnd->hd", probs / probs.sum(-1, keepdims=True), v)[None, :, None]
+    q, cache = Tensor(q_np).realize(), Tensor(cache_np).realize()
+    with patch.dict(os.environ, {"AMD_FLASH_DIRECT": "1"}):
+      getenv.cache_clear()
+      try:
+        run = TinyJit(lambda qq: flash_attention(qq, cache, 2048).realize())
+        for _ in range(3): out = run(q)
+        np.testing.assert_allclose(out.numpy(), expected, rtol=2e-4, atol=2e-4)
+      finally: getenv.cache_clear()
+
   @unittest.skipIf(OSX and DEV.interface.startswith("MOCK"), "TODO: incorrect results in the macOS AMD emulator")
   def test_flash_attention_decode_large_gqa_group(self): self._test_flash_decode(8, 1, 256, 256, 73)
 

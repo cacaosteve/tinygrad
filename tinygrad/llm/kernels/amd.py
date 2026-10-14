@@ -951,10 +951,10 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   pdt = "float32"
   partial = Tensor.empty(B, H, chunks, D, dtype=pdt, device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
-  # ml_lds is (WAVES, 2, G) so G==SEC (e.g. 16-wave GQA) does not alias stats L on AMDRenderer.
-  # 16 waves help the 4:1 GQA path, but hurt the recursively split per-head decode path.
+  # Pad acc LDS rows when G==SEC to avoid aliasing stats LDS on AMDRenderer.
   group = H // cache_kv.shape[2]
-  waves = 16 if group == 4 else 8
+  # 16 waves give incorrect long-context graph replays for the common 4:1 GQA case.
+  waves = 8
   assert block_n % waves == 0
   while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
