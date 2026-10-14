@@ -1,5 +1,6 @@
 import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.dtype import dtypes
 from tinygrad.helpers import getenv, DEBUG, prod, TC_OPT, TC_SELECT, TC_MIN_GLOBALS, USE_TC, IMAGE
 from tinygrad.uop.ops import Ops, resolve, AxisType
 from tinygrad.codegen.late.coalesce import image_valid_dims
@@ -100,11 +101,16 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     for vector_load in (() if simple_matvec else indexes):
       vector_idx = vector_load.src[1].get_idx()
       vector_ranges = set(vector_idx.ranges)
-      if not vector_ranges or not vector_ranges.issubset(reduce_ranges): continue
-      matrix_indexes = [u.src[1].get_idx() for u in indexes if u is not vector_load]
+      if not vector_ranges or not vector_ranges.intersection(reduce_ranges): continue
+      matrix_loads = [u for u in indexes if u is not vector_load]
+      # Batched activation vectors (e.g. per-token MoE experts) are only treated as matvecs when
+      # the matrix is a large packed weight; small quantized reductions include flash attention.
+      if not vector_ranges.issubset(reduce_ranges) and not any(p.op is Ops.PARAM and p.dtype is dtypes.uchar and
+        isinstance(p.max_numel(), int) and p.max_numel() >= 1_000_000 for u in matrix_loads for p in u.src[0].toposort()): continue
+      matrix_indexes = [u.src[1].get_idx() for u in matrix_loads]
       matrix_ranges = set().union(*(idx.ranges for idx in matrix_indexes))
-      is_matrix_vector = vector_ranges.issubset(matrix_ranges) and any(any(r.axis_type is AxisType.GLOBAL for r in idx.ranges)
-                                                                       for idx in matrix_indexes)
+      is_matrix_vector = vector_ranges.issubset(matrix_ranges) and any(r.axis_type is AxisType.GLOBAL and r not in vector_ranges
+                                                                       for idx in matrix_indexes for r in idx.ranges)
       unit_reduce_ranges = [r for r in k.reduce_ranges if r in vector_idx.split_uop(Ops.ADD) and
                             r.src[0].divides(complex_mv_group) is not None]
       if is_matrix_vector and unit_reduce_ranges:
