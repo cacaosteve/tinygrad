@@ -593,7 +593,9 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
                                   rdna4:bool=False) -> UOp:
   token_tile = (32 if out.shape[0] % 32 == 0 else 16) if ggml_type == Q3_K else \
     64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
-  output_tiles = 1 if direct_isa and (out_features % 32 or ggml_type in (IQ2_S, IQ3_XXS, IQ4_NL, IQ3_S)) else 2
+  # On RDNA3, a single Q6 output tile is faster than two for multi-token WMMA.
+  output_tiles = 1 if direct_isa and (out_features % 32 or ggml_type in (IQ2_S, IQ3_XXS, IQ4_NL, IQ3_S) or
+                                      ggml_type == Q6_K and not rdna4) else 2
   layout = _wmma_layout(out, out_features, token_tile, output_tiles)
   output_waves, _, _, lane, wave, physical_half, _, _, _ = layout
   word_indices = (physical_half, physical_half+2) if rdna4 else tuple(range(4))
