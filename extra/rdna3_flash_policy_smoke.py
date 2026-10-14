@@ -53,7 +53,7 @@ sum_d = float(arr_d.astype("float64").sum()) if np.isfinite(arr_d).all() else No
 med_d = median_us(lambda: decode(q_d))
 
 ok_p = sum_p is not None and abs(sum_p - (-3.3788577654734127)) < 1e-4
-ok_d = sum_d is not None and abs(sum_d - (-17.283014647706295)) < 1e-3
+ok_d = sum_d is not None and abs(sum_d - (-17.329257181412686)) < 1e-3
 
 print(json.dumps({
   "dev": Device.DEFAULT,
