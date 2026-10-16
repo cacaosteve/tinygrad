@@ -3,7 +3,7 @@ import enum, functools, itertools, math, pathlib, re
 from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, amd_direct_isa
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
 from tinygrad.uop.ops import resolve
 from tinygrad.helpers import unwrap, round_up
@@ -212,6 +212,10 @@ class FFNBlock:
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
     self._init_state(x)
+    # Direct ISA flash decode realizes its kernel and must stay outside @function's device-use scope.
+    if amd_direct_isa(x.device) and x.shape[1] == 1:
+      h = x + self._attention(self.attn_norm(x), start_pos)
+      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
@@ -257,7 +261,7 @@ class TransformerBlock(FFNBlock):
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
     # on RDNA3/4, hybrid models use custom flash attention kernels on the KV cache
-    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
+    if amd_custom_kernels_supported(x.device) and (self.config.ssm is not None or (amd_direct_isa(x.device) and T == 1)):
       attn = flash_attention(q, assigned_kv, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
