@@ -122,6 +122,7 @@ def _reg(shape:tuple[int, ...], slot:int, value:float, dep:UOp|None=None) -> UOp
 class Linear(nn.Linear):
   ggml_type:int|None = None
   use_custom_quant = True
+  shard_axis:int|None = None
   def __init__(self, in_features:int, out_features:int, bias=True):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
@@ -129,20 +130,20 @@ class Linear(nn.Linear):
     if self.in_features % GGML_BLOCK_SIZE: return
     packed_sizes = {typ: decoded.numel() // 256 * type_size for typ,type_size in QUANT_SIZES.items()}
     graph = decoded.uop.toposort()
-    raw = next((u for u in graph if u.op is Ops.SHRINK and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes.values()), None)
-    # Full-span slices can canonicalize away; then the original packed uint8 buffer is the raw view.
-    if raw is None: raw = next((u for u in graph if u.op is Ops.BUFFER and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes.values()), None)
+    raw = next((u for u in graph if u.op in (Ops.SHRINK, Ops.BUFFER, Ops.UNSHARD) and u.dtype == dtypes.uint8 and
+                prod(u.shape) in packed_sizes.values()), None)
     if raw is None: return
     # Only unwrap storage/order-preserving views, then require the exact dequantization expression.
     # This rejects subsequent arithmetic and permutations, including RoPE's concatenated query weights.
     def unwrapped(u:UOp) -> UOp:
-      while u.op in (Ops.RESHAPE, Ops.STAGE) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
+      while u.op in (Ops.RESHAPE, Ops.STAGE) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)) or \
+        (u.op is Ops.PERMUTE and (kept:=[a for a in u.marg if u.src[0].shard_shape[a] != 1]) == sorted(kept)):
         u = u.src[0]
       return u
     # Several formats have the same byte count (Q3_K/IQ3_S and Q4_K/IQ4_NL). Match the expression, not just the size.
     for ggml_type, size in packed_sizes.items():
       if size != prod(raw.shape): continue
-      expected = ggml_data_to_tensor(Tensor(raw), self.in_features * self.out_features, ggml_type)
+      expected = ggml_data_to_tensor(Tensor(raw).flatten(), self.in_features * self.out_features, ggml_type)
       if unwrapped(decoded.uop).key == unwrapped(expected.uop).key: break
     else: return
     # Some blocks are only halfword-aligned; keep all formats as zero-copy views of the GGUF storage.
@@ -150,7 +151,8 @@ class Linear(nn.Linear):
     raw_offset = raw.contiguous_view_offset()
     if raw_offset is None or raw_offset % word_dtype.itemsize or raw.buf_uop.dtype != dtypes.uint8: return
     self.ggml_type = ggml_type
-    self.weight = Tensor(raw).bitcast(word_dtype).contiguous()
+    self.shard_axis = decoded.uop.axis
+    self.weight = Tensor(raw).flatten().bitcast(word_dtype).contiguous()
   def __call__(self, x:Tensor) -> Tensor:
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
