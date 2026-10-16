@@ -26,7 +26,7 @@ class TestRegalloc(unittest.TestCase):
     self.assertEqual(len(add), 1)
     self.assertLess(sub[0], add[0])
     self.assertLess(add[0], ret)
-    self.assertIs(lin[-1].op, Ops.SINK)
+    self.assertEqual(ret, len(lin)-1)
 
 
 if __name__ == "__main__":
