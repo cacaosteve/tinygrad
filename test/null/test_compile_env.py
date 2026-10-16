@@ -37,10 +37,9 @@ class TestCompileEnv(unittest.TestCase):
     self.assertNotEqual(first, second)
 
   def test_kernel_schedule_hints_survive_optimization(self):
-    for hint in ("wmma_interleave", "wmma_interleave_reverse"):
-      ast = UOp.sink(UOp.const(0), arg=KernelInfo(opts_to_apply=(), schedule_hints=(hint,)))
-      optimized = Scheduler(ast, Renderer(Target())).get_optimized_ast("hint_test")
-      self.assertEqual(optimized.arg.schedule_hints, (hint,))
+    ast = UOp.sink(UOp.const(0), arg=KernelInfo(opts_to_apply=(), schedule_hints=("wmma_interleave",)))
+    optimized = Scheduler(ast, Renderer(Target())).get_optimized_ast("hint_test")
+    self.assertEqual(optimized.arg.schedule_hints, ("wmma_interleave",))
 
   def test_worker_pool_restarts_for_new_compile_environment(self):
     class FakePool:

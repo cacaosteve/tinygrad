@@ -13,7 +13,7 @@ from tinygrad.uop import Ops
 from tinygrad.uop.ops import PatternMatcher, UPat, UOp
 
 class WMMASchedulePolicy:
-  def __init__(self, sink:UOp, reverse:bool=False):
+  def __init__(self, sink:UOp):
     self.schedule_past: dict[UOp, tuple[UOp, ...]] = {}
 
     wmma_deps: dict[UOp, list[set[UOp]]] = {}
@@ -34,8 +34,7 @@ class WMMASchedulePolicy:
 
     carry: list[UOp] = []
     scheduled: set[UOp] = set()
-    groups = tuple(sched_groups.values())
-    for i, g in enumerate(reversed(groups) if reverse else groups):
+    for i, g in enumerate(sched_groups.values()):
       deps: set[UOp] = set()
       for w in g:
         for loads in wmma_deps[w]: deps.update(loads)

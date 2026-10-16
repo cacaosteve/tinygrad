@@ -583,10 +583,9 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
     if compile_timing: timings["rewrite_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
     # Opt-in: schedule later WMMA groups' loads after prior WMMA (flash latency hide).
     hints = getattr(ast.arg, "schedule_hints", ())
-    if getenv("AMD_WMMA_INTERLEAVE", 0) or "wmma_interleave" in hints or "wmma_interleave_reverse" in hints:
+    if getenv("AMD_WMMA_INTERLEAVE", 0) or "wmma_interleave" in hints:
       full_sink = graph_rewrite(full_sink, pm_schedule_interleave_wmma,
-                                ctx=WMMASchedulePolicy(full_sink, reverse="wmma_interleave_reverse" in hints),
-                                name="wmma load interleave")
+                                ctx=WMMASchedulePolicy(full_sink), name="wmma load interleave")
     prog_info = ProgramInfo.from_sink(full_sink, renderer.target)
     if isinstance(renderer, ISARenderer):
       # Instruction selection replaces LOAD/STORE/ALU with INS, so estimate while their meaning is still available.
