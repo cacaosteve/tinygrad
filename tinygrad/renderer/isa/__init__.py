@@ -19,7 +19,6 @@ class Register:
   name: str
   index: int
   _cons: tuple[Register, ...] = field(default_factory=tuple)
-  # vreg size represents the area an instructions output occupies, not necessarily the entire register
   size: int = 8
   _cons_hash: int = field(init=False, repr=False, compare=False)
   def __post_init__(self): object.__setattr__(self, "_cons_hash", hash(tuple(r.index for r in self._cons)))
@@ -60,6 +59,7 @@ class LinearContext:
   def __init__(self, ren:ISARenderer):
     self.ren, self.stack_size = ren, 0
     self.loop_label: dict[UOp, str] = {}
+  def insert_linearized(self, uops:list[UOp]) -> list[UOp]: return uops
   def assign_spill_slot(self, r:Register, u:UOp) -> Any: raise NotImplementedError("arch specific")
 
 class ISARenderer(Renderer):

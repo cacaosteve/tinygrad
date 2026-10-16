@@ -195,11 +195,11 @@ def fix_group_for_reduce(x:UOp):
   return buf.reduce(*reduce_loop, arg=(x.arg[0], 0))
 
 def merge_reduce_ends(sink:UOp):
-  # merge ENDs that share the same range and nesting context (only those created by reduce_to_acc)
+  # merge ENDs that share the same range and nesting context
   # ENDs at different nesting depths get cloned RANGEs so each RANGE maps to one END
   range_to_ends: dict[tuple[UOp, ...], list[UOp]] = {}
   for u in sink.backward_slice:
-    if u.op is Ops.END and u.tag == "mergeable": range_to_ends.setdefault(u.src[1:], []).append(u)
+    if u.op is Ops.END: range_to_ends.setdefault(u.src[1:], []).append(u)
   subs: dict[UOp, UOp] = {}
   next_axis = max((u.axis_id[0] for u in sink.backward_slice if u.op is Ops.RANGE), default=-1) + 1
   for r, ends in range_to_ends.items():
@@ -220,7 +220,7 @@ def reduce_ranges_to_acc(ctx:itertools.count, r:UOp):
   acc_init = acc.after(*input_ranges).store(UOp.const(identity_element(r.arg[0], r.dtype)))
   acc_initted = acc.after(acc_init, *r.src[1:])
   inp = r.src[0].reduce(arg=r.arg) if r.arg[1] else r.src[0]
-  acc_out = acc_initted.store(acc_initted.alu(r.arg[0], inp)).end(*r.src[1:]).rtag("mergeable")
+  acc_out = acc_initted.store(acc_initted.alu(r.arg[0], inp)).end(*r.src[1:])
   return acc.after(acc_out)
 
 def expand_horizontal_reduce(r:UOp):
@@ -427,7 +427,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   sink = graph_rewrite(sink, pm_final_rewrite+pm_remove_invalid, ctx=ren, name="final rewrite")
 
   # commit every const still bare so no renderer reads one
-  sink = graph_rewrite(sink, pm_cast_const, name="cast consts")
+  sink = graph_rewrite(sink, pm_cast_const, name="cast consts", walk=True)
 
   # add implicit barriers (stores/loads through LOCAL memory ordered by AFTER or across loop iterations need workgroup barriers)
   sink = graph_rewrite(sink, pm_implicit_barriers, ctx=local_afters_covered_by_nested(sink), name="add implicit barriers")
@@ -519,6 +519,7 @@ def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:
     _print_compile_stage(prg, "regalloc_init", stage_st, len(lst))
     stage_st = time.perf_counter_ns()
     lst = line_rewrite(lst, pm_regalloc_rewrite, regalloc_ctx)
+    lst = lin_ctx.insert_linearized(lst)
     _print_compile_stage(prg, "regalloc", stage_st, len(lst))
     stage_st = time.perf_counter_ns()
     lst = line_rewrite(lst, ctx.post_regalloc_matcher, regalloc_ctx if ctx.wide_regalloc else lin_ctx)
@@ -579,7 +580,7 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
     stage_st = time.perf_counter_ns()
     if VIZ: graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
     ast = graph_rewrite(ast, pm_lower_calls, ctx=renderer, name="lower calls", walk=True)
-    full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.tag is None)
+    full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.arg is None or not ast.arg.optimized)
     if compile_timing: timings["rewrite_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
     # Opt-in: schedule later WMMA groups' loads after prior WMMA (flash latency hide).
     hints = getattr(ast.arg, "schedule_hints", ())

@@ -1,4 +1,4 @@
-import time, math, unittest, functools, platform, warnings, sys
+import time, math, unittest, functools, warnings, sys, platform
 import numpy as np
 import torch
 from tinygrad.helpers import getenv, DEBUG, DEV, IMAGE, Context, to_tuple

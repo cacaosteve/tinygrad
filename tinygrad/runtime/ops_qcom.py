@@ -1,6 +1,5 @@
 from __future__ import annotations
-import os, ctypes, functools, mmap, struct, array, math, sys, contextlib
-assert sys.platform != 'win32'
+import os, ctypes, functools, mmap, struct, array, math, contextlib
 from typing import Any
 from tinygrad.device import Compiled, BufferStorage, BufferSpec, Buffer, Device, Allocator, TinyELF
 from tinygrad.runtime.support.hcq2 import HWQueue, HCQ_RUNTIME_DEV, ccall, cstruct, patch, unwrap_view, layout_args, pack_args, make_program
@@ -27,7 +26,7 @@ def dcache_flush():
   i = UOp.range(n, 0, dtype=dtypes.int)
   flush = UOp(Ops.CUSTOM, src=(buf.index(i * 64),), arg=('__asm__ volatile("dc cvac, %0" :: "r"({0}) : "memory");', dtypes.void))
   sink = UOp.sink(flush.end(i), UOp(Ops.CUSTOM, arg=('__asm__ volatile("dsb sy" ::: "memory");', dtypes.void)),
-                  arg=KernelInfo(name="dcache_flush"), tag=1)
+                  arg=KernelInfo(name="dcache_flush", opts_to_apply=()))
   prg = to_program(sink, Device["CPU"].renderer)
   return Device["CPU"].runtime(prg.to_elf())
 
