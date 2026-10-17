@@ -212,10 +212,6 @@ class FFNBlock:
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
     self._init_state(x)
-    # Direct ISA flash decode realizes its kernel and must stay outside @function's device-use scope.
-    if amd_direct_isa(x.device) and x.shape[1] == 1:
-      h = x + self._attention(self.attn_norm(x), start_pos)
-      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
