@@ -3168,44 +3168,6 @@ def insts_from_linear(lin:UOp):
         early_emitted.add(partner_i)
         oi += 1
         continue
-    if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.MUL:
-      partner_i = None
-      vopd = None
-      max_scan = 8
-      for k in range(oi + 1, min(oi + 1 + max_scan, len(scheduled))):
-        if k in early_emitted: continue
-        cand = scheduled[k]
-        if (pair:=_try_vopd_mul_pair(u, cand)) is None: continue
-        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
-          continue
-        partner_i, vopd = k, pair
-        break
-      if vopd is not None and partner_i is not None:
-        src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[partner_i].src))
-        if src and _pending_src(src): flush_regs(src)
-        for inst in vopd: emit(inst)
-        early_emitted.add(partner_i)
-        oi += 1
-        continue
-    if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.MAX:
-      partner_i = None
-      vopd = None
-      max_scan = 8
-      for k in range(oi + 1, min(oi + 1 + max_scan, len(scheduled))):
-        if k in early_emitted: continue
-        cand = scheduled[k]
-        if (pair:=_try_vopd_max_pair(u, cand)) is None: continue
-        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
-          continue
-        partner_i, vopd = k, pair
-        break
-      if vopd is not None and partner_i is not None:
-        src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[partner_i].src))
-        if src and _pending_src(src): flush_regs(src)
-        for inst in vopd: emit(inst)
-        early_emitted.add(partner_i)
-        oi += 1
-        continue
     # Pair independent scalar MOVs into VOPD (const zero runs / copy streaks).
     if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.MOV:
       partner_i = None
