@@ -260,8 +260,9 @@ class TransformerBlock(FFNBlock):
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
-    # Use custom AMD flash attention for hybrid models; RDNA3 direct ISA also uses it for decode.
-    if amd_custom_kernels_supported(x.device) and (self.config.ssm is not None or (amd_direct_isa(x.device) and T == 1)):
+    # The custom kernels implement causal attention, not sliding windows or sink columns.
+    if amd_custom_kernels_supported(x.device) and not (self.config.sliding_window or self.config.attn_sinks) and \
+       (self.config.ssm is not None or (amd_direct_isa(x.device) and T == 1)):
       attn = flash_attention(q, assigned_kv, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))

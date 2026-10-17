@@ -51,6 +51,15 @@ class TestAttention(unittest.TestCase):
                         [4., 4.]]]) # ([3,3] + [5,5]) / 2
     self.assertTrue(block._attention(x, 0).allclose(expected, rtol=0, atol=1e-6).item())
 
+  def test_sliding_window_decode(self):
+    x = Tensor([[[1., 1.], [3., 3.], [5., 5.]]])
+    block = TransformerBlock(self._make_config(dim=2, hidden_dim=2, n_heads=1, sliding_window=2))
+    block.attn_q.weight, block.attn_k.weight = Tensor.zeros(2, 2), Tensor.zeros(2, 2)
+    block.attn_v.weight, block.attn_output.weight = Tensor.eye(2), Tensor.eye(2)
+    block._init_state(x)
+    block._attention(x[:, :2], 0).realize()
+    np.testing.assert_allclose(block._attention(x[:, 2:], 2).numpy(), [[[4., 4.]]], rtol=0, atol=1e-6)
+
   def test_partial_rope_in_attention(self):
     dim, rope_dim, seqlen = 8, 4, 3
     config = TransformerConfig(num_blocks=1, dim=dim, hidden_dim=16, n_heads=1, n_kv_heads=1,
