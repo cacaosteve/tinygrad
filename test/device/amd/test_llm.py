@@ -394,6 +394,10 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
 
   def test_flash_attention_decode_gqa_output_layout(self): self._test_flash_decode(4, 1, 128, 256, 3)
 
+  def test_flash_attention_decode_llama1b_shapes(self):
+    for valid in (13, 32, 65, 1025):
+      with self.subTest(valid=valid): self._test_flash_decode(32, 8, 64, 2048, valid, symbolic=True)
+
   def test_flash_attention_decode_gqa4_long_jit(self):
     if not amd_direct_isa(Tensor.empty(1).device): self.skipTest("RDNA3 DIRECT required")
     from tinygrad.helpers import getenv

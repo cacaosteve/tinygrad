@@ -112,6 +112,14 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         raw.assign(raw.full_like(1)).realize()
         np.testing.assert_array_equal(linear.weight.bitcast(dtypes.uint8).numpy(), np.ones(type_size, dtype=np.uint8))
 
+  def test_quant_weights_reject_arithmetic_and_column_permutation(self):
+    raw = Tensor(np.arange(16*210, dtype=np.uint8)).realize()
+    decoded = ggml_data_to_tensor(raw, 16*256, 14).reshape(16, 256)
+    for transformed in (decoded+1, decoded.int().float(), decoded.reshape(16, 16, 16).transpose(1, 2).reshape(16, 256)):
+      linear = Linear(256, 16, bias=False)
+      linear.set_quantized(transformed)
+      self.assertIsNone(linear.ggml_type)
+
   @unittest.skipIf(Device.DEFAULT == "WEBGPU", "slow on WEBGPU")
   def test_quant_linear_fallback(self):
     if amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("run with DISABLE_AMD_KERNELS=1")
