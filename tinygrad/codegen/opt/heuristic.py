@@ -59,20 +59,6 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # make a copy so it does not mutate the input
   k = k.copy()
 
-  # Experimental fixed reduction mapping for backend-to-backend GEMV comparisons.
-  if (force_group:=getenv("MV_FORCE_GROUP", 0)) and k.ren.has_local:
-    force_axis = getenv("MV_FORCE_GROUP_AXIS", -1)
-    reduce_axes = k.axes_of(reduce=True)
-    if force_axis < 0: force_axis = reduce_axes[-1]
-    else: force_axis = reduce_axes[force_axis]
-    if DEBUG >= 3: print(f"FORCE_GROUP: {k.full_shape=} {k.colored_shape()=} {force_axis=} {force_group=}")
-    k.apply_opt(Opt(OptOps.SPLIT, force_axis, (force_group, AxisType.LOCAL)))
-    force_unroll = getenv("MV_FORCE_UNROLL_INNER", 0)
-    if force_unroll < 0: _unroll_small_inner_reduces(k)
-    else:
-      for _ in range(force_unroll): k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (0, AxisType.UPCAST)))
-    return k
-
   # Direct-ISA renderers can provide a narrow, structurally matched quantized-matvec schedule.
   # Keep this behind a renderer hook: native backends may need explicit unrolling that LLVM performs itself.
   if (quant_mv:=getattr(k.ren, "apply_quant_matvec_opts", None)) is not None and quant_mv(k): return k
@@ -160,7 +146,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   kernel_name = getattr(getattr(k.ast, "arg", None), "name", None)
   group_limit = 240 if k.ren.target.device == "QCOM" else 2048
   if kernel_name != "flash_decode_combine" and resolve(prod(k.full_shape[i] for i in k.upcastable_dims()) <= group_limit, False):
-    for axis, sz in itertools.product(k.axes_of(reduce=True)[:3], (16,)):
+    for axis in k.axes_of(reduce=True)[:3]:
       try:
         k.apply_opt(Opt(OptOps.SPLIT, axis, (16, AxisType.LOCAL, True)))
         break
