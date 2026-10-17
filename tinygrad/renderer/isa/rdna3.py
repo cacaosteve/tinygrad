@@ -1,6 +1,5 @@
 from __future__ import annotations
 import math
-import os
 import struct
 
 from tinygrad.device import CompileError
@@ -22,7 +21,8 @@ from tinygrad.renderer.isa.rdna3_tc import pm_expand_wmma_lds, pm_stage_wmma_ab
 
 def _register_pools(ctx:IselContext|PreRegAllocContext) -> RegisterPools:
   if (pools:=ctx.scratch.get("register_pools")) is None:
-    base = getenv("AMD_WMMA_ACC_BASE", 121)
+    default_base = 121 if allow_upcast16() or getenv("TC_LDS_AB", 0) else -1
+    base = getenv("AMD_WMMA_ACC_BASE", default_base)
     ctx.scratch["register_pools"] = pools = register_pools(base, getenv("AMD_WMMA_ACC_N", 48 if base >= 140 else 128))
   return pools
 
@@ -3889,24 +3889,9 @@ def apply_tc_hand_opts(tk, rngs):
   # separate half.realize() then ah@bh is fine. Refuse TC so ALU path runs (HIP/LLVM OK).
   if _wmma_has_fused_float_to_half_cast(tk):
     raise KernelOptError("RDNA3 DIRECT: fused float→half CAST into WMMA MMU-faults")
-  # Default TC_LDS_AB=0: register product-16 uses ACC_BASE=121; Q6_K spills fall 15→8
-  # and 2048² half matmul stays within noise of the previous base 96. base≤88 spills ACC.
-  # Flash forces TC_LDS_AB=0 + ACC_BASE=145 and clears AMD_WMMA_DELAY.
-  if not getenv("TC_LDS_AB", 0):
-    # Register TC path. Product-16 uses ACC_BASE=121 + UP16 PACK pools; ALLOW_UPCAST16=0
-    # clamps expand to product≤8 and must not use the product soft partition (PACK window too
-    # small → wide_alloc OOM on 8-slot packs; ACC=-1 or flash's 145 is fine).
-    if allow_upcast16():
-      if os.environ.get("AMD_WMMA_ACC_BASE") is None: os.environ["AMD_WMMA_ACC_BASE"] = "121"
-      if os.environ.get("AMD_WMMA_ACC_N") is None: os.environ["AMD_WMMA_ACC_N"] = "128"
-      # Prefetch-A only applies on LDS_AB path below; product-16 returns early.
-      # Post-WMMA s_delay_alu hardcoded 1 in emit (was AMD_WMMA_DELAY=1).
-    elif os.environ.get("AMD_WMMA_ACC_BASE") is None:
-      os.environ["AMD_WMMA_ACC_BASE"] = "-1"
-    getenv.cache_clear()  # type: ignore[attr-defined]
-    return apply_register_tc_hand_opts(tk, rngs)
+  if not getenv("TC_LDS_AB", 0): return apply_register_tc_hand_opts(tk, rngs)
   lds_ab = getenv("TC_LDS_AB", 0)
-  up_cap = getenv("TC_UPCAST", 4 if allow_upcast16() else 2)
+  up_cap = getenv("TC_UPCAST", 4)
   # Prefetch-A was for register within-K tiles; register path returns early above.
   # Under LDS_AB the (not lds_ab) gate made prefetch dead — leave OFF (AMD_PREFETCH_A removed).
   _PREFETCH_NEXT_A = False
@@ -4154,9 +4139,6 @@ class AMDRenderer(ISARenderer):
 
   def __init__(self, target:Target):
     if not target.arch.startswith("gfx11"): raise RuntimeError(f"AMDRenderer is RDNA3/gfx11 only, got {target.arch}")
-    # Half matmul opts: product-16 register path (ACC_BASE set in apply_tc_hand_opts).
-    if os.environ.get("TC_UPCAST") is None: os.environ["TC_UPCAST"] = "4"
-    if os.environ.get("ALLOW_UPCAST16") is None: os.environ["ALLOW_UPCAST16"] = "1"
     super().__init__(target)
     self.tensor_cores = [x for x in tc.get_amd(target.arch) if (x.dtype_in, x.dtype_out) == (dtypes.half, dtypes.float)]
     # AMD_VGPR_EXCLUDE_ACC removed (fair checksum wrong; never protected mid-band ACC).
@@ -4527,7 +4509,7 @@ class AMDRenderer(ISARenderer):
       if (_iop(x) is AMDOps.EXTRACT and x.dtype is dtypes.half and x.src and
           x.src[0].op is Ops.INS and _iop(x.src[0]) is AMDOps.LLOAD):
         return True
-      if getenv("ALLOW_UPCAST16", 0) and _iop(x) is AMDOps.LLOAD and x.dtype is dtypes.half:
+      if allow_upcast16() and _iop(x) is AMDOps.LLOAD and x.dtype is dtypes.half:
         return True
     if not getenv("AMD_REMAT_ADDR", 1 if getenv("TC_LDS_AB", 0) else 0): return False
     # AMD_REMAT_LIDX_ADDR / AMD_REMAT_BIND_ADD removed (default OFF; never shipped).

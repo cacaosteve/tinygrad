@@ -11,6 +11,26 @@ from tinygrad.helpers import getenv
 from tinygrad.uop.ops import KernelInfo, UOp
 
 class TestCompileEnv(unittest.TestCase):
+  def test_rdna3_defaults_do_not_write_environment(self):
+    from tinygrad.renderer.isa.rdna3 import AMDRenderer, _register_pools, apply_tc_hand_opts
+    from tinygrad.renderer.isa import PreRegAllocContext
+    from tinygrad.renderer.isa.rdna3_defs import VGPR
+    try:
+      with patch.dict(os.environ):
+        for key in ("ALLOW_UPCAST16", "TC_UPCAST", "TC_LDS_AB", "AMD_WMMA_ACC_BASE", "AMD_WMMA_ACC_N"): os.environ.pop(key, None)
+        getenv.cache_clear()
+        before = dict(os.environ)
+        AMDRenderer(Target("AMD", "AMD", "gfx1100"))
+        with patch("tinygrad.renderer.isa.rdna3._wmma_has_fused_float_to_half_cast", return_value=False), \
+             patch("tinygrad.renderer.isa.rdna3.apply_register_tc_hand_opts"):
+          apply_tc_hand_opts(None, [])
+        self.assertEqual(dict(os.environ), before)
+        self.assertEqual(_register_pools(PreRegAllocContext()).acc, VGPR[121:249])
+        os.environ["ALLOW_UPCAST16"] = "0"
+        getenv.cache_clear()
+        self.assertEqual(_register_pools(PreRegAllocContext()).acc, VGPR)
+    finally: getenv.cache_clear()
+
   def test_rdna3_register_pools_are_per_compile(self):
     from tinygrad.renderer.isa import PreRegAllocContext
     from tinygrad.renderer.isa.rdna3 import _register_pools
