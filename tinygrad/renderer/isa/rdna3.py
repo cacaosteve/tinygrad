@@ -757,6 +757,40 @@ def _promote_reg_cons(ctx:PreRegAllocContext, buf:UOp) -> tuple[Register, ...]:
   # AMD_FLASH_ACC_HIGH_VGPR removed (never shipped; LinearScan mid-band ok for flash).
   return allowed
 
+def _index_bounds(root:UOp) -> tuple[int, int]|None:
+  """Mathematical bounds before a 32-bit index is zero-extended into a GLOBAL address."""
+  memo:dict[UOp, tuple[int, int]|None] = {}
+  def bounds(u:UOp) -> tuple[int, int]|None:
+    if u in memo: return memo[u]
+    ret:tuple[int, int]|None = None
+    if (c:=_const_int(u)) is not None: ret = c, c
+    elif u.op is Ops.INS:
+      op = _iop(u)
+      if op in (AMDOps.MOV, AMDOps.CAST) and u.src: ret = bounds(u.src[0])
+      elif op in (AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR):
+        a, b = bounds(u.src[0]), bounds(u.src[1])
+        if a is not None and b is not None:
+          if op is AMDOps.ADD: ret = a[0]+b[0], a[1]+b[1]
+          elif op is AMDOps.SUB: ret = a[0]-b[1], a[1]-b[0]
+          elif op is AMDOps.MUL:
+            products = [x*y for x in a for y in b]
+            ret = min(products), max(products)
+          elif op in (AMDOps.SHL, AMDOps.SHR) and 0 <= b[0] <= b[1] < 32 and a[0] >= 0:
+            ret = (a[0]<<b[0], a[1]<<b[1]) if op is AMDOps.SHL else (a[0]>>b[1], a[1]>>b[0])
+          elif op is AMDOps.AND:
+            if b[0] == b[1] and b[0] >= 0: ret = 0, b[0]
+            elif a[0] == a[1] and a[0] >= 0: ret = 0, a[0]
+          elif op in (AMDOps.OR, AMDOps.XOR) and a[0] >= 0 and b[0] >= 0:
+            ret = 0, (1 << max(a[1], b[1]).bit_length())-1
+    elif u.op is Ops.CAST: ret = bounds(u.src[0])
+    elif u.dtype in dtypes.ints+(dtypes.weakint,) and isinstance(u.vmin, int) and isinstance(u.vmax, int): ret = u.vmin, u.vmax
+    if ret is not None and u.op in (Ops.CAST, Ops.INS) and u.dtype in dtypes.ints and \
+       not (u.dtype.min <= ret[0] <= ret[1] <= u.dtype.max):
+      ret = None
+    memo[u] = ret
+    return ret
+  return bounds(root)
+
 def _peel_add_imm(idx:UOp, itemsize:int, max_byte:int=0xffff, deep:bool=False) -> tuple[UOp, int]:
   """Peel ADD+imm from an index into a byte offset. Keeps one address base live.
   deep=True folds nested ADD+const chains (WMMA C stores: ADD(ADD(base,1024),16))."""
@@ -772,6 +806,9 @@ def _peel_add_imm(idx:UOp, itemsize:int, max_byte:int=0xffff, deep:bool=False) -
         total, cur, peeled = byte, cur.src[base_i], True
         break
     if not peeled or not deep: break
+  # GLOBAL's immediate is added after zero-extending the VGPR byte address. A negative
+  # peeled base (e.g. flip's 47-i) would become base+4GiB, not the original valid index.
+  if total and ((span:=_index_bounds(cur)) is None or span[0] < 0 or span[1]*itemsize+total > 0xffffffff): return idx, 0
   return (cur, total) if total else (idx, 0)
 
 def _ds_off(byte_off:int) -> dict:
@@ -2982,19 +3019,9 @@ def insts_from_linear(lin:UOp):
   def _pending_src(regs:set[int]) -> bool:
     if any(pr & regs for pr, _ in pending_vm): return True
     return bool(pending["lgkm"] & regs)
-  last_vcc_key: tuple|None = None
   def _emit_uop(u, masked=False, with_store_cache=False):
-    nonlocal last_vcc_key
-    # CSE identical VCC compares: E_32 remats the same gate cmp before every cndmask.
-    if u.op is Ops.INS and _iop(u) in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ):
-      try:
-        key = (_iop(u), _src(u.src[0]), _src(u.src[1]) if len(u.src) > 1 else None)
-      except Exception:
-        key = None
-      if key is not None and key == last_vcc_key: return []
-      if key is not None: last_vcc_key = key
-    elif u.op is Ops.INS and _iop(u) in (AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.CBRANCH_VCCNZ):
-      last_vcc_key = None
+    # Physical operands are not value identities: regalloc may redefine the same
+    # VGPR between two predicates. Keep every explicitly rematerialized comparison.
     return list(insts_for_uop(u, skip, masked, store_addr_cache if with_store_cache else None,
                               d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst))
   # Required: d16 lo-before-hi (no-op — AMD_D16_HI removed). Optional: WMMA hoist/sink + emit-time store cluster.

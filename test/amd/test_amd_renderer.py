@@ -2864,7 +2864,7 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_scalar_global_load_peels_byte_offset(self):
     buf = UOp.placeholder((128,), dtypes.float, slot=0)
-    base = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("base", 260),))
+    base = _uop(Ops.INS, dtypes.uint32, (UOp.special(64, "lidx0"),), AMDOps.MOV, (Register("base", 260),))
     addr = buf.index(base + UOp.const(32, dtypes.uint32))
     load = addr.load()
     lowered = amd_lib._load_ins(load, addr)
@@ -2947,7 +2947,7 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_wmma_scalar_fragment_recoalesces_to_wide_load(self):
     buf = UOp.placeholder((256,), dtypes.half, slot=0)
-    base = _uop(Ops.INS, dtypes.int32, arg=AMDOps.DEFINE, tag=(Register("base", 260),))
+    base = _uop(Ops.INS, dtypes.int32, (UOp.special(64, "lidx0"),), AMDOps.MOV, (Register("base", 260),))
     elems = tuple(buf.index(base + UOp.const(16+i, dtypes.int32)).load() for i in range(16))
     loads = amd_lib._wmma_ab_vec_loads(elems)
     self.assertIsNotNone(loads)
@@ -3432,6 +3432,43 @@ class TestAMDRenderer(unittest.TestCase):
             inst, = amd_lib.insts_for_uop(ins)
             relevant = regs[:2] if compare else regs
             self.assertTrue(inst.op_name.endswith("E64" if max(relevant) >= 128 else "E32"))
+
+  def test_address_peeling_preserves_32bit_arithmetic(self):
+    lane = UOp.special(32, "lidx0")
+    def alu(op, *src, dtype=dtypes.int32): return _uop(Ops.INS, dtype, src, op)
+    reverse = alu(AMDOps.MUL, lane, UOp.const(-1, dtypes.int32))
+    idx = alu(AMDOps.ADD, reverse, UOp.const(31, dtypes.int32))
+    self.assertEqual(amd_lib._peel_add_imm(idx, 4, deep=True), (idx, 0))
+    base = alu(AMDOps.MUL, lane, UOp.const(4, dtypes.int32))
+    positive = alu(AMDOps.ADD, base, UOp.const(7, dtypes.int32))
+    self.assertEqual(amd_lib._peel_add_imm(positive, 4, deep=True), (base, 28))
+    large = UOp.variable("address", 0, 0xffffffff).cast(dtypes.uint32)
+    wrap = alu(AMDOps.ADD, large, UOp.const(7, dtypes.uint32), dtype=dtypes.uint32)
+    self.assertEqual(amd_lib._peel_add_imm(wrap, 4, deep=True), (wrap, 0))
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_argsort_reversed_offsets(self):
+    import numpy as np
+    values = np.random.default_rng(72).uniform(-2, 2, (8, 8, 6)).astype(np.float32)
+    actual = Tensor(values, device="AMD").argsort(1, True).numpy()
+    np.testing.assert_array_equal(actual, np.argsort(-values, axis=1, kind="stable").astype(np.int32))
+
+  def test_predicate_recomputed_after_physical_register_reuse(self):
+    reg = Register("gate", 269)
+    first = _uop(Ops.INS, dtypes.uint32, (UOp.const(1, dtypes.uint32),), AMDOps.MOV, (reg,))
+    second = _uop(Ops.INS, dtypes.uint32, (UOp.const(0, dtypes.uint32),), AMDOps.MOV, (reg,))
+    def compare(value): return _uop(Ops.INS, dtypes.bool, (value, UOp.const(0, dtypes.uint32)), AMDOps.CMPNE)
+    lin = _uop(Ops.LINEAR, src=(first, compare(first), second, compare(second)))
+    names = [i.op_name for i in _REN._insts_from_linear(lin)]
+    self.assertEqual(names.count("V_CMP_NE_U32_E32"), 2)
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_convolution_gradient_reused_predicates(self):
+    import numpy as np
+    values = Tensor(np.arange(1, 10, dtype=np.float32).reshape(1, 1, 3, 3), device="AMD").realize()
+    weights = Tensor.ones(1, 1, 2, 2, device="AMD").realize()
+    grad = values.conv2d(weights, padding=(2, 1, 2, 1)).sum().gradient(weights)[0]
+    np.testing.assert_allclose(grad.numpy(), 45., rtol=1e-5, atol=1e-5)
 
   def test_bitwise_assembles(self):
     prg = _bitwise_program()
