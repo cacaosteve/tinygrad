@@ -2065,9 +2065,12 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
           return pre + [r3.v_and_b32_e32(_dst(u), (1 << bits) - 1, cast_src)]
         return pre + [r3.v_bfe_i32(_dst(u), cast_src, 0, narrow.itemsize * 8)]
       if u.dtype is dtypes.float32 and u.src[0].dtype is dtypes.float16:
-        return pre + [r3.v_cvt_f32_f16_e32(_dst(u), cast_src)]
+        # E32 true16 operands use bit 7 as the half selector, not the VGPR index MSB.
+        cast = r3.v_cvt_f32_f16_e64 if isinstance(cast_src, Reg) and cast_src.offset >= 384 else r3.v_cvt_f32_f16_e32
+        return pre + [cast(_dst(u), cast_src)]
       if u.src[0].dtype is dtypes.float32 and u.dtype is dtypes.float16:
-        return pre + [r3.v_cvt_f16_f32_e32(_dst(u), cast_src)]
+        cast = r3.v_cvt_f16_f32_e64 if _dst(u).offset >= 384 else r3.v_cvt_f16_f32_e32
+        return pre + [cast(_dst(u), cast_src)]
       if u.dtype is dtypes.float32 and u.src[0].dtype in dtypes.ints:
         if u.src[0].dtype in dtypes.sints and u.src[0].dtype.itemsize < 4:
           if u.src[0].op is Ops.INS and _iop(u.src[0]) is AMDOps.LOAD:

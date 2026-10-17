@@ -1526,7 +1526,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   if decode:
     if not (amd_direct_isa(q.device) or getenv("AMD_FLASH_DIRECT", 0)):
       return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N))
-    # ALLOW_UPCAST16=0 for whole decode build+realize (see _flash_direct_compile_env).
+    # Upstream QKV/norm kernels must not inherit flash-only instruction selection.
+    q.realize(assigned_kv)
     with _flash_direct_compile_env(flash_acc_small=False):
       return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N)).realize()
   # Keep hand WMMA prefill opt-in and restricted to aligned static starts; other cases use SDPA.

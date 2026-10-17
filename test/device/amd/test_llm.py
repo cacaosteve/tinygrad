@@ -213,6 +213,17 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     linear.weight = Tensor.full((1, 128), 1/128, dtype=dtypes.float32).realize()
     np.testing.assert_array_equal(linear(Tensor.full((1, 128), 65536, dtype=dtypes.float32)).numpy(), 65536)
 
+  def test_dense_gemv_high_half_register_pressure(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    rng = np.random.default_rng(72)
+    x = rng.normal(0, 0.1, (4, 2048)).astype(np.float32)
+    weight = rng.normal(0, 0.01, (64, 2048)).astype(np.float16)
+    linear = Linear(2048, 64, bias=False)
+    linear.weight = Tensor(weight).realize()
+    actual = linear(Tensor(x)).numpy()
+    self.assertTrue(np.isfinite(actual).all())
+    np.testing.assert_allclose(actual, x @ weight.astype(np.float32).T, rtol=2e-5, atol=1e-6)
+
   def test_gated_delta_state_and_precision(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     for case in ("view", "reset", "half"):
@@ -564,6 +575,25 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     values = np.concatenate([old_kv[1, 0, 0], new_kv[1, 0, 0]]).astype(np.float16).astype(np.float32)
     expected = np.stack([values[:start_pos+i+1].mean(0) for i in range(32)])[None, None].repeat(8, axis=1)
     np.testing.assert_allclose(out.numpy(), expected, rtol=2e-3, atol=2e-3)
+
+  def test_decode_realizes_dependencies_before_flash_policy(self):
+    from tinygrad.helpers import getenv
+    from tinygrad.llm.kernels import amd as amd_mod
+    q, kv, out = Tensor.empty(1, 2, 1, 64, device="CPU"), Tensor.empty(2, 1, 1, 64, 64, device="CPU"), Tensor.empty(1, device="CPU")
+    calls = []
+    def realize(tensor, *others):
+      calls.append(((tensor, *others), getenv("AMD_VOPD_FMAC", 0)))
+      return tensor
+    with patch.dict(os.environ):
+      for key in amd_mod._FLASH_DECODE_ONLY: os.environ.pop(key, None)
+      getenv.cache_clear()
+      try:
+        with patch.object(amd_mod, "amd_direct_isa", return_value=True), \
+             patch.object(amd_mod, "amd_flash_attention_decode", return_value=out), \
+             patch.object(Tensor, "realize", autospec=True, side_effect=realize):
+          self.assertIs(amd_mod.flash_attention(q, kv, 64), out)
+        self.assertEqual(calls, [((q, kv), 0), ((out,), 1)])
+      finally: getenv.cache_clear()
 
   def test_prefill_compile_policy_overrides_sticky_decode(self):
     """Flash scheduling is scoped to compilation and prefill overrides stale decode settings."""

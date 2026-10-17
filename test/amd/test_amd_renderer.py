@@ -3379,6 +3379,20 @@ class TestAMDRenderer(unittest.TestCase):
     for name in ("V_CVT_F32_F16_E32", "V_CVT_F16_F32_E32", "V_SIN_F32_E32"):
       self.assertIn(name, inst_names)
 
+  def test_half_cast_encoding_preserves_high_vgprs(self):
+    for reg in (127, 128, 253):
+      for src_dtype,dst_dtype in ((dtypes.float16,dtypes.float32), (dtypes.float32,dtypes.float16)):
+        with self.subTest(reg=reg, src=src_dtype, dst=dst_dtype):
+          src_reg, dst_reg = (reg,5) if src_dtype is dtypes.float16 else (5,reg)
+          src = _uop(Ops.INS, src_dtype, arg=AMDOps.MOV, tag=(Register("source",256+src_reg),))
+          cast = _uop(Ops.INS, dst_dtype, (src,), AMDOps.CAST, (Register("destination",256+dst_reg),))
+          inst, = amd_lib.insts_for_uop(cast)
+          suffix = "E32" if reg < 128 else "E64"
+          direction = "F32_F16" if src_dtype is dtypes.float16 else "F16_F32"
+          self.assertEqual(inst.op_name, f"V_CVT_{direction}_{suffix}")
+          self.assertEqual(inst.src0, amd_lib.v[src_reg])
+          self.assertEqual(inst.vdst, amd_lib.v[dst_reg])
+
   def test_bitwise_assembles(self):
     prg = _bitwise_program()
     _check_elf(self, prg)
