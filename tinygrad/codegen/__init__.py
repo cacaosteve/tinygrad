@@ -17,8 +17,6 @@ from tinygrad.uop.symbolic import sym, symbolic_simple, symbolic, pm_move_where_
 from tinygrad.uop.movement import mop_cleanup
 from tinygrad.codegen.late.index_mops import pm_index_mops
 codegen_mops = mop_cleanup + pm_index_mops  # INDEX→RESHAPE/PERMUTE; not mop_cleanup (breaks JIT)
-# AMD LDS WMMA tile expand — installed by renderer.isa.rdna3 (avoid circular import).
-expand_wmma_lds_hook: Callable|None = None
 _WMMA_LDS_LOOP_BASE = 200  # must match amd._WMMA_LDS_LOOP_BASE (probe_stage_loop)
 from tinygrad.codegen.decomp.dtype import DTypeDecompCtx, pm_dtype_decomps
 from tinygrad.codegen.decomp.op import get_late_rewrite_patterns, get_simplifying_rewrite_patterns
@@ -75,14 +73,14 @@ def unroll_axis(u:UOp, dims:list[int], sizes:list[int]) -> UOp:
   out = u.unflatten(-1, tuple(sizes))
   return out.permute(argsort([i for i in range(out.ndim) if i not in dims]+dims))
 
-def expand_wmma(ctx:dict[tuple, int], u:UOp):
+def expand_wmma(ctx:dict[tuple, int], u:UOp, custom_expand:Callable|None=None):
   if u.arg[3] is None: return None
   # Skip axes absent from the expand map (e.g. size-1 TC pads dropped after TC_LDS_AB staging).
   in0, in1, out0 = [[ctx[rn] for rn,_ in upcast_axes if rn in ctx] for upcast_axes in u.arg[3]]
   a, b, c = contract_axis(u.src[0], in0), contract_axis(u.src[1], in1), u.src[2]
   done_arg = (*u.arg[:3], None)
   sizes = [sz for rn,sz in u.arg[3][2] if rn in ctx]
-  if expand_wmma_lds_hook is not None and (ret := expand_wmma_lds_hook(u, a, b, c, done_arg, unroll_axis, out0, sizes)) is not None:
+  if custom_expand is not None and (ret := custom_expand(u, a, b, c, done_arg, unroll_axis, out0, sizes)) is not None:
     return ret
   return unroll_axis(u.replace(src=(a, b, c), arg=done_arg), out0, sizes)
 expander = PatternMatcher([
@@ -355,7 +353,8 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
                        name="postopt symbolic")
 
   # expand
-  sink = graph_rewrite(sink, expander, ctx=build_range_map(sink), name="expander")
+  pm_expand = expander if ren.extra_expander is None else ren.extra_expander+expander
+  sink = graph_rewrite(sink, pm_expand, ctx=build_range_map(sink), name="expander")
 
   # ISA renderers may lower narrowly supported group reductions to native wave operations.
   if (pm := getattr(ren, "pm_group_reduce", None)) is not None:

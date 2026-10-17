@@ -19,7 +19,7 @@ from tinygrad.renderer.isa import rdna3_defs as _defs
 from tinygrad.renderer.isa.rdna3_defs import (AMDOps, KERNARG_REG, WGID, LID, SGPR, SGPR32, VGPR,
   TMP_VDATA, TMP_VADDR, TMP_BRANCH, TMP_SDATA0, TMP_SDATA1, refresh_vgpr_pools,
   allow_upcast16, unwrap_const as _unwrap_const, const_value as _const_value, tconst as _tconst)
-from tinygrad.renderer.isa.rdna3_tc import expand_wmma_lds_tiles, pm_stage_wmma_ab
+from tinygrad.renderer.isa.rdna3_tc import pm_expand_wmma_lds, pm_stage_wmma_ab
 
 # Live soft-partition pools live in rdna3_defs (refresh_vgpr_pools mutates them). Forward so
 # `amd_lib.WMMA_ACC_*` / tests see the current binding after flash/matmul compile_env.
@@ -3902,7 +3902,7 @@ def apply_tc_hand_opts(tk, rngs):
       os.environ["AMD_WMMA_ACC_BASE"] = "-1"
     getenv.cache_clear()  # type: ignore[attr-defined]
     refresh_vgpr_pools()
-    return llvm_tc_hand_opts(tk, rngs)
+    return apply_register_tc_hand_opts(tk, rngs)
   lds_ab = getenv("TC_LDS_AB", 0)
   up_cap = getenv("TC_UPCAST", 4 if allow_upcast16() else 2)
   # Prefetch-A was for register within-K tiles; register path returns early above.
@@ -3960,8 +3960,7 @@ def apply_tc_hand_opts(tk, rngs):
     do_local()
   # TC_LDS_GROUP omitted: GROUP≥2 on WMMA half GEMM needs >64KB LDS (always KernelOptError).
 
-def llvm_tc_hand_opts(tk, rngs):
-  # AMDLLVM: stock TC schedule unless TC_LDS_AB (shared staging with AMDRenderer).
+def apply_register_tc_hand_opts(tk, rngs):
   if getenv("TC_LDS_AB", 0): return apply_tc_hand_opts(tk, rngs)
   from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
   max_prod = 16 if allow_upcast16() else 8
@@ -3980,10 +3979,6 @@ def llvm_tc_hand_opts(tk, rngs):
   if (szs := [sz for sz in [4, 2] if rngs[0].src[0].divides(sz) is not None]):
     try: tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[0]), (szs[0], AxisType.LOCAL)))
     except KernelOptError: pass
-
-def install_amdllvm_tc(cls):
-  cls.pm_stage_wmma_ab = pm_stage_wmma_ab
-  cls.apply_tc_hand_opts = lambda self, tk, rngs: llvm_tc_hand_opts(tk, rngs)
 
 def merge_adjacent_half_loads(sink:UOp) -> UOp:
   """Re-widen devectorized scalar half global loads into SHRINK×4 for B64 VMEM (flash _vec_load)."""
@@ -4150,6 +4145,7 @@ class AMDRenderer(ISARenderer):
   post_regalloc_matcher = post_regalloc_matcher
   pm_group_reduce = pm_warp_group_reduce
   pm_stage_wmma_ab = pm_stage_wmma_ab
+  extra_expander = pm_expand_wmma_lds
   _code_ops = (Ops.ADD, Ops.SUB, Ops.MUL, Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.TRUNC, Ops.SIN, Ops.MAX,
                Ops.SHL, Ops.SHR, Ops.AND, Ops.OR, Ops.XOR, Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ)
   code_for_op = {op: (lambda: None) for op in _code_ops}
@@ -4601,16 +4597,6 @@ class AMDRenderer(ISARenderer):
 
   def supported_dtypes(self):
     return {dtypes.bool, dtypes.int8, dtypes.uint8, dtypes.int16, dtypes.uint16, dtypes.int32, dtypes.uint32, dtypes.float16, dtypes.float32}
-
-# ***** public install (was thin isa/amd.py) *****
-def _install_hooks():
-  # expand_wmma_lds_hook: shared AMD/AMDLLVM LDS WMMA tile expansion (gated by TC_LDS_AB +
-  # renderer pm_stage_wmma_ab). install_amdllvm_tc attaches the same TC hand opts to LLVM.
-  from tinygrad.renderer.llvmir import AMDLLVMRenderer
-  import tinygrad.codegen as cg
-  cg.expand_wmma_lds_hook = expand_wmma_lds_tiles
-  install_amdllvm_tc(AMDLLVMRenderer)
-_install_hooks()
 
 # Gabriel/x86-style aliases
 RDNA3Renderer = AMDRenderer

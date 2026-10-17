@@ -3028,7 +3028,7 @@ class TestAMDRenderer(unittest.TestCase):
       self.assertGreater(inst_names.count("V_PACK_B32_F16"), 0)
       self.assertGreaterEqual(inst_names.count("S_CLAUSE"), 1)
       self.assertGreaterEqual(inst_names.count("V_WMMA_F32_16X16X16_F16"), 4)
-      # llvm_tc_hand_opts may still apply LOCAL on dim0; wavefront size stays 32.
+      # Register TC opts may still apply LOCAL on dim0; wavefront size stays 32.
       self.assertEqual(prg.arg.local_size[0], 32)
     finally:
       for k, v in old.items():
@@ -3038,7 +3038,7 @@ class TestAMDRenderer(unittest.TestCase):
       to_program_cache.clear()
 
   def test_half_matmul_register_path_vpack_default(self):
-    # Register path + ALLOW_UPCAST16: product-16 (llvm_tc_hand_opts). u16+v_pack; D16_HI opt-in.
+    # Register path + ALLOW_UPCAST16: product-16. u16+v_pack; D16_HI opt-in.
     import os
     old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_D16_HI", "ALLOW_UPCAST16")}
     os.environ["TC_LDS_AB"] = "0"

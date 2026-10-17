@@ -1,4 +1,4 @@
-import os, unittest
+import os, subprocess, sys, unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from tinygrad.engine.realize import _compile_kernel
@@ -11,6 +11,15 @@ from tinygrad.helpers import getenv
 from tinygrad.uop.ops import KernelInfo, UOp
 
 class TestCompileEnv(unittest.TestCase):
+  def test_rdna3_import_preserves_llvm_renderer(self):
+    script = "\n".join((
+      "from tinygrad.renderer.llvmir import AMDLLVMRenderer",
+      "before = dict(vars(AMDLLVMRenderer))",
+      "import tinygrad.renderer.isa.rdna3",
+      "assert dict(vars(AMDLLVMRenderer)) == before, 'RDNA3 import changed AMDLLVM policy'",
+    ))
+    subprocess.run([sys.executable, "-c", script], check=True)
+
   def test_worker_compile_env_is_scoped(self):
     key = "AMD_TEST_WORKER_ENV"
     previous = os.environ.get(key)

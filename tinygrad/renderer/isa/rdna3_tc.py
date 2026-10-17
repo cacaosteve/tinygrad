@@ -7,6 +7,12 @@ from tinygrad.uop import Ops
 from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
 from tinygrad.renderer.isa.rdna3_defs import allow_upcast16, const_value, tconst
 
+def expand_staged_wmma(ctx, u:UOp):
+  from tinygrad.codegen import expand_wmma
+  return expand_wmma(ctx, u, expand_wmma_lds_tiles)
+
+pm_expand_wmma_lds = PatternMatcher([(UPat(Ops.WMMA, name="u"), expand_staged_wmma)])
+
 # ***** TC_LDS_AB staging (codegen hooks via AMDRenderer.pm_stage_wmma_ab) *****
 _WMMA_LDS_AXES, _WMMA_LDS_LOOP_BASE, _WMMA_TC = (AxisType.LOCAL, AxisType.WARP), 200, 16
 
