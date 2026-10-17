@@ -1,36 +1,47 @@
-"""RDNA3 VOPD dual-issue pairing (post-regalloc optional emit).
-
-Bound from `rdna3.py` after `_iop` / `_dst` / `_src` / `_vgpr_num` / `_fmac_mul_operand_choices`
-exist — keeps emit pairing reviewable without a circular import.
-"""
+"""RDNA3 VOPD dual-issue pairing (post-regalloc optional emit)."""
 from __future__ import annotations
-
-from typing import Any
 
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import getenv
 from tinygrad.renderer.amd.dsl import Reg
-from tinygrad.renderer.isa.rdna3_defs import AMDOps
+from tinygrad.renderer.isa.rdna3_defs import (AMDOps, iop as _iop, dst_operand as _dst, src_operand as _src, vgpr_num as _vgpr_num,
+  mov_imm_or_src as _mov_imm_or_src, reg_slots as _reg_slots, unwrap_const as _unwrap_const)
 from tinygrad.runtime.autogen.amd.rdna3 import ins as r3
 from tinygrad.runtime.autogen.amd.rdna3.enum import VOPDOp
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import UOp
 
-# Patched by rdna3.bind_vopd() after helpers are defined.
-_iop: Any = None
-_dst: Any = None
-_src: Any = None
-_vgpr_num: Any = None
-_fmac_mul_operand_choices: Any = None
-_mov_imm_or_src: Any = None
-_reg_slots: Any = None
+def _fmac_mul_src(x:UOp):
+  """FMAC multiplier: peel MOV/CAST to a float literal when possible."""
+  cur = x
+  for _ in range(6):
+    if (c:=_unwrap_const(cur)) is not None:
+      try: return float(c.val)
+      except Exception: return _src(x)
+    if cur.op is Ops.CAST and cur.src:
+      cur = cur.src[0]
+      continue
+    if cur.op is Ops.INS and _iop(cur) is AMDOps.MOV and cur.src and cur.src[0].op is not Ops.SPECIAL:
+      cur = cur.src[0]
+      continue
+    break
+  return _src(x)
 
-def bind_vopd(*, iop, dst, src, vgpr_num, fmac_mul_operand_choices, mov_imm_or_src=None, reg_slots=None) -> None:
-  global _iop, _dst, _src, _vgpr_num, _fmac_mul_operand_choices, _mov_imm_or_src, _reg_slots
-  _iop, _dst, _src, _vgpr_num = iop, dst, src, vgpr_num
-  _fmac_mul_operand_choices = fmac_mul_operand_choices
-  if mov_imm_or_src is not None: _mov_imm_or_src = mov_imm_or_src
-  if reg_slots is not None: _reg_slots = reg_slots
+def _fmac_mul_operand_choices(u:UOp) -> list[tuple[object, Reg]]:
+  """VOPD-eligible multiplier orientations. Multiplication is commutative."""
+  if u.dtype is not dtypes.float32: return []
+  a, b = _fmac_mul_src(u.src[1]), _fmac_mul_src(u.src[2])
+  out: list[tuple[object, Reg]] = []
+  seen: set[tuple[object, int]] = set()
+  for src0, src1 in ((a, b), (b, a)):
+    if not (isinstance(src1, Reg) and src1.offset >= 256): continue
+    num1 = _vgpr_num(src1)
+    if num1 is None: continue
+    key: tuple[object, int] = (src0 if not isinstance(src0, Reg) else _vgpr_num(src0), num1)
+    if key in seen: continue
+    seen.add(key)
+    out.append((src0, src1))
+  return out
 
 def _vopd_src0_ok(a0, a1) -> bool:
   """VOPD src0: even/odd VGPR pair, or the same VGPR/literal broadcast to both lanes."""

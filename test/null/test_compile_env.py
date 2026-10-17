@@ -15,6 +15,7 @@ class TestCompileEnv(unittest.TestCase):
     script = "\n".join((
       "import sys",
       "from tinygrad.renderer.isa import rdna3_schedule as schedule",
+      "from tinygrad.renderer.isa import rdna3_vopd as vopd",
       "from tinygrad.renderer.isa.rdna3_defs import AMDOps",
       "from tinygrad import dtypes",
       "from tinygrad.uop.ops import Ops, UOp",
@@ -23,6 +24,7 @@ class TestCompileEnv(unittest.TestCase):
       "pack = UOp(Ops.INS, src=(value, value), arg=(AMDOps.PACK, dtypes.int32))",
       "assert schedule._reg_slots(pack) == 2",
       "assert schedule.strength_reduce_int_muls([pack]) == [pack]",
+      "assert vopd.parallel_vmov([]) == []",
     ))
     subprocess.run([sys.executable, "-c", script], check=True)
 

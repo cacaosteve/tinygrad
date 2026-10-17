@@ -11,6 +11,7 @@ from tinygrad.helpers import Context, Target, getenv
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Q6_K, Q6_WORDS, _quant_decode_kernel
 from tinygrad.renderer.isa import IselContext, PreRegAllocContext, Register, greg
+from tinygrad.renderer.amd.dsl import s as scalar_regs
 from tinygrad.renderer.isa.rdna3 import _loop_label
 from tinygrad.runtime.autogen import amdgpu_kd
 from tinygrad.runtime.support.elf import elf_loader
@@ -673,10 +674,10 @@ def _boundless_loop_program(name:str, renderer=_REN):
 
 def _long_branch_program():
   base, loop, exit_label = _range_program(), ".HW_LONG_LOOP", ".HW_LONG_EXIT"
-  prefix = (_uop(Ops.INS, arg=amd_lib.r3.s_mov_b32(amd_lib.s[100], 0)),
+  prefix = (_uop(Ops.INS, arg=amd_lib.r3.s_mov_b32(scalar_regs[100], 0)),
             _uop(Ops.INS, arg=AMDOps.LABEL, tag=loop),
-            _uop(Ops.INS, arg=amd_lib.r3.s_add_u32(amd_lib.s[100], amd_lib.s[100], 1)),
-            _uop(Ops.INS, arg=amd_lib.r3.s_cmp_eq_u32(amd_lib.s[100], 2)),
+            _uop(Ops.INS, arg=amd_lib.r3.s_add_u32(scalar_regs[100], scalar_regs[100], 1)),
+            _uop(Ops.INS, arg=amd_lib.r3.s_cmp_eq_u32(scalar_regs[100], 2)),
             _uop(Ops.INS, arg=AMDOps.CBRANCH_SCC1, tag=exit_label))
   padding = tuple(_uop(Ops.INS, arg=amd_lib.r3.s_nop(0)) for _ in range(0x8001))
   suffix = (_uop(Ops.INS, arg=AMDOps.BRANCH, tag=loop), _uop(Ops.INS, arg=AMDOps.LABEL, tag=exit_label))
@@ -3678,11 +3679,11 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual([getattr(i, "op_name", "") for i in spill_insts],
                      ["V_MOV_B32_E32", "V_MOV_B32_E32", "SCRATCH_STORE_B32", "S_WAITCNT_VSCNT"])
     self.assertEqual(spill_insts[1].vdst, amd_lib.TMP_VDATA)
-    self.assertEqual(spill_insts[1].src0, amd_lib.s[6])
+    self.assertEqual(spill_insts[1].src0, scalar_regs[6])
     self.assertEqual([getattr(i, "op_name", "") for i in fill_insts],
                      ["V_MOV_B32_E32", "SCRATCH_LOAD_B32", "S_WAITCNT_VMCNT", "V_READFIRSTLANE_B32_E32"])
     self.assertEqual(fill_insts[1].vdst, amd_lib.TMP_VDATA)
-    self.assertEqual(fill_insts[3].vdst, amd_lib.s[8])
+    self.assertEqual(fill_insts[3].vdst, scalar_regs[8])
     self.assertEqual(fill_insts[3].src0, amd_lib.TMP_VDATA)
     self.assertEqual(spill_insts[2].sve, 1)
     self.assertEqual(fill_insts[1].sve, 1)

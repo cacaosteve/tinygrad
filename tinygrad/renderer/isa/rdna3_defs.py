@@ -1,8 +1,10 @@
 from dataclasses import dataclass
+import struct
+from tinygrad.device import CompileError
 from tinygrad.dtype import DType, dtypes
 from tinygrad.helpers import getenv
 from tinygrad.renderer.isa import Register, greg
-from tinygrad.renderer.amd.dsl import s, v
+from tinygrad.renderer.amd.dsl import Reg, s, v
 from tinygrad.uop import FastEnum, Ops, auto
 from tinygrad.uop.ops import UOp
 
@@ -221,3 +223,47 @@ def pack_f16_half2_load(lo:UOp, hi:UOp) -> tuple[UOp, int]|None:
   lo_lane, hi_lane = const_int(lo.src[1]), const_int(hi.src[1])
   if lo_lane is None or hi_lane != lo_lane + 1 or lo_lane % 2: return None
   return base, lo_lane // 2
+
+def reg_to_amd(reg:Register, sz:int=1) -> Reg:
+  if reg.index >= 256:
+    idx = reg.index - 256
+    return v[idx] if sz == 1 else v[idx:idx+sz-1]
+  return s[reg.index] if sz == 1 else s[reg.index:reg.index+sz-1]
+
+def reg_lane(reg:Register, lane:int) -> Reg:
+  return reg_to_amd(Register(f"{reg.name}_{lane}", reg.index + lane))
+
+def src_operand(x:UOp):
+  if x.op is Ops.AFTER: return src_operand(x.src[0])
+  if (c:=unwrap_const(x)) is not None:
+    if x.dtype is dtypes.float32: return float(c.val)
+    if x.dtype is dtypes.float16: return struct.unpack("H", struct.pack("e", float(c.val)))[0]
+    return int(c.val)
+  if not isinstance(greg(x), Register): raise CompileError(f"expected reg src {x}")
+  if elem_count(x) > 1: return reg_lane(greg(x), 0)
+  return reg_to_amd(greg(x), reg_slots(x))
+
+def dst_operand(x:UOp) -> Reg:
+  if not isinstance(greg(x), Register): raise CompileError(f"expected reg dst {x}")
+  return reg_to_amd(greg(x), reg_slots(x))
+
+def vgpr_num(reg:Reg) -> int|None:
+  return reg.offset - 256 if isinstance(reg, Reg) and reg.sz == 1 and 256 <= reg.offset < 512 else None
+
+def mov_imm_or_src(x:UOp):
+  """Peel MOV/CAST to a scalar literal when possible; otherwise use the physical source."""
+  cur = x
+  for _ in range(6):
+    if (c:=unwrap_const(cur)) is not None:
+      try:
+        if x.dtype in dtypes.floats or cur.dtype in dtypes.floats: return float(c.val)
+        return int(c.val)
+      except Exception: return src_operand(x)
+    if cur.op is Ops.CAST and cur.src:
+      cur = cur.src[0]
+      continue
+    if cur.op is Ops.INS and iop(cur) is AMDOps.MOV and cur.src and cur.src[0].op is not Ops.SPECIAL:
+      cur = cur.src[0]
+      continue
+    break
+  return src_operand(x)

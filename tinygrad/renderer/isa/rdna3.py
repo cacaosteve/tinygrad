@@ -1,13 +1,12 @@
 from __future__ import annotations
 import math
-import struct
 
 from tinygrad.device import CompileError
 from tinygrad.dtype import dtypes, DType, AddrSpace
 from tinygrad.helpers import Target, getenv, prod, is_image_shape
 from tinygrad.renderer.isa import ISARenderer, IselContext, LinearContext, PreRegAllocContext, Register, greg
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.amd.dsl import Reg, s, v, NULL, EXEC, VCC, Inst
+from tinygrad.renderer.amd.dsl import Reg, v, NULL, EXEC, VCC, Inst
 from tinygrad.runtime.autogen.amd.rdna3 import ins as r3
 from tinygrad.codegen.decomp.op import fast_idiv
 from tinygrad.renderer import tc
@@ -20,7 +19,8 @@ from tinygrad.renderer.isa.rdna3_defs import (AMDOps, KERNARG_REG, WGID, LID, SG
   iop as _iop, elem_count as _elem_count, reg_slots as _reg_slots, reg_idxs as _reg_idxs, const_int as _const_int,
   mem_byte_off as _mem_byte_off, lds_byte_off as _lds_byte_off, load_count_src as _load_count_src,
   pack_f16_is_vec_load as _pack_f16_is_vec_load, pack_f16_is_half2_lo_only as _pack_f16_is_half2_lo_only,
-  pack_f16_half2_load as _pack_f16_half2_load)
+  pack_f16_half2_load as _pack_f16_half2_load, reg_to_amd as _reg_to_amd, reg_lane as _reg_lane,
+  src_operand as _src, dst_operand as _dst, mov_imm_or_src as _mov_imm_or_src)
 from tinygrad.renderer.isa.rdna3_tc import pm_expand_wmma_lds, pm_stage_wmma_ab
 
 def _register_pools(ctx:IselContext|PreRegAllocContext) -> RegisterPools:
@@ -44,75 +44,11 @@ _ISEL_UNARY = {Ops.RECIPROCAL: AMDOps.RECIPROCAL, Ops.EXP2: AMDOps.EXP2, Ops.LOG
                Ops.TRUNC: AMDOps.TRUNC, Ops.SIN: AMDOps.SIN}
 
 def _mem_itemsize(dt:DType) -> int: return dt.itemsize
-def _reg_to_amd(reg:Register, sz:int=1) -> Reg:
-  if reg.index >= 256:
-    idx = reg.index - 256
-    return v[idx] if sz == 1 else v[idx:idx+sz-1]
-  return s[reg.index] if sz == 1 else s[reg.index:reg.index+sz-1]
-def _reg_lane(reg:Register, lane:int) -> Reg:
-  return _reg_to_amd(Register(f"{reg.name}_{lane}", reg.index + lane))
 def _parallel_vmov(moves:list[tuple[Reg, Reg|int|float]]) -> list:
   return _vopd.parallel_vmov(moves)
 
-def _src(x:UOp):
-  if x.op is Ops.AFTER: return _src(x.src[0])
-  if (c:=_unwrap_const(x)) is not None:
-    if x.dtype is dtypes.float32: return float(c.val)
-    if x.dtype is dtypes.float16: return struct.unpack("H", struct.pack("e", float(c.val)))[0]
-    return int(c.val)
-  if not isinstance(greg(x), Register): raise CompileError(f"expected reg src {x}")
-  if _elem_count(x) > 1: return _reg_lane(greg(x), 0)
-  return _reg_to_amd(greg(x), _reg_slots(x))
-
-def _dst(x:UOp) -> Reg:
-  if not isinstance(greg(x), Register): raise CompileError(f"expected reg dst {x}")
-  return _reg_to_amd(greg(x), _reg_slots(x))
-
-def _vgpr_num(reg:Reg) -> int|None:
-  return reg.offset - 256 if isinstance(reg, Reg) and reg.sz == 1 and 256 <= reg.offset < 512 else None
-
-def _fmac_mul_src(x:UOp):
-  """FMAC mul operand: peel MOV/CAST to a float literal when possible, else phys _src."""
-  cur = x
-  for _ in range(6):
-    if (c:=_unwrap_const(cur)) is not None:
-      try: return float(c.val)
-      except Exception: return _src(x)
-    if cur.op is Ops.CAST and cur.src:
-      cur = cur.src[0]
-      continue
-    if cur.op is Ops.INS and _iop(cur) is AMDOps.MOV and cur.src and cur.src[0].op is not Ops.SPECIAL:
-      cur = cur.src[0]
-      continue
-    break
-  return _src(x)
-
-def _fmac_mul_operand_choices(u:UOp) -> list[tuple[object, Reg]]:
-  """VOPD-eligible (src0, src1_vgpr) orientations for float32 FMAC. Mul is commutative."""
-  if u.dtype is not dtypes.float32: return []
-  a, b = _fmac_mul_src(u.src[1]), _fmac_mul_src(u.src[2])
-  out: list[tuple[object, Reg]] = []
-  seen: set[tuple[object, int]] = set()
-  for src0, src1 in ((a, b), (b, a)):
-    if not (isinstance(src1, Reg) and src1.offset >= 256): continue
-    num1 = _vgpr_num(src1)
-    if num1 is None: continue
-    key: tuple[object, int] = (src0 if not isinstance(src0, Reg) else _vgpr_num(src0), num1)
-    if key in seen: continue
-    seen.add(key)
-    out.append((src0, src1))
-  return out
-
-def _fmac_mul_operands(u:UOp) -> tuple[object, Reg]|None:
-  """Return (src0, src1_vgpr) for a float32 FMAC, or None if not VOPD-eligible."""
-  ch = _fmac_mul_operand_choices(u)
-  return ch[0] if ch else None
-
 # --- emit: VOPD pairing (post-regalloc optional dual-issue) ---
-# Physical split: pairing lives in rdna3_vopd.py (bound after helpers above).
 from tinygrad.renderer.isa import rdna3_vopd as _vopd
-_vopd.bind_vopd(iop=_iop, dst=_dst, src=_src, vgpr_num=_vgpr_num,
-                fmac_mul_operand_choices=_fmac_mul_operand_choices)
 _try_vopd_fmac_pair = _vopd.try_vopd_fmac_pair
 _try_vopd_fmac_alu_pair = _vopd.try_vopd_fmac_alu_pair
 _try_vopd_add_pair = _vopd.try_vopd_add_pair
@@ -121,47 +57,8 @@ _try_vopd_max_pair = _vopd.try_vopd_max_pair
 
 from tinygrad.renderer.isa import rdna3_schedule as _sched
 
-def _mov_imm0_or_src(x:UOp):
-  """Inline 0 if x is const-zero (peeling through MOV), else the phys src Reg."""
-  cur = x
-  for _ in range(4):
-    if (c:=_unwrap_const(cur)) is not None:
-      try:
-        if float(c.val) == 0.0: return 0
-      except Exception: pass
-      return _src(x)
-    if cur.op is Ops.INS and _iop(cur) is AMDOps.MOV and cur.src and cur.src[0].op is not Ops.SPECIAL:
-      cur = cur.src[0]
-      continue
-    break
-  return _src(x)
-
-def _mov_imm_or_src(x:UOp):
-  """Peel MOV/CAST to a scalar literal when possible; else phys _src. Flash const broadcasts."""
-  cur = x
-  for _ in range(6):
-    if (c:=_unwrap_const(cur)) is not None:
-      try:
-        if x.dtype in dtypes.floats or cur.dtype in dtypes.floats: return float(c.val)
-        return int(c.val)
-      except Exception:
-        return _src(x)
-    if cur.op is Ops.CAST and cur.src:
-      cur = cur.src[0]
-      continue
-    if cur.op is Ops.INS and _iop(cur) is AMDOps.MOV and cur.src and cur.src[0].op is not Ops.SPECIAL:
-      cur = cur.src[0]
-      continue
-    break
-  return _src(x)
-
 def _try_vopd_mov_pair(u0:UOp, u1:UOp) -> list|None:
   return _vopd.try_vopd_mov_pair(u0, u1)
-
-# Late VOPD bind: mov pair needs imm peel + reg_slots.
-_vopd.bind_vopd(iop=_iop, dst=_dst, src=_src, vgpr_num=_vgpr_num,
-                fmac_mul_operand_choices=_fmac_mul_operand_choices,
-                mov_imm_or_src=_mov_imm_or_src, reg_slots=_reg_slots)
 
 def _full_src(x:UOp) -> Reg:
   if not isinstance(greg(x), Register): raise CompileError(f"expected reg src {x}")
