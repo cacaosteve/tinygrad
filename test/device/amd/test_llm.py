@@ -612,6 +612,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
       os.environ["AMD_VOPD_FMAC"] = "1"
       os.environ["AMD_VOPD_FMAC_ALU"] = "1"
       os.environ.pop("AMD_WMMA_INTERLEAVE", None)
+      before = {k:os.environ.get(k) for k in keys}
       getenv.cache_clear()
       with amd_mod._flash_direct_compile_env():
         self.assertEqual(getenv("AMD_FLASH_ACC_SMALL", 0), 1)
@@ -619,21 +620,22 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         self.assertEqual(os.environ.get("AMD_REG_PROMOTE_SKIP_SLOTS"), "")
         self.assertNotIn("AMD_VOPD_FMAC", os.environ)
         self.assertNotIn("AMD_VOPD_FMAC_ALU", os.environ)
-      self.assertNotIn("AMD_WMMA_INTERLEAVE", os.environ)
-      self.assertEqual(os.environ.get("AMD_FLASH_ACC_SMALL"), "0")
-      self.assertEqual(os.environ.get("TC_LDS_AB"), "0")
-      self.assertEqual(os.environ.get("AMD_WMMA_ACC_BASE"), "145")
-      self.assertEqual(os.environ.get("AMD_WMMA_ACC_N"), "48")
-      self.assertEqual(os.environ.get("ALLOW_UPCAST16"), "0")
+        self.assertEqual(getenv("AMD_WMMA_ACC_BASE"), 145)
+        self.assertEqual(getenv("AMD_WMMA_ACC_N"), 48)
+        self.assertEqual(getenv("ALLOW_UPCAST16"), 0)
+      self.assertEqual({k:os.environ.get(k) for k in keys}, before)
       # Decode-only options are active during compilation but must not leak into later kernels.
       os.environ.pop("AMD_VOPD_FMAC", None)
       os.environ.pop("AMD_VOPD_FMAC_ALU", None)
+      before = {k:os.environ.get(k) for k in keys}
       getenv.cache_clear()
       with amd_mod._flash_direct_compile_env(flash_acc_small=False):
         self.assertEqual(getenv("AMD_VOPD_FMAC"), 1)
         self.assertEqual(getenv("ALLOW_UPCAST16"), 1)
-      self.assertNotIn("AMD_VOPD_FMAC", os.environ)
-      self.assertNotIn("AMD_VOPD_FMAC_ALU", os.environ)
+      self.assertEqual({k:os.environ.get(k) for k in keys}, before)
+      with self.assertRaisesRegex(RuntimeError, "compile failed"):
+        with amd_mod._flash_direct_compile_env(): raise RuntimeError("compile failed")
+      self.assertEqual({k:os.environ.get(k) for k in keys}, before)
     finally:
       for k, v in old.items():
         if v is None: os.environ.pop(k, None)

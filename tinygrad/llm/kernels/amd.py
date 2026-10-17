@@ -892,14 +892,11 @@ def _flash_clear_decode_policy() -> None:
 @contextlib.contextmanager
 def _flash_direct_compile_env(*, flash_acc_small:bool=True):
   """Apply ship flash DIRECT compile policy for build+realize."""
-  prev = os.environ.get("AMD_FLASH_ACC_SMALL")
-  prev_remat = os.environ.get("AMD_REMAT_ADDR")
-  prev_interleave = os.environ.get("AMD_WMMA_INTERLEAVE")
-  prev_decode = {k:os.environ.get(k) for k in _FLASH_DECODE_ONLY}
+  previous = {k:os.environ.get(k) for k in _FLASH_PREFILL.keys() | _FLASH_DECODE.keys()}
   if flash_acc_small:
     for k in _FLASH_DECODE_ONLY: os.environ.pop(k, None)
     _flash_apply_env(_FLASH_PREFILL)
-    # Force path flips (must overwrite sticky decode / matmul / prior ACC_SMALL).
+    # Force the path-specific register partition, regardless of caller defaults.
     os.environ.update({
       "TC_LDS_AB": "0", "AMD_FLASH_ACC_SMALL": "1",
       "AMD_WMMA_ACC_BASE": "145", "AMD_WMMA_ACC_N": "48",
@@ -916,14 +913,7 @@ def _flash_direct_compile_env(*, flash_acc_small:bool=True):
   try:
     yield
   finally:
-    if flash_acc_small:
-      if prev is None: os.environ.pop("AMD_FLASH_ACC_SMALL", None)
-      else: os.environ["AMD_FLASH_ACC_SMALL"] = prev
-      if prev_remat is None: os.environ.pop("AMD_REMAT_ADDR", None)
-      else: os.environ["AMD_REMAT_ADDR"] = prev_remat
-      if prev_interleave is None: os.environ.pop("AMD_WMMA_INTERLEAVE", None)
-      else: os.environ["AMD_WMMA_INTERLEAVE"] = prev_interleave
-    for k, v in prev_decode.items():
+    for k, v in previous.items():
       if v is None: os.environ.pop(k, None)
       else: os.environ[k] = v
     getenv.cache_clear()  # type: ignore[attr-defined]
@@ -1552,6 +1542,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # Mid-store belongs in the cache key (not a bare getenv inside the cached builder).
   _mid_default = 4 if (use_k_unroll == 1 or use_k_unroll >= 8) else 0
   use_k_midstore = _mid_default if use_acc_small else 0  # K_MIDSTORE follows factor default
+  # Keep QKV producers out of the flash-only accumulator partition and scheduler.
+  if ALLOW_DEVICE_USAGE: q.realize(assigned_kv)
   # Build+realize under ACC_SMALL remat + ALLOW_UPCAST16=0 (must wrap custom_kernel).
   # Read SKIP_SLOTS only after compile_env re-applies prefill policy (decode leaves sticky "").
   with _flash_direct_compile_env(flash_acc_small=use_acc_small):
