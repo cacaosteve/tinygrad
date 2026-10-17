@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, dtypes, nn
 from tinygrad.llm.model import (
@@ -88,6 +89,16 @@ class TestAttention(unittest.TestCase):
     expected = [[[[4 + (3/5 + 3*2/5)], [4 + (1/3 + 3*2/3)]]]]
     actual = hc(Tensor([[[[1.], [3.]]]]), lambda x: x.square())
     np.testing.assert_allclose(actual.numpy(), expected, rtol=1e-6, atol=1e-7)
+
+  def test_hyperconnection_single_token_block(self):
+    block = TransformerBlock(self._make_config(hc=HCConfig(count=2, sinkhorn_iters=1, eps=0.0)))
+    block.attn_output.weight, block.ffn_down.weight = Tensor.zeros(4, 4), Tensor.zeros(4, 4)
+    x = Tensor([[[[1., 2., 3., 4.], [5., 6., 7., 8.]]]])
+    # Direct decode must use the same block wrapper, including the residual stream mixing.
+    with patch("tinygrad.llm.model.amd_direct_isa", return_value=True), \
+         patch("tinygrad.llm.model.amd_custom_kernels_supported", return_value=False):
+      actual = block(x, 0).numpy()
+    np.testing.assert_allclose(actual, [[[[3., 4., 5., 6.], [3., 4., 5., 6.]]]], rtol=1e-6, atol=1e-6)
 
   def test_indexer(self):
     indexer = Indexer(self._make_config(dim=2, q_lora_rank=2, indexer=IndexerConfig(n_heads=1, head_dim=2, top_k=2, kpool=2, norm_eps=1e-6)))
