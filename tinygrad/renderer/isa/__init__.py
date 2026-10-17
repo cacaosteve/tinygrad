@@ -61,6 +61,9 @@ class LinearContext:
     self.loop_label: dict[UOp, str] = {}
   def insert_linearized(self, uops:list[UOp]) -> list[UOp]: return uops
   def assign_spill_slot(self, r:Register, u:UOp) -> Any: raise NotImplementedError("arch specific")
+  def register_buffers(self, uops:list[UOp]) -> set[UOp]: return set()
+  def register_order(self, u:UOp, cons:tuple[Register, ...]) -> tuple[Register, ...]: return cons
+  def allocated(self, u:UOp, reg:Register) -> None: pass
 
 class ISARenderer(Renderer):
   float4_dtypes: tuple[DType, ...]|None = None
@@ -77,9 +80,14 @@ class ISARenderer(Renderer):
 
   def prepare_pre_regalloc(self, lst:list[UOp]) -> tuple[list[UOp], dict]: return lst, {}
   def is_two_address(self, x:UOp) -> bool: return False
+  def redefines_register(self, x:UOp) -> bool: return self.is_two_address(x)
+  def is_promoted_reg_redef(self, x:UOp) -> bool: return False
   def prefer_phys(self, x:UOp, src_phys:list) -> Register|None: return None
   def loop_end(self, x:UOp) -> UOp|None: return x.src[1] if x.op is Ops.END else None
   def rematerialize(self, x:UOp) -> bool: return False
+  def is_rematerialized_constant(self, x:UOp) -> bool: return False
+  def remat(self, x:UOp, reg:Register, src_regs:list[Register|None]) -> UOp: raise NotImplementedError("arch specific")
+  def bind(self, dtype:DType, reg:Register) -> UOp: raise NotImplementedError("arch specific")
   # If True, a rematerialized value stays in its phys reg across uses (no re-remat each time).
   def keep_remat(self, x:UOp) -> bool: return False
   def register_slots(self, x:UOp, v:Register|None=None) -> int: return 1

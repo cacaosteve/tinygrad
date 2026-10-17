@@ -6,7 +6,7 @@ import struct
 from tinygrad.device import CompileError
 from tinygrad.dtype import dtypes, DType, AddrSpace
 from tinygrad.helpers import Target, getenv, prod, is_image_shape
-from tinygrad.renderer.isa import ISARenderer, IselContext, PreRegAllocContext, Register, greg
+from tinygrad.renderer.isa import ISARenderer, IselContext, LinearContext, PreRegAllocContext, Register, greg
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.amd.dsl import Reg, s, v, NULL, EXEC, VCC, Inst
 from tinygrad.runtime.autogen.amd.rdna3 import ins as r3
@@ -4106,6 +4106,28 @@ def _sink_alu_into_reg_store(ops: list[UOp]) -> list[UOp]:
   return _sched.sink_alu_into_reg_store(ops)
 
 # --- renderer entry: isel, remat, regalloc hooks, asm ---
+class AMDLinearContext(LinearContext):
+  ren: AMDRenderer
+  def __init__(self, ren:AMDRenderer):
+    super().__init__(ren)
+    self.last_const_register: int|None = None
+
+  def register_buffers(self, uops:list[UOp]) -> set[UOp]: return _reg_promotable_buffers(PreRegAllocContext(uops))
+
+  def register_order(self, u:UOp, cons:tuple[Register, ...]) -> tuple[Register, ...]:
+    # Prefer adjacent even/odd destinations for independent constant MOVs (VOPD).
+    if not self.ren._vopd_pair_op(u) or not cons: return cons
+    want = 0
+    if self.last_const_register is not None:
+      next_idx = self.last_const_register + 1
+      exact = tuple(r for r in cons if r.index == next_idx)
+      if exact: return exact + tuple(r for r in cons if r.index != next_idx)
+      want = 1 - self.last_const_register % 2
+    return tuple(r for r in cons if r.index % 2 == want) + tuple(r for r in cons if r.index % 2 != want)
+
+  def allocated(self, u:UOp, reg:Register) -> None:
+    if self.ren._vopd_pair_op(u): self.last_const_register = reg.index
+
 class AMDRenderer(ISARenderer):
   device = "AMD"
   has_local = True
@@ -4114,6 +4136,7 @@ class AMDRenderer(ISARenderer):
   float4_dtypes = (dtypes.float32, dtypes.half)
   wide_regalloc = True
   disk_program_cache = True
+  linear_ctx_type = AMDLinearContext
   preferred_reduce_group = 16
   preferred_complex_matvec_group = 32
   global_max = (0x8fffffff, 0x8fffffff, 0x8fffffff)
@@ -4266,6 +4289,8 @@ class AMDRenderer(ISARenderer):
     if _iop(x) in (AMDOps.WMMA, AMDOps.FMAC, AMDOps.FMA_MIX_F32, AMDOps.REG_STORE): return True
     # PACK_F16(half×16 LOAD) — coalesce onto the load (hand FA/FB).
     return _iop(x) is AMDOps.PACK_F16 and _pack_f16_is_vec_load(x) and len(x.src) == 1
+  def redefines_register(self, x:UOp) -> bool: return self.is_two_address(x) or _iop(x) is AMDOps.PACK
+  def is_rematerialized_constant(self, x:UOp) -> bool: return self._const_mov_leaf(x) is not None
   def is_promoted_reg_redef(self, x:UOp) -> bool:
     """ALU sinked onto a promoted REG slot: allow mid-live redef without uses[0] coalesce.
 
@@ -4287,170 +4312,6 @@ class AMDRenderer(ISARenderer):
     if _unwrap_const(x.src[0]) is not None: return True
     return self._const_mov_leaf(x) is not None
 
-  def _vopd_src1_op(self, x:UOp) -> bool:
-    """Producers that become FMAC VOPD src1 — track only these so MOV/ALU don't break the chain.
-
-    Softmax FMACs need consecutive EXP2 VGPRs. EXTRACT is intentionally excluded: pack
-    lanes interleave with EXP2 in linearize order and would steal the +1 mate (leaving
-    EXP2 on scattered banks). ACC FMAC src1s are stride-8 anyway, so EXTRACT pairing
-    cannot feed dual_fmac.
-    """
-    if x.op is not Ops.INS or x.dtype is not dtypes.float32: return False
-    return _iop(x) is AMDOps.EXP2
-  def vopd_pair_bias_cons(self, u:UOp, cons:tuple, last_idx:int|None,
-                          src1_last_idx:int|None=None, park_last_idx:int|None=None) -> tuple:
-    """Reorder cons so wide_alloc prefers last+1 (true VOPD pair), else parity.
-
-    FMAC mul-src producers (EXP2) use src1_last_idx only — never fall back to the general
-    ALU last_idx (that starts EXP2 chains on odd banks).
-    """
-    if not self._vopd_pair_op(u) or not cons: return cons
-    if self._vopd_src1_op(u):
-      track = src1_last_idx  # None → start on even; do not inherit FMAC/MOV last
-      if track is not None:
-        want_idx = int(track) + 1
-        exact = tuple(r for r in cons if r.index == want_idx)
-        if exact:
-          rest = tuple(r for r in cons if r.index != want_idx)
-          return exact + rest
-      want = 0  # fresh even pair if chain breaks
-    else:
-      track = last_idx
-      if track is not None:
-        want_idx = int(track) + 1
-        exact = tuple(r for r in cons if r.index == want_idx)
-        if exact:
-          rest = tuple(r for r in cons if r.index != want_idx)
-          return exact + rest
-        want = 1 - (int(track) % 2)
-      else:
-        want = 0
-    prefer = tuple(r for r in cons if r.index % 2 == want)
-    rest = tuple(r for r in cons if r.index % 2 != want)
-    return prefer + rest if prefer else cons
-  def vopd_track_alloc(self, u:UOp, phys:Register, last_idx:int|None,
-                       src1_last_idx:int|None=None, park_last_idx:int|None=None) -> tuple[int|None, int|None, int|None]:
-    # EXP2 is src1-chain only: advancing last_idx steals the FMAC/ADD dest pair track.
-    new_last = phys.index if self._vopd_pair_op(u) and not self._vopd_src1_op(u) else last_idx
-    new_src1 = phys.index if self._vopd_src1_op(u) else src1_last_idx
-    return new_last, new_src1, park_last_idx
-  def pack_chain_bias_cons(self, u:UOp, cons:tuple, live:dict) -> tuple:
-    """Bias LLOAD/LOAD dests so multi-src PACK_F16 vec fragments stay contiguous.
-
-    Without this, 2×B128 A/B loads often land on non-adjacent VGPRs and PACK evacuates
-    (v86–93→v104–111). Gate: AMD_PACK_LLOAD_CHAIN (default ON).
-
-    For src[0], reserve a free contiguous span covering the whole PACK so later srcs
-    can chain; src[i>0] prefer prev+slots (or the reserved base+offset).
-
-    Note: under flash pressure the full-span reserve often finds nothing (ranked empty);
-    soft / any-src first-visit variants raised v_mov/ninst — keep the strict si==0 path.
-    (AMD_CLUSTER_PACK_LLOAD / AMD_HOIST_PACK_AFTER_LLOAD schedule knobs removed — checksum/regress.)
-
-    Also: AMD_PACK_F16_HALF2_GLOBAL even-lane EXTRACTs (full half2 words) — bias so the
-    lo dests of one PACK land contiguous and prefer_phys can alias PACK onto them.
-    """
-    if getenv("AMD_FLASH_ACC_SMALL", 0) and u.op is Ops.INS and _iop(u) is AMDOps.EXTRACT and \
-       u.dtype is dtypes.float16 and isinstance(u.tag, tuple):
-      idx = getattr(self, "_pack_half2_lo_index", None)
-      if idx is None:
-        idx = {}
-        for pu in getattr(self, "_pack_chain_uops", ()):
-          if pu.op is not Ops.INS or _iop(pu) is not AMDOps.PACK_F16 or _pack_f16_is_vec_load(pu): continue
-          if _pack_f16_is_half2_lo_only(pu):
-            for lane, lo in enumerate(pu.src):
-              idx[lo] = (pu, lane)
-            continue
-          if len(pu.src) < 2 or len(pu.src) % 2: continue
-          pairs = list(zip(pu.src[::2], pu.src[1::2]))
-          if not all(_pack_f16_half2_load(lo, hi) is not None for lo, hi in pairs): continue
-          for lane, (lo, _) in enumerate(pairs):
-            idx[lo] = (pu, lane)
-        self._pack_half2_lo_index: dict[UOp, tuple[UOp, int]] = idx
-      got = idx.get(u)
-      if got is not None:
-        pack, lane = got
-        bases: dict[int, int] | None = getattr(self, "_pack_half2_bases", None)
-        if bases is None:
-          self._pack_half2_bases: dict[int, int] = {}
-          bases = self._pack_half2_bases
-        need = len(pack.src) if _pack_f16_is_half2_lo_only(pack) else len(pack.src) // 2
-        occupied: set[int] = set()
-        for p in live.values():
-          if isinstance(p, Register): occupied.add(p.index)
-        if lane == 0:
-          pool_idxs = {r.index for r in u.tag[0].cons}
-          ranked: list[Register] = [r for r in cons
-                    if not any((r.index + k) in occupied for k in range(need))
-                    and all((r.index + k) in pool_idxs for k in range(need))]
-          if ranked:
-            ranked = sorted(ranked, key=lambda r: r.index)
-            bases[id(pack)] = ranked[0].index
-            return tuple(ranked) + tuple(r for r in cons if r not in ranked)
-        else:
-          want = bases.get(id(pack))
-          if want is not None:
-            want = want + lane
-            exact = tuple(r for r in cons if r.index == want)
-            if exact: return exact + tuple(r for r in cons if r.index != want)
-    if u.op is not Ops.INS or _iop(u) not in (AMDOps.LLOAD, AMDOps.LOAD): return cons
-    if _elem_count(u) < 2 or not isinstance(u.tag, tuple): return cons
-    # Lazy index: mem → (pack, src_i)
-    idx = getattr(self, "_pack_lload_index", None)
-    if idx is None:
-      idx = {}
-      for pu in getattr(self, "_pack_chain_uops", ()):
-        if pu.op is Ops.INS and _iop(pu) is AMDOps.PACK_F16 and _pack_f16_is_vec_load(pu) and len(pu.src) >= 2:
-          for si, s in enumerate(pu.src):
-            idx[s] = (pu, si)
-      self._pack_lload_index: dict[UOp, tuple[UOp, int]] = idx
-    got = idx.get(u)
-    if got is None: return cons
-    pack, si = got
-    chain_bases: dict[int, int] | None = getattr(self, "_pack_chain_bases", None)
-    if chain_bases is None:
-      self._pack_chain_bases: dict[int, int] = {}
-      chain_bases = self._pack_chain_bases
-    need = sum(_reg_slots(s) for s in pack.src)
-    chain_occupied: set[int] = set()
-    for p in live.values():
-      if isinstance(p, Register): chain_occupied.add(p.index)
-    if si == 0:
-      # Prefer a base where the full pack span is free and in this UOp's cons pool.
-      pool_idxs = {r.index for r in u.tag[0].cons}
-      chain_ranked: list[Register] = []
-      for r in cons:
-        base = r.index
-        if any((base + k) in chain_occupied for k in range(need)): continue
-        if not all((base + k) in pool_idxs for k in range(need)): continue
-        chain_ranked.append(r)
-      if not chain_ranked:
-        # Soft full-span reserve (AMD_PACK_LLOAD_SOFT) removed — scrambled fragment order.
-        return cons
-      # Prefer WMMA-aligned bases (mod 8) — A/B matrices want 8-VGPR alignment; reduces evacuate.
-      # Then lowest index (earlier free space) so later pack srcs can chain before the band fills.
-      if need >= 8 and not getenv("AMD_FLASH_ACC_SMALL", 0):
-        chain_ranked = sorted(chain_ranked, key=lambda r: (0 if r.index % 8 == 0 else 1, r.index))
-      elif need >= 4:
-        chain_ranked = sorted(chain_ranked, key=lambda r: (0 if r.index % 4 == 0 else 1, r.index))
-      else:
-        chain_ranked = sorted(chain_ranked, key=lambda r: r.index)
-      chain_bases[id(pack)] = chain_ranked[0].index
-      return tuple(chain_ranked) + tuple(r for r in cons if r not in chain_ranked)
-    # si > 0: prefer reserved base+offset, else prev+slots.
-    off = sum(_reg_slots(s) for s in pack.src[:si])
-    want = chain_bases.get(id(pack))
-    if want is not None: want = want + off
-    else:
-      prev = pack.src[si - 1]
-      try: prev_r = greg(prev)
-      except Exception: return cons
-      prev_phys = live.get(prev_r) if isinstance(prev_r, Register) else None
-      if prev_phys is None: return cons
-      want = prev_phys.index + _reg_slots(prev)
-    exact = tuple(r for r in cons if r.index == want)
-    if not exact: return cons
-    return exact + tuple(r for r in cons if r.index != want)
   def spill(self, disp:UOp, x:UOp, slots:int|None=None) -> UOp:
     # REG_STORE is void; spill the written value, not the void node.
     if x.op is Ops.INS and _iop(x) is AMDOps.REG_STORE: x = x.src[1]
@@ -4605,12 +4466,6 @@ class AMDRenderer(ISARenderer):
     # Keep default SCAN=64 — large SCAN (256+) wrong-sum / hang on decode (2026-09-25).
     # ADD↔ADD hoist removed (AMD_SCHEDULE_ADD_ADD): NaN root; dual_add not worth it.
     lst = _schedule_fmac_add_pairs(lst)
-    # Snapshot for pack_chain_bias_cons (contiguous multi-src PACK_F16 LLOAD coloring).
-    self._pack_chain_uops: list[UOp] = lst
-    self._pack_lload_index = {}
-    self._pack_chain_bases = {}
-    self._pack_half2_lo_index = {}
-    self._pack_half2_bases = {}
     return lst
   def _pure_addr(self, x:UOp) -> bool:
     if x.op in (Ops.CONST, Ops.SPECIAL): return True

@@ -1,13 +1,36 @@
 import unittest
 
 from tinygrad.codegen import to_program, to_program_cache
+from tinygrad.codegen.late.regalloc import LinearScanRegallocContext
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import Target
+from tinygrad.renderer.isa import ISARenderer, LinearContext, Register
 from tinygrad.renderer.isa.x86 import X86Ops, X86Renderer
 from tinygrad.uop.ops import KernelInfo, Ops, UOp
 
 
 class TestRegalloc(unittest.TestCase):
+  def test_allocation_policy_state_is_per_program(self):
+    class PolicyContext(LinearContext):
+      def __init__(self, renderer):
+        super().__init__(renderer)
+        self.allocations = []
+      def register_order(self, u, cons):
+        offset = len(self.allocations) % len(cons)
+        return cons[offset:] + cons[:offset]
+      def allocated(self, u, reg): self.allocations.append(reg)
+
+    renderer = ISARenderer(Target("CPU", arch="x86_64"))
+    renderer.wide_regalloc = True
+    physical = tuple(Register(f"p{i}", i, size=4) for i in range(2))
+    virtual = tuple(Register(f"v{i}", 0, physical, size=4) for i in range(2))
+    uops = [UOp(Ops.INS, arg=("value", dtypes.float32), tag=(v,)) for v in virtual]
+    for _ in range(2):
+      context = PolicyContext(renderer)
+      allocated = LinearScanRegallocContext(context, uops, renderer)
+      self.assertEqual(context.allocations, list(physical))
+      self.assertEqual([allocated.reals[i][v] for i,v in enumerate(virtual)], list(physical))
+
   def test_stack_dealloc_emits_before_sink(self):
     renderer = X86Renderer(Target("CPU", arch="x86_64"))
     out = UOp.placeholder((1,), dtypes.float32, 0)
