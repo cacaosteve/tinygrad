@@ -15,19 +15,16 @@ from tinygrad.renderer import tc
 from tinygrad.uop import Ops, GroupOp
 from tinygrad.uop.divandmod import affine_int_bounds
 from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
-from tinygrad.renderer.isa import rdna3_defs as _defs
 from tinygrad.renderer.isa.rdna3_defs import (AMDOps, KERNARG_REG, WGID, LID, SGPR, SGPR32, VGPR,
-  TMP_VDATA, TMP_VADDR, TMP_BRANCH, TMP_SDATA0, TMP_SDATA1, refresh_vgpr_pools,
+  TMP_VDATA, TMP_VADDR, TMP_BRANCH, TMP_SDATA0, TMP_SDATA1, RegisterPools, register_pools,
   allow_upcast16, unwrap_const as _unwrap_const, const_value as _const_value, tconst as _tconst)
 from tinygrad.renderer.isa.rdna3_tc import pm_expand_wmma_lds, pm_stage_wmma_ab
 
-# Live soft-partition pools live in rdna3_defs (refresh_vgpr_pools mutates them). Forward so
-# `amd_lib.WMMA_ACC_*` / tests see the current binding after flash/matmul compile_env.
-def __getattr__(name: str):
-  if name in ("WMMA_ACC_VGPR", "WMMA_ACC_QUANT_VGPR", "LLOAD_VGPR", "PACK_F16_VGPR",
-              "PACK_F16_VGPR_UP16", "LLOAD_VGPR_UP16"):
-    return getattr(_defs, name)
-  raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+def _register_pools(ctx:IselContext|PreRegAllocContext) -> RegisterPools:
+  if (pools:=ctx.scratch.get("register_pools")) is None:
+    base = getenv("AMD_WMMA_ACC_BASE", 121)
+    ctx.scratch["register_pools"] = pools = register_pools(base, getenv("AMD_WMMA_ACC_N", 48 if base >= 140 else 128))
+  return pools
 
 # RDNA3: kernarg in s[0:1], local ids packed in v0. Even SGPR bases for 64-bit kernarg loads.
 # WGID follows USER_SGPR_COUNT: s2 when count=2 (1D locals); s15 when gfx1100 pads to 15 (2D locals).
@@ -916,7 +913,8 @@ def _promote_reg_cons(ctx:PreRegAllocContext, buf:UOp) -> tuple[Register, ...]:
     return VGPR
   packed_quant = True and any(
     u.op is Ops.INS and _iop(u) in (AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16) for u in uops)
-  acc_pool = _defs.WMMA_ACC_QUANT_VGPR if packed_quant else _defs.WMMA_ACC_VGPR
+  pools = _register_pools(ctx)
+  acc_pool = pools.quant_acc if packed_quant else pools.acc
   if acc_pool and acc_pool is not VGPR:
     try: cut = next(i for i,r in enumerate(VGPR) if r.index == acc_pool[0].index)
     except StopIteration: cut = len(VGPR) - len(acc_pool)
@@ -1162,7 +1160,8 @@ def _isel_wmma(ctx:IselContext, x:UOp) -> UOp:
     # tile. pre-assign a unique vreg so each tile's accumulator stays distinct.
     quantized = True and any(
       u.op in (Ops.CUSTOM, Ops.CUSTOMI) and _custom_name(u) in (AMD_FMA_TO_F16, AMD_PACKED_F16_MUL_TO_F16) for u in ctx.uses)
-    c = _wmma_stack_operand(cin, 2).replace(tag=(ctx.vreg(_defs.WMMA_ACC_QUANT_VGPR if quantized else _defs.WMMA_ACC_VGPR),))
+    pools = _register_pools(ctx)
+    c = _wmma_stack_operand(cin, 2).replace(tag=(ctx.vreg(pools.quant_acc if quantized else pools.acc),))
   return UOp(Ops.INS, src=(c, a, b), arg=(AMDOps.WMMA, dtypes.float if x.dtype is dtypes.float else x.dtype), tag=x.tag)
 
 def _wmma_inst(u:UOp):
@@ -1453,7 +1452,8 @@ def _alloc_vregs(ctx:IselContext, x:UOp, sgpr_pool:tuple[Register, ...], vgpr_po
     # Vec-load PACK shares a pool with its mem src so prefer_phys / coalesce can alias.
     if _pack_f16_is_vec_load(x):
       if all(s.op is Ops.INS and _iop(s) is AMDOps.LLOAD for s in x.src):
-        return x.replace(tag=(ctx.vreg(_defs.LLOAD_VGPR_UP16 if allow_upcast16() else _defs.LLOAD_VGPR),))
+        pools = _register_pools(ctx)
+        return x.replace(tag=(ctx.vreg(pools.load_upcast if allow_upcast16() else pools.load),))
       return x.replace(tag=(ctx.vreg(vgpr_pool),))
     if (base := _pack_f16_identity_load(x)) is not None and isinstance(base.tag, tuple):
       return x.replace(tag=base.tag)
@@ -1464,10 +1464,13 @@ def _alloc_vregs(ctx:IselContext, x:UOp, sgpr_pool:tuple[Register, ...], vgpr_po
       (u.op is Ops.INS and _iop(u) is AMDOps.WMMA) for u in ctx.uses))
     # AMD_PACK_F16_GENERAL removed (flash needs scalar LSTORE fix). HALF2_GLOBAL still widens pool.
     if getenv("AMD_FLASH_ACC_SMALL", 0): pack_pool = vgpr_pool
-    else: pack_pool = (_defs.PACK_F16_VGPR_UP16 if allow_upcast16() else _defs.PACK_F16_VGPR) if has_wmma else vgpr_pool
+    else:
+      pools = _register_pools(ctx)
+      pack_pool = (pools.pack_upcast if allow_upcast16() else pools.pack) if has_wmma else vgpr_pool
     return x.replace(tag=(ctx.vreg(pack_pool),))
   if iop is AMDOps.LLOAD:
-    return x.replace(tag=(ctx.vreg(_defs.LLOAD_VGPR_UP16 if allow_upcast16() else _defs.LLOAD_VGPR),))
+    pools = _register_pools(ctx)
+    return x.replace(tag=(ctx.vreg(pools.load_upcast if allow_upcast16() else pools.load),))
   if _wants_uniform_sgpr(x): return x.replace(tag=(ctx.vreg(scalar_pool),))
   return x.replace(tag=(ctx.vreg(vgpr_pool),))
 
@@ -3901,7 +3904,6 @@ def apply_tc_hand_opts(tk, rngs):
     elif os.environ.get("AMD_WMMA_ACC_BASE") is None:
       os.environ["AMD_WMMA_ACC_BASE"] = "-1"
     getenv.cache_clear()  # type: ignore[attr-defined]
-    refresh_vgpr_pools()
     return apply_register_tc_hand_opts(tk, rngs)
   lds_ab = getenv("TC_LDS_AB", 0)
   up_cap = getenv("TC_UPCAST", 4 if allow_upcast16() else 2)
@@ -4250,7 +4252,6 @@ class AMDRenderer(ISARenderer):
   def merge_memory_loads(self, sink:UOp) -> UOp: return merge_adjacent_uint32_loads(merge_adjacent_half_loads(sink))
 
   def prepare_pre_regalloc(self, lst:list[UOp]) -> tuple[list[UOp], dict]:
-    refresh_vgpr_pools()  # flash ACC_BASE/LLOAD_POOL may be set after import
     lst = _hoist_kernargs(_protect_loop_invariant_fmac(lst))
     # Unroll lowers WMMA cin to zero PACKs + ADD into phi. Those PACKs must run each K
     # iteration: if they stay pre-loop, two-address WMMA keeps ACC across iters and the
@@ -4582,7 +4583,6 @@ class AMDRenderer(ISARenderer):
     return "\n".join(ret)
 
   def render(self, uops:list[UOp]) -> str:
-    refresh_vgpr_pools()  # flash ACC_BASE / LLOAD_POOL set after import
     _B_PAGE_IDX.clear()
     return self.asm_str(uops, "kernel")
   def _insts_for_uop(self, u:UOp): return insts_for_uop(u)

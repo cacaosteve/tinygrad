@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from tinygrad.dtype import DType
 from tinygrad.helpers import getenv
 from tinygrad.renderer.isa import Register
@@ -22,48 +23,24 @@ SGPR32 = tuple(Register(f"s{i}", i, size=4) for i in range(6, 102) if i not in (
 VGPR = tuple(Register(f"v{i}", 256+i, size=4) for i in range(5, 254))
 # AMD_VGPR_CAP lab path removed (never shipped; occupancy experiments via fork only).
 
-# Soft partition: ACC packs live in a high VGPR band so LinearScan does not spill them.
-# Default product ACC_BASE=121: gives Q6_K WMMA a wider quant-ACC pool (8 vs 15 spills,
-# ~15% faster at 4096x4096x32) without regressing the 2048² half-matmul check. Flash prefill
-# compile_env sets 145 + LLOAD_POOL=135; call
-# refresh_vgpr_pools() at render entry so sticky env applies after import.
-WMMA_ACC_VGPR: tuple[Register, ...] = VGPR
-WMMA_ACC_QUANT_VGPR: tuple[Register, ...] = VGPR
-LLOAD_VGPR: tuple[Register, ...] = VGPR[:118]
-PACK_F16_VGPR: tuple[Register, ...] = VGPR[185:244]
-PACK_F16_VGPR_UP16: tuple[Register, ...] = VGPR[59:121]
-LLOAD_VGPR_UP16: tuple[Register, ...] = VGPR[:59]
+# Accumulator tuples use a reserved VGPR band to avoid spilling large WMMA values.
+@dataclass(frozen=True)
+class RegisterPools:
+  acc: tuple[Register, ...] = VGPR
+  quant_acc: tuple[Register, ...] = VGPR
+  load: tuple[Register, ...] = VGPR[:118]
+  pack: tuple[Register, ...] = VGPR[185:244]
+  pack_upcast: tuple[Register, ...] = VGPR[59:121]
+  load_upcast: tuple[Register, ...] = VGPR[:59]
 
-def refresh_vgpr_pools() -> None:
-  """Re-bind soft-partition pools from current env (flash sets ACC_BASE after import)."""
-  global WMMA_ACC_VGPR, WMMA_ACC_QUANT_VGPR, LLOAD_VGPR, PACK_F16_VGPR, PACK_F16_VGPR_UP16, LLOAD_VGPR_UP16
-  # Default 121 for product-16. Q4K/flash override
-  # (-1 / 145+N=48). Setting only via os.environ after getenv misses cache — callers must
-  # getenv.cache_clear().
-  acc_base_env = int(getenv("AMD_WMMA_ACC_BASE", 121))
-  if acc_base_env < 0:
-    WMMA_ACC_VGPR = VGPR
-    WMMA_ACC_QUANT_VGPR = VGPR
-    LLOAD_VGPR = VGPR[:118]
-    PACK_F16_VGPR = VGPR[185:244]
-    PACK_F16_VGPR_UP16 = VGPR[59:121]
-    LLOAD_VGPR_UP16 = VGPR[:59]
-    return
-  # Product-16 needs ACC_N=128; flash ACC_BASE≥140 uses N=48 (set explicitly too).
-  acc_n_req = max(1, int(getenv("AMD_WMMA_ACC_N", 48 if acc_base_env >= 140 else 128)))
-  acc_base = max(89, min(acc_base_env, len(VGPR) - acc_n_req))
-  acc_n = min(acc_n_req, len(VGPR) - acc_base)
-  WMMA_ACC_VGPR = VGPR[acc_base:acc_base + acc_n]
-  WMMA_ACC_QUANT_VGPR = VGPR[min(89, acc_base):acc_base + acc_n]
-  LLOAD_VGPR = VGPR[:min(135, acc_base)]  # AMD_LLOAD_POOL hardcoded 135 (flash ship)
-  if acc_base >= 201:
-    PACK_F16_VGPR = VGPR[max(121, acc_base - 60):acc_base]
-  else:
-    PACK_F16_VGPR = VGPR[max(89, acc_base - 50):acc_base]
-  PACK_F16_VGPR_UP16 = VGPR[59:min(121, acc_base)]
-  LLOAD_VGPR_UP16 = VGPR[:59]
-
-refresh_vgpr_pools()
+def register_pools(acc_base:int=121, acc_n:int|None=None) -> RegisterPools:
+  if acc_base < 0: return RegisterPools()
+  count = max(1, acc_n if acc_n is not None else (48 if acc_base >= 140 else 128))
+  base = max(89, min(acc_base, len(VGPR) - count))
+  end = base + min(count, len(VGPR) - base)
+  pack_base = max(121, base - 60) if base >= 201 else max(89, base - 50)
+  return RegisterPools(acc=VGPR[base:end], quant_acc=VGPR[min(89, base):end], load=VGPR[:min(135, base)],
+                       pack=VGPR[pack_base:base], pack_upcast=VGPR[59:min(121, base)])
 
 # v3/v4: per-instruction VGPR scratch; s20/s21: SALU/permlane; s22:23: long branch.
 TMP_VDATA, TMP_VADDR = v[3], v[4]

@@ -11,6 +11,23 @@ from tinygrad.helpers import getenv
 from tinygrad.uop.ops import KernelInfo, UOp
 
 class TestCompileEnv(unittest.TestCase):
+  def test_rdna3_register_pools_are_per_compile(self):
+    from tinygrad.renderer.isa import PreRegAllocContext
+    from tinygrad.renderer.isa.rdna3 import _register_pools
+    from tinygrad.renderer.isa.rdna3_defs import VGPR
+    first, second = PreRegAllocContext(), PreRegAllocContext()
+    try:
+      with patch.dict(os.environ, {"AMD_WMMA_ACC_BASE":"-1", "AMD_WMMA_ACC_N":"128"}):
+        getenv.cache_clear()
+        original = _register_pools(first)
+      with patch.dict(os.environ, {"AMD_WMMA_ACC_BASE":"145", "AMD_WMMA_ACC_N":"48"}):
+        getenv.cache_clear()
+        changed = _register_pools(second)
+        self.assertIs(_register_pools(first), original)
+      self.assertEqual(original.acc, VGPR)
+      self.assertEqual(changed.acc, VGPR[145:193])
+    finally: getenv.cache_clear()
+
   def test_rdna3_import_preserves_llvm_renderer(self):
     script = "\n".join((
       "from tinygrad.renderer.llvmir import AMDLLVMRenderer",

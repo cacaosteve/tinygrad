@@ -1127,7 +1127,7 @@ class TestAMDRenderer(unittest.TestCase):
     # Residual SPILL under ACC soft-partition is acceptable; peak stays in-file above.
 
   def test_wmma_acc_reload_matches_rebuilt_vreg_tag(self):
-    vreg = Register("acc", 0, _cons=amd_lib.WMMA_ACC_QUANT_VGPR)
+    vreg = Register("acc", 0, _cons=amd_lib.register_pools().quant_acc)
     init_tag, reload_tag = (vreg,), tuple([vreg])
     self.assertIsNot(init_tag, reload_tag)
     init = _uop(Ops.INS, dtypes.float32, tuple(UOp.const(0.0, dtypes.float32) for _ in range(8)), AMDOps.PACK, init_tag)
