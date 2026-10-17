@@ -828,6 +828,9 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
     if volatile: src = (src[0], src[1], src[2].rtag("volatile"), *src[3:])
     return x.ins(AMDOps.LOAD, dtype=x.dtype, src=src)
   if alt is not None and gate is not None:
+    # Coalescing uses SHRINK addresses, which bypass the scalar pre-isel gated-load
+    # rewrite. Selecting the result alone must not issue an out-of-bounds load.
+    a = a.replace(src=(a.src[0], gate.where(a.src[1], a.src[1].const_like(0)), *a.src[2:]))
     raw = UOp(Ops.LOAD, src=(a,))
     if n == 1: return gate.where(raw, alt)
     return UOp(Ops.STACK, src=tuple(

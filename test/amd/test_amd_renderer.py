@@ -3985,6 +3985,24 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertGreaterEqual(linear_ops.count(AMDOps.WHERE), 4)
     self.assertIn(AMDOps.LOAD, linear_ops)
 
+  def test_gated_vector_load_uses_safe_address(self):
+    buf = UOp.placeholder((64,), dtypes.float32, 0)
+    lane = UOp.special(16, "lidx0")
+    index, gate, alt = lane-4, lane<4, UOp.const(0., dtypes.float32)
+    addr = UOp(Ops.SHRINK, src=(buf, index, UOp.const(4, dtypes.weakint)))
+    value = UOp(Ops.LOAD, src=(addr, alt, gate))
+    lowered = amd_lib._load_ins(value, addr, alt, gate)
+    raw, = [u for u in lowered.toposort() if u.op is Ops.LOAD]
+    self.assertEqual(raw.src[0].src[1], gate.where(index, index.const_like(0)))
+    self.assertEqual(raw.shape, (4,))
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_logcumsumexp_gated_vectors(self):
+    import numpy as np
+    values = np.random.default_rng(72).uniform(-2, 2, (6, 6, 6, 6)).astype(np.float32)
+    actual = Tensor(values, device="AMD").logcumsumexp(2).numpy()
+    np.testing.assert_allclose(actual, np.logaddexp.accumulate(values, axis=2), atol=1e-6, rtol=1e-3)
+
   def test_gated_store_uses_exec_mask_around_store(self):
     lin = _late_gated_store_linear()
     self.assertFalse(any(u.op in (Ops.INDEX, Ops.IF, Ops.ENDIF, Ops.STORE) for u in lin.src))
