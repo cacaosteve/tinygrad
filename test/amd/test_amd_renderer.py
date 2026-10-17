@@ -115,6 +115,31 @@ def _simple_add_program():
   sink = out.index(idx).store(inp.index(idx).load() + UOp.const(1.0, dtypes.float)).sink(idx, arg=KernelInfo(name="amd_asm_add"))
   return _to_prg(sink)
 
+def _physical_half_program(op, regs):
+  """Keep upper/lower halves and low-register aliases distinct at the true16 boundary."""
+  from tinygrad.renderer.amd.dsl import VCC_LO, NULL
+  from tinygrad.renderer.amd.elf import assemble_linear
+  from tinygrad.runtime.autogen.amd.rdna3 import ins as r3
+  a, b, dst = regs
+  compare = op in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ)
+  vals = [_uop(Ops.INS, dtypes.float16, arg=AMDOps.MOV, tag=(Register(str(r), 256+r),)) for r in regs]
+  src = (vals[2], *vals[:2]) if op is AMDOps.FMAC else tuple(vals[:2])
+  ins = _uop(Ops.INS, dtypes.bool if compare else dtypes.float16, src, op, vals[2].tag)
+  def halves(lo, hi): return struct.unpack("I", struct.pack("ee", lo, hi))[0]
+  insts = [r3.s_load_b64(scalar_regs[6:7], scalar_regs[0:1]), r3.v_bfe_u32(amd_lib.v[5], amd_lib.v[0], 0, 10),
+           r3.s_waitcnt_lgkmcnt(NULL)]
+  for reg in set(regs) | {r-128 for r in regs if r >= 128}: insts.append(r3.v_mov_b32_e32(amd_lib.v[reg], halves(-9., -8.)))
+  insts += [r3.v_mov_b32_e32(amd_lib.v[dst], halves(2., 7.)), r3.v_mov_b32_e32(amd_lib.v[a], halves(1., 6.)),
+            r3.v_mov_b32_e32(amd_lib.v[b], halves(3., 5.)), *amd_lib.insts_for_uop(ins)]
+  insts += [r3.v_cndmask_b32_e64(amd_lib.v[10], 0., 1., VCC_LO) if compare else
+            r3.v_cvt_f32_f16_e64(amd_lib.v[10], amd_lib.v[dst])]
+  insts += [r3.v_lshlrev_b32_e64(amd_lib.v[4], 2, amd_lib.v[5]),
+            r3.global_store_b32(amd_lib.v[0], amd_lib.v[4], amd_lib.v[10], scalar_regs[6:7]),
+            r3.s_waitcnt_vscnt(NULL), r3.s_endpgm()]
+  prg = _simple_add_program()
+  lin = UOp(Ops.LINEAR, src=tuple(_uop(Ops.INS, arg=i) for i in insts))
+  return prg.replace(src=(prg.src[0], lin, prg.src[2], prg.src[3].replace(arg=assemble_linear(prg, lin, "gfx1100"))))
+
 def _two_load_add_program():
   out = UOp.placeholder((16,), dtypes.float, 0)
   a = UOp.placeholder((16,), dtypes.float, 1)
@@ -3393,6 +3418,21 @@ class TestAMDRenderer(unittest.TestCase):
           self.assertEqual(inst.src0, amd_lib.v[src_reg])
           self.assertEqual(inst.vdst, amd_lib.v[dst_reg])
 
+  def test_half_alu_encoding_preserves_high_vgprs(self):
+    for op in (AMDOps.ADD, AMDOps.SUB, AMDOps.MUL, AMDOps.MAX, AMDOps.FMAC, AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ):
+      compare = op in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ)
+      for high in (127, 128, 253):
+        for pos in range(3):
+          regs = [6, 7, 8]
+          regs[pos] = high
+          with self.subTest(op=op, regs=regs):
+            a, b, dst = [_uop(Ops.INS, dtypes.float16, arg=AMDOps.MOV, tag=(Register(str(r), 256+r),)) for r in regs]
+            src = (dst, a, b) if op is AMDOps.FMAC else (a, b)
+            ins = _uop(Ops.INS, dtypes.bool if compare else dtypes.float16, src, op, dst.tag)
+            inst, = amd_lib.insts_for_uop(ins)
+            relevant = regs[:2] if compare else regs
+            self.assertTrue(inst.op_name.endswith("E64" if max(relevant) >= 128 else "E32"))
+
   def test_bitwise_assembles(self):
     prg = _bitwise_program()
     _check_elf(self, prg)
@@ -4173,6 +4213,18 @@ class TestAMDRenderer(unittest.TestCase):
     rt = _amd_rt(prg)
     rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [3.0, 7.0, 13.0, 21.0])
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_half_high_register_operands(self):
+    out, inp = (Tensor.empty(16, dtype=dtypes.float32, device="AMD").realize() for _ in range(2))
+    bufs = [x._buffer().ensure_allocated() for x in (out, inp)]
+    for op, expected in ((AMDOps.ADD, 4.), (AMDOps.SUB, -2.), (AMDOps.MUL, 3.), (AMDOps.MAX, 3.), (AMDOps.FMAC, 5.),
+                         (AMDOps.CMPLT, 1.), (AMDOps.CMPNE, 1.), (AMDOps.CMPEQ, 0.)):
+      for regs in ((6, 7, 8), (134, 7, 8), (6, 135, 8), (6, 7, 136), (134, 135, 136)):
+        with self.subTest(op=op, regs=regs):
+          prg = _physical_half_program(op, regs)
+          _amd_rt(prg)(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+          self.assertEqual(out.tolist(), [expected]*16)
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_int_narrow_cast_smoke(self):

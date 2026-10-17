@@ -6,7 +6,7 @@ from tinygrad.dtype import dtypes, DType, AddrSpace
 from tinygrad.helpers import Target, getenv, prod, is_image_shape
 from tinygrad.renderer.isa import ISARenderer, IselContext, LinearContext, PreRegAllocContext, Register, greg
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.amd.dsl import Reg, v, NULL, EXEC, VCC, Inst
+from tinygrad.renderer.amd.dsl import Reg, v, NULL, EXEC, VCC, VCC_LO, Inst
 from tinygrad.runtime.autogen.amd.rdna3 import ins as r3
 from tinygrad.codegen.decomp.op import fast_idiv
 from tinygrad.renderer import tc
@@ -1787,12 +1787,16 @@ _ALU2: dict[AMDOps, tuple] = {
   AMDOps.SUB: (r3.v_sub_f16_e32, r3.v_sub_f32_e32, r3.s_sub_u32, r3.v_sub_nc_u32_e64),
   AMDOps.MUL: (r3.v_mul_f16_e32, r3.v_mul_f32_e32, r3.s_mul_i32, r3.v_mul_lo_u32),
 }
+def _high_vgpr(*operands) -> bool: return any(isinstance(x, Reg) and x.offset >= 384 for x in operands)
+
 def _alu2(u:UOp):
   f16, f32, sgpr, vint = _ALU2[_iop(u)]
   d = _dst(u)
   sc = u.dtype
   if sc in (dtypes.float16, dtypes.float32):
     inst, a, b = (f16 if sc is dtypes.float16 else f32), _src(u.src[0]), _src(u.src[1])
+    if sc is dtypes.float16 and _high_vgpr(d, a, b):
+      inst = {AMDOps.ADD:r3.v_add_f16_e64, AMDOps.SUB:r3.v_sub_f16_e64, AMDOps.MUL:r3.v_mul_f16_e64}[_iop(u)]
     if isinstance(b, Reg) and b.offset >= 256: out = [inst(d, a, b)]
     elif _iop(u) in (AMDOps.ADD, AMDOps.MUL) and isinstance(a, Reg) and a.offset >= 256: out = [inst(d, b, a)]
     else:
@@ -1821,13 +1825,14 @@ def _max(u:UOp):
     return [scalar_max(d, _src(u.src[0]), _src(u.src[1]))]
   pre, a = _vgpr_data(TMP_VDATA, u.src[0])
   b = _src(u.src[1])
-  if sc is dtypes.float16: return pre + [r3.v_max_f16_e32(d, a, b)]
+  if sc is dtypes.float16: return pre + [(r3.v_max_f16_e64 if _high_vgpr(d, a, b) else r3.v_max_f16_e32)(d, a, b)]
   if sc is dtypes.float32: return pre + [r3.v_max_f32_e32(d, a, b)]
   if sc in dtypes.sints: return pre + [r3.v_max_i32_e64(d, a, b)]
   return pre + [r3.v_max_u32_e64(d, a, b)]
 def _cmp_lt(u:UOp):
   pre, a = _vgpr_data(TMP_VDATA, u.src[0])
   sc = u.src[0].dtype
+  if sc is dtypes.float16 and _high_vgpr(a, _src(u.src[1])): return pre + [r3.v_cmp_gt_f16_e64(VCC_LO, _src(u.src[1]), a)]
   if sc is dtypes.float16: cmp = r3.v_cmp_gt_f16_e32
   elif sc is dtypes.float32: cmp = r3.v_cmp_gt_f32_e32
   elif sc in dtypes.sints: cmp = r3.v_cmp_gt_i32_e32
@@ -1837,6 +1842,7 @@ def _cmp_ne(u:UOp):
   sc = u.src[0].dtype
   cmp = r3.v_cmp_neq_f16_e32 if sc is dtypes.float16 else r3.v_cmp_neq_f32_e32 if sc is dtypes.float32 else r3.v_cmp_ne_u32_e32
   a, b = _src(u.src[0]), _src(u.src[1])
+  if sc is dtypes.float16 and _high_vgpr(a, b): return [r3.v_cmp_neq_f16_e64(VCC_LO, a, b)]
   if isinstance(b, Reg) and b.offset >= 256: return [cmp(a, b)]
   if isinstance(a, Reg) and a.offset >= 256: return [cmp(b, a)]
   pre, b = _vgpr_data(TMP_VDATA, u.src[1])
@@ -1845,6 +1851,7 @@ def _cmp_eq(u:UOp):
   sc = u.src[0].dtype
   cmp = r3.v_cmp_eq_f16_e32 if sc is dtypes.float16 else r3.v_cmp_eq_f32_e32 if sc is dtypes.float32 else r3.v_cmp_eq_u32_e32
   a, b = _src(u.src[0]), _src(u.src[1])
+  if sc is dtypes.float16 and _high_vgpr(a, b): return [r3.v_cmp_eq_f16_e64(VCC_LO, a, b)]
   if isinstance(b, Reg) and b.offset >= 256: return [cmp(a, b)]
   if isinstance(a, Reg) and a.offset >= 256: return [cmp(b, a)]
   pre, b = _vgpr_data(TMP_VDATA, u.src[1])
@@ -2018,7 +2025,8 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       raise CompileError(f"f16/f32 mulacc only, got {u.dtype}")
     case AMDOps.FMAC:
       a, b = _src(u.src[1]), _src(u.src[2])
-      inst = r3.v_fmac_f16_e32 if u.dtype is dtypes.float16 else r3.v_fmac_f32_e32 if u.dtype is dtypes.float32 else None
+      inst = (r3.v_fmac_f16_e64 if _high_vgpr(_dst(u), a, b) else r3.v_fmac_f16_e32) if u.dtype is dtypes.float16 else \
+             r3.v_fmac_f32_e32 if u.dtype is dtypes.float32 else None
       if inst is None: raise CompileError(f"f16/f32 fmac only, got {u.dtype}")
       if isinstance(b, Reg) and b.offset >= 256: out = [inst(_dst(u), a, b)]
       elif isinstance(a, Reg) and a.offset >= 256: out = [inst(_dst(u), b, a)]
@@ -2066,10 +2074,10 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
         return pre + [r3.v_bfe_i32(_dst(u), cast_src, 0, narrow.itemsize * 8)]
       if u.dtype is dtypes.float32 and u.src[0].dtype is dtypes.float16:
         # E32 true16 operands use bit 7 as the half selector, not the VGPR index MSB.
-        cast = r3.v_cvt_f32_f16_e64 if isinstance(cast_src, Reg) and cast_src.offset >= 384 else r3.v_cvt_f32_f16_e32
+        cast = r3.v_cvt_f32_f16_e64 if _high_vgpr(cast_src) else r3.v_cvt_f32_f16_e32
         return pre + [cast(_dst(u), cast_src)]
       if u.src[0].dtype is dtypes.float32 and u.dtype is dtypes.float16:
-        cast = r3.v_cvt_f16_f32_e64 if _dst(u).offset >= 384 else r3.v_cvt_f16_f32_e32
+        cast = r3.v_cvt_f16_f32_e64 if _high_vgpr(_dst(u)) else r3.v_cvt_f16_f32_e32
         return pre + [cast(_dst(u), cast_src)]
       if u.dtype is dtypes.float32 and u.src[0].dtype in dtypes.ints:
         if u.src[0].dtype in dtypes.sints and u.src[0].dtype.itemsize < 4:
