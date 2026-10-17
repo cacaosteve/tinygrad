@@ -1,7 +1,7 @@
 from dataclasses import dataclass
-from tinygrad.dtype import DType
+from tinygrad.dtype import DType, dtypes
 from tinygrad.helpers import getenv
-from tinygrad.renderer.isa import Register
+from tinygrad.renderer.isa import Register, greg
 from tinygrad.renderer.amd.dsl import s, v
 from tinygrad.uop import FastEnum, Ops, auto
 from tinygrad.uop.ops import UOp
@@ -130,3 +130,94 @@ class AMDOps(FastEnum):
   LSHL_OR = auto()
   LSHL_ADD = auto()
   FMA_MIX_F32 = auto()  # srcs: (acc_f32, half, f32)
+
+def iop(u:UOp):
+  """Instruction selector carried by the dtype-less UOp INS argument."""
+  return u.arg[0] if u.op is Ops.INS else None
+
+def elem_count(u:UOp) -> int:
+  """Logical vector element count. INS shape is scalar; width lives in the opcode/srcs."""
+  if u.op is Ops.AFTER: return elem_count(u.src[0])
+  if u.op is Ops.SHRINK and len(u.src) > 2 and (n:=const_value(u.src[2])) is not None: return int(n)
+  if u.op is Ops.INS:
+    if iop(u) is AMDOps.WMMA: return 8
+    if iop(u) is AMDOps.PACK: return len(u.src)
+    if iop(u) is AMDOps.PACK_F16:
+      if pack_f16_is_vec_load(u): return sum(elem_count(s) for s in u.src)
+      if pack_f16_is_half2_lo_only(u): return len(u.src) * 2
+      return len(u.src)
+    if iop(u) is AMDOps.EXTRACT: return 1
+    if iop(u) in (AMDOps.LOAD, AMDOps.LLOAD, AMDOps.SLOAD):
+      return int(n) if len(u.src) > 2 and (n:=const_value(u.src[2])) is not None else 1
+    if iop(u) is AMDOps.MOV and u.src and u.src[0].op is not Ops.SPECIAL: return elem_count(u.src[0])
+    return 1
+  try: return u.max_numel()
+  except (ValueError, RuntimeError): return 1
+
+def reg_slots(u:UOp) -> int:
+  """VGPR/SGPR slots occupied by u. PACK_F16 packs two halves per slot."""
+  if u.op is Ops.AFTER: return reg_slots(u.src[0])
+  if u.op is Ops.INS:
+    if iop(u) is AMDOps.WMMA: return 8
+    if iop(u) is AMDOps.PACK: return len(u.src)
+    if iop(u) is AMDOps.PACK_F16:
+      if pack_f16_is_vec_load(u): return sum(reg_slots(s) for s in u.src)
+      if pack_f16_is_half2_lo_only(u): return len(u.src)
+      return max(1, len(u.src) // 2)
+    if iop(u) is AMDOps.EXTRACT: return 1
+    if iop(u) is AMDOps.FILL:
+      return int(n) if len(u.src) > 1 and (n:=const_value(u.src[1])) is not None else 1
+    if iop(u) in (AMDOps.LOAD, AMDOps.LLOAD, AMDOps.SLOAD):
+      return max(1, (u.dtype.itemsize * elem_count(u) + 3) // 4)
+    if iop(u) in (AMDOps.STORE, AMDOps.LSTORE, AMDOps.SSTORE): return reg_slots(u.src[2])
+    if iop(u) is AMDOps.SPILL: return reg_slots(u.src[1])
+    if iop(u) is AMDOps.MOV and u.src and u.src[0].op is not Ops.SPECIAL: return reg_slots(u.src[0])
+    return max(1, (u.dtype.itemsize + 3) // 4)
+  return max(1, (u.dtype.itemsize * elem_count(u) + 3) // 4)
+
+def reg_idxs(x:UOp) -> set[int]:
+  if x.op is Ops.AFTER: return set().union(*(reg_idxs(s) for s in x.src))
+  if not isinstance(greg(x), Register): return set()
+  return set(range(greg(x).index, greg(x).index + reg_slots(x)))
+
+def const_int(x:UOp) -> int|None:
+  if (c:=unwrap_const(x)) is not None:
+    try: return int(c.val)
+    except (OverflowError, ValueError): return None
+  if x.op is Ops.INS and iop(x) is AMDOps.MOV and x.src and (c:=unwrap_const(x.src[0])) is not None:
+    try: return int(c.val)
+    except (OverflowError, ValueError): return None
+  return None
+
+def mem_byte_off(u:UOp, src_i:int=3) -> int:
+  return const_int(u.src[src_i]) or 0 if len(u.src) > src_i else 0
+
+def lds_byte_off(u:UOp) -> int: return mem_byte_off(u, 3)
+def load_count_src(n:int) -> UOp: return tconst(n, dtypes.int32).rtag()
+
+def pack_f16_is_vec_load(u:UOp) -> bool:
+  """PACK_F16(half×n LOAD/LLOAD, ...) — not scalar-LOAD B packs."""
+  def is_vec_mem(s:UOp) -> bool:
+    if s.op is Ops.LOAD and s.max_numel() >= 2: return True
+    return s.op is Ops.INS and iop(s) in (AMDOps.LOAD, AMDOps.LLOAD) and elem_count(s) >= 2
+  return bool(u.src) and all(is_vec_mem(s) for s in u.src)
+
+def pack_f16_is_half2_lo_only(u:UOp) -> bool:
+  """Each source is an even-lane EXTRACT carrying a full half2 word."""
+  if not u.src or pack_f16_is_vec_load(u): return False
+  for src in u.src:
+    if not (src.op is Ops.INS and iop(src) is AMDOps.EXTRACT and src.dtype is dtypes.float16): return False
+    if (lane := const_int(src.src[1])) is None or lane % 2: return False
+  return True
+
+def pack_f16_half2_load(lo:UOp, hi:UOp) -> tuple[UOp, int]|None:
+  # LDS pairs rebuild one half2 word. Global pairs may only alias while flash keeps the load live.
+  if not (lo.op is Ops.INS and iop(lo) is AMDOps.EXTRACT and hi.op is Ops.INS and iop(hi) is AMDOps.EXTRACT): return None
+  if lo.src[0] is not hi.src[0]: return None
+  base = lo.src[0]
+  if base.op is not Ops.INS or iop(base) not in (AMDOps.LLOAD, AMDOps.LOAD): return None
+  if iop(base) is AMDOps.LOAD and not getenv("AMD_FLASH_ACC_SMALL", 0): return None
+  if not isinstance(greg(base), Register): return None
+  lo_lane, hi_lane = const_int(lo.src[1]), const_int(hi.src[1])
+  if lo_lane is None or hi_lane != lo_lane + 1 or lo_lane % 2: return None
+  return base, lo_lane // 2

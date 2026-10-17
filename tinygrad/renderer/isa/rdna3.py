@@ -16,7 +16,11 @@ from tinygrad.uop.divandmod import affine_int_bounds
 from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, UPat
 from tinygrad.renderer.isa.rdna3_defs import (AMDOps, KERNARG_REG, WGID, LID, SGPR, SGPR32, VGPR,
   TMP_VDATA, TMP_VADDR, TMP_BRANCH, TMP_SDATA0, TMP_SDATA1, RegisterPools, register_pools,
-  allow_upcast16, unwrap_const as _unwrap_const, const_value as _const_value, tconst as _tconst)
+  allow_upcast16, unwrap_const as _unwrap_const, const_value as _const_value, tconst as _tconst,
+  iop as _iop, elem_count as _elem_count, reg_slots as _reg_slots, reg_idxs as _reg_idxs, const_int as _const_int,
+  mem_byte_off as _mem_byte_off, lds_byte_off as _lds_byte_off, load_count_src as _load_count_src,
+  pack_f16_is_vec_load as _pack_f16_is_vec_load, pack_f16_is_half2_lo_only as _pack_f16_is_half2_lo_only,
+  pack_f16_half2_load as _pack_f16_half2_load)
 from tinygrad.renderer.isa.rdna3_tc import pm_expand_wmma_lds, pm_stage_wmma_ab
 
 def _register_pools(ctx:IselContext|PreRegAllocContext) -> RegisterPools:
@@ -39,53 +43,7 @@ _F32_UNARY = {AMDOps.RECIPROCAL: r3.v_rcp_f32_e32, AMDOps.EXP2: r3.v_exp_f32_e32
 _ISEL_UNARY = {Ops.RECIPROCAL: AMDOps.RECIPROCAL, Ops.EXP2: AMDOps.EXP2, Ops.LOG2: AMDOps.LOG2, Ops.SQRT: AMDOps.SQRT,
                Ops.TRUNC: AMDOps.TRUNC, Ops.SIN: AMDOps.SIN}
 
-def _iop(u:UOp):
-  """Instruction selector carried by the dtype-less UOp INS argument."""
-  return u.arg[0] if u.op is Ops.INS else None
-
-def _elem_count(u:UOp) -> int:
-  """Logical vector element count. INS shape is always scalar; width lives in the opcode/srcs."""
-  if u.op is Ops.AFTER: return _elem_count(u.src[0])
-  if u.op is Ops.SHRINK and len(u.src) > 2 and (n:=_const_value(u.src[2])) is not None: return int(n)
-  if u.op is Ops.INS:
-    if _iop(u) is AMDOps.WMMA: return 8
-    if _iop(u) is AMDOps.PACK: return len(u.src)
-    if _iop(u) is AMDOps.PACK_F16:
-      # Vec-load form: srcs are half×n LOAD/LLOAD (see _wmma_ab_vec_loads); else EXTRACT/scalar list.
-      if _pack_f16_is_vec_load(u): return sum(_elem_count(s) for s in u.src)
-      if _pack_f16_is_half2_lo_only(u): return len(u.src) * 2  # each lo is one half2 = 2 f16
-      return len(u.src)
-    if _iop(u) is AMDOps.EXTRACT: return 1
-    if _iop(u) in (AMDOps.LOAD, AMDOps.LLOAD, AMDOps.SLOAD):
-      return int(n) if len(u.src) > 2 and (n:=_const_value(u.src[2])) is not None else 1
-    if _iop(u) is AMDOps.MOV and u.src and u.src[0].op is not Ops.SPECIAL: return _elem_count(u.src[0])
-    return 1
-  try: return u.max_numel()
-  except (ValueError, RuntimeError): return 1
-
-def _reg_slots(u:UOp) -> int:
-  """VGPR/SGPR slots occupied by u. PACK_F16 packs 2 halves per slot."""
-  if u.op is Ops.AFTER: return _reg_slots(u.src[0])
-  if u.op is Ops.INS:
-    if _iop(u) is AMDOps.WMMA: return 8
-    if _iop(u) is AMDOps.PACK: return len(u.src)
-    if _iop(u) is AMDOps.PACK_F16:
-      if _pack_f16_is_vec_load(u): return sum(_reg_slots(s) for s in u.src)
-      if _pack_f16_is_half2_lo_only(u): return len(u.src)  # one VGPR per half2 word
-      return max(1, len(u.src) // 2)
-    if _iop(u) is AMDOps.EXTRACT: return 1
-    if _iop(u) is AMDOps.FILL:
-      return int(n) if len(u.src) > 1 and (n:=_const_value(u.src[1])) is not None else 1
-    if _iop(u) in (AMDOps.LOAD, AMDOps.LLOAD, AMDOps.SLOAD):
-      return max(1, (u.dtype.itemsize * _elem_count(u) + 3) // 4)
-    if _iop(u) in (AMDOps.STORE, AMDOps.LSTORE, AMDOps.SSTORE): return _reg_slots(u.src[2])
-    if _iop(u) is AMDOps.SPILL: return _reg_slots(u.src[1])
-    if _iop(u) is AMDOps.MOV and u.src and u.src[0].op is not Ops.SPECIAL: return _reg_slots(u.src[0])
-    return max(1, (u.dtype.itemsize + 3) // 4)
-  return max(1, (u.dtype.itemsize * _elem_count(u) + 3) // 4)
-
 def _mem_itemsize(dt:DType) -> int: return dt.itemsize
-def _load_count_src(n:int) -> UOp: return _tconst(n, dtypes.int32).rtag()
 def _reg_to_amd(reg:Register, sz:int=1) -> Reg:
   if reg.index >= 256:
     idx = reg.index - 256
@@ -162,7 +120,6 @@ _try_vopd_mul_pair = _vopd.try_vopd_mul_pair
 _try_vopd_max_pair = _vopd.try_vopd_max_pair
 
 from tinygrad.renderer.isa import rdna3_schedule as _sched
-_sched.bind_schedule(iop=_iop)
 
 def _mov_imm0_or_src(x:UOp):
   """Inline 0 if x is const-zero (peeling through MOV), else the phys src Reg."""
@@ -326,11 +283,6 @@ def _global_store_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
     return [r3.global_store_b128(addr=addr, data=lo, saddr=saddr),
             r3.global_store_b128(addr=addr, data=hi, saddr=saddr, offset=16)]
   raise CompileError(f"no global store {val.dtype}")
-
-def _reg_idxs(x:UOp) -> set[int]:
-  if x.op is Ops.AFTER: return set().union(*(_reg_idxs(s) for s in x.src))
-  if not isinstance(greg(x), Register): return set()
-  return set(range(greg(x).index, greg(x).index + _reg_slots(x)))
 
 def _vopd_mov_scan_safe(candidate:UOp, between:list[UOp]) -> bool:
   """A scanned MOV can move to the current instruction only if its registers stay untouched."""
@@ -653,15 +605,6 @@ def _amd_skip(ctx:PreRegAllocContext) -> set[UOp]:
   if "skip" not in ctx.scratch and ctx.uops: ctx.scratch["skip"] = _compute_amd_skip(ctx.uops)
   return ctx.scratch.get("skip") or set()
 
-def _const_int(x:UOp) -> int|None:
-  if (c:=_unwrap_const(x)) is not None:
-    try: return int(c.val)
-    except (OverflowError, ValueError): return None
-  if x.op is Ops.INS and _iop(x) is AMDOps.MOV and x.src and (c:=_unwrap_const(x.src[0])) is not None:
-    try: return int(c.val)
-    except (OverflowError, ValueError): return None
-  return None
-
 def _strength_reduce_int_muls(ops:list[UOp]) -> list[UOp]:
   return _sched.strength_reduce_int_muls(ops)
 
@@ -944,17 +887,11 @@ def _peel_add_imm(idx:UOp, itemsize:int, max_byte:int=0xffff, deep:bool=False) -
 def _ds_off(byte_off:int) -> dict:
   return {"offset0": byte_off & 0xff, "offset1": (byte_off >> 8) & 0xff}
 
-def _mem_byte_off(u:UOp, src_i:int=3) -> int:
-  return _const_int(u.src[src_i]) or 0 if len(u.src) > src_i else 0
-
 def _is_b_compact_load(u:UOp) -> bool:
   return len(u.src) > 3 and _const_value(u.src[3]) is not None and u.src[3].tag == "b_compact"
 
 def _is_byte_addr_load(u:UOp) -> bool:
   return len(u.src) > 3 and _const_value(u.src[3]) is not None and u.src[3].tag == "byte_addr"
-
-def _lds_byte_off(u:UOp) -> int:
-  return _mem_byte_off(u, 3)
 
 def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
   n = x.max_numel()
@@ -1064,21 +1001,6 @@ def _pack_vec(x:UOp) -> UOp|None:
     return UOp(Ops.INS, src=x.src, arg=(AMDOps.PACK_F16, dtypes.half), tag=x.tag)
   raise CompileError(f"no pack {x.dtype}")
 
-def _pack_f16_is_vec_load(u:UOp) -> bool:
-  """PACK_F16(half×n LOAD/LLOAD, ...) from _wmma_ab_vec_loads — not scalar-LOAD B packs."""
-  def is_vec_mem(s:UOp) -> bool:
-    if s.op is Ops.LOAD and s.max_numel() >= 2: return True
-    return s.op is Ops.INS and _iop(s) in (AMDOps.LOAD, AMDOps.LLOAD) and _elem_count(s) >= 2
-  return bool(u.src) and all(is_vec_mem(s) for s in u.src)
-
-def _pack_f16_is_half2_lo_only(u:UOp) -> bool:
-  """PACK_F16 after _rewrite_half2_global_packs: each src is even-lane EXTRACT (full half2 word)."""
-  if not u.src or _pack_f16_is_vec_load(u): return False
-  for src in u.src:
-    if not (src.op is Ops.INS and _iop(src) is AMDOps.EXTRACT and src.dtype is dtypes.float16): return False
-    if (lane := _const_int(src.src[1])) is None or lane % 2: return False
-  return True
-
 def _wmma_ab_from_lds(wmma:UOp) -> bool:
   """True if WMMA A/B is staged from LDS (TC_LDS_AB), not unrelated LLOAD elsewhere in the kernel."""
   def from_lds(x:UOp, depth:int=0) -> bool:
@@ -1168,29 +1090,6 @@ def _wmma_inst(u:UOp):
   dt_in, dt_out = u.src[1].dtype, u.dtype
   if dt_in is dtypes.half and dt_out is dtypes.float: return r3.v_wmma_f32_16x16x16_f16
   raise CompileError(f"no wmma {dt_in} -> {dt_out}")
-
-def _pack_f16_half2_load(lo:UOp, hi:UOp) -> tuple[UOp, int]|None:
-  # EXTRACT(LLOAD, 2k)/EXTRACT(LLOAD, 2k+1) rebuilds the same half2 VGPR word — MOV it.
-  # Global LOAD: emit sources from the even-lane EXTRACT dest (full-word MOV), not the
-  # LOAD VGPR — flash reuses b128 dests before PACK (raw greg(base) → sum −22.3).
-  # Gate: AMD_PACK_F16_HALF2_GLOBAL.
-  if not (lo.op is Ops.INS and _iop(lo) is AMDOps.EXTRACT and hi.op is Ops.INS and _iop(hi) is AMDOps.EXTRACT): return None
-  if lo.src[0] is not hi.src[0]: return None
-  base = lo.src[0]
-  if base.op is not Ops.INS or _iop(base) not in (AMDOps.LLOAD, AMDOps.LOAD): return None
-  if _iop(base) is AMDOps.LOAD and not getenv("AMD_FLASH_ACC_SMALL", 0): return None
-  if not isinstance(greg(base), Register): return None
-  lo_lane, hi_lane = _const_int(lo.src[1]), _const_int(hi.src[1])
-  if lo_lane is None or hi_lane != lo_lane + 1 or lo_lane % 2: return None
-  return base, lo_lane // 2
-
-# Late schedule bind: WMMA/half2/scratch schedule need helpers defined above.
-_sched.bind_schedule(iop=_iop, reg_idxs=_reg_idxs, elem_count=_elem_count,
-                     pack_f16_is_vec_load=_pack_f16_is_vec_load, reg_slots=_reg_slots,
-                     pack_f16_half2_load=_pack_f16_half2_load,
-                     pack_f16_is_half2_lo_only=_pack_f16_is_half2_lo_only,
-                     const_int=_const_int, lds_byte_off=_lds_byte_off,
-                     load_count_src=_load_count_src, tconst=_tconst)
 
 def _pack_f16_identity_load(u:UOp) -> UOp|None:
   # PACK_F16(EXTRACT(L,0)..EXTRACT(L,2n-1)) with L = half×n LLOAD → reuse L's VGPRs.

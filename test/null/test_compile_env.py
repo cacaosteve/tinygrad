@@ -11,6 +11,21 @@ from tinygrad.helpers import getenv
 from tinygrad.uop.ops import KernelInfo, UOp
 
 class TestCompileEnv(unittest.TestCase):
+  def test_rdna3_schedule_import_is_independent(self):
+    script = "\n".join((
+      "import sys",
+      "from tinygrad.renderer.isa import rdna3_schedule as schedule",
+      "from tinygrad.renderer.isa.rdna3_defs import AMDOps",
+      "from tinygrad import dtypes",
+      "from tinygrad.uop.ops import Ops, UOp",
+      "assert 'tinygrad.renderer.isa.rdna3' not in sys.modules",
+      "value = UOp.const(3, dtypes.int32)",
+      "pack = UOp(Ops.INS, src=(value, value), arg=(AMDOps.PACK, dtypes.int32))",
+      "assert schedule._reg_slots(pack) == 2",
+      "assert schedule.strength_reduce_int_muls([pack]) == [pack]",
+    ))
+    subprocess.run([sys.executable, "-c", script], check=True)
+
   def test_rdna3_defaults_do_not_write_environment(self):
     from tinygrad.renderer.isa.rdna3 import AMDRenderer, _register_pools, apply_tc_hand_opts
     from tinygrad.renderer.isa import PreRegAllocContext

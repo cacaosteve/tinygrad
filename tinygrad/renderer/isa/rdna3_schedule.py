@@ -1,47 +1,17 @@
-"""RDNA3 pre-regalloc schedule helpers (FMAC↔ADD adjacency, swizzle batches).
-
-Bound from `rdna3.py` after `_iop` exists — keeps schedule reviewable without circular import.
-"""
+"""RDNA3 pre-regalloc schedule helpers (FMAC↔ADD adjacency, swizzle batches)."""
 from __future__ import annotations
 
 import itertools
-from typing import Any
 
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import getenv
 from tinygrad.renderer.isa import Register, greg
-from tinygrad.renderer.isa.rdna3_defs import AMDOps, VGPR
+from tinygrad.renderer.isa.rdna3_defs import (AMDOps, VGPR, iop as _iop, reg_idxs as _reg_idxs, elem_count as _elem_count,
+  pack_f16_is_vec_load as _pack_f16_is_vec_load, pack_f16_half2_load as _pack_f16_half2_load,
+  pack_f16_is_half2_lo_only as _pack_f16_is_half2_lo_only, reg_slots as _reg_slots, const_int as _const_int,
+  lds_byte_off as _lds_byte_off, load_count_src as _load_count_src, tconst as _tconst)
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import UOp
-
-_iop: Any = None
-_reg_idxs: Any = None
-_elem_count: Any = None
-_pack_f16_is_vec_load: Any = None
-_pack_f16_half2_load: Any = None
-_pack_f16_is_half2_lo_only: Any = None
-_reg_slots: Any = None
-_const_int: Any = None
-_lds_byte_off: Any = None
-_load_count_src: Any = None
-_tconst: Any = None
-
-def bind_schedule(*, iop, reg_idxs=None, elem_count=None, pack_f16_is_vec_load=None, reg_slots=None,
-                   pack_f16_half2_load=None, pack_f16_is_half2_lo_only=None, const_int=None,
-                   lds_byte_off=None, load_count_src=None, tconst=None) -> None:
-  global _iop, _reg_idxs, _elem_count, _pack_f16_is_vec_load, _reg_slots, _pack_f16_half2_load
-  global _pack_f16_is_half2_lo_only, _const_int, _lds_byte_off, _load_count_src, _tconst
-  _iop = iop
-  if reg_idxs is not None: _reg_idxs = reg_idxs
-  if elem_count is not None: _elem_count = elem_count
-  if pack_f16_is_vec_load is not None: _pack_f16_is_vec_load = pack_f16_is_vec_load
-  if reg_slots is not None: _reg_slots = reg_slots
-  if pack_f16_half2_load is not None: _pack_f16_half2_load = pack_f16_half2_load
-  if pack_f16_is_half2_lo_only is not None: _pack_f16_is_half2_lo_only = pack_f16_is_half2_lo_only
-  if const_int is not None: _const_int = const_int
-  if lds_byte_off is not None: _lds_byte_off = lds_byte_off
-  if load_count_src is not None: _load_count_src = load_count_src
-  if tconst is not None: _tconst = tconst
 
 def schedule_fmac_add_pairs(ops:list[UOp]) -> list[UOp]:
   """Pull an independent ADD/SUB next to each FMAC for mixed VOPD.
