@@ -2808,9 +2808,20 @@ class TestAMDRenderer(unittest.TestCase):
     candidate = _uop(Ops.INS, dtypes.float32, (UOp.const(0.0, dtypes.float32).rtag(),), AMDOps.MOV, (reg,))
     overwrite = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32).rtag(),), AMDOps.MOV, (reg,))
     read = _uop(Ops.INS, dtypes.float32, (candidate,), AMDOps.ADD, (other,))
-    self.assertFalse(r._vopd_mov_scan_safe(candidate, [overwrite]))
-    self.assertFalse(r._vopd_mov_scan_safe(candidate, [read]))
-    self.assertTrue(r._vopd_mov_scan_safe(candidate, []))
+    self.assertFalse(r._vopd_scan_safe(candidate, [overwrite]))
+    self.assertFalse(r._vopd_scan_safe(candidate, [read]))
+    self.assertTrue(r._vopd_scan_safe(candidate, []))
+
+  def test_vopd_arithmetic_scan_preserves_old_register_value(self):
+    def value(reg): return _uop(Ops.INS, dtypes.float32, arg=AMDOps.MOV, tag=(Register(str(reg), 256+reg),))
+    scale, a, b, old = (value(reg) for reg in (8, 10, 11, 17))
+    for op, name in ((AMDOps.MUL, "V_MUL_F32_E32"), (AMDOps.MAX, "V_MAX_F32_E32"), (AMDOps.ADD, "V_ADD_F32_E32")):
+      with self.subTest(op=op):
+        first = _uop(Ops.INS, dtypes.float32, (scale, a), op, (Register("first", 272),))
+        read = _uop(Ops.INS, dtypes.float32, (scale, old), op, (Register("read", 266),))
+        candidate = _uop(Ops.INS, dtypes.float32, (scale, b), op, (Register("candidate", 273),))
+        insts = _REN._insts_from_linear(_uop(Ops.LINEAR, src=(first, read, candidate)))
+        self.assertEqual([i.op_name for i in insts], [name]*3)
 
   def test_regalloc_rewrites_surviving_shrink(self):
     renderer = _REN
@@ -4023,6 +4034,20 @@ class TestAMDRenderer(unittest.TestCase):
     expected = np.zeros((20, 12), dtype=np.float32)
     for y, x in itertools.product(range(6), range(5)): expected[y*3:y*3+3, x*2:x*2+3] += 4
     np.testing.assert_array_equal(actual, np.broadcast_to(expected, (2, 4, 20, 12)))
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_attention_query_gradient(self):
+    import numpy as np
+    rng = np.random.default_rng(72)
+    arrays = [rng.uniform(-2, 2, (32, 8, 16, 64)).astype(np.float32) for _ in range(3)]
+    q, k, v = [Tensor(a, device="AMD").realize() for a in arrays]
+    actual = q.scaled_dot_product_attention(k, v).sum().gradient(q)[0].numpy()
+    scores = (arrays[0] @ arrays[1].swapaxes(-1, -2))/8
+    probs = np.exp(scores-scores.max(axis=-1, keepdims=True))
+    probs /= probs.sum(axis=-1, keepdims=True)
+    upstream = arrays[2].sum(axis=-1)[..., None, :]
+    ds = probs*(upstream-(probs*upstream).sum(axis=-1, keepdims=True))
+    np.testing.assert_allclose(actual, (ds @ arrays[1])/8, atol=1e-4, rtol=1e-3)
 
   def test_gated_store_uses_exec_mask_around_store(self):
     lin = _late_gated_store_linear()

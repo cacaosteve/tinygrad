@@ -174,8 +174,8 @@ def _global_store_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
             r3.global_store_b128(addr=addr, data=hi, saddr=saddr, offset=16)]
   raise CompileError(f"no global store {val.dtype}")
 
-def _vopd_mov_scan_safe(candidate:UOp, between:list[UOp]) -> bool:
-  """A scanned MOV can move to the current instruction only if its registers stay untouched."""
+def _vopd_scan_safe(candidate:UOp, between:list[UOp]) -> bool:
+  """A scanned instruction can move only if its physical operands stay untouched."""
   dst, src = _reg_idxs(candidate), set().union(*(_reg_idxs(s) for s in candidate.src))
   for mid in between:
     if mid.op is Ops.INS and _iop(mid) in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ,
@@ -3076,7 +3076,7 @@ def insts_from_linear(lin:UOp):
         if pair is None: continue
         # Emit cand early with u only if cand does not depend on intervening ops
         # (those would still be pending). Mid depending on u is fine — u writes first.
-        if any(_vopd.depends(cand, scheduled[m]) for m in range(oi + 1, k)):
+        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(_vopd.depends(cand, scheduled[m]) for m in range(oi + 1, k)):
           continue
         partner_i, vopd = k, pair
         break
@@ -3097,7 +3097,7 @@ def insts_from_linear(lin:UOp):
         cand = scheduled[k]
         if _iop(cand) is not AMDOps.FMAC: continue
         if (pair:=_try_vopd_fmac_alu_pair(u, cand)) is None: continue
-        if any(_vopd.depends(cand, scheduled[m]) for m in range(oi + 1, k)):
+        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(_vopd.depends(cand, scheduled[m]) for m in range(oi + 1, k)):
           continue
         partner_i, vopd = k, pair
         break
@@ -3117,7 +3117,7 @@ def insts_from_linear(lin:UOp):
         cand = scheduled[k]
         if (pair:=_try_vopd_add_pair(u, cand)) is None: continue
         # Refuse if anything between produces a cand src or consumes cand (early emit).
-        if any(_vopd.depends(cand, scheduled[m]) or _vopd.depends(scheduled[m], cand)
+        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(_vopd.depends(cand, scheduled[m]) or _vopd.depends(scheduled[m], cand)
                for m in range(oi + 1, k)):
           continue
         partner_i, vopd = k, pair
@@ -3138,7 +3138,7 @@ def insts_from_linear(lin:UOp):
         if k in early_emitted: continue
         cand = scheduled[k]
         if (pair:=_try_vopd_mul_pair(u, cand)) is None: continue
-        if any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
+        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
           continue
         partner_i, vopd = k, pair
         break
@@ -3157,7 +3157,7 @@ def insts_from_linear(lin:UOp):
         if k in early_emitted: continue
         cand = scheduled[k]
         if (pair:=_try_vopd_max_pair(u, cand)) is None: continue
-        if any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
+        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
           continue
         partner_i, vopd = k, pair
         break
@@ -3176,7 +3176,7 @@ def insts_from_linear(lin:UOp):
         if k in early_emitted: continue
         cand = scheduled[k]
         if (pair:=_try_vopd_mul_pair(u, cand)) is None: continue
-        if any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
+        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
           continue
         partner_i, vopd = k, pair
         break
@@ -3195,7 +3195,7 @@ def insts_from_linear(lin:UOp):
         if k in early_emitted: continue
         cand = scheduled[k]
         if (pair:=_try_vopd_max_pair(u, cand)) is None: continue
-        if any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
+        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
           continue
         partner_i, vopd = k, pair
         break
@@ -3217,7 +3217,7 @@ def insts_from_linear(lin:UOp):
         if (pair:=_try_vopd_mov_pair(u, cand)) is None: continue
         # Dual emits cand at u. Preserve its value across every intervening read/write/control-flow.
         between = scheduled[oi + 1:k]
-        if any(_vopd.depends(cand, mid) for mid in between) or not _vopd_mov_scan_safe(cand, between):
+        if any(_vopd.depends(cand, mid) for mid in between) or not _vopd_scan_safe(cand, between):
           continue
         partner_i, vopd = k, pair
         break
