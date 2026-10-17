@@ -1,6 +1,6 @@
 from dataclasses import replace
-import itertools, functools, hashlib, json, os, pathlib, pickle, re, sys, time
-from typing import Callable
+import contextlib, itertools, functools, hashlib, json, os, pathlib, pickle, re, sys, time
+from typing import Callable, Iterator
 from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, USE_TC
 from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, TC_SELECT, TC_OPT, TC_MIN_GLOBALS, CCACHE, TracingKey, Context, panic, getenv
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, MapCtx, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
@@ -616,8 +616,7 @@ to_program_config = (NOOPT, EMULATED_DTYPES, USE_TC, IMAGE, DISABLE_FAST_IDIV, T
                      DEFAULT_FLOAT, DEFAULT_INT, TC_SELECT, TC_OPT, TC_MIN_GLOBALS)
 to_program_context = (*to_program_config, SPEC, DEBUG)
 def to_program_key(ast:UOp, renderer:Renderer) -> tuple:
-  return (ast.key, type(renderer), renderer.target, *[x.value for x in to_program_config],
-          getenv("AMD_WMMA_INTERLEAVE", 0), getenv("TC_LDS_AB", 0))
+  return (ast.key, type(renderer), renderer.target, *[x.value for x in to_program_config])
 
 @functools.cache
 def _program_source_paths() -> tuple[pathlib.Path, ...]:
@@ -647,21 +646,50 @@ def _program_cache_env_names() -> tuple[str, ...]:
   names = {name.decode() for path in paths for name in re.findall(rb"getenv\(\s*['\"]([A-Z][A-Z0-9_]*)['\"]", path.read_bytes())}
   return tuple(sorted(names - {"COMPILE_TIMING"}))
 
+def _kernel_compile_env(ast:UOp) -> dict[str, str|None]:
+  info = (ast.src[0] if ast.op is Ops.PROGRAM else ast).arg
+  return dict(info.compiler_env) if isinstance(info, KernelInfo) else {}
+
+def _program_environment(ast:UOp) -> tuple[tuple[str, str], ...]:
+  env = {name:os.environ[name] for name in _program_cache_env_names() if name in os.environ}
+  for name, value in _kernel_compile_env(ast).items():
+    if value is None: env.pop(name, None)
+    else: env[name] = value
+  return tuple(sorted(env.items()))
+
+@contextlib.contextmanager
+def _compiler_environment(overrides:dict[str, str|None]) -> Iterator[None]:
+  if not overrides:
+    yield
+    return
+  previous = {name:os.environ.get(name) for name in overrides}
+  for name, value in overrides.items():
+    if value is None: os.environ.pop(name, None)
+    else: os.environ[name] = value
+  getenv.cache_clear()  # type: ignore[attr-defined]
+  try: yield
+  finally:
+    for name, value in previous.items():
+      if value is None: os.environ.pop(name, None)
+      else: os.environ[name] = value
+    getenv.cache_clear()  # type: ignore[attr-defined]
+
 def to_program_disk_key(ast:UOp, renderer:Renderer) -> str|None:
   # VIZ must execute the compilation pipeline so every program and rewrite is recorded.
   if not CCACHE or VIZ or not getattr(renderer, "disk_program_cache", False): return None
-  env = tuple((name, os.environ[name]) for name in _program_cache_env_names() if name in os.environ)
+  env = _program_environment(ast)
   key = (to_program_key(ast, renderer), _program_source_fingerprint(), env, sys.version_info[:2])
   return hashlib.sha256(pickle.dumps(key, protocol=pickle.HIGHEST_PROTOCOL)).hexdigest()
 
 def to_program_mem_key(ast:UOp, renderer:Renderer) -> tuple:
   # In-memory key must include getenv-driven compiler env (same idea as disk cache).
   # Without this, toggling AMD_REG_PROMOTE_SKIP_SLOTS (etc.) silently returns a stale program.
-  env = tuple((name, os.environ[name]) for name in _program_cache_env_names() if name in os.environ)
+  env = _program_environment(ast)
   return (to_program_key(ast, renderer), env)
 
 to_program_cache: dict[tuple, UOp] = {}
 def to_program(ast:UOp, renderer:Renderer) -> UOp:
-  if (prg:=to_program_cache.get(key:=to_program_mem_key(ast, renderer))) is None:
-    to_program_cache[key] = prg = do_to_program(ast, renderer)
-  return prg
+  with _compiler_environment(_kernel_compile_env(ast)):
+    if (prg:=to_program_cache.get(key:=to_program_mem_key(ast, renderer))) is None:
+      to_program_cache[key] = prg = do_to_program(ast, renderer)
+    return prg

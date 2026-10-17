@@ -1,5 +1,6 @@
 from __future__ import annotations
 import contextlib, functools, math, os
+from dataclasses import replace
 from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.llm.gguf import ggml_data_to_tensor
@@ -880,6 +881,12 @@ _FLASH_DECODE_ONLY = (
   "AMD_VOPD_FMAC", "AMD_VOPD_FMAC_ALU",
 )
 
+def _flash_kernel(fxn:Callable[..., UOp], *buffers:UOp, **kwargs) -> UOp:
+  sink = fxn(*buffers, **kwargs)
+  # TinyJit/@function may compile after the Python policy scope has ended.
+  policy = tuple((k, os.environ.get(k)) for k in sorted(_FLASH_PREFILL.keys() | _FLASH_DECODE.keys()))
+  return sink.replace(arg=replace(sink.arg, compiler_env=policy))
+
 def _flash_apply_env(policy:dict[str, str]) -> None:
   for k, v in policy.items():
     if os.environ.get(k) is None: os.environ[k] = v
@@ -951,11 +958,12 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   assert waves > 0, "attention head group exceeds shared memory capacity"
   fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len,
                           block_n=block_n, waves=waves)
+  fxn = functools.partial(_flash_kernel, fxn)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len + block_n - 1) // block_n
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)
   out = Tensor.empty(B, H, 1, D, dtype="float32", device=q.device)
-  fxn = functools.partial(_amd_flash_decode_combine, live=live)
+  fxn = functools.partial(_flash_kernel, functools.partial(_amd_flash_decode_combine, live=live))
   return Tensor.custom_kernel(out, partial, stats, fxn=fxn)[0]
 
 def _wmma_fragment(fragment:UOp, lane:UOp, rdna4:bool) -> UOp:
@@ -1565,6 +1573,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
                             acc_small=use_acc_small, k_unroll=use_k_unroll, use_acc_work=use_acc_work,
                             k_hip_scope=use_k_hip_scope, k_midstore=use_k_midstore,
                             acc_vgpr=use_acc_vgpr, hoist_q=use_hoist_q)
+    fxn = functools.partial(_flash_kernel, fxn)
     q_input = q.half().reshape(B*H, T, D)
     if isinstance(valid_end, UOp) or isinstance(q_start, UOp):
       # Keep bound dimensions as free variables in the kernel body. The outer LINEAR carries their values,

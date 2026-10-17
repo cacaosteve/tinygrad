@@ -2,7 +2,7 @@ import os, subprocess, sys, unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from tinygrad.engine.realize import _compile_kernel
-from tinygrad.codegen import to_program_mem_key
+from tinygrad.codegen import to_program, to_program_cache, to_program_mem_key
 from tinygrad.codegen.opt.postrange import Scheduler
 from tinygrad.renderer import Renderer
 from tinygrad.helpers import Target
@@ -102,16 +102,57 @@ class TestCompileEnv(unittest.TestCase):
 
   def test_program_memory_key_tracks_compile_environment(self):
     key = "AMD_TEST_PROGRAM_CACHE_ENV"
+    ast = UOp.sink(UOp.const(0), arg=KernelInfo())
     with patch("tinygrad.codegen.to_program_key", return_value=("same-ast",)), \
          patch("tinygrad.codegen._program_cache_env_names", return_value=(key,)):
-      with patch.dict(os.environ, {key:"first"}): first = to_program_mem_key(None, None)
-      with patch.dict(os.environ, {key:"second"}): second = to_program_mem_key(None, None)
+      with patch.dict(os.environ, {key:"first"}): first = to_program_mem_key(ast, None)
+      with patch.dict(os.environ, {key:"second"}): second = to_program_mem_key(ast, None)
     self.assertNotEqual(first, second)
 
+  def test_kernel_compile_environment_is_scoped_and_cached(self):
+    key, disabled = "AMD_TEST_KERNEL_ENV", "AMD_TEST_DISABLED_ENV"
+    ast = UOp.sink(UOp.const(0), arg=KernelInfo(compiler_env=((key, "kernel"), (disabled, None))))
+    renderer, result = Renderer(Target()), UOp.const(7)
+    before = {key:"caller", disabled:"enabled"}
+    try:
+      with patch.dict(os.environ, before), patch("tinygrad.codegen._program_cache_env_names", return_value=(key, disabled)):
+        getenv.cache_clear()
+        outer_key = to_program_mem_key(ast, renderer)
+        def compile_kernel(*_):
+          self.assertEqual(getenv(key, ""), "kernel")
+          self.assertNotIn(disabled, os.environ)
+          self.assertEqual(to_program_mem_key(ast, renderer), outer_key)
+          return result
+        with patch("tinygrad.codegen.do_to_program", side_effect=compile_kernel) as compiler:
+          self.assertIs(to_program(ast, renderer), result)
+          self.assertIs(to_program(ast, renderer), result)
+          with patch.dict(os.environ, {key:"different caller", disabled:"different caller"}):
+            self.assertEqual(to_program_mem_key(ast, renderer), outer_key)
+            self.assertIs(to_program(ast, renderer), result)
+          compiler.assert_called_once()
+        self.assertEqual({k:os.environ.get(k) for k in before}, before)
+        self.assertEqual(getenv(key, ""), "caller")
+    finally:
+      to_program_cache.clear()
+      getenv.cache_clear()
+
+  def test_kernel_compile_environment_restored_on_failure(self):
+    key = "AMD_TEST_KERNEL_FAILURE_ENV"
+    ast = UOp.sink(UOp.const(0), arg=KernelInfo(compiler_env=((key, "kernel"),)))
+    try:
+      with patch.dict(os.environ, {key:"caller"}), patch("tinygrad.codegen.do_to_program", side_effect=RuntimeError("compile failed")):
+        with self.assertRaisesRegex(RuntimeError, "compile failed"): to_program(ast, Renderer(Target()))
+        self.assertEqual(getenv(key, ""), "caller")
+    finally:
+      to_program_cache.clear()
+      getenv.cache_clear()
+
   def test_kernel_schedule_hints_survive_optimization(self):
-    ast = UOp.sink(UOp.const(0), arg=KernelInfo(opts_to_apply=(), schedule_hints=("wmma_interleave",)))
+    policy = (("TC_LDS_AB", "0"),)
+    ast = UOp.sink(UOp.const(0), arg=KernelInfo(opts_to_apply=(), schedule_hints=("wmma_interleave",), compiler_env=policy))
     optimized = Scheduler(ast, Renderer(Target())).get_optimized_ast("hint_test")
     self.assertEqual(optimized.arg.schedule_hints, ("wmma_interleave",))
+    self.assertEqual(optimized.arg.compiler_env, policy)
 
   def test_worker_pool_restarts_for_new_compile_environment(self):
     class FakePool:

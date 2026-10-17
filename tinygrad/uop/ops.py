@@ -1341,6 +1341,7 @@ class KernelInfo:
   beam: int = 0
   schedule_hints: tuple[str, ...] = tuple()
   optimized: bool = False       # the AST has been through the optimizer, skip re-optimization
+  compiler_env: tuple[tuple[str, str|None], ...] = tuple()  # kernel-local getenv overrides, including delayed/JIT compilation
   @property
   def function_name(self): return to_function_name(self.name)
 
