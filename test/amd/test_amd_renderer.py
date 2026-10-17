@@ -3996,12 +3996,33 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(raw.src[0].src[1], gate.where(index, index.const_like(0)))
     self.assertEqual(raw.shape, (4,))
 
+  def test_late_where_compares_materialized_boolean(self):
+    gate = _uop(Ops.INS, dtypes.bool, (UOp.const(True, dtypes.bool), UOp.const(False, dtypes.bool)), AMDOps.AND)
+    a, b = UOp.const(1, dtypes.int32), UOp.const(0, dtypes.int32)
+    selected = amd_lib._where_ins(gate, a, b, gate.where(a, b))
+    self.assertIs(_iop(selected), AMDOps.WHERE)
+    self.assertIs(_iop(selected.src[0]), AMDOps.CMPNE)
+    self.assertIs(selected.src[0].src[0], gate)
+    comparison = UOp(Ops.CMPLT, src=(a, b))
+    selected = amd_lib._where_ins(comparison, a, b, comparison.where(a, b))
+    self.assertIs(selected.src[0], comparison)
+
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_logcumsumexp_gated_vectors(self):
     import numpy as np
     values = np.random.default_rng(72).uniform(-2, 2, (6, 6, 6, 6)).astype(np.float32)
     actual = Tensor(values, device="AMD").logcumsumexp(2).numpy()
     np.testing.assert_allclose(actual, np.logaddexp.accumulate(values, axis=2), atol=1e-6, rtol=1e-3)
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_output_padded_transposed_convolution(self):
+    import numpy as np
+    values = Tensor.ones(2, 4, 6, 5, device="AMD").realize()
+    weights = Tensor.ones(4, 4, 3, 3, device="AMD").realize()
+    actual = values.conv_transpose2d(weights, output_padding=(2, 1), stride=(3, 2)).numpy()
+    expected = np.zeros((20, 12), dtype=np.float32)
+    for y, x in itertools.product(range(6), range(5)): expected[y*3:y*3+3, x*2:x*2+3] += 4
+    np.testing.assert_array_equal(actual, np.broadcast_to(expected, (2, 4, 20, 12)))
 
   def test_gated_store_uses_exec_mask_around_store(self):
     lin = _late_gated_store_linear()

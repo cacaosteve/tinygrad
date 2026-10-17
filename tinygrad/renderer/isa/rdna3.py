@@ -1449,6 +1449,14 @@ def _materialize_bool_where(m:UOp, a:UOp, b:UOp) -> UOp|None:
   if m.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): return None
   return UOp(Ops.WHERE, src=(UOp(Ops.CMPNE, src=(m, _tconst(False, dtypes.bool))), a, b))
 
+def _where_ins(m:UOp, a:UOp, b:UOp, x:UOp) -> UOp:
+  # Gated vector loads introduce WHEREs after pre-isel. A materialized boolean
+  # register does not own VCC; compare it explicitly before selecting a value.
+  if m.op not in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) and \
+     (m.op is not Ops.INS or _iop(m) not in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ)):
+    m = UOp(Ops.INS, src=(m, _tconst(False, dtypes.bool)), arg=(AMDOps.CMPNE, dtypes.bool))
+  return x.ins(AMDOps.WHERE, src=(m, a, b))
+
 def _merge_zero_cmp_and(a:UOp, b:UOp) -> UOp|None:
   def nonzero_src(x:UOp) -> UOp|None:
     if x.op is Ops.WHERE and len(x.src) == 3 and x.src[1].op is Ops.CONST and x.src[1].val is True and \
@@ -1613,7 +1621,7 @@ def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Regis
     (UPat(Ops.CMPLT, name="x"), lambda x: x.ins(AMDOps.CMPLT, dtype=dtypes.bool)),
     (UPat(Ops.CMPNE, name="x"), lambda x: x.ins(AMDOps.CMPNE, dtype=dtypes.bool)),
     (UPat(Ops.CMPEQ, name="x"), lambda x: x.ins(AMDOps.CMPEQ, dtype=dtypes.bool)),
-    (UPat.var("m").where(UPat.var("a"), UPat.var("b")).named("x"), lambda m,a,b,x: x.ins(AMDOps.WHERE, src=(m, a, b))),
+    (UPat.var("m").where(UPat.var("a"), UPat.var("b")).named("x"), _where_ins),
     (UPat(Ops.LOAD, src=(UPat((Ops.INDEX, Ops.SHRINK), name="a"), UPat.var("alt"), UPat.var("gate", dtype=dtypes.bool)), name="x"), _load_ins),
     (UPat(Ops.LOAD, src=(UPat((Ops.INDEX, Ops.SHRINK), name="a"),), name="x"), _load_ins),
     (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), name="a"), UPat.var("val")), name="x"), _store_ins),
