@@ -3457,12 +3457,28 @@ class TestAMDRenderer(unittest.TestCase):
     wrap = alu(AMDOps.ADD, large, UOp.const(7, dtypes.uint32), dtype=dtypes.uint32)
     self.assertEqual(amd_lib._peel_add_imm(wrap, 4, deep=True), (wrap, 0))
 
+  def test_restoring_division_cannot_extract_bits_above_u32(self):
+    numerator = UOp.variable("numerator", 0, 0xffffffff).cast(dtypes.uint32)
+    divisor = UOp.variable("divisor", 0, 0xffffffff).cast(dtypes.uint32)
+    self.assertEqual(amd_lib._u32_divmod(numerator, divisor, bits=34), amd_lib._u32_divmod(numerator, divisor, bits=32))
+
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_argsort_reversed_offsets(self):
     import numpy as np
     values = np.random.default_rng(72).uniform(-2, 2, (8, 8, 6)).astype(np.float32)
     actual = Tensor(values, device="AMD").argsort(1, True).numpy()
     np.testing.assert_array_equal(actual, np.argsort(-values, axis=1, kind="stable").astype(np.int32))
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_fancy_index_normalized_division(self):
+    import numpy as np
+    values = np.arange(2*5*6*5*3*4, dtype=np.float32).reshape(2, 5, 6, 5, 3, 4)
+    j = np.zeros((1, 3, 1, 1, 1, 1), dtype=np.int32)
+    offsets = (np.arange(10, dtype=np.int32) % 4).reshape(2, 1, 1, 5, 1, 1)
+    for o in (offsets, offsets-4):
+      with self.subTest(negative=bool(o.min() < 0)):
+        actual = Tensor(values, device="AMD")[1, Tensor(j, device="AMD"), 2, Tensor(o, device="AMD"), 2].numpy()
+        np.testing.assert_array_equal(actual, values[1, j, 2, o, 2])
 
   def test_predicate_recomputed_after_physical_register_reuse(self):
     reg = Register("gate", 269)

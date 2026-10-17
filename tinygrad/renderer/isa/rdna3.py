@@ -1332,7 +1332,9 @@ def _u32_divmod(n:UOp, d:UOp, bits:int|None=None) -> tuple[UOp, UOp]:
   q, r = zero, zero
   # Restoring division only needs the numerator's reachable bits. Symbolic LLM indices are
   # often bounded by max_context; building all 32 rounds makes their kernels enormous.
-  for i in range(max(1, int(n.vmax).bit_length() if bits is None else bits) - 1, -1, -1):
+  # Algebraic bounds may exceed the dtype after index normalization, but the machine
+  # numerator is still 32 bits. Shifts by 32+ would wrap on RDNA3 instead of reading zero.
+  for i in range(min(32, max(1, int(n.vmax).bit_length() if bits is None else bits)) - 1, -1, -1):
     r = (r << _tconst(1, dtypes.uint32)) | ((n >> _tconst(i, dtypes.uint32)) & one)
     ge = _bool_not(r < d)
     q = q | ge.where(one << _tconst(i, dtypes.uint32), zero)
