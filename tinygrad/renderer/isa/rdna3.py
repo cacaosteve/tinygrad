@@ -33,10 +33,8 @@ def _register_pools(ctx:IselContext|PreRegAllocContext) -> RegisterPools:
 # RDNA3: kernarg in s[0:1], local ids packed in v0. Even SGPR bases for 64-bit kernarg loads.
 # WGID follows USER_SGPR_COUNT: s2 when count=2 (1D locals); s15 when gfx1100 pads to 15 (2D locals).
 # COALESCE_U8 / UNIFORM_INT / VOPD_PAIR_CONST / SWIZZLE_BATCH_MAX hardcoded ON/16.
-# AMD_PREFETCH_A removed (dead under current TC_LDS_AB early-return structure).
 _FMAC_DELAY_N = [0]
 # AMD_INSTR_WAIT / AMD_CONSERVATIVE_WAIT / AMD_IN_ORDER_EMIT removed (always optional emit).
-_PREFETCH_NEXT_A = False
 
 _F32_UNARY = {AMDOps.RECIPROCAL: r3.v_rcp_f32_e32, AMDOps.EXP2: r3.v_exp_f32_e32, AMDOps.LOG2: r3.v_log_f32_e32,
               AMDOps.SQRT: r3.v_sqrt_f32_e32, AMDOps.TRUNC: r3.v_trunc_f32_e32}
@@ -91,15 +89,10 @@ def _global_load_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
             r3.global_load_b128(_reg_chunk(greg(u), 4, 4), addr, saddr=saddr, offset=16, **cache_kw)]
   raise CompileError(f"no global load {u.dtype}")
 
-# CSE per-k B gather bases (elem idx = base + k*(4096/itemsize)). Cleared each linear emit.
-_B_PAGE_IDX: dict[tuple[int, int], UOp] = {}
-
 def _b_page_idx(base:UOp, page:int, itemsize:int) -> UOp:
-  key = (id(base), page)
-  if (hit := _B_PAGE_IDX.get(key)) is not None: return hit
   # Always ADD (incl. page 0) so the page VGPR is distinct from raw `base` (safe in-place <<1).
-  _B_PAGE_IDX[key] = (out := base + (page * (0x1000 // itemsize)))
-  return out
+  # UOp interning already shares identical page expressions, including their element size.
+  return base + (page * (0x1000 // itemsize))
 
 def _apply_byte_off(addr:Reg, byte_off:int, idx:UOp|None=None, itemsize:int=1) -> tuple[list, Reg, int]:
   """GLOBAL offset is 0..4095; peel larger byte_off into addr via v_lshl_add / v_add."""
@@ -2420,9 +2413,6 @@ def _is_addr_alu(u:UOp) -> bool:
 def _hoist_b_between_a_and_pack(ops:list[UOp]) -> list[UOp]:
   return _sched.hoist_b_between_a_and_pack(ops)
 
-def _prefetch_next_a_b128_before_pack(ops:list[UOp]) -> list[UOp]:
-  return _sched.prefetch_next_a_b128_before_pack(ops)
-
 
 def _prefetch_a_after_packed_quant(ops:list[UOp]) -> list[UOp]:
   return _sched.prefetch_a_after_packed_quant(ops)
@@ -2933,7 +2923,6 @@ def insts_from_linear(lin:UOp):
   pending: dict[str, set[int]] = {"lgkm": set(), "vs": set()}
   items, targets = [], {}
   store_addr_cache = _StoreAddrCache()
-  _B_PAGE_IDX.clear()
   # Compact B: page-idx UOps already shifted to bytes (in-place <<1 once per idx UOp).
   byte_scaled: set[int]|None = set()  # always-on compact B page-idx <<1
   def emit(inst):
@@ -3679,8 +3668,6 @@ def _wmma_has_fused_float_to_half_cast(tk) -> bool:
 # --- TC / WMMA hand schedule opts (expand tiles, prefetch A) ---
 def apply_tc_hand_opts(tk, rngs):
   from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
-  global _PREFETCH_NEXT_A
-  _B_PAGE_IDX.clear()
   # Fused (a.half()@b.half()) MMU-faults on DIRECT under any WMMA schedule (2026-09-27 HW);
   # separate half.realize() then ah@bh is fine. Refuse TC so ALU path runs (HIP/LLVM OK).
   if _wmma_has_fused_float_to_half_cast(tk):
@@ -3688,9 +3675,6 @@ def apply_tc_hand_opts(tk, rngs):
   if not getenv("TC_LDS_AB", 0): return apply_register_tc_hand_opts(tk, rngs)
   lds_ab = getenv("TC_LDS_AB", 0)
   up_cap = getenv("TC_UPCAST", 4)
-  # Prefetch-A was for register within-K tiles; register path returns early above.
-  # Under LDS_AB the (not lds_ab) gate made prefetch dead — leave OFF (AMD_PREFETCH_A removed).
-  _PREFETCH_NEXT_A = False
   loc_cap = getenv("TC_LOCAL", 2 if lds_ab else 4)
   up16 = allow_upcast16()
   max_tiles = min(getenv("TC_UPCAST_TILES", 16 if up16 else 8), 8 if not up16 else 10**9)
@@ -4190,7 +4174,6 @@ class AMDRenderer(ISARenderer):
     """
     lst = _lower_fma_mix_f32(lst)
     lst = _schedule_fma_mixhi_pairs(lst)
-    lst = _prefetch_next_a_b128_before_pack(lst) if _PREFETCH_NEXT_A else lst
     lst = _prefetch_a_after_packed_quant(lst) if True else lst
     lst = _prefetch_late_iq4_a_before_mix(lst) if True else lst
     lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
@@ -4361,7 +4344,6 @@ class AMDRenderer(ISARenderer):
     return "\n".join(ret)
 
   def render(self, uops:list[UOp]) -> str:
-    _B_PAGE_IDX.clear()
     return self.asm_str(uops, "kernel")
   def _insts_for_uop(self, u:UOp): return insts_for_uop(u)
   def _insts_from_linear(self, lin:UOp): return insts_from_linear(lin)

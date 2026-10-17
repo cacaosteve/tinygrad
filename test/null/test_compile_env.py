@@ -11,6 +11,15 @@ from tinygrad.helpers import getenv
 from tinygrad.uop.ops import KernelInfo, UOp
 
 class TestCompileEnv(unittest.TestCase):
+  def test_rdna3_page_index_is_shared_by_expression(self):
+    from tinygrad.renderer.isa.rdna3 import _b_page_idx
+    from tinygrad import dtypes
+    base = UOp.variable("page_base", 0, 1024, dtypes.int32)
+    half = _b_page_idx(base, 1, 2)
+    self.assertIs(half, _b_page_idx(base, 1, 2))
+    self.assertIsNot(half, _b_page_idx(base, 1, 4))
+    self.assertEqual(half.src[1].val, 2048)
+
   def test_rdna3_schedule_import_is_independent(self):
     script = "\n".join((
       "import sys",

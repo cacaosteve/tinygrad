@@ -290,66 +290,6 @@ def hoist_b_between_a_and_pack(ops:list[UOp]) -> list[UOp]:
     i = pack_a_i + len(chunk)
   return out
 
-def prefetch_next_a_b128_before_pack(ops:list[UOp]) -> list[UOp]:
-  """Issue next wide A (B128) before current PACK_A so both A tiles are in flight.
-
-  Pre-regalloc: A0 → PACK_A0 → WMMA* → … → A1_addr* → A1
-  becomes:      A0 → A1_addr* → A1 → PACK_A0 → WMMA* → …
-  Regalloc must give A0/A1 distinct VGPRs; soft waitcnt leaves A1 in flight into WMMA.
-  """
-  if not any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops): return ops
-  out = list(ops)
-  i = 0
-  while i < len(out):
-    u = out[i]
-    if not (u.op is Ops.INS and _iop(u) is AMDOps.PACK_F16 and _pack_f16_is_vec_load(u)):
-      i += 1
-      continue
-    if i + 1 >= len(out) or not (out[i + 1].op is Ops.INS and _iop(out[i + 1]) is AMDOps.WMMA):
-      i += 1
-      continue
-    if out[i + 1].src[1] is not u and out[i + 1].src[2] is not u:
-      i += 1
-      continue
-    # Find next wide A after this pack (skip WMMA/PACK/B-u16/EXTRACT/addr).
-    j = i + 1
-    while j < len(out):
-      v = out[j]
-      if v.op is Ops.INS and _iop(v) is AMDOps.LOAD and v.dtype is dtypes.half and _elem_count(v) >= 8:
-        break
-      if v.op is Ops.INS and _iop(v) in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ, AMDOps.STORE,
-                                       AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER):
-        j = -1
-        break
-      j += 1
-    else:
-      j = -1
-    if j < 0:
-      i += 1
-      continue
-    start = j
-    while start > i + 1 and is_addr_alu(out[start - 1]): start -= 1
-    if start <= i + 1:
-      i += 1
-      continue
-    end = j + 1
-    mid, chunk = out[i:start], out[start:end]
-    mid_set, chunk_set = set(mid), set(chunk)
-    if any(s in mid_set for cu in chunk for s in cu.src):
-      i += 1
-      continue
-    if any(s in chunk_set for mu in mid for s in mu.src):
-      i += 1
-      continue
-    # Don't hoist an A that feeds a WMMA we're skipping past (already its input).
-    if any(s in chunk_set for s in out[i + 1].src):
-      i += 1
-      continue
-    del out[start:end]
-    out[i:i] = chunk
-    i = i + len(chunk) + len(mid)
-  return out
-
 def prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
   """Issue next strided B U16 tile while current B U16 loads are still in flight.
 

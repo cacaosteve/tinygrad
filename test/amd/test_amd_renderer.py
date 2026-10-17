@@ -3231,14 +3231,9 @@ class TestAMDRenderer(unittest.TestCase):
       getenv.cache_clear()
       to_program_cache.clear()
 
-  def test_half_matmul_prefetch_next_a_default_on(self):
-    # Product-16 (TC_LDS_AB=0) ships AMD_PREFETCH_A=0 — small median regress vs OFF (2026-09-27 HW).
-    # Prefetch remains available via AMD_PREFETCH_A=1; LDS_AB path still defaults prefetch on.
-    import os
-    import tinygrad.renderer.isa.rdna3 as rdna3
-    old = {k: os.environ.get(k) for k in ("TC_LDS_AB", "AMD_PREFETCH_A")}
+  def test_half_matmul_large_register_schedule(self):
+    old = os.environ.get("TC_LDS_AB")
     os.environ["TC_LDS_AB"] = "0"
-    os.environ.pop("AMD_PREFETCH_A", None)
     getenv.cache_clear()
     to_program_cache.clear()
     try:
@@ -3246,24 +3241,10 @@ class TestAMDRenderer(unittest.TestCase):
         with Context(BEAM=0):
           ast = (Tensor.empty(n, n, dtype=dtypes.half, device="AMD") @
                  Tensor.empty(n, n, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
-          _to_prg(ast.schedule_linear().src[-1].src[0])
-        self.assertFalse(rdna3._PREFETCH_NEXT_A, f"N={n}")
-      # Opt-in still enables.
-      os.environ["AMD_PREFETCH_A"] = "1"
-      getenv.cache_clear()
-      to_program_cache.clear()
-      with Context(BEAM=0):
-        ast = (Tensor.empty(2048, 2048, dtype=dtypes.half, device="AMD") @
-               Tensor.empty(2048, 2048, dtype=dtypes.half, device="AMD")).cast(dtypes.float)
-        _to_prg(ast.schedule_linear().src[-1].src[0])
-      # Product-16 path forces AMD_PREFETCH_A=0 when unset; with explicit 1 it should stick
-      # only if apply_tc_hand_opts does not overwrite — it only sets when None, so stays 1.
-      # _PREFETCH_NEXT_A reads getenv after that — expect True.
-      self.assertTrue(rdna3._PREFETCH_NEXT_A or getenv("AMD_PREFETCH_A", 0) == 1)
+          _check_asm(self, _to_prg(ast.schedule_linear().src[-1].src[0]), AMDOps.WMMA)
     finally:
-      for k, v in old.items():
-        if v is None: os.environ.pop(k, None)
-        else: os.environ[k] = v
+      if old is None: os.environ.pop("TC_LDS_AB", None)
+      else: os.environ["TC_LDS_AB"] = old
       getenv.cache_clear()
       to_program_cache.clear()
 
