@@ -257,6 +257,7 @@ class TestAsmKernel(unittest.TestCase):
     self.assertTrue((a.numpy() == 6.0).all())
 
   def test_cfg_branch_diamond(self):
+    if self.arch != "rdna3": self.skipTest("only rdna3")
     def cfg_kernel(out:UOp):
       k = Kernel()
       k.emit(s_load_b64(s[0:1], s[0:1], soffset=NULL))
@@ -281,6 +282,7 @@ class TestAsmKernel(unittest.TestCase):
     self.assertListEqual(out.tolist(), [2.0, 1.0, 3.0])
 
   def test_cfg_loop(self):
+    if self.arch != "rdna3": self.skipTest("only rdna3")
     def cfg_kernel(out:UOp):
       k = Kernel()
       k.emit(s_load_b64(s[0:1], s[0:1], soffset=NULL))
