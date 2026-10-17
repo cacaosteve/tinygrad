@@ -3,7 +3,8 @@
 
 Flash: DIRECT/HIP use hand kernels (CUSTOM); LLVM cannot render those — column uses
 SDPA (documented). Matmul and Q4_K/Q5_K/Q6_K/IQ4_XS/Q8_0 GEMV compare the same Tensor graphs.
-The matrix reports checksums as a smoke signal; correctness gates are the device tests.
+Every timed case first checks its output against an independent NumPy/CPU reference.
+Quantized kernels use their documented activation/weight precision for that reference.
 
 Usage:
   AMD_SOFT_SYSFS=1 PYTHONPATH=. python extra/rdna3_backend_matrix.py
@@ -66,17 +67,32 @@ cold_ms = (time.perf_counter() - t_cold0) * 1e3
 for _ in range(7):
   out = runner(q); Device[Device.DEFAULT].synchronize()
 arr = out.numpy()
+q_ref = patterned((1, 32, tokens, 128))
+kv_ref = patterned((2, 1, 8, 2048, 128), np.float16).astype(np.float32)
+keys, values = (np.repeat(kv_ref[i], 4, axis=1) for i in range(2))
+scores = (q_ref @ keys.swapaxes(-1, -2)) / math.sqrt(128)
+if tokens > 1:
+  valid_mask = np.arange(valid)[None, :] <= valid-tokens+np.arange(tokens)[:, None]
+  scores = np.where(valid_mask, scores, -np.inf)
+probs = np.exp(scores-scores.max(axis=-1, keepdims=True))
+expected = (probs/probs.sum(axis=-1, keepdims=True)) @ values
+np.testing.assert_allclose(arr, expected, rtol=2e-3, atol=2e-3)
+warm_until = time.perf_counter()+0.2
+while time.perf_counter() < warm_until:
+  runner(q); Device[Device.DEFAULT].synchronize()
 xs = []
 for _ in range(int(os.environ.get("NREP", "80"))):
   t0 = time.perf_counter_ns()
   runner(q); Device[Device.DEFAULT].synchronize()
   xs.append((time.perf_counter_ns() - t0) / 1e3)
 xs = sorted(xs)
+np.testing.assert_allclose(out.numpy(), expected, rtol=2e-3, atol=2e-3)
 print(json.dumps({
   "workload": os.environ["WORKLOAD"], "backend": backend, "path": path,
   "dev": os.environ["DEV"], "renderer": type(Device[Device.DEFAULT].renderer).__name__,
   "sum": float(arr.astype("float64").sum()) if np.isfinite(arr).all() else None,
   "finite": bool(np.isfinite(arr).all()),
+  "max_abs_err": float(np.max(np.abs(arr-expected))),
   "median_us": statistics.median(xs), "best_us": min(xs),
   "p10_us": xs[max(0, len(xs)//10 - 1)], "cold_ms": cold_ms,
 }))
@@ -105,19 +121,24 @@ cold_ms = (time.perf_counter() - t_cold0) * 1e3
 for _ in range(5):
   out = runner(); Device[Device.DEFAULT].synchronize()
 got = out.numpy().astype(np.float32)
+np.testing.assert_allclose(got, ref, rtol=5e-3, atol=5e-3)
+warm_until = time.perf_counter()+0.2
+while time.perf_counter() < warm_until:
+  runner(); Device[Device.DEFAULT].synchronize()
 xs = []
 for _ in range(int(os.environ.get("NREP", "40"))):
   t0 = time.perf_counter_ns()
   runner(); Device[Device.DEFAULT].synchronize()
   xs.append((time.perf_counter_ns() - t0) / 1e3)
 xs = sorted(xs)
+np.testing.assert_allclose(out.numpy(), ref, rtol=5e-3, atol=5e-3)
 max_err = float(np.max(np.abs(got - ref)))
 print(json.dumps({
   "workload": "matmul_h_2048", "backend": os.environ["BACKEND"],
   "dev": os.environ["DEV"], "renderer": type(Device[Device.DEFAULT].renderer).__name__,
   "sum": float(got.astype(np.float64).sum()), "finite": bool(np.isfinite(got).all()),
   "max_err_vs_numpy_f32": max_err,
-  "ok_atol": bool(max_err < 1.0),  # half matmul loose gate
+  "correct": True,
   "median_us": statistics.median(xs), "best_us": min(xs),
   "p10_us": xs[max(0, len(xs)//10 - 1)], "cold_ms": cold_ms,
 }))
@@ -165,17 +186,35 @@ cold_ms = (time.perf_counter() - t_cold0) * 1e3
 for _ in range(5):
   out = runner(x); Device[Device.DEFAULT].synchronize()
 arr = out.numpy()
+raw_ref = Tensor(np.pad(qdata, (4, 0)), device="CPU").contiguous().realize()[4:]
+weights = ggml_data_to_tensor(raw_ref, rows*cols, ggml_type).reshape(rows, cols).numpy()
+custom = linear.ggml_type is not None
+wmma = custom and tokens % 16 == 0 and rows % 16 == 0 and not (os.environ["BACKEND"] == "direct" and qtype == "IQ4_XS")
+ref_x = x_np.astype(np.float16).astype(np.float32) if wmma else x_np
+if custom and not wmma:
+  grouped = ref_x.reshape(tokens, -1, 32)
+  scales = np.maximum(np.max(np.abs(grouped), axis=-1, keepdims=True)/127, 1e-8)
+  ref_x = (np.clip(np.rint(grouped/scales), -127, 127)*scales).reshape(tokens, cols)
+ref_weights = weights.astype(np.float16).astype(np.float32) if wmma else weights
+expected = ref_x @ ref_weights.T
+rtol, atol = (1e-2, 1e-1) if custom and qtype == "IQ4_XS" else (3e-3, 2e-2)
+np.testing.assert_allclose(arr, expected, rtol=rtol, atol=atol)
+warm_until = time.perf_counter()+0.2
+while time.perf_counter() < warm_until:
+  runner(x); Device[Device.DEFAULT].synchronize()
 xs = []
 for _ in range(int(os.environ.get("NREP", "60"))):
   t0 = time.perf_counter_ns()
   runner(x); Device[Device.DEFAULT].synchronize()
   xs.append((time.perf_counter_ns() - t0) / 1e3)
 xs = sorted(xs)
+np.testing.assert_allclose(out.numpy(), expected, rtol=rtol, atol=atol)
 print(json.dumps({
   "workload": f"{qtype.lower()}_gemv_{rows}x{cols}_t{tokens}", "qtype": qtype, "backend": os.environ["BACKEND"],
   "dev": os.environ["DEV"], "renderer": type(Device[Device.DEFAULT].renderer).__name__,
   "sum": float(arr.astype("float64").sum()) if np.isfinite(arr).all() else None,
   "finite": bool(np.isfinite(arr).all()),
+  "max_abs_err": float(np.max(np.abs(arr-expected))),
   "median_us": statistics.median(xs), "best_us": min(xs),
   "p10_us": xs[max(0, len(xs)//10 - 1)], "cold_ms": cold_ms,
 }))
@@ -190,6 +229,7 @@ def run_child(label_backend: str, dev: str, extra: dict, child: str, env_extra: 
     env.pop(k, None)
   env.update({
     "AMD_SOFT_SYSFS": "1", "PYTHONPATH": ROOT, "PARALLEL": "0", "CACHELEVEL": "0", "CCACHE": "0",
+    "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
     "DEV": dev, "BACKEND": label_backend,
   })
   env.update(extra)
@@ -198,6 +238,7 @@ def run_child(label_backend: str, dev: str, extra: dict, child: str, env_extra: 
   if p.returncode != 0 or not p.stdout.strip():
     return {
       "workload": env_extra.get("WORKLOAD", "?"), "backend": label_backend, "dev": dev,
+      "parameters": env_extra,
       "error": (p.stderr or p.stdout or "")[-500:].replace("\n", " "),
     }
   line = p.stdout.strip().splitlines()[-1]
@@ -222,7 +263,6 @@ def main() -> None:
     for be, dev, extra in BACKENDS:
       print(f"… {qtype} gemv {be}", flush=True)
       env_extra = {"QTYPE": qtype, "NREP": "60"}
-      if qtype == "Q4_K": env_extra["AMD_WMMA_ACC_BASE"] = "-1"
       rows.append(run_child(be, dev, extra, GEMV_CHILD, env_extra))
 
   # Multitoken Q6 GEMV exercises the WMMA path; keep it opt-in so the quick matrix stays quick.
@@ -270,6 +310,7 @@ def main() -> None:
         "sum_delta_vs_hip": m[be].get("sum") - m["hip"].get("sum") if m[be].get("sum") is not None and
                              m["hip"].get("sum") is not None else None,
       }), flush=True)
+  if any("error" in row for row in rows): raise SystemExit(1)
 
 
 if __name__ == "__main__":
