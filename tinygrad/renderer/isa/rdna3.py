@@ -1370,12 +1370,15 @@ def _var_divmod(x:UOp, d:UOp, op:UOp) -> UOp|None:
     gap = affine_int_bounds((signed_zero - d) - x)
     if gap is not None and gap[0] > 0: return signed_zero if op.op is Ops.CDIV else x
     zero = _tconst(0, dtypes.uint32)
-    q, r = _u32_divmod(x.cast(dtypes.uint32), zero - d.cast(dtypes.uint32), int(x.vmax).bit_length())
+    q, r = _u32_fast_divmod(x.cast(dtypes.uint32), zero - d.cast(dtypes.uint32))
     return ((zero - q) if op.op is Ops.CDIV else r).cast(dtypes.int32)
   zero = _tconst(0, dtypes.int32)
   xneg, dneg = x < zero, d < zero
   ax, ad = xneg.where(zero - x, x).cast(dtypes.uint32), dneg.where(zero - d, d).cast(dtypes.uint32)
-  q, r = _u32_divmod(ax, ad, max(abs(int(x.vmin)), abs(int(x.vmax))).bit_length())
+  # Taking the unsigned magnitude also handles INT_MIN. A proven nonzero divisor
+  # can share the reciprocal lowering; keep restoring division when zero is possible.
+  q, r = _u32_fast_divmod(ax, ad) if d.vmin > 0 or d.vmax < 0 else \
+    _u32_divmod(ax, ad, max(abs(int(x.vmin)), abs(int(x.vmax))).bit_length())
   q, r = q.cast(dtypes.int32), r.cast(dtypes.int32)
   return xneg.where(zero - r, r) if op.op is Ops.CMOD else (xneg ^ dneg).where(zero - q, q)
 
@@ -1584,7 +1587,7 @@ def make_isel_matcher(sgpr_pool:tuple[Register, ...]=SGPR, vgpr_pool:tuple[Regis
      if not isinstance(x.tag, tuple) else None),
     (UPat(Ops.PARAM, name="x"), lambda ctx,x:
      UOp(Ops.INS, src=(_tconst(_kernarg_offset(ctx, x), dtypes.int32).rtag(),),
-         arg=(AMDOps.KERNARG, dtypes.uint64 if x.arg.addrspace is not AddrSpace.ALU else dtypes.uint32))
+         arg=(AMDOps.KERNARG, dtypes.uint64 if x.arg.addrspace is not AddrSpace.ALU else x.dtype))
      if not isinstance(x.tag, tuple) else None),
     (UPat((Ops.BUFFER, Ops.ALLOC), name="x"), lambda ctx,x: _lds_base(ctx, x)),
     (UPat(Ops.SPECIAL, name="x"), lambda ctx,x,vgpr_pool=vgpr_pool:

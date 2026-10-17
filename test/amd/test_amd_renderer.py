@@ -521,6 +521,24 @@ def _uniform_positive_var_divmod_program():
                                          arg=KernelInfo(name="amd_asm_uniform_positive_var_divmod"))
   return _to_prg(sink)
 
+def _signed_var_divmod_program(negative_divisor=False):
+  out_q, out_r = UOp.placeholder((256,), dtypes.int32, 0), UOp.placeholder((256,), dtypes.int32, 1)
+  inp = UOp.placeholder((256,), dtypes.int32, 2)
+  bounds = (dtypes.int32.min, -1) if negative_divisor else (1, dtypes.int32.max)
+  div = UOp.param(3, dtypes.int32, (), vmin_vmax=bounds, name="div", addrspace=AddrSpace.ALU)
+  idx = UOp.special(256, "lidx0")
+  value = inp.index(idx).load()
+  q, r = _uop(Ops.CDIV, dtypes.int32, (value, div)), _uop(Ops.CMOD, dtypes.int32, (value, div))
+  return _to_prg(out_q.index(idx).store(q).sink(out_r.index(idx).store(r), idx, div,
+                                             arg=KernelInfo(name="amd_asm_signed_var_divmod")))
+
+def _signed_parameter_program():
+  out = UOp.placeholder((3,), dtypes.int32, 0)
+  value = UOp.param(1, dtypes.int32, (), vmin_vmax=(dtypes.int32.min, dtypes.int32.max), name="value", addrspace=AddrSpace.ALU)
+  zero, one = UOp.const(0, dtypes.int32), UOp.const(1, dtypes.int32)
+  stores = [out.index(UOp.const(i)).store(v) for i, v in enumerate(((value < zero).where(-one, one), value >> 3, value.maximum(zero)))]
+  return _to_prg(UOp.sink(*stores, value, arg=KernelInfo(name="amd_asm_signed_parameter", opts_to_apply=())))
+
 def _bounded_negative_divmod_program():
   out = UOp.placeholder((2,), dtypes.int32, 0)
   n = UOp.param(1, dtypes.int32, (), vmin_vmax=(1, 4127), name="n", addrspace=AddrSpace.ALU)
@@ -3550,6 +3568,23 @@ class TestAMDRenderer(unittest.TestCase):
     linear_ops = _lin_ops(prg)
     for op in (AMDOps.SHL, AMDOps.BFE, AMDOps.CMPLT, AMDOps.WHERE):
       self.assertIn(op, linear_ops)
+    self.assertNotIn(AMDOps.RECIPROCAL, linear_ops)  # The unconstrained divisor may be zero.
+
+  def test_signed_nonzero_var_divmod_uses_fast_reciprocal(self):
+    for negative in (False, True):
+      with self.subTest(negative=negative):
+        prg = _signed_var_divmod_program(negative)
+        _check_elf(self, prg)
+        self.assertIn(AMDOps.RECIPROCAL, _lin_ops(prg))
+        self.assertIn(AMDOps.MULHI, _lin_ops(prg))
+        self.assertLess(len(_prg_lin(prg).src), 200)
+
+  def test_scalar_parameter_keeps_signed_dtype(self):
+    prg = _signed_parameter_program()
+    params = [u for u in _prg_lin(prg).src if u.op is Ops.INS and _iop(u) is AMDOps.KERNARG and u.dtype.itemsize == 4]
+    self.assertTrue(params)
+    self.assertTrue(all(u.dtype is dtypes.int32 for u in params))
+    self.assertIn("S_CMP_LT_I32", _amd_inst_names(prg))
 
   def test_positive_var_divmod_uses_fast_reciprocal(self):
     prg = _positive_var_divmod_program()
@@ -4375,6 +4410,36 @@ class TestAMDRenderer(unittest.TestCase):
     rt = _amd_rt(prg)
     rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
     self.assertEqual(out.tolist(), [-21, 19, 21, -19])
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_signed_parameter(self):
+    out = Tensor.empty(3, dtype=dtypes.int32, device="AMD").contiguous().realize()
+    prg = _signed_parameter_program()
+    rt = _amd_rt(prg)
+    for value in (-2**31, -65537, -8, -1, 0, 1, 8, 65537, 2**31-1):
+      with self.subTest(value=value):
+        rt(out._buffer().ensure_allocated(), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(value,), wait=True)
+        self.assertEqual(out.tolist(), [-1 if value < 0 else 1, value >> 3, max(0, value)])
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_signed_nonzero_var_divmod(self):
+    import random
+    rng = random.Random(61017)
+    values = [-2**31, -2**31+1, -2**30-1, -65537, -1, 0, 1, 2, 65537, 2**30-1, 2**31-2, 2**31-1]
+    values += [rng.randrange(-2**31, 2**31) for _ in range(256-len(values))]
+    inp = Tensor(values, dtype=dtypes.int32, device="AMD").contiguous().realize()
+    out_q, out_r = (Tensor.empty(256, dtype=dtypes.int32, device="AMD").contiguous().realize() for _ in range(2))
+    bufs = [x._buffer().ensure_allocated() for x in (out_q, out_r, inp)]
+    divisors = [1, 2, 3, 7, 31, 255, 257, 65535, 65537, 2**30, 2**31-1] + [rng.randrange(1, 2**31) for _ in range(50)]
+    for negative in (False, True):
+      prg = _signed_var_divmod_program(negative)
+      rt = _amd_rt(prg)
+      for divisor in ([-d for d in divisors]+[-2**31] if negative else divisors):
+        with self.subTest(divisor=divisor):
+          rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(divisor,), wait=True)
+          quotients = [(-1 if (x < 0) != (divisor < 0) else 1)*(abs(x)//abs(divisor)) for x in values]
+          self.assertEqual(out_q.tolist(), [(q+2**31) % 2**32 - 2**31 for q in quotients])
+          self.assertEqual(out_r.tolist(), [x-q*divisor for x, q in zip(values, quotients)])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_positive_var_divmod(self):
