@@ -71,7 +71,6 @@ class ISARenderer(Renderer):
   preferred_complex_matvec_group: int|None = None
   local_prod_max: int|None = None
   wide_regalloc: bool = False
-  disk_program_cache: bool = False
   pre_isel_matcher: PatternMatcher
   isel_matcher: PatternMatcher
   pre_regalloc_matcher: PatternMatcher

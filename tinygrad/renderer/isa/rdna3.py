@@ -3910,7 +3910,6 @@ class AMDRenderer(ISARenderer):
   supports_float4 = True
   float4_dtypes = (dtypes.float32, dtypes.half)
   wide_regalloc = True
-  disk_program_cache = True
   linear_ctx_type = AMDLinearContext
   preferred_reduce_group = 16
   preferred_complex_matvec_group = 32

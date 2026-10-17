@@ -1,8 +1,8 @@
 from dataclasses import replace
-import contextlib, itertools, functools, hashlib, json, os, pathlib, pickle, re, sys, time
+import contextlib, itertools, functools, json, os, pathlib, re, time
 from typing import Callable, Iterator
 from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, USE_TC
-from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, TC_SELECT, TC_OPT, TC_MIN_GLOBALS, CCACHE, TracingKey, Context, panic, getenv
+from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, TC_SELECT, TC_OPT, TC_MIN_GLOBALS, TracingKey, Context, panic, getenv
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, MapCtx, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
 from tinygrad.uop.weak import pm_lower_weak, pm_commit_weak, pm_cast_const
 from tinygrad.uop.render import render_uir
@@ -619,25 +619,6 @@ def to_program_key(ast:UOp, renderer:Renderer) -> tuple:
   return (ast.key, type(renderer), renderer.target, *[x.value for x in to_program_config])
 
 @functools.cache
-def _program_source_paths() -> tuple[pathlib.Path, ...]:
-  root = pathlib.Path(__file__).resolve().parents[1]
-  paths = [root/"dtype.py", root/"helpers.py", root/"runtime"/"autogen"/"amdgpu_kd.py",
-           root/"runtime"/"autogen"/"hsa.py", root/"runtime"/"autogen"/"libc.py"]
-  for dirname in ("codegen", "renderer", "schedule", "uop", "runtime/autogen/amd"):
-    paths.extend((root/dirname).rglob("*.py"))
-  return tuple(sorted(paths))
-
-@functools.cache
-def _program_source_fingerprint() -> bytes:
-  """Invalidate native PROGRAM pickles whenever lowering, rendering, or encoding code changes."""
-  root = pathlib.Path(__file__).resolve().parents[1]
-  h = hashlib.sha256()
-  for path in _program_source_paths():
-    h.update(path.relative_to(root).as_posix().encode())
-    h.update(path.read_bytes())
-  return h.digest()
-
-@functools.cache
 def _program_cache_env_names() -> tuple[str, ...]:
   # Literal getenv controls in compiler sources can alter code without altering an AST. Capture any that are set,
   # while leaving the timing-only switch free to inspect cache hits.
@@ -674,15 +655,8 @@ def _compiler_environment(overrides:dict[str, str|None]) -> Iterator[None]:
       else: os.environ[name] = value
     getenv.cache_clear()  # type: ignore[attr-defined]
 
-def to_program_disk_key(ast:UOp, renderer:Renderer) -> str|None:
-  # VIZ must execute the compilation pipeline so every program and rewrite is recorded.
-  if not CCACHE or VIZ or not getattr(renderer, "disk_program_cache", False): return None
-  env = _program_environment(ast)
-  key = (to_program_key(ast, renderer), _program_source_fingerprint(), env, sys.version_info[:2])
-  return hashlib.sha256(pickle.dumps(key, protocol=pickle.HIGHEST_PROTOCOL)).hexdigest()
-
 def to_program_mem_key(ast:UOp, renderer:Renderer) -> tuple:
-  # In-memory key must include getenv-driven compiler env (same idea as disk cache).
+  # In-memory keys include getenv-driven compiler policy, not only the AST.
   # Without this, toggling AMD_REG_PROMOTE_SKIP_SLOTS (etc.) silently returns a stale program.
   env = _program_environment(ast)
   return (to_program_key(ast, renderer), env)
