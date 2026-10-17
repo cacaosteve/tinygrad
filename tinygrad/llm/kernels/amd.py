@@ -1517,9 +1517,10 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     if not (amd_direct_isa(q.device) or getenv("AMD_FLASH_DIRECT", 0)):
       return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N))
     # Upstream QKV/norm kernels must not inherit flash-only instruction selection.
-    q.realize(assigned_kv)
+    if ALLOW_DEVICE_USAGE: q.realize(assigned_kv)
     with _flash_direct_compile_env(flash_acc_small=False):
-      return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N)).realize()
+      out = amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N))
+      return out.realize() if ALLOW_DEVICE_USAGE else out
   # Keep hand WMMA prefill opt-in and restricted to aligned static starts; other cases use SDPA.
   # ACC_SMALL stays scoped to flash because global WMMA accumulator parking changes quantized GEMV behavior.
   q_tokens = _bound_int(T_real)

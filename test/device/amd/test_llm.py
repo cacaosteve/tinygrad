@@ -599,6 +599,43 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         self.assertEqual(calls, [((q, kv), 0), ((out,), 1)])
       finally: getenv.cache_clear()
 
+  def test_decode_builds_without_device_execution(self):
+    from tinygrad.helpers import Context
+    from tinygrad.llm.kernels import amd as amd_mod
+    q, kv, out = Tensor.empty(1, 2, 1, 64, device="CPU"), Tensor.empty(2, 1, 1, 64, 64, device="CPU"), Tensor.empty(1, device="CPU")
+    with patch.object(amd_mod, "amd_direct_isa", return_value=True), \
+         patch.object(amd_mod, "amd_flash_attention_decode", return_value=out), \
+         patch.object(Tensor, "realize", side_effect=AssertionError("execution during graph capture")), \
+         Context(ALLOW_DEVICE_USAGE=0):
+      self.assertIs(amd_mod.flash_attention(q, kv, 64), out)
+
+  def test_flash_attention_function_capture(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    from tinygrad.helpers import getenv
+    rng = np.random.default_rng(73)
+    cache = rng.normal(size=(2, 1, 1, 128, 128)).astype(np.float16)
+    kv = Tensor(cache).realize()
+    keys, values = (np.repeat(cache[i].astype(np.float32), 4, axis=1) for i in range(2))
+    with patch.dict(os.environ, {"AMD_FLASH_DIRECT":"1"}):
+      getenv.cache_clear()
+      try:
+        for tokens in (1, 32):
+          q_np = rng.normal(size=(1, 4, tokens, 128)).astype(np.float16)
+          q = Tensor(q_np).realize()
+          @function(allow_implicit=True)
+          def wrapped(query:Tensor, cache:Tensor, end:int|UOp): return flash_attention(query, cache, end)
+          run = TinyJit(lambda query, cache, end: wrapped(query, cache, end).realize())
+          for valid in ((37, 37, 73, 37, 127) if tokens == 1 else (128, 128, 128)):
+            with self.subTest(tokens=tokens, valid=valid):
+              end = UOp.variable("function_valid", 1, 128).bind(valid) if tokens == 1 else valid
+              actual = run(q, kv, end).numpy()
+              scores = (q_np.astype(np.float32) @ keys[:, :, :valid].swapaxes(-1, -2))/np.sqrt(128)
+              scores = np.where(np.arange(valid)[None, :] <= np.arange(valid-tokens, valid)[:, None], scores, -np.inf)
+              probs = np.exp(scores-scores.max(axis=-1, keepdims=True))
+              expected = (probs/probs.sum(axis=-1, keepdims=True)) @ values[:, :, :valid]
+              np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=2e-3)
+      finally: getenv.cache_clear()
+
   def test_prefill_compile_policy_overrides_sticky_decode(self):
     """Flash scheduling is scoped to compilation and prefill overrides stale decode settings."""
     from tinygrad.helpers import getenv
