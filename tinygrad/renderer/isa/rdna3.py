@@ -2690,14 +2690,15 @@ def _fused_scratch_contig_store(uops:list[UOp], i:int, store_addr_cache:_StoreAd
   data = _reg_chunk(r0, 0, 4)
   return 4, pre + [r3.scratch_store_b128(addr=addr, data=data, offset=byte_off, sve=1)], deps
 
-def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAddrCache|None=None) -> tuple[int, list, set[int]]|None:
-  """Fold four contiguous scalar SLOAD (offs +0..+12, consecutive dest VGPRs) into SCRATCH_LOAD_B128.
+def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAddrCache|None=None,
+                               *, count:int=4) -> tuple[int, list, set[int]]|None:
+  """Fold two or four aligned scalar SLOADs with consecutive destinations into a wide scratch load.
 
   Accepts either shared idx + byte_off 0/4/8/12, or consecutive const element indices
   (flash soft-copy SLOAD(base, i)..SLOAD(base, i+3)).
   """
-  if i + 3 >= len(uops): return None
-  loads = uops[i:i+4]
+  if i + count - 1 >= len(uops): return None
+  loads = uops[i:i+count]
   if not all(x.op is Ops.INS and _iop(x) is AMDOps.SLOAD for x in loads): return None
   dt = loads[0].dtype
   if dt not in (dtypes.float32, dtypes.uint32, dtypes.int32): return None
@@ -2710,13 +2711,13 @@ def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAdd
   idxs = [_const_int(x.src[1]) for x in loads]
   byte_off = 0
   idx = loads[0].src[1]
-  if all(x.src[1] is idx for x in loads) and offs[0] % 16 == 0 and \
-     all(offs[n] == offs[0] + 4 * n for n in range(4)) and offs[0] + 12 <= 0xfff:
+  if all(x.src[1] is idx for x in loads) and offs[0] % (count*4) == 0 and \
+     all(offs[n] == offs[0] + 4 * n for n in range(count)) and offs[0] + (count-1)*4 <= 0xfff:
     byte_off = offs[0]
   elif all(i is not None for i in idxs) and all(o == 0 for o in offs):
     i0 = idxs[0]
     assert i0 is not None
-    if i0 % 4 == 0 and all(idxs[n] == i0 + n for n in range(4)) and (i0 + 3) * dt.itemsize <= 0xfff:
+    if i0 % count == 0 and all(idxs[n] == i0 + n for n in range(count)) and (i0 + count-1) * dt.itemsize <= 0xfff:
       # Const element indices → encode as byte offset from a zero index.
       byte_off = i0 * dt.itemsize
       idx = _tconst(0, dtypes.int32).rtag()
@@ -2735,43 +2736,8 @@ def _fused_scratch_contig_load(uops:list[UOp], i:int, store_addr_cache:_StoreAdd
     if soff: pre = pre + [r3.v_add_nc_u32_e64(TMP_VADDR, soff, addr)]
     addr = TMP_VADDR
   deps = set().union(*(_reg_idxs(x.src[1]) for x in loads))
-  return 4, pre + [r3.scratch_load_b128(addr=addr, vdst=_reg_chunk(r0, 0, 4), offset=byte_off, sve=1)], deps
-
-def _fused_scratch_contig_load_b64(uops:list[UOp], i:int, store_addr_cache:_StoreAddrCache|None=None) -> tuple[int, list, set[int]]|None:
-  """Fold two contiguous scalar SLOAD into SCRATCH_LOAD_B64 (8-byte aligned)."""
-  if i + 1 >= len(uops): return None
-  loads = uops[i:i+2]
-  if not all(x.op is Ops.INS and _iop(x) is AMDOps.SLOAD for x in loads): return None
-  dt = loads[0].dtype
-  if dt not in (dtypes.float32, dtypes.uint32, dtypes.int32): return None
-  if not all(x.dtype is dt and _elem_count(x) == 1 and isinstance(greg(x), Register) for x in loads): return None
-  r0 = greg(loads[0])
-  if greg(loads[1]).index != r0.index + 1: return None
-  base = loads[0].src[0]
-  if loads[1].src[0] is not base: return None
-  offs = [_lds_byte_off(x) for x in loads]
-  idxs = [_const_int(x.src[1]) for x in loads]
-  byte_off = 0
-  idx = loads[0].src[1]
-  if loads[1].src[1] is idx and offs[0] % 8 == 0 and offs[1] == offs[0] + 4 and offs[0] + 4 <= 0xfff:
-    byte_off = offs[0]
-  elif (all(t is not None for t in idxs) and all(o == 0 for o in offs) and
-        int(idxs[0]) % 2 == 0 and int(idxs[1]) == int(idxs[0]) + 1 and  # type: ignore[arg-type]
-        (int(idxs[0]) + 1) * dt.itemsize <= 0xfff):  # type: ignore[arg-type]
-    byte_off = int(idxs[0]) * dt.itemsize  # type: ignore[arg-type]
-    idx = _tconst(0, dtypes.int32).rtag()
-  else:
-    return None
-  soff = _scratch_base_offset(base)
-  if store_addr_cache is not None:
-    pre, addr, byte_off = store_addr_cache.addr(idx, dt.itemsize, byte_off, base_key=id(base))
-    if pre and soff: pre = pre + [r3.v_add_nc_u32_e64(addr, soff, addr)]
-  else:
-    pre, addr = _scaled_addr(TMP_VADDR, idx, dt.itemsize)
-    if soff: pre = pre + [r3.v_add_nc_u32_e64(TMP_VADDR, soff, addr)]
-    addr = TMP_VADDR
-  deps = set().union(*(_reg_idxs(x.src[1]) for x in loads))
-  return 2, pre + [r3.scratch_load_b64(addr=addr, vdst=_reg_chunk(r0, 0, 2), offset=byte_off, sve=1)], deps
+  load = {2:r3.scratch_load_b64, 4:r3.scratch_load_b128}[count]
+  return count, pre + [load(addr=addr, vdst=_reg_chunk(r0, 0, count), offset=byte_off, sve=1)], deps
 
 def _fused_lds_pack_load(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
   """Fold four contiguous f32 LLOAD (same base, offs +0..+12) into one DS_LOAD_B128."""
@@ -3293,7 +3259,7 @@ def insts_from_linear(lin:UOp):
       oi += count
       continue
     # Contiguous SLOAD×2 → scratch_load_b64 when b128 cannot match.
-    if mask_depth == 0 and (fused_s64:=_fused_scratch_contig_load_b64(scheduled, oi, store_addr_cache)) is not None:
+    if mask_depth == 0 and (fused_s64:=_fused_scratch_contig_load(scheduled, oi, store_addr_cache, count=2)) is not None:
       count, emitted, deps = fused_s64
       if deps and _pending_src(deps): flush_regs(deps)
       for inst in emitted: emit(inst)
@@ -3310,7 +3276,7 @@ def insts_from_linear(lin:UOp):
         j += 1
       if j - oi >= 2 and not any(_fused_scratch_contig_load(scheduled, start, None) is not None
                                   for start in range(oi, j - 3)) and \
-         not any(_fused_scratch_contig_load_b64(scheduled, start, None) is not None
+         not any(_fused_scratch_contig_load(scheduled, start, None, count=2) is not None
                  for start in range(oi, j - 1)):
         scratch_cache_snap = (store_addr_cache.key, store_addr_cache.page, store_addr_cache._bcast_src, store_addr_cache.lds_key)
         parts = [_emit_uop(scheduled[k], with_store_cache=True) for k in range(oi, j)]

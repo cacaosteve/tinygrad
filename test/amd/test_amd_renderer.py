@@ -3204,6 +3204,20 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertTrue(amd_lib._tmp_vaddr_clause_safe([scale(), scale()], [load_other]))
     self.assertFalse(amd_lib._tmp_vaddr_clause_safe([scale(), scale()], [load_tmp, load_tmp]))
 
+  def test_scratch_load_fusion_width_and_alignment(self):
+    base = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.SCRATCH_BASE)
+    for count in (2, 4):
+      for first in (0, 1, 4):
+        with self.subTest(count=count, first=first):
+          loads = [_uop(Ops.INS, dtypes.float32, (base, UOp.const(first+i, dtypes.int32), UOp.const(1, dtypes.int32)),
+                        AMDOps.SLOAD, (Register(f"load{i}", 261+i),)) for i in range(count)]
+          result = amd_lib._fused_scratch_contig_load(loads, 0, count=count)
+          if first % count: self.assertIsNone(result)
+          else:
+            self.assertIsNotNone(result)
+            self.assertEqual(result[0], count)
+            self.assertEqual(result[1][-1].op_name, f"SCRATCH_LOAD_B{count*32}")
+
   def test_scalar_load_clause_preserves_reused_address_register(self):
     half_base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.KERNARG, tag=(Register("half_base", 8, size=8),))
     float_base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.KERNARG, tag=(Register("float_base", 10, size=8),))
