@@ -415,17 +415,31 @@
       "branch": "codex/rdna3-ib-coherency-20261018",
       "commit": "93b518db1",
       "accepted": false,
-      "result": "Candidate changes only gfx11 compute-IB cache-policy bits to bypass; other generations retain their prior bits. Packet test fails before and passes after. Explicit native mock/DSL/event/weight/HCQ gate: 347 passed, 3 skipped, 406 subtests; Ruff/mypy pass. An equivalent external diagnostic completed 120 complete Llama generations with exact repeated output. A fresh explicit LRU control fails at generation 12 (target 2121, signal 2119, drained queues), followed by a passing fresh-process GPU smoke. Further 0/3/0/3 fresh-process controls were still running when connectivity dropped; do not claim their final result or a proven production fix. The smaller alternating non-LLM 5000-cycle probe passes even without bypass, so it is a health check, not a reproducer."
+      "result": "Candidate changes only gfx11 compute-IB cache-policy bits to bypass; other generations retain their prior bits. Packet test fails before and passes after. Explicit native mock/DSL/event/weight/HCQ gate: 347 passed, 3 skipped, 406 subtests; Ruff/mypy pass. An equivalent external diagnostic completed 120 complete Llama generations with exact repeated output, independently rechecked from the recovered JSON. A fresh explicit LRU control fails at generation 12 (target 2121, signal 2119, drained queues), followed by a passing fresh-process GPU smoke. Recovery finds only this first completed control in the controller JSON; the following bypass control log persists through round 20 then has a NUL tail, with no completed result. The remaining controls did not complete. Do not count an interrupted control as passing or failing, or claim a proven production fix. The smaller alternating non-LLM 5000-cycle probe passes even without bypass, so it is a health check, not a reproducer."
     }
   ],
   "session_stop": {
-    "reason": "Gaming PC SSH first timed out, then reported Network is unreachable; hardware iteration stopped as requested.",
+    "reason": "Gaming PC is reachable again, but only gfx1201 / PCI 1002:7551 is exposed, not the required gfx1100 / RX 7900. No GPU tests launched on the wrong target; hardware iteration stopped.",
+    "hardware_resume_check": {
+      "checked_at_utc": "2026-10-18 22:08:02 UTC",
+      "host": "ms-1602EF6719A6",
+      "gpu_count": 1,
+      "gfx_target_version": 120001,
+      "pci_id": "1002:7551",
+      "required_target": "gfx1100 / PCI 1002:744c",
+      "gpu_tests_started": false,
+      "prior_test_processes_found": false
+    },
     "main_worktree": "/Users/steve/tinygrad-rdna3-pr-candidate-20261018",
     "main_branch": "codex/rdna3-pr-ready-20261018",
     "validated_product_commit": "be4ce7d04267d98d55ce335b74a622b628b2b88c",
     "isolated_runtime_trial": "93b518db1b2ad66b314795c08a250e01e656c000",
-    "remote_state": "Primary checkout last confirmed at be4ce7d04. Trial bundle transfer succeeded, but the SSH command to fetch it/create the trial worktree timed out. Do not assume that worktree exists. The remote control runner may finish if only network connectivity dropped; its final status is unknown.",
+    "remote_state": "Primary checkout is clean and detached at be4ce7d04. Runtime trial worktree does not exist; its earlier bundle transfer did not create it. No prior test process remains. Recovered controls are incomplete: policy 0 failed at round 12, policy 3 persisted only through round 20 with no final result. The GPU is now gfx1201, so further gfx1100 controls and trial hardware validation must wait for the 7900.",
     "local_frozen_failure_backup": "/Users/steve/rdna3-validation-artifacts-20261018/rdna3-model-timeout-buffers-main-failure-20261018.tgz",
+    "local_recovered_results": [
+      "/Users/steve/rdna3-validation-artifacts-20261018/model-ib-bypass-120-20261018.json",
+      "/Users/steve/rdna3-validation-artifacts-20261018/model-ib-policy-controls-20261018.json"
+    ],
     "resume_order": [
       "Verify gfx1100 and inspect any still-running prior jobs before starting another GPU job.",
       "Read resume-1/model-ib-policy-controls-20261018.json/log; preserve every negative control as failed.",
