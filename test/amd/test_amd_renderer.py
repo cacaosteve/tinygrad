@@ -2365,6 +2365,27 @@ class TestAMDRenderer(unittest.TestCase):
       self.assertEqual({id(idx_map[(buf, lane)][0]) for lane in range(8)}, {id(inits[bidx])})
       self.assertEqual([idx_map[(buf, lane)][1] for lane in range(8)], list(range(8)))
 
+  def test_single_fragment_acc_mapping_without_quant_marker(self):
+    # A full eight-float fragment can park without opting all small buffers into flash layout.
+    from tinygrad.renderer.isa.rdna3 import _single_wmma_fragment_base, _wmma_acc_zero_inits
+    bufs = [UOp.placeholder((8,), dtypes.float32, slot=i, addrspace=AddrSpace.REG) for i in range(4)]
+    def pack(buf, indices, tag):
+      loads = tuple(_uop(Ops.INS, dtypes.float32, (buf, idx), AMDOps.SLOAD,
+                          (Register(f"load{i}", 100+i),)) for i,idx in enumerate(indices))
+      return _uop(Ops.INS, dtypes.float32, loads, AMDOps.PACK, tag)
+    indices = tuple(UOp.const(i, dtypes.int32) for i in range(8))
+    packs = [pack(buf, indices, (Register(f"acc{i}", 200+i*8),)) for i,buf in enumerate(bufs)]
+    for buf,p in zip(bufs,packs): self.assertIs(_single_wmma_fragment_base(p), buf)
+    uops = [u for p in packs for u in (*p.src, p, _uop(Ops.INS, dtypes.float32, (p,p,p), AMDOps.WMMA, p.tag))]
+    inits, _, idx_map, _ = _wmma_acc_zero_inits(uops)
+    self.assertEqual(len(inits), 4)
+    self.assertEqual(len(idx_map), 32)
+    for buf in bufs: self.assertEqual([idx_map[(buf, i)][1] for i in range(8)], list(range(8)))
+    self.assertIsNone(_single_wmma_fragment_base(pack(bufs[0], indices[:-1]+(indices[0],), packs[0].tag)))
+    self.assertIsNone(_single_wmma_fragment_base(pack(bufs[0], indices[:-1]+(UOp.special(8, "lidx0"),), packs[0].tag)))
+    large = UOp.placeholder((16,), dtypes.float32, slot=8, addrspace=AddrSpace.REG)
+    self.assertIsNone(_single_wmma_fragment_base(pack(large, indices, packs[0].tag)))
+
   def test_wmma_acc_small_buf_tiles_separate_buffers(self):
     # Flash ACC_SEP: S_reg (16) then pv_acc (32) both park ACC with dynamic SLOAD indices.
     # Global expand-order tile ids collide (both have tile_local 0); linear lookup needs buf_tiles.
