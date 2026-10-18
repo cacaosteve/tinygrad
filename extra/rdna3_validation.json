@@ -415,7 +415,20 @@
       "branch": "codex/rdna3-ib-coherency-20261018",
       "commit": "93b518db1",
       "accepted": false,
-      "result": "Candidate changes only gfx11 compute-IB cache-policy bits to bypass; other generations retain their prior bits. Packet test fails before and passes after. Explicit native mock/DSL/event/weight/HCQ gate: 347 passed, 3 skipped, 406 subtests; Ruff/mypy pass. An equivalent external diagnostic completed 120 complete Llama generations with exact repeated output, independently rechecked from the recovered JSON. A fresh explicit LRU control fails at generation 12 (target 2121, signal 2119, drained queues), followed by a passing fresh-process GPU smoke. Recovery finds only this first completed control in the controller JSON; the following bypass control log persists through round 20 then has a NUL tail, with no completed result. The remaining controls did not complete. Do not count an interrupted control as passing or failing, or claim a proven production fix. The smaller alternating non-LLM 5000-cycle probe passes even without bypass, so it is a health check, not a reproducer."
+      "result": "REJECTED after fresh gfx1100 controls: bypass alone still times out at generation 79 (target 12795, signal 12793, both queues drained). Policy-0 control fails on generation 0 (target 168, signal 166); fresh GPU smoke passes after both failures. The earlier 120-generation bypass pass and interrupted control were insufficient evidence. Keep this branch unmerged. A later ring-side pre-fetch flush trial is tracked separately."
+    },
+    {
+      "branch": "codex/rdna3-ib-prefetch-20261018",
+      "commit": "a885c3170",
+      "accepted": false,
+      "result": "Reuse the existing gfx11 memory-barrier encoder on the ring before indirect-buffer fetch, without cache-policy bypass. Packet regression fails on parent and passes after, preserving other target packets and a nonzero command-buffer view offset. External diagnostic: 240 complete model generations with identical tokens. Reversed policy-0 control again fails at generation 0 (target 184, signal 182), followed by passing GPU smoke. Actual candidate, without monkeypatches: 240 complete model generations with identical tokens. Local mock/compiler/DSL/HCQ scope: 381 passed, 3 skipped, 408 subtests; Ruff/mypy pass. Full physical suite stops at an existing decode NaN: 338 passed and 422 subtests before the failure. Independent poisoned-tail cases reproduce the same numerical failure on parent and trial, not only on the runtime trial."
+    },
+    {
+      "branch": "codex/rdna3-copy-scoreboard-20261018",
+      "commit": "1bbcd61a5",
+      "merged_upstream_commit": "b2d67bbd1",
+      "accepted": false,
+      "result": "Copies and VOPD pairs previously waited only for pending source reads, not pending writes to their physical destinations. Late VMEM/LDS results can overwrite a new initializer after its old load value is dead. Add destination-register dependencies, retaining scheduling. Four packet-order subtests (VMEM/LDS, single/paired MOV) fail on parent and pass after. Nine-shape poisoned-tail diagnostic fails identically on parent/runtime-only trial and passes with destination waits; HIP passes the same corpus. A 27-subtest NaN/+Inf/-Inf tail test plus the original cache-length regression pass on actual post-merge source b2d67bbd1. Post-merge local scope: 382 passed, 3 skipped, 412 subtests; Ruff/mypy (221 files) pass. Full serial physical suite is running, not yet counted as passed."
     }
   ],
   "session_stop": {
@@ -448,6 +461,23 @@
       "Keep the emulator checkout untouched; no PR or push."
     ]
   },
+  "session_resume": {
+    "date": "2026-10-18",
+    "arch": "gfx1100",
+    "pci_id": "1002:744c",
+    "status": "Serial hardware validation running; supersedes the previous wrong-card stop.",
+    "product_under_validation": "b2d67bbd1fc9422158dfddb5f3503801f350157c",
+    "trial_worktree": "/Users/steve/tinygrad-rdna3-copy-scoreboard-20261018",
+    "remote_trial": "/home/admin441766/rdna3-copy-scoreboard-20261018",
+    "remote_results": "/home/admin441766/rdna3-validation-results-20261017/resume-2-20261018",
+    "local_results": "/Users/steve/rdna3-validation-artifacts-20261018",
+    "next": [
+      "Finish full serial native scope on b2d67bbd1, keeping failures as failures.",
+      "Run DIRECT/HIP changing-input and frozen flash replay gates, HIP bf16 regression, and long model replay on the actual combined source.",
+      "Measure fresh paired whole-model throughput before accepting either fix or the independent symbolic-row trial.",
+      "Integrate only validated changes into codex/rdna3-pr-ready-20261018; do not modify the emulator or open/push a PR."
+    ]
+  },
   "external_review": {
     "gabriel_rdna3_pr_head": "c5640ec5e",
     "useful_recent_branches": [
@@ -455,7 +485,7 @@
       "unified_stack (0ba9397af)",
       "remove_range (3ef3c903e)"
     ],
-    "disposition": "Official master c04397442 (LLVM sqrt edge cases) is merged as be4ce7d04. Gabriel early_estimates remains 85740d39f: f82fa1d8e counts inline CALL bodies with caller-range multipliers; 85740d39f updates a bounded-loop test. These build on his per-range estimator rewrite, whereas this branch retains master's linear estimator. Useful accounting work, not a drop-in RDNA3 speed fix; no wholesale merge. ins_is_call_v3 remains dd31a682c and RDNA3 PR head remains c5640ec5e. No fresh comparable Gabriel RDNA3 performance data.",
+    "disposition": "Fresh review: official master advances from c04397442 to ae0d6439c, a single HIP bf16 cast cleanup. Merged into the isolated combined trial as b2d67bbd1 before physical regression; primary candidate not advanced yet. Gabriel early_estimates remains 85740d39f; ins_is_call_v3 remains dd31a682c and RDNA3 PR head/fork master remains c5640ec5e. These are unchanged, with no new comparable RDNA3 performance data. No wholesale Gabriel merge.",
     "compile_profile": "Large Q6 compile ~1029 ms after cleanup; estimates ~22 ms, rewrite ~608 ms. Estimates alone are not the dominant cold-compile bottleneck."
   }
 }
