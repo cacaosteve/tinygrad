@@ -45,6 +45,7 @@ def _mem_itemsize(dt:DType) -> int: return dt.itemsize
 
 # --- emit: VOPD pairing (post-regalloc optional dual-issue) ---
 from tinygrad.renderer.isa import rdna3_vopd as _vopd
+_vopd_scan_safe = _vopd.scan_safe
 _parallel_vmov = _vopd.parallel_vmov
 _try_vopd_fmac_pair = _vopd.try_vopd_fmac_pair
 _try_vopd_fmac_alu_pair = _vopd.try_vopd_fmac_alu_pair
@@ -171,16 +172,6 @@ def _global_store_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
     return [r3.global_store_b128(addr=addr, data=lo, saddr=saddr),
             r3.global_store_b128(addr=addr, data=hi, saddr=saddr, offset=16)]
   raise CompileError(f"no global store {val.dtype}")
-
-def _vopd_scan_safe(candidate:UOp, between:list[UOp]) -> bool:
-  """A scanned instruction can move only if its physical operands stay untouched."""
-  dst, src = _reg_idxs(candidate), set().union(*(_reg_idxs(s) for s in candidate.src))
-  for mid in between:
-    if mid.op is Ops.INS and _iop(mid) in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ,
-                                          AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER): return False
-    reads = set().union(*(_reg_idxs(s) for s in mid.src)) if mid.src else set()
-    if dst & (_reg_idxs(mid) | reads) or src & _reg_idxs(mid): return False
-  return True
 
 def _wait_for_domain(domain:str, cnt:int=0):
   if domain == "vm": return r3.s_waitcnt_vmcnt(sdst=NULL, simm16=cnt)
@@ -2961,134 +2952,14 @@ def insts_from_linear(lin:UOp):
       for inst in emitted: emit(inst)
       oi += count
       continue
-    # Pair independent FMACs into VOPD (HIP SDPA uses dual-issue heavily).
-    # Scan a short window — bank-compatible partners are often not adjacent.
-    # Also try FMAC+ADD/SUB (HIP's common mixed form; dest/src1 banks are independent).
-    if mask_depth == 0 and getenv("AMD_VOPD_FMAC", 0) and u.op is Ops.INS and _iop(u) is AMDOps.FMAC:
-      partner_i: int|None = None
-      vopd: list|None = None
-      max_scan = 8
-      for k in range(oi + 1, min(oi + 1 + max_scan, len(scheduled))):
-        if k in early_emitted: continue
-        cand = scheduled[k]
-        pair = _try_vopd_fmac_pair(u, cand) or _try_vopd_fmac_alu_pair(u, cand)
-        if pair is None: continue
-        # Emit cand early with u only if cand does not depend on intervening ops
-        # (those would still be pending). Mid depending on u is fine — u writes first.
-        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(_vopd.depends(cand, scheduled[m]) for m in range(oi + 1, k)):
-          continue
-        partner_i, vopd = k, pair
-        break
-      if vopd is not None and partner_i is not None:
-        src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[partner_i].src))
-        if src and _pending_src(src): flush_regs(src)
-        for inst in vopd: emit(inst)
-        early_emitted.add(partner_i)
-        oi += 1
-        continue
-    if mask_depth == 0 and getenv("AMD_VOPD_FMAC_ALU", 0) and u.op is Ops.INS and \
-       _iop(u) in (AMDOps.ADD, AMDOps.SUB):
-      partner_i = None
-      vopd = None
-      max_scan = 8
-      for k in range(oi + 1, min(oi + 1 + max_scan, len(scheduled))):
-        if k in early_emitted: continue
-        cand = scheduled[k]
-        if _iop(cand) is not AMDOps.FMAC: continue
-        if (pair:=_try_vopd_fmac_alu_pair(u, cand)) is None: continue
-        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(_vopd.depends(cand, scheduled[m]) for m in range(oi + 1, k)):
-          continue
-        partner_i, vopd = k, pair
-        break
-      if vopd is not None and partner_i is not None:
-        src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[partner_i].src))
-        if src and _pending_src(src): flush_regs(src)
-        for inst in vopd: emit(inst)
-        early_emitted.add(partner_i)
-        oi += 1
-        continue
-    if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.ADD:
-      partner_i = None
-      vopd = None
-      max_scan = 8
-      for k in range(oi + 1, min(oi + 1 + max_scan, len(scheduled))):
-        if k in early_emitted: continue
-        cand = scheduled[k]
-        if (pair:=_try_vopd_add_pair(u, cand)) is None: continue
-        # Refuse if anything between produces a cand src or consumes cand (early emit).
-        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(_vopd.depends(cand, scheduled[m]) or _vopd.depends(scheduled[m], cand)
-               for m in range(oi + 1, k)):
-          continue
-        partner_i, vopd = k, pair
-        break
-      if vopd is not None and partner_i is not None:
-        src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[partner_i].src))
-        if src and _pending_src(src): flush_regs(src)
-        for inst in vopd: emit(inst)
-        early_emitted.add(partner_i)
-        oi += 1
-        continue
-    # Pair independent MULs / MAXs into VOPD (flash soft/scale has many parallel lanes).
-    if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.MUL:
-      partner_i = None
-      vopd = None
-      max_scan = 8
-      for k in range(oi + 1, min(oi + 1 + max_scan, len(scheduled))):
-        if k in early_emitted: continue
-        cand = scheduled[k]
-        if (pair:=_try_vopd_mul_pair(u, cand)) is None: continue
-        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
-          continue
-        partner_i, vopd = k, pair
-        break
-      if vopd is not None and partner_i is not None:
-        src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[partner_i].src))
-        if src and _pending_src(src): flush_regs(src)
-        for inst in vopd: emit(inst)
-        early_emitted.add(partner_i)
-        oi += 1
-        continue
-    if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.MAX:
-      partner_i = None
-      vopd = None
-      max_scan = 8
-      for k in range(oi + 1, min(oi + 1 + max_scan, len(scheduled))):
-        if k in early_emitted: continue
-        cand = scheduled[k]
-        if (pair:=_try_vopd_max_pair(u, cand)) is None: continue
-        if not _vopd_scan_safe(cand, scheduled[oi:k]) or any(u in scheduled[m].src or cand in scheduled[m].src for m in range(oi + 1, k)):
-          continue
-        partner_i, vopd = k, pair
-        break
-      if vopd is not None and partner_i is not None:
-        src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[partner_i].src))
-        if src and _pending_src(src): flush_regs(src)
-        for inst in vopd: emit(inst)
-        early_emitted.add(partner_i)
-        oi += 1
-        continue
-    # Pair independent scalar MOVs into VOPD (const zero runs / copy streaks).
-    if mask_depth == 0 and u.op is Ops.INS and _iop(u) is AMDOps.MOV:
-      partner_i = None
-      vopd = None
-      max_scan = 32  # AMD_VOPD_MOV_SCAN hardcoded
-      for k in range(oi + 1, min(oi + 1 + max_scan, len(scheduled))):
-        if k in early_emitted: continue
-        cand = scheduled[k]
-        if (pair:=_try_vopd_mov_pair(u, cand)) is None: continue
-        # Dual emits cand at u. Preserve its value across every intervening read/write/control-flow.
-        between = scheduled[oi + 1:k]
-        if any(_vopd.depends(cand, mid) for mid in between) or not _vopd_scan_safe(cand, between):
-          continue
-        partner_i, vopd = k, pair
-        break
-      if vopd is not None and partner_i is not None:
-        src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[partner_i].src))
-        if src and _pending_src(src): flush_regs(src)
-        for inst in vopd: emit(inst)
-        early_emitted.add(partner_i)
-        oi += 1
-        continue
+    if mask_depth == 0 and (paired:=_vopd.find_pair(scheduled, oi, early_emitted)) is not None:
+      partner_i, vopd = paired
+      src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[partner_i].src))
+      if src and _pending_src(src): flush_regs(src)
+      for inst in vopd: emit(inst)
+      early_emitted.add(partner_i)
+      oi += 1
+      continue
     if mask_depth == 0 and (fused_reduce:=_fused_lds_reduce_loop(scheduled, oi)) is not None:
       count, emitted = fused_reduce
       flush("lgkm")

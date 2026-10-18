@@ -1,11 +1,12 @@
 """RDNA3 VOPD dual-issue pairing (post-regalloc optional emit)."""
 from __future__ import annotations
+from typing import Callable
 
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import getenv
 from tinygrad.renderer.amd.dsl import Reg
 from tinygrad.renderer.isa.rdna3_defs import (AMDOps, iop as _iop, dst_operand as _dst, src_operand as _src, vgpr_num as _vgpr_num,
-  mov_imm_or_src as _mov_imm_or_src, reg_slots as _reg_slots, unwrap_const as _unwrap_const)
+  mov_imm_or_src as _mov_imm_or_src, reg_slots as _reg_slots, unwrap_const as _unwrap_const, reg_idxs as _reg_idxs)
 from tinygrad.runtime.autogen.amd.rdna3 import ins as r3
 from tinygrad.runtime.autogen.amd.rdna3.enum import VOPDOp
 from tinygrad.uop import Ops
@@ -61,6 +62,42 @@ def depends(u:UOp, dep:UOp) -> bool:
 
 def independent(u0:UOp, u1:UOp) -> bool:
   return not depends(u0, u1) and not depends(u1, u0)
+
+def scan_safe(candidate:UOp, between:list[UOp]) -> bool:
+  """A scanned instruction can move only if its physical operands stay untouched."""
+  dst, src = _reg_idxs(candidate), set().union(*(_reg_idxs(s) for s in candidate.src))
+  for mid in between:
+    if mid.op is Ops.INS and _iop(mid) in (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ,
+                                          AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER): return False
+    reads = set().union(*(_reg_idxs(s) for s in mid.src)) if mid.src else set()
+    if dst & (_reg_idxs(mid) | reads) or src & _reg_idxs(mid): return False
+  return True
+
+def find_pair(ops:list[UOp], i:int, emitted:set[int]) -> tuple[int, list]|None:
+  """Find the first eligible partner, preserving each instruction class's scan policy."""
+  u = ops[i]
+  if u.op is not Ops.INS: return None
+  policies:list[tuple[tuple[Callable[[UOp, UOp], list|None], ...], str, int]] = []
+  if _iop(u) is AMDOps.FMAC and getenv("AMD_VOPD_FMAC", 0):
+    policies.append(((try_vopd_fmac_pair, try_vopd_fmac_alu_pair), "forward", 8))
+  if _iop(u) in (AMDOps.ADD, AMDOps.SUB) and getenv("AMD_VOPD_FMAC_ALU", 0):
+    policies.append(((try_vopd_fmac_alu_pair,), "forward", 8))
+  if _iop(u) is AMDOps.ADD: policies.append(((try_vopd_add_pair,), "both", 8))
+  if _iop(u) is AMDOps.MUL: policies.append(((try_vopd_mul_pair,), "direct", 8))
+  if _iop(u) is AMDOps.MAX: policies.append(((try_vopd_max_pair,), "direct", 8))
+  if _iop(u) is AMDOps.MOV: policies.append(((try_vopd_mov_pair,), "mov", 32))
+  for pairers, guard, window in policies:
+    for k in range(i+1, min(i+1+window, len(ops))):
+      if k in emitted: continue
+      cand, between = ops[k], ops[i+1:k]
+      pair = next((p for fn in pairers if (p:=fn(u, cand)) is not None), None)
+      if pair is None: continue
+      if not scan_safe(cand, between if guard == "mov" else ops[i:k]): continue
+      if guard in ("forward", "mov") and any(depends(cand, mid) for mid in between): continue
+      if guard == "both" and any(depends(cand, mid) or depends(mid, cand) for mid in between): continue
+      if guard == "direct" and any(u in mid.src or cand in mid.src for mid in between): continue
+      return k, pair
+  return None
 
 def _add_operands(u:UOp) -> tuple[object, object]|None:
   if u.dtype is not dtypes.float32 or len(u.src) < 2: return None
