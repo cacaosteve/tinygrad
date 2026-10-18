@@ -3799,8 +3799,9 @@ class AMDRenderer(ISARenderer):
     return None
 
   def coalesce_vec_alignment(self, buf):
-    # gfx11 wide global memory operations accept any dword-aligned address; they do not require
-    # natural vector alignment (for example, a B128 byte load may begin at byte offset four).
+    # The PCI and KFD runtimes select SH_MEM_ALIGNMENT_MODE_UNALIGNED. Byte-buffer
+    # loads may therefore coalesce at odd offsets (for example, Q6's 210-byte blocks).
+    if buf.addrspace is AddrSpace.GLOBAL and buf.dtype is dtypes.uint8: return 1
     return max(4 // buf.dtype.itemsize, 1) if buf.addrspace is AddrSpace.GLOBAL else None
 
   def merge_memory_loads(self, sink:UOp) -> UOp: return merge_adjacent_uint32_loads(merge_adjacent_half_loads(sink))
