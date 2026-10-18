@@ -499,14 +499,33 @@ def _flash_acc_small_enabled() -> bool:
   """
   return bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 0))
 
-def _single_wmma_fragment_base(pack:UOp) -> UOp|None:
+def _single_wmma_fragment_base(pack:UOp, uops:list[UOp]) -> UOp|None:
   # A complete, statically indexed eight-float fragment has an unambiguous ACC map.
   # Do not enable the different linear-index mapping used by larger flash buffers.
   if len(pack.src) != 8 or any(s.op is not Ops.INS or _iop(s) is not AMDOps.SLOAD or s.dtype is not dtypes.float32 for s in pack.src):
     return None
   base = _reg_buffer_base(pack.src[0].src[0])
   if base is None or base.max_numel() != 8 or any(_reg_buffer_base(s.src[0]) is not base or _lds_byte_off(s) for s in pack.src): return None
-  return base if {_const_int(s.src[1]) for s in pack.src} == set(range(8)) else None
+  if {_const_int(s.src[1]) for s in pack.src} != set(range(8)): return None
+  # Parking replaces the initial scratch value with zero and assumes one fragment
+  # owns each lane. Prove both, rather than inferring ownership from buffer size.
+  owners = {u.src[0] for u in uops if u.op is Ops.INS and _iop(u) is AMDOps.WMMA and
+            any(s.op is Ops.INS and _iop(s) is AMDOps.SLOAD and _reg_buffer_base(s.src[0]) is base for s in u.src[0].src)}
+  if owners != {pack}: return None
+  loop = next((i for i,u in enumerate(uops) if u.op is Ops.RANGE), len(uops))
+  initialized = set()
+  for i,u in enumerate(uops):
+    if u.op is not Ops.INS or _iop(u) is not AMDOps.SSTORE or _reg_buffer_base(u.src[0]) is not base: continue
+    key = _reg_mem_key(u.src[0], u.src[1], _lds_byte_off(u), u.src[2].dtype.itemsize)
+    if key is None or _elem_count(u.src[2]) != 1: return None
+    if i < loop and _is_zero_val(u.src[2]): initialized.add(key[1])
+    else:
+      val = u.src[2]
+      if val.op is Ops.INS and _iop(val) is AMDOps.EXTRACT: val = val.src[0]
+      if val.op is not Ops.INS or _iop(val) is not AMDOps.WMMA: return None
+      while val.op is Ops.INS and _iop(val) is AMDOps.WMMA: val = val.src[0]
+      if val is not pack: return None
+  return base if initialized == set(range(8)) else None
 
 def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
   """REG buffers whose scalar traffic can stay resident in WMMA accumulator fragments."""
@@ -519,7 +538,7 @@ def _wmma_acc_buffers(ctx:PreRegAllocContext) -> set[UOp]:
     if u.op is not Ops.INS or _iop(u) is not AMDOps.WMMA: continue
     pack = u.src[0]
     if not _is_wmma_acc_reload_pack(pack): continue
-    single_fragment = _single_wmma_fragment_base(pack)
+    single_fragment = _single_wmma_fragment_base(pack, ctx.uops or [])
     for slot in pack.src:
       if slot.op is Ops.INS and _iop(slot) is AMDOps.SLOAD:
         if (base:=_reg_buffer_base(slot.src[0])) is None: continue

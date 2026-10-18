@@ -2375,16 +2375,29 @@ class TestAMDRenderer(unittest.TestCase):
       return _uop(Ops.INS, dtypes.float32, loads, AMDOps.PACK, tag)
     indices = tuple(UOp.const(i, dtypes.int32) for i in range(8))
     packs = [pack(buf, indices, (Register(f"acc{i}", 200+i*8),)) for i,buf in enumerate(bufs)]
-    for buf,p in zip(bufs,packs): self.assertIs(_single_wmma_fragment_base(p), buf)
-    uops = [u for p in packs for u in (*p.src, p, _uop(Ops.INS, dtypes.float32, (p,p,p), AMDOps.WMMA, p.tag))]
+    zero = UOp.const(0.0, dtypes.float32)
+    stores = [_uop(Ops.INS, dtypes.void, (buf, idx, zero), AMDOps.SSTORE) for buf in bufs for idx in indices]
+    loop = UOp.range(4, 0, AxisType.LOOP)
+    body = [u for p in packs for u in (*p.src, p, _uop(Ops.INS, dtypes.float32, (p,p,p), AMDOps.WMMA, p.tag))]
+    uops = stores+[loop]+body
+    for buf,p in zip(bufs,packs): self.assertIs(_single_wmma_fragment_base(p, uops), buf)
     inits, _, idx_map, _ = _wmma_acc_zero_inits(uops)
     self.assertEqual(len(inits), 4)
     self.assertEqual(len(idx_map), 32)
     for buf in bufs: self.assertEqual([idx_map[(buf, i)][1] for i in range(8)], list(range(8)))
-    self.assertIsNone(_single_wmma_fragment_base(pack(bufs[0], indices[:-1]+(indices[0],), packs[0].tag)))
-    self.assertIsNone(_single_wmma_fragment_base(pack(bufs[0], indices[:-1]+(UOp.special(8, "lidx0"),), packs[0].tag)))
+    self.assertIsNone(_single_wmma_fragment_base(pack(bufs[0], indices[:-1]+(indices[0],), packs[0].tag), uops))
+    self.assertIsNone(_single_wmma_fragment_base(pack(bufs[0], indices[:-1]+(UOp.special(8, "lidx0"),), packs[0].tag), uops))
     large = UOp.placeholder((16,), dtypes.float32, slot=8, addrspace=AddrSpace.REG)
-    self.assertIsNone(_single_wmma_fragment_base(pack(large, indices, packs[0].tag)))
+    self.assertIsNone(_single_wmma_fragment_base(pack(large, indices, packs[0].tag), uops))
+    # Never silently replace a nonzero/partial initializer or a second fragment view.
+    self.assertIsNone(_single_wmma_fragment_base(packs[0], stores[1:]+[loop]+body))
+    one = UOp.const(1.0, dtypes.float32)
+    nonzero = stores[0].replace(src=(*stores[0].src[:2], one))
+    self.assertIsNone(_single_wmma_fragment_base(packs[0], [nonzero]+stores[1:]+[loop]+body))
+    p2 = pack(bufs[0], indices[::-1], (Register("other_acc", 240),))
+    w2 = _uop(Ops.INS, dtypes.float32, (p2,p2,p2), AMDOps.WMMA, p2.tag)
+    self.assertIsNone(_single_wmma_fragment_base(packs[0], uops+[*p2.src, p2, w2]))
+    self.assertIsNone(_single_wmma_fragment_base(packs[0], stores+[loop, stores[0]]+body))
 
   def test_wmma_acc_small_buf_tiles_separate_buffers(self):
     # Flash ACC_SEP: S_reg (16) then pv_acc (32) both park ACC with dynamic SLOAD indices.
