@@ -651,7 +651,8 @@ class KFDIface:
   @functools.cached_property
   def queue_event(self) -> tuple[UOp, int]:
     if not hasattr(KFDIface, 'event_page'):
-      KFDIface.event_page = Buffer(self.dev.device, 0x8000, options=BufferSpec(uncached=True), preallocate=True)
+      # Queue creation needs this event. Do not let its allocation query has_copy_queue recursively.
+      KFDIface.event_page = Buffer(self.dev.device, 0x8000, options=BufferSpec(uncached=True, cpu_access=True), preallocate=True)
       kfd.AMDKFD_IOC_CREATE_EVENT(KFDIface.kfd, event_page_offset=KFDIface.event_page.meta.handle)
 
     KFDIface.event_page.get_buf(self.dev.device)

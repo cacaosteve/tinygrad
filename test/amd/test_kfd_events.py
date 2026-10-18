@@ -1,4 +1,4 @@
-import contextlib, ctypes, unittest
+import contextlib, ctypes, subprocess, sys, unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from tinygrad import Device, Tensor, TinyJit, UOp, dtypes
@@ -6,10 +6,30 @@ from tinygrad.device import Buffer
 from tinygrad.engine.realize import run_linear
 from tinygrad.uop import Ops
 from tinygrad.runtime.autogen import kfd
-from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDSDMAQueue, KFDIface
+from tinygrad.runtime.ops_amd import AMDAllocator, AMDComputeQueue, AMDSDMAQueue, KFDIface
 from tinygrad.runtime.support.hcq2 import timeline
 
 class TestKFDEvents(unittest.TestCase):
+  def test_event_page_allocation_does_not_create_queues(self):
+    iface = object.__new__(KFDIface)
+    class Dev:
+      device = "AMD"
+      @property
+      def has_copy_queue(self): raise AssertionError("event allocation recursively initialized the copy queue")
+    dev = Dev()
+    dev.iface, iface.dev, iface.alloc = iface, dev, Mock()
+    page = UOp.placeholder((4096,), dtypes.uint64, device="AMD")
+    events = [SimpleNamespace(), *[SimpleNamespace(event_slot_index=s, event_id=i) for s,i in ((7, 11), (8, 12), (9, 13))]]
+    def allocate(device, size, options, preallocate):
+      AMDAllocator(dev)._alloc(size, options)
+      return Mock(meta=SimpleNamespace(handle=3))
+    with patch("tinygrad.runtime.ops_amd.KFDIface", type("Events", (), {"kfd":None})), \
+         patch("tinygrad.runtime.ops_amd.Buffer", side_effect=allocate), \
+         patch.object(kfd, "AMDKFD_IOC_CREATE_EVENT", side_effect=events), \
+         patch("tinygrad.runtime.ops_amd.UOp.from_buffer", return_value=page):
+      self.assertEqual(iface.queue_event, (page[7:8], 11))
+    iface.alloc.assert_called_once_with(0x8000, host=False, uncached=True, cpu_access=True)
+
   def test_event_id_and_mailbox_slot_are_distinct(self):
     iface = object.__new__(KFDIface)
     iface.dev = SimpleNamespace(device="AMD")
@@ -48,6 +68,15 @@ class TestKFDEvents(unittest.TestCase):
               args, kwargs = emit.call_args
               self.assertEqual(args[:2] if queue_type is AMDComputeQueue else args[1:3], (mailbox.getaddr(q.devs), 11))
               self.assertEqual(kwargs["ctxid"] if queue_type is AMDComputeQueue else args[-1], 11)
+
+  @unittest.skipUnless(Device.DEFAULT.startswith("AMD"), "requires physical AMD KFD runtime")
+  def test_hardware_compute_first_initialization(self):
+    dev = Device[Device.DEFAULT]
+    if not isinstance(dev.iface, KFDIface) or type(dev.iface).__name__.startswith("MOCK"):
+      self.skipTest("requires physical KFD events")
+    code = "from tinygrad import Tensor; assert Tensor.full((128,), 3, device='AMD').contiguous().realize().tolist() == [3]*128"
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
 
   @unittest.skipUnless(Device.DEFAULT.startswith("AMD"), "requires physical AMD KFD runtime")
   def test_hardware_compute_and_copy_wake_kfd_wait(self):
