@@ -37,18 +37,25 @@ class QuantLinearMixin:
         wmma = custom and (32 if symbolic else tokens) % 16 == 0 and out_features % 16 == 0 and \
           not (ggml_type == 23 and amd_direct_isa(Tensor.empty(1).device))
         if wmma: reference_x = x.astype(np.float16).astype(np.float32)
+        rounding_bound = None
         if custom and not wmma:
           grouped = reference_x.reshape(tokens, -1, 32)
           scale = np.maximum(np.abs(grouped).max(-1, keepdims=True) / 127, 1e-8)
+          if ggml_type == 23:
+            # Only exact mathematical half-way points may choose either adjacent Q8 bin.
+            # Bound their contribution independently instead of relaxing every IQ4 output.
+            ratio = grouped.astype(np.float64) / np.maximum(np.abs(grouped.astype(np.float64)).max(-1, keepdims=True)/127, 1e-8)
+            ties = np.isclose(ratio-np.floor(ratio), 0.5, atol=1e-12, rtol=0)
+            rounding_bound = (ties*scale).reshape(tokens, in_features) @ np.abs(weight.T)
           reference_x = (np.clip(np.rint(grouped/scale), -127, 127)*scale).reshape(tokens, in_features)
         reference_w = weight.astype(np.float16).astype(np.float32) if wmma else weight
         inp = Tensor(x) if not symbolic else Tensor(np.pad(x, ((0, 32-tokens), (0, 0)))).contiguous()[:
           UOp.variable("wmma_tokens", 1, 32).bind(tokens)]
         actual = (run if tokens == 1 or symbolic else linear)(inp)[:tokens].numpy()
         self.assertEqual(linear.ggml_type, ggml_type if custom else None)
-        # IQ4_XS Q8 activation quantization can differ by one level at a float32 half-way point.
-        tol = (1e-2, 1e-1) if custom and ggml_type == 23 else (3e-3, 2e-2)
-        np.testing.assert_allclose(actual, reference_x @ reference_w.T + bias_value, rtol=tol[0], atol=tol[1])
+        expected = reference_x @ reference_w.T + bias_value
+        if rounding_bound is None: np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=2e-2)
+        else: np.testing.assert_array_less(np.abs(actual-expected), 2e-2 + 3e-3*np.abs(expected) + rounding_bound)
         if not symbolic and tokens == 3 and ggml_type not in (12, 13, 14, 23):
           sym = Tensor(np.pad(x, ((0, 1), (0, 0)))).contiguous()[:UOp.variable("tokens", 1, 4).bind(3)]
           np.testing.assert_allclose(linear(sym)[:3].numpy(), reference_x @ reference_w.T + bias_value, rtol=3e-3, atol=2e-2)
