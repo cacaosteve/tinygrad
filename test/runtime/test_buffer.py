@@ -1,8 +1,16 @@
 import unittest
-from tinygrad.device import Buffer
+from unittest.mock import Mock
+from tinygrad.device import Allocator, Buffer, BufferStorage, Device
 from tinygrad.helpers import Context
 
 class TestBuffer(unittest.TestCase):
+  def test_initial_values_survive_staging_reuse(self):
+    for size in (4, 64, 4096):
+      with self.subTest(size=size):
+        values = [bytes([i]) * size for i in range(16)]
+        bufs = [Buffer(Device.DEFAULT, size, initial_value=value) for value in values]
+        for buf, value in zip(bufs, values): self.assertEqual(bytes(buf.as_memoryview()), value)
+
   def test_host_view(self):
     b = Buffer("CPU", 16)
     v = b.view(4, 4)
@@ -42,5 +50,18 @@ class TestBuffer(unittest.TestCase):
         buf = b._buf
         b.deallocate()
         self.assertEqual(b._buf is buf, opaque is None)
+
+class TestAllocatorCache(unittest.TestCase):
+  def test_reuse_waits_for_mapped_devices(self):
+    allocator = Allocator(Mock())
+    peers = [Mock(), Mock()]
+    storage = BufferStorage(object(), maps={peer:BufferStorage(object()) for peer in peers})
+    with Context(LRU=1):
+      allocator.free(storage, 4)
+      for peer in peers: peer.synchronize.assert_not_called()
+      self.assertIs(allocator.alloc(4), storage)
+      for peer in peers:
+        peer.synchronize.assert_called_once_with()
+        peer.allocator._unmap.assert_not_called()
 
 if __name__ == "__main__": unittest.main()
