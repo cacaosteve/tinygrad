@@ -15,6 +15,7 @@ from tinygrad.codegen.opt.postrange import Scheduler
 from tinygrad.codegen.late.linearizer import linearize
 from tinygrad.renderer.tc import amd_cdna_1616128
 from tinygrad.renderer.llvmir import LLVMRenderer, AMDLLVMRenderer
+from tinygrad.renderer.isa import ISARenderer
 
 # TODO: write a clean version of this
 from test.runtime.test_linearizer import helper_realized_ast, helper_linearizer_opt
@@ -75,7 +76,7 @@ def helper_tc_allclose(N:int, M:int, K:int, dtype_in:DType, dtype_out:DType, axi
   opts = [Opt(op=OptOps.TC, axis=axis, arg=(tc_select, tc_opt, use_tensor_cores))] + extra_opts
   ast = replace_opts(realized_ast, opts)
   pu = to_program(ast, Device[Device.DEFAULT].renderer)
-  if use_tensor_cores == 1: assert len([uop for uop in pu.src[1].src if uop.op is Ops.WMMA]) > 0, "wmma not triggered"
+  if use_tensor_cores == 1: assert wmma_uops(ast), "wmma not triggered"
   assert len([x for x in pu.src[0].arg.applied_opts if x.op is OptOps.TC]) == 1, "tensor core opt not included"
   run_program(ast, bufs)
   if dtype_in == dtypes.half: tc_atol, tc_rtol = 1e-2, 1e-3
@@ -222,6 +223,9 @@ class TestTensorCores(unittest.TestCase):
         assert "0x201000" in prg.src[2].arg
       elif Device[Device.DEFAULT].renderer.suffix == "PTX":
         assert "mma.sync.aligned" in prg.src[2].arg
+      elif isinstance(Device[Device.DEFAULT].renderer, ISARenderer):
+        assert "WMMA" in prg.src[2].arg
+        assert prg.src[3].arg.startswith(b"\x7fELF")
       else:
         assert "__WMMA_" in prg.src[2].arg
 
@@ -303,7 +307,7 @@ class TestTensorCores(unittest.TestCase):
 
         ast = replace_opts(realized_ast, [Opt(OptOps.TC, axis, (-1, 2, 1))])
         program = to_program(ast, Device[Device.DEFAULT].renderer)
-        assert len([uop for uop in tuple(program.src[1].src) if uop.op is Ops.WMMA]) > 0, "tensor core not triggered"
+        assert wmma_uops(ast), "tensor core not triggered"
         assert len([x for x in program.src[0].arg.applied_opts if x.op is OptOps.TC]) == 1, "tensor core opt not included"
 
         # TODO: support this even if numpy doesn't
