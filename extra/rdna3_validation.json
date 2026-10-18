@@ -1,7 +1,7 @@
 {
   "date": "2026-10-18",
-  "source_commit": "758e1acca935a29247453adb677babf15348e8ed",
-  "upstream_master": "bfa6337f267fd61d72dacfa936aa144d388c3482",
+  "source_commit": "be4ce7d04267d98d55ce335b74a622b628b2b88c",
+  "upstream_master": "c04397442b179dc3ecca03229c8c90a7d0aa211c",
   "status": "not PR-ready",
   "constraints": {
     "pull_request_opened": false,
@@ -43,20 +43,20 @@
       "note": "Serial gfx1100 scope includes renderer/DSL, physical scratch poisoning, KFD events, LLM, operations, dtype/ALU, attention, tensor cores, HCQ2, GGUF dequantization and complete IQ tables. The later VOPD deduplication preserves all 83 compiler-fixture binaries and has a separate compiler gate."
     },
     "spec2_null_ci": {
-      "commit": "cf95684e7",
+      "commit": "be4ce7d04",
       "command": "DEV=NULL SPEC=2 python -m pytest test/null/ -x -q -n12",
-      "passed": 1885,
+      "passed": 1887,
       "skipped": 89,
       "xfailed": 20,
-      "subtests": 156
+      "subtests": 160
     },
     "spec2_cpu_ci": {
-      "commit": "cf95684e7",
+      "commit": "be4ce7d04",
       "command": "DEV=CPU SPEC=2 python -m pytest test/runtime/ test/device/cpu/ -x -q -n12",
-      "passed": 2038,
+      "passed": 2039,
       "skipped": 325,
       "xfailed": 24,
-      "subtests": 321
+      "subtests": 327
     },
     "tensor_core_hcq_llm_gate": {
       "commit": "732421e34",
@@ -76,11 +76,11 @@
       "quant_source_commit": "e175c326d",
       "strict_iq4_hardware_passed": 3,
       "strict_iq4_subtests": 8,
-      "note": "Restores Tensor large-angle tests and replaces blanket IQ4 tolerance with a bound only for exact Q8 rounding ties. Full-suite counts above predate these stricter checks."
+      "note": "Restores Tensor large-angle tests and replaces blanket IQ4 tolerance with a bound only for exact Q8 rounding ties. Included in the current physical-suite scope."
     },
     "cleanup_binary_gates": {
       "corpus_programs": 83,
-      "comparison": "cf95684e7 versus afaf7309f (VOPD ADD/binary-pair deduplication)",
+      "comparison": "cf95684e7 versus afaf7309f (VOPD deduplication); 7007edb0a versus 51e74800a (dead-load-pass removal)",
       "result": "byte-identical",
       "flash_mappings": [
         "direct factor-two",
@@ -103,11 +103,17 @@
       "note": "Explicit native renderer: no HIP-default skips. The measured large-Q6 ELF remains byte-identical after tightening identity-writeback and early-read guards."
     },
     "native_compiler_and_dsl": {
-      "commit": "afaf7309f",
-      "passed": 326,
-      "skipped": 2,
-      "subtests": 396,
-      "note": "Explicit MOCK+AMD:AMD, test_amd_renderer/test_dsl2/test_kfd_events with -n12. The two physical-only state/event tests skip under mock. Compiler/CPU-emulation evidence, not physical validation. Ruff and mypy (221 files) pass on merged source 758e1acca."
+      "commit": "be4ce7d04",
+      "passed": 329,
+      "skipped": 3,
+      "subtests": 400,
+      "note": "Explicit MOCK+AMD:AMD, renderer/DSL/KFD-event/weight-view tests with -n12. Three physical-only tests skip under mock. Compiler/CPU-emulation evidence, not physical validation. Ruff and mypy (221 files) pass. GitHub CI was not triggered: no push or PR."
+    },
+    "weight_rounding_and_startup": {
+      "commit": "7007edb0a",
+      "hardware_passed": 96,
+      "subtests": 346,
+      "note": "Serial LLM/KFD/HCQ2 gate. Event-page allocation explicitly requests CPU access to avoid recursive copy-queue initialization during compute-first startup. Dense weight views retain narrowing casts, matching upstream: an adversarial half-rounding GEMV must be exactly 129, not the old 129.031494 result."
     },
     "scratch_poison_regression": {
       "commit": "12c1e2c74",
@@ -311,39 +317,40 @@
     "note": "Shared GGUF bitfield shifts avoid software division; native policy fully unrolls one bounded 32-value packed block only without an existing expansion. This is not a fresh HIP/LLVM paired model comparison, a general language-quality result, or evidence for every quantization/model."
   },
   "current_full_model": {
-    "measured_commit": "afaf7309f",
-    "merged_as": "758e1acca",
+    "measured_commit": "7007edb0a",
     "model": "Llama 3.2 1B Q6_K, 1024 numeric prompt tokens, 33 generated tokens",
     "method": "Seven complete generations per backend/chunk; medians of rounds 2 through 6. Synchronized wall time, normal KFD sleeping enabled, no spin-only workaround. All six cases generate identical tokens in every round.",
     "comparison_limit": "Same-product paths, not identical kernel mappings: DIRECT/HIP use supported custom kernels; AMDLLVM uses generic graphs. This is not a general language-quality or universal compiler-speed claim.",
     "rows": [
-      {"backend": "direct", "chunk": 1024, "prefill_tps": 2256.29, "decode_tps": 238.08, "cold_prefill_compile_seconds": 4.260},
-      {"backend": "hip", "chunk": 1024, "prefill_tps": 2974.32, "decode_tps": 78.37, "cold_prefill_compile_seconds": 6.879},
-      {"backend": "llvm", "chunk": 1024, "prefill_tps": 147.8, "decode_tps": 30.7, "cold_prefill_compile_seconds": 7.143},
-      {"backend": "direct", "chunk": 32, "prefill_tps": 1494.9, "decode_tps": 299.1, "cold_prefill_compile_seconds": 3.607},
-      {"backend": "hip", "chunk": 32, "prefill_tps": 2248.55, "decode_tps": 101.89, "cold_prefill_compile_seconds": 4.725},
-      {"backend": "llvm", "chunk": 32, "prefill_tps": 144.18, "decode_tps": 30.85, "cold_prefill_compile_seconds": 7.003}
+      {"backend": "direct", "chunk": 1024, "prefill_tps": 2257.71, "decode_tps": 238.58, "cold_prefill_compile_seconds": 4.259},
+      {"backend": "hip", "chunk": 1024, "prefill_tps": 2958.65, "decode_tps": 78.94, "cold_prefill_compile_seconds": 6.820},
+      {"backend": "llvm", "chunk": 1024, "prefill_tps": 145.04, "decode_tps": 30.62, "cold_prefill_compile_seconds": 7.035},
+      {"backend": "direct", "chunk": 32, "prefill_tps": 1494.88, "decode_tps": 299.29, "cold_prefill_compile_seconds": 3.629},
+      {"backend": "hip", "chunk": 32, "prefill_tps": 2249.98, "decode_tps": 101.95, "cold_prefill_compile_seconds": 4.676},
+      {"backend": "llvm", "chunk": 32, "prefill_tps": 143.93, "decode_tps": 30.85, "cold_prefill_compile_seconds": 6.985}
     ],
-    "remaining_prefill_latency_vs_hip": {"chunk1024": 1.318, "chunk32": 1.504},
-    "artifacts": "Gaming PC: rdna3-validation-results-20261017/resume-1/model-kfd-matrix-20261018.json"
+    "remaining_prefill_latency_vs_hip": {"chunk1024": 1.310, "chunk32": 1.505},
+    "artifacts": "Gaming PC: rdna3-validation-results-20261017/resume-1/model-rounding-matrix-20261018.json",
+    "soak_limit": "These six seven-round measurements pass. Longer model replay later reproduced a submission/timeline timeout on both the main candidate and an isolated row-reuse trial; short-run parity and throughput are not a long-run correctness proof."
   },
   "kfd_completion_events": {
     "commit": "cf95684e7",
-    "physical_gate": "32 tests and 20 subtests passed, including six drained-event compute/copy wake checks. Without the fix all six wake checks return WAIT_RESULT_TIMEOUT; with the fix they return COMPLETE.",
+    "physical_gate": "34 tests and 20 subtests passed after d9e42c45e, including fresh compute-first startup and six drained-event compute/copy wake checks. Without the wake fix all six checks return WAIT_RESULT_TIMEOUT; with it they return COMPLETE.",
     "cause": "HCQ2 timeline signals no longer wrote KFD's registered completion mailbox/interrupt context. GPU work finished while the host slept until the next 200 ms timeout.",
     "measurement_proof": "Before the fix the memory-reduction candidate has about 457 ms of warmed GPU work but about 620 ms prefill wall time. Diagnostic spin-only execution exposes about 455 ms; the corrected event path retains normal sleeping and measures about 454 ms.",
     "llvm_regression_check": "Shared GGUF shift before/after was unchanged at about 78.37/78.38 prefill tok/s for chunk32. Correct KFD wakeups restore about 144 tok/s, matching the earlier roughly 145 tok/s baseline. Do not attribute the apparent regression to GGUF shifts.",
     "flash_gate": "afaf7309f: DIRECT and HIP prefill batches 10/50/100 pass independent NumPy output checks; synchronized prefill and attention decode also pass. Python prewait remains."
   },
   "known_blockers": [
-    "Size gate fails: 31935 counted lines at afaf7309f versus MAX_LINE_COUNT=26500; do not conceal or exclude renderer code to pass.",
+    "Long model replay reproduces a runtime timeout on main be4ce7d04 and trial 2cb40f23e. Captured queues are drained, but timeline regresses (for example target 9007, signal 9005). CPU-visible compute command buffers contain the correct 9006/9007 release values. Submission visibility/ordering remains under investigation; not fixed by retries or the KFD wakeup repair.",
+    "Size gate fails: 31862 counted lines at be4ce7d04 versus MAX_LINE_COUNT=26500; do not conceal or exclude renderer code to pass.",
     "Full-model Q6 prefill and short-batch Q6 WMMA are not uniformly HIP-competitive.",
     "Actual Llama 1B prefill uses generic D=64 symbolic attention, not the fast standalone aligned D=128 flash mapping; do not remove the correctness gates to change routing.",
     "Earlier vector divmod GPU timing trailed HIP/LLVM; ordinary reductions are now improved, not a remaining 2x deficit.",
     "An isolated HIP Q6 t64 timeout and a profiling-enabled subwave experiment replay timeout remain unexplained; subsequent smoke/repeats passed.",
     "An ordinary uint32 divmod repeated-JIT check timed out once at timeline [1661,1662] before the KFD wakeup change. Six fresh-process repeats on each pre-fix version pass and produce identical ELFs. The cause is unresolved; retries and the wakeup fix are not proof of a timeline-hang fix.",
     "Shared-runtime Python prewait still serializes device work; native-fence-only removal is experimental, not accepted.",
-    "A natural-language prompt changes its greedy continuation versus pristine HIP, including through candidate HIP. Numeric-prompt token parity is not a general language-quality or numerical-equivalence guarantee.",
+    "Two natural-language prompts are stable across four runs each at 7007edb0a, but continuations still differ versus pristine HIP, including through candidate HIP. The narrowing-cast fix is independently correct but does not eliminate all shared-path drift. Numeric-prompt parity is not a general language-quality or numerical-equivalence guarantee.",
     "Only gfx1100 hardware validated; no universal LLVM/HIP replacement claim."
   ],
   "experiments": [
@@ -391,6 +398,17 @@
       "accepted": true,
       "merged_as": "758e1acca",
       "result": "Combined hardware gate: 1182 passed, 72 skipped, 864 subtests before KFD work; later expanded gate above also passes. Byte offsets 0 through 15 and all runnable GGUF tables/dequantization pass. Key projection 3378/3341 -> 1623/1626 us; original model QK 15817/15831 -> 9253/9264 us. Seven symbolic/tail/cache shapes and padding sentinels pass. Actual warmed profile confirms about 100 ms less total GPU work. Normal host sleeping masked the full-size model gain until the KFD completion-event fix; see the fresh same-source matrix above."
+    },
+    {
+      "branch": "codex/rdna3-symbolic-rows-20261018",
+      "commit": "2cb40f23e",
+      "accepted": false,
+      "result": "Existing two-row packed-matvec policy extended only to bounded symbolic outputs with a fixed even split axis. Seven independently dequantized/half-rounded full-output reference shapes pass with sentinel tails intact; 83 existing fixture binaries are unchanged. Actual query projection improves about 9%, full-size model prefill about 1-2%, decode retained in reversed pairs. Longer model replay timed out; the same drained-queue/timeline-regression failure also reproduces without this policy on main. Keep isolated while runtime correctness is investigated."
+    },
+    {
+      "commit": "51e74800a",
+      "accepted": true,
+      "result": "Removed 77 renderer lines and the generic merge_memory_loads compiler hook. Both adjacent-load passes were provably inert: they require INDEX then apply get_idx to the INDEX itself, which cannot become ADD/CONST. Generic memory coalescing remains; all 83 fixture binaries are byte-identical and explicit native mock/compiler/DSL/event tests pass. No replacement late optimization or flags added."
     }
   ],
   "external_review": {
@@ -400,7 +418,7 @@
       "unified_stack (0ba9397af)",
       "remove_range (3ef3c903e)"
     ],
-    "disposition": "Official tinygrad master remains bfa6337f2 and is already merged. Gabriel early_estimates advanced to 85740d39f: f82fa1d8e counts inline CALL bodies with caller-range multipliers; 85740d39f updates a bounded-loop test. These build on his per-range estimator rewrite, whereas this branch retains master's linear estimator. Useful accounting work, not a drop-in RDNA3 speed fix; no wholesale merge. ins_is_call_v3 remains dd31a682c. No fresh comparable RDNA3 performance data.",
+    "disposition": "Official master c04397442 (LLVM sqrt edge cases) is merged as be4ce7d04. Gabriel early_estimates remains 85740d39f: f82fa1d8e counts inline CALL bodies with caller-range multipliers; 85740d39f updates a bounded-loop test. These build on his per-range estimator rewrite, whereas this branch retains master's linear estimator. Useful accounting work, not a drop-in RDNA3 speed fix; no wholesale merge. ins_is_call_v3 remains dd31a682c and RDNA3 PR head remains c5640ec5e. No fresh comparable Gabriel RDNA3 performance data.",
     "compile_profile": "Large Q6 compile ~1029 ms after cleanup; estimates ~22 ms, rewrite ~608 ms. Estimates alone are not the dominant cold-compile bottleneck."
   }
 }
