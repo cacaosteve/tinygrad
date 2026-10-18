@@ -3746,6 +3746,13 @@ class TestAMDRenderer(unittest.TestCase):
     with np.errstate(invalid="ignore"): expected = np.sin(values)
     np.testing.assert_allclose(Tensor(values, device="AMD").sin().numpy(), expected, atol=1e-6, rtol=1e-5, equal_nan=True)
 
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_sin_full_float16_range(self):
+    import numpy as np
+    values = np.arange(65536, dtype=np.uint16).view(np.float16)
+    with np.errstate(invalid="ignore"): expected = np.sin(values)
+    np.testing.assert_allclose(Tensor(values, device="AMD").sin().numpy(), expected, atol=1e-3, rtol=1e-3, equal_nan=True)
+
   def test_uint32_wrap_literal_assembles(self):
     prg = _uint_wrap_program()
     _check_elf(self, prg)
