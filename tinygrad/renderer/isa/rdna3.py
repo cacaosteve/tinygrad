@@ -42,11 +42,10 @@ _ISEL_UNARY = {Ops.RECIPROCAL: AMDOps.RECIPROCAL, Ops.EXP2: AMDOps.EXP2, Ops.LOG
                Ops.TRUNC: AMDOps.TRUNC, Ops.SIN: AMDOps.SIN}
 
 def _mem_itemsize(dt:DType) -> int: return dt.itemsize
-def _parallel_vmov(moves:list[tuple[Reg, Reg|int|float]]) -> list:
-  return _vopd.parallel_vmov(moves)
 
 # --- emit: VOPD pairing (post-regalloc optional dual-issue) ---
 from tinygrad.renderer.isa import rdna3_vopd as _vopd
+_parallel_vmov = _vopd.parallel_vmov
 _try_vopd_fmac_pair = _vopd.try_vopd_fmac_pair
 _try_vopd_fmac_alu_pair = _vopd.try_vopd_fmac_alu_pair
 _try_vopd_add_pair = _vopd.try_vopd_add_pair
@@ -55,8 +54,7 @@ _try_vopd_max_pair = _vopd.try_vopd_max_pair
 
 from tinygrad.renderer.isa import rdna3_schedule as _sched
 
-def _try_vopd_mov_pair(u0:UOp, u1:UOp) -> list|None:
-  return _vopd.try_vopd_mov_pair(u0, u1)
+_try_vopd_mov_pair = _vopd.try_vopd_mov_pair
 
 def _full_src(x:UOp) -> Reg:
   if not isinstance(greg(x), Register): raise CompileError(f"expected reg src {x}")
@@ -470,21 +468,17 @@ def _compute_amd_skip(uops:list[UOp]) -> set[UOp]:
       skip.add(u)
   return skip
 
-def _is_f16_to_f32_cast(u:UOp) -> bool:
-  return _sched._is_f16_to_f32_cast(u)
+_is_f16_to_f32_cast = _sched._is_f16_to_f32_cast
 
-def _fma_mix_f32_folds(uops:list[UOp]) -> tuple[dict[UOp, tuple[UOp, UOp]], set[UOp]]:
-  return _sched.fma_mix_f32_folds(uops)
+_fma_mix_f32_folds = _sched.fma_mix_f32_folds
 
-def _lower_fma_mix_f32(lst:list[UOp]) -> list[UOp]:
-  return _sched.lower_fma_mix_f32(lst)
+_lower_fma_mix_f32 = _sched.lower_fma_mix_f32
 
 def _amd_skip(ctx:PreRegAllocContext) -> set[UOp]:
   if "skip" not in ctx.scratch and ctx.uops: ctx.scratch["skip"] = _compute_amd_skip(ctx.uops)
   return ctx.scratch.get("skip") or set()
 
-def _strength_reduce_int_muls(ops:list[UOp]) -> list[UOp]:
-  return _sched.strength_reduce_int_muls(ops)
+_strength_reduce_int_muls = _sched.strength_reduce_int_muls
 
 def _u32_high_bits_clear(src:UOp, bits:int) -> bool:
   """True when src is already in [0, 2^bits) so a narrowing AND is a no-op (Q5 scale f16 extract)."""
@@ -1490,8 +1484,7 @@ def _fused_mulacc(ctx:IselContext, a:UOp, b:UOp, c:UOp) -> UOp|None:
   # literal addend has no VGPR to tie, so keep it as a three-source FMA instead.
   return a.ins(AMDOps.FMAC, src=(b, *a.src)) if _const_value(b) is None and _is_foldable(ctx, c, b) else a.ins(AMDOps.MULACC, src=(*a.src, b))
 
-def _protect_loop_invariant_fmac(lst:list[UOp]) -> list[UOp]:
-  return _sched.protect_loop_invariant_fmac(lst)
+_protect_loop_invariant_fmac = _sched.protect_loop_invariant_fmac
 
 def _promote_f16_unary(x:UOp, d:UOp) -> UOp:
   return UOp(x.op, src=(d.cast(dtypes.float32),)).cast(dtypes.float16)
@@ -1805,8 +1798,7 @@ def _lower_late_endif(x:UOp) -> tuple[UOp, list[UOp]]:
   mend = UOp(Ops.INS, src=x.src, arg=(AMDOps.END_MASK, dtypes.void))
   return mend, [mend]
 
-def _schedule_loop_cmps(lst:list[UOp]) -> list[UOp]:
-  return _sched.schedule_loop_cmps(lst)
+_schedule_loop_cmps = _sched.schedule_loop_cmps
 
 pre_regalloc_matcher = PatternMatcher([
   (UPat(Ops.INDEX, name="x"), _lower_late_index),
@@ -2442,98 +2434,75 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
   raise CompileError(f"cannot encode {_iop(u)}")
 
 
-def _hoist_kernargs(ops:list[UOp]) -> list[UOp]:
-  return _sched.hoist_kernargs(ops)
+_hoist_kernargs = _sched.hoist_kernargs
 
-def _hoist_lloads_before_extracts(ops:list[UOp]) -> list[UOp]:
-  return _sched.hoist_lloads_before_extracts(ops)
+_hoist_lloads_before_extracts = _sched.hoist_lloads_before_extracts
 
-def _schedule_lload_2addr_pairs(ops:list[UOp]) -> list[UOp]:
-  return _sched.schedule_lload_2addr_pairs(ops)
+_schedule_lload_2addr_pairs = _sched.schedule_lload_2addr_pairs
 
 
 # --- schedule: WMMA/load motion (pre-emit, post-regalloc order) ---
 # Physical: sink_wmma / hoist_b live in rdna3_schedule.py
-def _sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
-  return _sched.sink_wmma_past_loads(ops)
+_sink_wmma_past_loads = _sched.sink_wmma_past_loads
 
-def _is_addr_alu(u:UOp) -> bool:
-  return _sched.is_addr_alu(u)
+_is_addr_alu = _sched.is_addr_alu
 
-def _hoist_b_between_a_and_pack(ops:list[UOp]) -> list[UOp]:
-  return _sched.hoist_b_between_a_and_pack(ops)
+_hoist_b_between_a_and_pack = _sched.hoist_b_between_a_and_pack
 
 
-def _prefetch_a_after_packed_quant(ops:list[UOp]) -> list[UOp]:
-  return _sched.prefetch_a_after_packed_quant(ops)
+_prefetch_a_after_packed_quant = _sched.prefetch_a_after_packed_quant
 
 
-def _prefetch_a_before_dequant_mix(ops:list[UOp]) -> list[UOp]:
-  return _sched.prefetch_a_before_dequant_mix(ops)
+_prefetch_a_before_dequant_mix = _sched.prefetch_a_before_dequant_mix
 
 
-def _prefetch_late_iq4_a_before_mix(ops:list[UOp]) -> list[UOp]:
-  return _sched.prefetch_late_iq4_a_before_mix(ops)
+_prefetch_late_iq4_a_before_mix = _sched.prefetch_late_iq4_a_before_mix
 
 
-def _prefetch_next_bu16_before_pack(ops:list[UOp]) -> list[UOp]:
-  return _sched.prefetch_next_bu16_before_pack(ops)
+_prefetch_next_bu16_before_pack = _sched.prefetch_next_bu16_before_pack
 
 
-def _hoist_loads_before_wmma(ops:list[UOp]) -> list[UOp]:
-  return _sched.hoist_loads_before_wmma(ops)
+_hoist_loads_before_wmma = _sched.hoist_loads_before_wmma
 
 
 _VMEM_SCHEDULABLE = _sched.VMEM_SCHEDULABLE
 
-def _hoist_gated_fmac_loads(ops:list[UOp]) -> list[UOp]:
-  return _sched.hoist_gated_fmac_loads(ops)
+_hoist_gated_fmac_loads = _sched.hoist_gated_fmac_loads
 
-def _vmem_schedulable_load(u:UOp) -> bool:
-  return _sched.vmem_schedulable_load(u)
+_vmem_schedulable_load = _sched.vmem_schedulable_load
 
-def _schedule_scalar_vmem(ops:list[UOp], alu_breadth:bool|None=None) -> list[UOp]:
-  return _sched.schedule_scalar_vmem(ops, alu_breadth)
+_schedule_scalar_vmem = _sched.schedule_scalar_vmem
 
-def _schedule_fmac_add_pairs(ops:list[UOp]) -> list[UOp]:
-  return _sched.schedule_fmac_add_pairs(ops)
+_schedule_fmac_add_pairs = _sched.schedule_fmac_add_pairs
 
-def _schedule_swizzle_mov_batches(ops:list[UOp]) -> list[UOp]:
-  return _sched.schedule_swizzle_mov_batches(ops)
+_schedule_swizzle_mov_batches = _sched.schedule_swizzle_mov_batches
 
-def _gap_fill_after_loads(ops:list[UOp]) -> list[UOp]:
-  return _sched.gap_fill_after_loads(ops)
+_gap_fill_after_loads = _sched.gap_fill_after_loads
 
-def _cluster_const_scratch_stores(ops:list[UOp]) -> list[UOp]:
-  return _sched.cluster_const_scratch_stores(ops)
+_cluster_const_scratch_stores = _sched.cluster_const_scratch_stores
 
-def _cluster_const_scratch_loads(ops:list[UOp]) -> list[UOp]:
-  return _sched.cluster_const_scratch_loads(ops)
+_cluster_const_scratch_loads = _sched.cluster_const_scratch_loads
 
-def _scratch_batch_phys_conflict(loads:list[UOp], uses:list[UOp], new_load:UOp, new_use:UOp) -> bool:
-  return _sched._scratch_batch_phys_conflict(loads, uses, new_load, new_use)
+_scratch_batch_phys_conflict = _sched._scratch_batch_phys_conflict
 
-def _schedule_scratch_load_passes(ops:list[UOp]) -> list[UOp]:
-  return _sched.schedule_scratch_load_passes(ops)
+_schedule_scratch_load_passes = _sched.schedule_scratch_load_passes
 
-def _batch_scratch_load_uses(ops:list[UOp], *, check_phys:bool=False) -> list[UOp]:
-  return _sched.batch_scratch_load_uses(ops, check_phys=check_phys)
+_batch_scratch_load_uses = _sched.batch_scratch_load_uses
 
-def _pack_aligned_const_scratch_sloads(ops:list[UOp]) -> list[UOp]:
-  return _sched.pack_aligned_const_scratch_sloads(ops)
+_pack_aligned_const_scratch_sloads = _sched.pack_aligned_const_scratch_sloads
 
 # --- emit: waitcnt / clause / fused mem (post-regalloc) ---
 from tinygrad.renderer.isa import rdna3_emit as _emit
 
-def _vm_load_count(insts:list) -> int: return _emit.vm_load_count(insts)
-def _lgkm_store_count(insts:list) -> int: return _emit.lgkm_store_count(insts)
-def _split_lgkm_scale_and_stores(emitted:list) -> tuple[list, list]: return _emit.split_lgkm_scale_and_stores(emitted)
-def _lgkm_load_count(insts:list) -> int: return _emit.lgkm_load_count(insts)
-def _split_lgkm_scale_and_loads(emitted:list) -> tuple[list, list]: return _emit.split_lgkm_scale_and_loads(emitted)
-def _split_scale_and_loads(emitted:list) -> tuple[list, list]: return _emit.split_scale_and_loads(emitted)
-def _vm_store_count(insts:list) -> int: return _emit.vm_store_count(insts)
-def _split_scale_and_stores(emitted:list) -> tuple[list, list]: return _emit.split_scale_and_stores(emitted)
-def _tmp_vaddr_clause_safe(scales:list, loads:list) -> bool: return _emit.tmp_vaddr_clause_safe(scales, loads)
+_vm_load_count = _emit.vm_load_count
+_lgkm_store_count = _emit.lgkm_store_count
+_split_lgkm_scale_and_stores = _emit.split_lgkm_scale_and_stores
+_lgkm_load_count = _emit.lgkm_load_count
+_split_lgkm_scale_and_loads = _emit.split_lgkm_scale_and_loads
+_split_scale_and_loads = _emit.split_scale_and_loads
+_vm_store_count = _emit.vm_store_count
+_split_scale_and_stores = _emit.split_scale_and_stores
+_tmp_vaddr_clause_safe = _emit.tmp_vaddr_clause_safe
 
 def _clauseable_scalar_vmem_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
   # Scalar global LOAD with dest-as-addr (compact B). Streak → hoist scales + s_clause.
@@ -2593,20 +2562,16 @@ def _clauseable_wide_half_gload(u:UOp, skip:set[UOp], mask_depth:int) -> bool:
          not _is_scratch_ref(u.src[0])
 
 
-def _fma_mixhi_lo_map(uops:list[UOp]) -> dict[UOp, UOp]:
-  return _sched.fma_mixhi_lo_map(uops)
+_fma_mixhi_lo_map = _sched.fma_mixhi_lo_map
 
 
-def _half2_global_hi_skip(uops:list[UOp]) -> set[UOp]:
-  return _sched.half2_global_hi_skip(uops)
+_half2_global_hi_skip = _sched.half2_global_hi_skip
 
 
-def _rewrite_half2_global_packs(ops:list[UOp]) -> list[UOp]:
-  return _sched.rewrite_half2_global_packs(ops)
+_rewrite_half2_global_packs = _sched.rewrite_half2_global_packs
 
 
-def _schedule_half2_lo_before_pack(ops:list[UOp]) -> list[UOp]:
-  return _sched.schedule_half2_lo_before_pack(ops)
+_schedule_half2_lo_before_pack = _sched.schedule_half2_lo_before_pack
 
 
 def _fma_pair_pack_dsts(uops:list[UOp], fma_hi_lo:dict[UOp, UOp]) -> dict[UOp, Reg]:
@@ -2634,8 +2599,7 @@ def _fma_pair_pack_dsts(uops:list[UOp], fma_hi_lo:dict[UOp, UOp]) -> dict[UOp, R
       ret[lo] = ret[hi] = dst
   return ret
 
-def _schedule_fma_mixhi_pairs(uops:list[UOp]) -> list[UOp]:
-  return _sched.schedule_fma_mixhi_pairs(uops)
+_schedule_fma_mixhi_pairs = _sched.schedule_fma_mixhi_pairs
 
 
 def _fused_lds_pack_store(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|None:
@@ -3846,8 +3810,7 @@ _REG_STORE_SINK_ALU_OPS = _sched._REG_STORE_SINK_ALU_OPS
 # EXTRACT: WMMA/PACK lane → REG slot (64 single-use REG_STOREs on flash).
 # AMD_MOV_SINK_ALU removed (prefer_phys covers MAX).
 
-def _sink_alu_into_reg_store(ops: list[UOp]) -> list[UOp]:
-  return _sched.sink_alu_into_reg_store(ops)
+_sink_alu_into_reg_store = _sched.sink_alu_into_reg_store
 
 # --- renderer entry: isel, remat, regalloc hooks, asm ---
 class AMDLinearContext(LinearContext):

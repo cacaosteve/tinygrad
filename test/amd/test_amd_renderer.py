@@ -17,8 +17,8 @@ from tinygrad.runtime.autogen import amdgpu_kd
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import AxisType, KernelInfo, UOp, graph_rewrite
-import tinygrad.renderer.isa.amd as amd_lib
-from tinygrad.renderer.isa.amd import AMDRenderer, AMDOps
+import tinygrad.renderer.isa.rdna3 as amd_lib
+from tinygrad.renderer.isa.rdna3 import AMDRenderer, AMDOps
 
 _GFX11 = Target("AMD", arch="gfx1100")
 _REN = AMDRenderer(_GFX11)
