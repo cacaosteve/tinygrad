@@ -1,6 +1,6 @@
 {
   "date": "2026-10-17",
-  "source_commit": "0b92f05c8",
+  "source_commit": "732421e34b97feabe31e8f56054d468b60db5224",
   "upstream_master": "bfa6337f267fd61d72dacfa936aa144d388c3482",
   "status": "not PR-ready",
   "constraints": {
@@ -24,27 +24,58 @@
       "subtests": 464
     },
     "llm_direct": {
-      "commit": "9e9bc53c8",
-      "passed": 59,
+      "commit": "a1092b4df",
+      "passed": 60,
       "subtests": 324
     },
     "llm_hip": {
-      "commit": "c2255c0b9",
-      "passed": 56,
+      "commit": "a1092b4df",
+      "passed": 57,
       "skipped": 3,
-      "subtests": 322
+      "subtests": 326
     },
     "hardware_full": {
-      "commit": "898ca508c",
-      "passed": 1046,
+      "commit": "8cd060ae3",
+      "passed": 1049,
       "skipped": 66,
-      "subtests": 815,
-      "seconds": 443.0
+      "subtests": 817,
+      "seconds": 469.79
+    },
+    "spec2_null_ci": {
+      "commit": "5d1d98ca8",
+      "command": "DEV=NULL SPEC=2 python -m pytest test/null/ -x -q -n12",
+      "passed": 1885,
+      "skipped": 89,
+      "xfailed": 20,
+      "subtests": 156
+    },
+    "spec2_cpu_ci": {
+      "commit": "5d1d98ca8",
+      "command": "DEV=CPU SPEC=2 python -m pytest test/runtime/ test/device/cpu/ -x -q -n12",
+      "passed": 2037,
+      "skipped": 325,
+      "xfailed": 24,
+      "subtests": 318
+    },
+    "tensor_core_hcq_llm_gate": {
+      "commit": "732421e34",
+      "passed": 109,
+      "skipped": 5,
+      "subtests": 330,
+      "note": "Serial gfx1100 run includes zero-private metadata and the nonzero-accumulator regression. Semantic WMMA assertions run before instruction selection; numerical hardware checks and native codegen assertions remain enabled."
     },
     "half_sine": {
       "commit": "c2255c0b9",
       "input_bit_patterns": 65536,
       "result": "passed"
+    },
+    "test_audit": {
+      "trig_source_commit": "bc0f26435",
+      "trig_hardware_passed": 10,
+      "quant_source_commit": "e175c326d",
+      "strict_iq4_hardware_passed": 3,
+      "strict_iq4_subtests": 8,
+      "note": "Restores Tensor large-angle tests and replaces blanket IQ4 tolerance with a bound only for exact Q8 rounding ties. Full-suite counts above predate these stricter checks."
     },
     "cleanup_binary_gates": {
       "corpus_programs": 82,
@@ -54,10 +85,29 @@
         "HIP ranged",
         "scratch-backed ranged"
       ]
-    }
+    },
+    "postmerge_compiler": {
+      "commit": "3c88f2852",
+      "passed": 267,
+      "skipped": 47,
+      "subtests": 172
+    },
+    "native_compiler_gate": {
+      "commit": "732421e34",
+      "device": "MOCK+AMD:AMD",
+      "passed": 287,
+      "skipped": 0,
+      "subtests": 346,
+      "note": "Explicit native renderer: no HIP-default skips. The measured large-Q6 ELF remains byte-identical after tightening identity-writeback and early-read guards."
+    },
+    "quantized_sharding_contract": {
+      "commit": "a1092b4df",
+      "result": "Restored upstream per-device kernel sizes, column-shard output metadata, row-shard allreduce, and dense fallback guard. CPU graph-contract test passes both row and column cases. No multi-GPU hardware validation."
+    },
+    "single_gpu_coverage_limit": "An additional all-quantized-runtime run reached 61 passing tests, then failed trying AMD:1. This host has one GPU; do not count multi-GPU hardware as validated."
   },
   "performance": {
-    "method": "TinyJit, synchronized wall-clock samples, independent NumPy checks before/after timing; paired cases share runtime source",
+    "method": "Same-machine TinyJit with synchronized wall-clock samples and independent output checks before/after timing. Comparisons name source commits; pristine-upstream model peers do not share all candidate runtime changes. GPU-timestamp diagnostics are identified separately.",
     "flash": {
       "commit": "9e9bc53c8",
       "shape": {
@@ -108,34 +158,135 @@
       },
       "correctness": "all passed; divmod checks 1048576 random uint32 pairs exactly"
     },
+    "natural_language_model_check": {
+      "commit": "3c88f2852",
+      "prompt": "The purpose of a compiler is to",
+      "prompt_tokens": 7,
+      "first_differing_generated_token": 18,
+      "within_backend_repeats": "stable",
+      "same_direct_sequence_before_unroll": true,
+      "status": "Not exact-token parity for arbitrary prompts. Teacher-forced diagnostics also find shifts in candidate HIP, so this is not isolated to native ISA or the accepted unroll change.",
+      "teacher_forced_logit_rms_vs_pristine_hip": {
+        "candidate_hip": 0.036000,
+        "direct_sdpa": 0.040399,
+        "direct_default": 0.036487
+      },
+      "quantizer_diagnostic": "Restoring only upstream's precision-preserving Q8 activation quantizer changes candidate-HIP logits and greedy choices, but does not fully restore the pristine-HIP trajectory. Other shared kernel changes and attention mappings remain to be separated."
+    },
+    "actual_model_prefill_profile": {
+      "commit": "cbc2c182f",
+      "comparison": "Candidate DIRECT versus candidate HIP, DEBUG=2 synchronized GPU timings; three 1024-token prefill rounds, not a new unprofiled throughput score.",
+      "largest_attention_kernel_mean_us": {
+        "direct": 23713.54,
+        "hip": 6442.64
+      },
+      "second_attention_kernel_mean_us": {
+        "direct": 11847.08,
+        "hip": 5544.47
+      },
+      "note": "Llama 1B has D=64 and symbolic lengths. The hand DIRECT flash path is deliberately gated off for those cases. Standalone static aligned D=128 flash parity does not establish this product path's prefill parity. All 66 captured DIRECT programs had zero private bytes; removing more scratch is not the primary next lever for these attention kernels."
+    },
     "full_model": {
-      "commit": "b9abb2a9b",
+      "commit": "0ae34935b",
       "model": "Llama 3.2 1B Q6_K",
       "prompt_tokens": 1024,
       "generated_tokens": 33,
       "rounds": 3,
-      "prompt_kind": "synthetic numeric continuation, not a broad language-quality assessment",
-      "chunk32": {
-        "direct_prefill_tokens_per_second": 1400,
-        "hip_prefill_tokens_per_second": 2196,
-        "direct_decode_tokens_per_second": 299.6,
-        "hip_decode_tokens_per_second": 110.9
+      "prompt_kind": "synthetic numeric continuation, not broad language-quality assessment",
+      "comparison": "DIRECT/HIP/AMDLLVM generated identical tokens in all rounds at both chunk sizes",
+      "rows": [
+        {
+          "backend": "hip",
+          "chunk": 32,
+          "prefill_tokens_per_second": 2190.3233426988427,
+          "decode_tokens_per_second": 110.81611860966862,
+          "matches_hip": true
+        },
+        {
+          "backend": "direct",
+          "chunk": 32,
+          "prefill_tokens_per_second": 1402.2856524875347,
+          "decode_tokens_per_second": 298.7043400038993,
+          "matches_hip": true
+        },
+        {
+          "backend": "llvm",
+          "chunk": 32,
+          "prefill_tokens_per_second": 144.88522858040747,
+          "decode_tokens_per_second": 31.429490876207588,
+          "matches_hip": true
+        },
+        {
+          "backend": "hip",
+          "chunk": 1024,
+          "prefill_tokens_per_second": 2669.748592460853,
+          "decode_tokens_per_second": 79.1084290206288,
+          "matches_hip": true
+        },
+        {
+          "backend": "direct",
+          "chunk": 1024,
+          "prefill_tokens_per_second": 990.8021840045632,
+          "decode_tokens_per_second": 118.09918418539243,
+          "matches_hip": true
+        },
+        {
+          "backend": "llvm",
+          "chunk": 1024,
+          "prefill_tokens_per_second": 148.39149811819684,
+          "decode_tokens_per_second": 31.299502119131873,
+          "matches_hip": true
+        }
+      ]
+    },
+    "ordinary_after_unroll": {
+      "commit": "0ae34935b",
+      "merged_as": "3c88f2852",
+      "wall_us": {
+        "row_sum": {
+          "direct": 64.11,
+          "baseline": 81.3445,
+          "hip": 62.345,
+          "llvm": 63.32
+        },
+        "layernorm": {
+          "direct": 64.145,
+          "baseline": 76.23,
+          "hip": 60.25,
+          "llvm": 59.775
+        }
       },
-      "chunk1024": {
-        "direct_prefill_tokens_per_second": 990,
-        "hip_prefill_tokens_per_second": 2695,
-        "direct_decode_tokens_per_second": 118,
-        "hip_decode_tokens_per_second": 79.3
+      "gpu_timestamp_us": {
+        "method": "profiled TinyJit, per-launch wait=True; sum of GPU kernel intervals, not profiled wall time",
+        "row_sum": {
+          "direct": 24.98,
+          "baseline": 62.08,
+          "hip": 28.6,
+          "llvm": 28.42
+        },
+        "layernorm": {
+          "direct": 30.74,
+          "baseline": 36.84,
+          "hip": 28.3,
+          "llvm": 27.86
+        }
       },
-      "output": "generated tokens exact to HIP in all rounds"
+      "cold_row_sum_ms": {
+        "direct": 181.53,
+        "baseline": 142.26,
+        "hip": 164.88,
+        "llvm": 121.12
+      }
     }
   },
   "known_blockers": [
-    "Size gate fails: 31888 counted lines versus MAX_LINE_COUNT=26500; do not conceal or exclude renderer code to pass.",
+    "Size gate fails: 31925 counted lines versus MAX_LINE_COUNT=26500; do not conceal or exclude renderer code to pass.",
     "Full-model Q6 prefill and short-batch Q6 WMMA are not uniformly HIP-competitive.",
-    "Ordinary reductions and layernorm remain slower than HIP/LLVM on the measured shapes.",
+    "Actual Llama 1B prefill uses generic D=64 symbolic attention, not the fast standalone aligned D=128 flash mapping; do not remove the correctness gates to change routing.",
+    "Earlier vector divmod GPU timing trailed HIP/LLVM; ordinary reductions are now improved, not a remaining 2x deficit.",
     "An isolated HIP Q6 t64 timeout and a profiling-enabled subwave experiment replay timeout remain unexplained; subsequent smoke/repeats passed.",
     "Shared-runtime Python prewait still serializes device work; native-fence-only removal is experimental, not accepted.",
+    "A natural-language prompt changes its greedy continuation versus pristine HIP, including through candidate HIP. Numeric-prompt token parity is not a general language-quality or numerical-equivalence guarantee.",
     "Only gfx1100 hardware validated; no universal LLVM/HIP replacement claim."
   ],
   "experiments": [
@@ -147,15 +298,23 @@
     },
     {
       "branch": "codex/rdna3-reduce-unroll",
-      "commit": "436fe69c3",
-      "accepted": false,
-      "result": "Existing native unroll hook applied before two missed early returns; compiler tests pass; hardware A/B pending."
+      "commit": "0ae34935b",
+      "accepted": true,
+      "result": "Existing native unroll hook applied before two missed early returns, with total expansion capped at 16 values. Paired NumPy-checked row reduction 81.34 -> 64.11 us (HIP 62.35); layernorm 76.23 -> 64.15 us (HIP 60.25). Row cold time 182 ms versus baseline 142 ms / HIP 165 ms. Full hardware suite: 1047 passed, 66 skipped, 817 subtests. Paired GPU timestamps: row reduction 62.08 -> 24.98 us (HIP 28.60), layernorm 36.84 -> 30.74 us (HIP 28.30). Full-model regression passed: tokens exact to HIP/AMDLLVM, warm throughput retained at both chunk sizes.",
+      "merged_as": "3c88f2852"
     },
     {
       "branch": "codex/rdna3-hcq-native-fence",
       "commit": "50940a46e",
       "accepted": false,
       "result": "CPU fence demonstrably waits without Python-wide prewait; 39 HCQ tests pass. Hardware stalls in flash warmup (100 seconds without reaching the first batch); stopped the isolated test. The candidate retains the Python prewait."
+    },
+    {
+      "branch": "codex/rdna3-fragment-acc",
+      "commit": "052523ed1",
+      "final_commit": "732421e34",
+      "accepted": true,
+      "result": "Park complete static eight-float fragments only after proving zero initialization, single-fragment ownership, and identity writeback; reject early external reads. Nonzero initial state has a hardware regression test. Large Q6 removes 64 SLOAD and 64 SSTORE with no allocator spills; final private bytes are zero. 82 ordinary compiler fixtures remain byte-identical. Two alternating Q6 A/B rounds pass independent full-output checks: 1024-token 4096x4096 kernel 3185/3198 -> 2165/2155 us, versus same-product HIP 923/905 us. Short 32-token case is unchanged at about 232 us. Those timings precede the final metadata-only private-byte removal. Complete numeric Llama generation remains exact to the prior HIP reference but throughput is unchanged (chunk32 about 1399 prefill / 299 decode tok/s; chunk1024 about 992 / 116). Do not infer an end-to-end speedup from the standalone-kernel win."
     }
   ],
   "external_review": {
