@@ -14,6 +14,14 @@ def _unroll_small_inner_reduces(k:Scheduler, max_product:int=8) -> None:
     k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (0, AxisType.UPCAST)))
     unroll_product *= inner_size
 
+def _unroll_grouped_reduce(k:Scheduler) -> Scheduler:
+  # Native ISA needs adjacent iterations exposed; outsourced compilers recover this later.
+  if (fn:=getattr(k.ren, "get_grouped_reduce_unroll", None)) is not None and \
+     (unroll:=fn(k)) is not None and k.upcastable_dims(reduce=True):
+    try: k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (unroll, AxisType.UPCAST)))
+    except KernelOptError: pass
+  return k
+
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # first try the tensor cores
   """ Attempts to apply a tensor core optimization to the kernel. If one exists and applies properly, return true, otherwise return false.
@@ -133,14 +141,14 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             except KernelOptError: pass
             if MV_BLOCKSIZE > 1: k.apply_opt(Opt(OptOps.SPLIT, global_idx, (MV_BLOCKSIZE, AxisType.LOCAL)))
             if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.SPLIT, global_idx, (MV_ROWS_PER_THREAD, AxisType.UPCAST)))
-            return k
+            return _unroll_grouped_reduce(k)
 
   if k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and (pg:=getattr(k.ren, 'preferred_reduce_group', None)) is not None and \
      len(k.axes_of(reduce=True)) == 1 and k.reduceop.src[0].op is Ops.INDEX and \
      resolve(prod((1 if k.rngs[i] in k.reduce_ranges else s) for i,s in enumerate(k.full_shape)) > 1, False):
     try: k.apply_opt(Opt(OptOps.SPLIT, k.axes_of(reduce=True)[0], (pg, AxisType.LOCAL)))
     except KernelOptError: pass
-    else: return k
+    else: return _unroll_grouped_reduce(k)
 
   # are we grouping? (requires local shape support)
   kernel_name = getattr(getattr(k.ast, "arg", None), "name", None)
@@ -154,13 +162,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # no more opt if we are grouping
   if k.group_for_reduces:
-    # Native ISA renderers can expose a short vectorizable inner loop before lowering. Outsourced compilers
-    # normally recover this themselves with a loop-vectorization pass after the shared scheduler has run.
-    if (grouped_unroll:=getattr(k.ren, "get_grouped_reduce_unroll", None)) is not None and \
-       (unroll:=grouped_unroll(k)) is not None and k.upcastable_dims(reduce=True):
-      try: k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (unroll, AxisType.UPCAST)))
-      except KernelOptError: pass
-    return k
+    return _unroll_grouped_reduce(k)
 
   # **** below this line need to be optional and benchmarked ****
 
