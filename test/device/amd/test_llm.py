@@ -704,16 +704,19 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         else: os.environ[k] = v
       getenv.cache_clear()
 
-  def test_flash_k_midstore_is_cache_key(self):
-    """In-process MIDSTORE sweeps must not reuse a graph built under a different value."""
+  def test_flash_k_unroll_is_cache_key(self):
+    """Ranged and factor-two mappings must not share a cached graph."""
     _amd_flash_attention.cache_clear()
     o = UOp.placeholder((32, 32, 128), dtypes.float32, 0)
     q = UOp.placeholder((32, 32, 128), dtypes.float16, 1)
     kv = UOp.placeholder((2, 1, 8, 64, 128), dtypes.float16, 2)
-    a = _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=1, k_midstore=4)
-    b = _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=1, k_midstore=2)
+    a = _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=0)
+    b = _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=2)
     self.assertIsNot(a, b)
     # Same key hits cache.
-    self.assertIs(a, _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=1, k_midstore=4))
+    self.assertIs(a, _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=0))
+    for factor in (-1, 1, 4, 8):
+      with self.subTest(factor=factor), self.assertRaisesRegex(AssertionError, "validated"):
+        _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=factor)
 
 if __name__ == "__main__": unittest.main()

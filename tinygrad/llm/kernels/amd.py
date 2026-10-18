@@ -931,9 +931,7 @@ def _wmma_fragment(fragment:UOp, lane:UOp, rdna4:bool) -> UOp:
 
 @functools.cache
 def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None,
-                         acc_small:bool=False, k_unroll:int=0, use_acc_work:bool=False,
-                         k_hip_scope:str="all", k_midstore:int|None=None,
-                         acc_vgpr:bool=False, hoist_q:bool=False,
+                         acc_small:bool=False, k_unroll:int=0, acc_vgpr:bool=False, hoist_q:bool=False,
                          phase_dumps: tuple[tuple[str, UOp], ...]=()) -> UOp:
   """Hand flash-attn. Optional phase_dumps=(("qk", buf), ...) for diagnostics.
 
@@ -954,6 +952,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   Ntiles = ceil(S/BLOCK_N) when S is int. Probe wave_n=1 with qk_wmma → s_soft → p_reg.
   Shared Q/K LDS dumps rule out tile data before blaming wave-local ACC/VGPR/spill.
   """
+  assert k_unroll in (0, 2), "flash K unroll supports only the validated ranged and factor-two mappings"
   dumps = dict(phase_dumps)
   valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start) if q_start is not None else None
   BH, M, D = q.shape
@@ -975,8 +974,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   Q_ELEMS_PER_THREAD, KV_ELEMS_PER_THREAD = BLOCK_M * D // THREADS_PER_BLOCK, BLOCK_N * D // THREADS_PER_BLOCK
   Q_lds = UOp.placeholder((BLOCK_M, D + LDS_PAD), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)[:, :D]
   KV_lds = UOp.placeholder((BLOCK_N, D + LDS_PAD), dtypes.half, slot=1, addrspace=AddrSpace.LOCAL)[:, :D]
-  # ACC_VGPR: park REDUCE ACC in promotable slot 19 (no scratch / no ACC_WORK).
-  # ACC_LDS removed (never shipped; REG slot 2 + SKIP=2 is the work path).
+  # The accumulator can stay in promoted VGPRs or use the scratch-backed REG buffer.
   if acc_vgpr:
     acc = _reg((TM, TD), 19, 0)
   else:
@@ -1044,64 +1042,9 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   S_view = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)
   Q_view = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)
   K_view = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)
-  # AMD_FLASH_K_UNROLL: 0=ranged; N>=2 chained (default 2 w/ ACC_SMALL+UPCAST16=0);
-  # 1=full chain (MMU); -1=HIP-style store-each-K; 8 MMUs. Scope via k_hip_scope.
-  # AMD_FLASH_K_MIDSTORE=N: in full/hip QK|PV chains, store ACC every N WMMA (breaks MMU at N=4).
-  _k_factor = int(k_unroll) if _acc_small else 0
-  _k_hip = _k_factor == -1
-  _hip_scope = (k_hip_scope or "all").lower() if _k_hip or _k_factor >= 2 else ""
-  _k_hip_qk = _k_hip and _hip_scope in ("all", "qk", "q")
-  _k_hip_pv = _k_hip and _hip_scope in ("all", "pv", "v")
-  _k_unroll_full = _k_factor == 1
-  _k_unroll_factor = _k_factor if _k_factor >= 2 and (D // WMMA_K) % _k_factor == 0 else 0
-  # Mid-store every 4 WMMA. MIDSTORE=8 is unstable on Navi31 multi-tile prefill.
-  _mid_default = 4 if (_k_unroll_full or _k_hip or _k_factor >= 8) else 0
-  if not _acc_small: _mid_every = 0
-  elif k_midstore is None: _mid_every = _mid_default
-  else: _mid_every = k_midstore
-  # Factor unroll can be scoped like hip: qk|pv|all (default all when scope unset).
-  _factor_scope = (k_hip_scope or "all").lower() if _k_unroll_factor else ""
-  _factor_qk = bool(_k_unroll_factor) and _factor_scope in ("all", "qk", "q", "")
-  _factor_pv = bool(_k_unroll_factor) and _factor_scope in ("all", "pv", "v", "")
-  if not _k_unroll_factor: _factor_qk = _factor_pv = False
-  if _factor_scope in ("qk", "q"): _factor_pv = False
-  if _factor_scope in ("pv", "v"): _factor_qk = False
-  # Factor-8 with outer range of 1 is a full WMMA chain (MMU). Prefer hip-style + midstore.
-  if _mid_every and _k_unroll_factor >= 8:
-    if _factor_qk: _k_hip_qk = True
-    if _factor_pv: _k_hip_pv = True
-    _k_unroll_factor = 0
-    _factor_qk = _factor_pv = False
-  if _acc_small and _k_hip_qk:
-    # HIP-style: chain all K in ACC, one store per (tm,tn) — not store-reload each K.
-    qk_stores = []
-    for tn_i in range(TN):
-      for tm_i in range(TM // WMMA_ACC):
-        S_frag = S_view[tm_i, tn_i]
-        wmma_c = S_frag
-        for k_i in range(D // WMMA_K):
-          q_frag = Q_view[wave_m, tm_i, lane_n, k_i]
-          k_frag = K_view[tn_i, lane_n, k_i]
-          wmma_c = UOp.wmma(q_frag, k_frag, wmma_c, *WMMA_ARG)
-          if _mid_every and (k_i + 1) % _mid_every == 0 and k_i + 1 < D // WMMA_K:
-            wmma_c = S_frag.after(S_frag.store(wmma_c))
-        qk_stores.append(S_frag.store(wmma_c))
-    qk_done = UOp.group(*qk_stores)
-  elif _acc_small and _k_unroll_full:
-    qk_stores = []
-    for tn_i in range(TN):
-      for tm_i in range(TM // WMMA_ACC):
-        S_frag = S_view[tm_i, tn_i]
-        wmma_c = S_frag  # parked ACC cin (do not shadow output `acc`)
-        for k_i in range(D // WMMA_K):
-          q_frag = Q_view[wave_m, tm_i, lane_n, k_i]
-          k_frag = K_view[tn_i, lane_n, k_i]
-          wmma_c = UOp.wmma(q_frag, k_frag, wmma_c, *WMMA_ARG)
-          if _mid_every and (k_i + 1) % _mid_every == 0 and k_i + 1 < D // WMMA_K:
-            wmma_c = S_frag.after(S_frag.store(wmma_c))
-        qk_stores.append(S_frag.store(wmma_c))
-    qk_done = UOp.group(*qk_stores)
-  elif _acc_small and _factor_qk:
+  # Direct ISA chains pairs of WMMA operations; C/LLVM keeps the ranged mapping.
+  _k_unroll_factor = k_unroll if _acc_small and (D // WMMA_K) % 2 == 0 else 0
+  if _k_unroll_factor:
     k_outer = UOp.range((D // WMMA_K) // _k_unroll_factor, 101, AxisType.LOOP)
     qk_stores = []
     for tn_i in range(TN):
@@ -1220,22 +1163,12 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     .reshape(THREADS_PER_BLOCK, TM, TN)
   P_store = P_write[tid].store(S_reg.cast(dtypes.half))
   beta_i = UOp.placeholder((TM,), dtypes.float, slot=9, addrspace=AddrSpace.REG)
-  # Tile-local promotable working copy of REDUCE-carried acc when slot 2 stays scratch
-  # (or ACC is in LDS). Never combine REG-promoted ACC with the work copy — wrong checksums.
-  # One scratch/LDS load at tile start + one store at tile end; alpha*acc still runs before
-  # V load (keeps latency hiding). Soft/stats buffers already promote on their own.
-  # EARLY_V hardcoded on with ACC_SMALL (ship prefill).
+  # Load V early with ACC_SMALL to overlap memory traffic with accumulator correction.
   _early_v = bool(_acc_small)
-  _acc_work = bool(use_acc_work and _acc_small)
-  acc_work = UOp.placeholder((TM, TD), dtypes.float, slot=19, addrspace=AddrSpace.REG) if _acc_work else None
   # Slot 1 reuses K's LDS after QK (OVERLAP_V dedicated slot-7 removed).
   V_lds = UOp.placeholder((D, BLOCK_N + LDS_PAD), dtypes.half, slot=1,
                           addrspace=AddrSpace.LOCAL)[:, :BLOCK_N]
   V_store = None
-  def _kv_ld(idx:UOp) -> UOp:
-    return idx  # half→half LDS (KV_FLOAT_COPY removed)
-  def _kv_zero(sample:UOp) -> UOp:
-    return sample.const_like(0)
   def _v_store_unrolled(v_lds_view:UOp) -> UOp:
     v_flat = v.reshape(physical_n * D)
     v_dst = v_lds_view.permute(1, 0).reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)
@@ -1244,7 +1177,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
       flat = tid * KV_ELEMS_PER_THREAD + ei
       v_pos = n_tile * BLOCK_N + flat // D
       vraw = v_flat[n_tile * BLOCK_N * D + flat]
-      vval = (v_pos < valid_kv_len).where(_kv_ld(vraw), _kv_zero(vraw))
+      vval = (v_pos < valid_kv_len).where(vraw, vraw.const_like(0))
       stores.append(v_dst[tid, ei].store(vval))
       if dumps and "v_global" in dumps:
         stores.append(dumps["v_global"][block_bh, block_m, n_tile, flat % D, flat // D].store(vval.float()))
@@ -1252,17 +1185,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   if _early_v:
     V_store = _v_store_unrolled(V_lds.after(lds_reuse_barrier))
   acc_c, l_c, m_c = acc.after(n_tile), l_i.after(n_tile), m_i.after(n_tile)
-  if _acc_work:
-    assert acc_work is not None
-    # float4 copy: fewer scratch ops than 32 scalar SLOAD/SSTORE (promoted dst still VGPR).
-    if (TM * TD) % 4 == 0:
-      src, dst = acc_c.reshape(TM * TD), acc_work.reshape(TM * TD)
-      acc_work = acc_work.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)]))
-    else:
-      acc_work = acc_work.after(UOp.group(*[acc_work[ri, rj].store(acc_c[ri, rj]) for ri in range(TM) for rj in range(TD)]))
-    work = acc_work
-  else:
-    work = acc_c
+  work = acc_c
   corr = []
   for ri in range(TM):
     m_new = m_c[ri].maximum(m_ij[ri])
@@ -1271,11 +1194,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
                          l_c[ri].store(alpha_val * l_c[ri] + beta_val * p_sum[ri]),
                          m_c[ri].store(m_new), beta_i[ri].store(beta_val)))
   correction = UOp.group(*corr)
-  if _acc_work:
-    acc_work = work.after(correction)
-    acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
-  else:
-    acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
+  acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
   if not _early_v:
     # after(qk_done) is per-wave only; lds_reuse_barrier syncs the workgroup so K is not
     # overwritten by V while another wave is still in QK.
@@ -1306,35 +1225,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   pv_view = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)
   P_view = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)
   V_view = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)
-  if _acc_small and _k_hip_pv:
-    pv_stores = []
-    for td_i in range(TD):
-      for tm_i in range(TM // WMMA_ACC):
-        pv_frag = pv_view[tm_i, td_i]
-        wmma_c = pv_frag
-        for k_i in range(BLOCK_N // WMMA_K):
-          p_frag = P_view[wave_m, tm_i, lane_n, k_i]
-          v_frag = V_view[wave_n, td_i, lane_n, k_i]
-          wmma_c = UOp.wmma(p_frag, v_frag, wmma_c, *WMMA_ARG)
-          if _mid_every and (k_i + 1) % _mid_every == 0 and k_i + 1 < BLOCK_N // WMMA_K:
-            wmma_c = pv_frag.after(pv_frag.store(wmma_c))
-        pv_stores.append(pv_frag.store(wmma_c))
-    pv_done = UOp.group(*pv_stores)
-  elif _acc_small and _k_unroll_full:
-    pv_stores = []
-    for td_i in range(TD):
-      for tm_i in range(TM // WMMA_ACC):
-        pv_frag = pv_view[tm_i, td_i]
-        wmma_c = pv_frag
-        for k_i in range(BLOCK_N // WMMA_K):
-          p_frag = P_view[wave_m, tm_i, lane_n, k_i]
-          v_frag = V_view[wave_n, td_i, lane_n, k_i]
-          wmma_c = UOp.wmma(p_frag, v_frag, wmma_c, *WMMA_ARG)
-          if _mid_every and (k_i + 1) % _mid_every == 0 and k_i + 1 < BLOCK_N // WMMA_K:
-            wmma_c = pv_frag.after(pv_frag.store(wmma_c))
-        pv_stores.append(pv_frag.store(wmma_c))
-    pv_done = UOp.group(*pv_stores)
-  elif _acc_small and _factor_pv and (BLOCK_N // WMMA_K) % _k_unroll_factor == 0:
+  if _k_unroll_factor and (BLOCK_N // WMMA_K) % _k_unroll_factor == 0:
     k_outer = UOp.range((BLOCK_N // WMMA_K) // _k_unroll_factor, 400, AxisType.LOOP)
     pv_stores = []
     for td_i in range(TD):
@@ -1390,28 +1281,11 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # Post-copy dump: slot-17 soft buffer (or still slot-10 if PV_ACC_DIRECT).
   if dumps and "pv" in dumps:
     pv_acc = pv_acc.after(UOp.group(*_pv_logical_stores(dumps["pv"], pv_acc)))
-  # When ACC_WORK is on, normalize from the last tile's VGPR work copy so the epilogue
-  # does not reload slot-2 scratch (writeback still feeds the next n_tile iter).
-  acc_work_final: UOp|None = None
-  # Const-index acc update. Slot 2 stays unpromoted (REDUCE-carried); soft/stats promote.
+  # Const-index accumulator update, followed by a workgroup barrier before LDS reuse.
   acc_c = acc.after(n_tile)
-  if _acc_work:
-    assert acc_work is not None
-    work = acc_work
-    acc_up = UOp.group(*[work[ri, rj].store(work[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
-                         for ri in range(TM) for rj in range(TD)])
-    work = work.after(acc_up)
-    if (TM * TD) % 4 == 0:
-      src, dst = work.reshape(TM * TD), acc_c.reshape(TM * TD)
-      writeback = UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)])
-    else:
-      writeback = UOp.group(*[acc_c[ri, rj].store(work[ri, rj]) for ri in range(TM) for rj in range(TD)])
-    n_tile_end = writeback.barrier().end(n_tile)
-    acc_work_final = work.after(n_tile_end)
-  else:
-    acc_up = UOp.group(*[acc_c[ri, rj].store(acc_c[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
-                         for ri in range(TM) for rj in range(TD)])
-    n_tile_end = acc_up.barrier().end(n_tile)
+  acc_up = UOp.group(*[acc_c[ri, rj].store(acc_c[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
+                       for ri in range(TM) for rj in range(TD)])
+  n_tile_end = acc_up.barrier().end(n_tile)
   acc, l_i, m_i = acc.after(n_tile_end), l_i.after(n_tile_end), m_i.after(n_tile_end)
   # Diagnostic: pre-normalize accumulator → logical (BLOCK_M, D).
   if dumps and "acc" in dumps:
@@ -1424,12 +1298,10 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         acc_stores.append(da[block_bh, block_m, qrow, dcol].store(acc[ri, rj]))
     acc = acc.after(UOp.group(*acc_stores))
   # Fuse normalize into the global store — avoid writing scaled acc back through slot-2 scratch.
-  # Prefer ACC_WORK VGPRs when present so we also skip the epilogue scratch reload.
-  acc_out = acc_work_final if acc_work_final is not None else acc
   inv_l = (1 / l_i).reshape(TM, 1).expand(TM, TD)
   o = o.reshape(WAVES_M, TM, LANES_PER_WAVE_M, 1, WAVES_N, TD, LANES_PER_WAVE_N, 1) \
     .permute((0, 4, 2, 6, 1, 3, 5, 7)).reshape(THREADS_PER_BLOCK, TM, TD)
-  return o[tid].store(acc_out * inv_l).end(wave_m, wave_n, lane).end(block_m, block_bh).sink(arg=KernelInfo(opts_to_apply=()))
+  return o[tid].store(acc * inv_l).end(wave_m, wave_n, lane).end(block_m, block_bh).sink(arg=KernelInfo(opts_to_apply=()))
 
 def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
@@ -1477,10 +1349,6 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # Keep the partial K unroll on direct ISA; HIP retains its ranged QK mapping.
   use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
   use_k_unroll = 2 if direct_isa else 0
-  use_k_hip_scope = "all"
-  # Mid-store belongs in the cache key (not a bare getenv inside the cached builder).
-  _mid_default = 4 if (use_k_unroll == 1 or use_k_unroll >= 8) else 0
-  use_k_midstore = _mid_default if use_acc_small else 0  # K_MIDSTORE follows factor default
   # Keep QKV producers out of the flash-only accumulator partition and scheduler.
   if ALLOW_DEVICE_USAGE: q.realize(assigned_kv)
   # Build+realize under ACC_SMALL remat + ALLOW_UPCAST16=0 (must wrap custom_kernel).
@@ -1488,9 +1356,6 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   with _flash_direct_compile_env(flash_acc_small=use_acc_small):
     # Ship prefill: ACC_VGPR + HOIST_Q; SKIP clears slot 2 under ACC_VGPR.
     use_acc_vgpr = bool(use_acc_small)  # ACC_VGPR hardcoded on with ACC_SMALL
-    # REG_PROMOTE_SKIP folded into ACC_SMALL/VOPD_FMAC in renderer (promote slot 2 under flash)
-    _skip_reg: set[int] = set() if use_acc_vgpr else {2}
-    use_acc_work = bool(use_acc_small and not use_acc_vgpr and 2 in _skip_reg)
     use_hoist_q = bool(use_acc_small)  # HOIST_Q hardcoded on with ACC_SMALL
     if isinstance(T_real, UOp):
       # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
@@ -1500,8 +1365,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     B, H, T, D = q.shape
     out = Tensor.empty(B*H, T, D, dtype="float32", device=q.device)
     fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start,
-                            acc_small=use_acc_small, k_unroll=use_k_unroll, use_acc_work=use_acc_work,
-                            k_hip_scope=use_k_hip_scope, k_midstore=use_k_midstore,
+                            acc_small=use_acc_small, k_unroll=use_k_unroll,
                             acc_vgpr=use_acc_vgpr, hoist_q=use_hoist_q)
     fxn = functools.partial(_flash_kernel, fxn)
     q_input = q.half().reshape(B*H, T, D)
