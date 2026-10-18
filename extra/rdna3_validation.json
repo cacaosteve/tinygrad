@@ -1,0 +1,171 @@
+{
+  "date": "2026-10-17",
+  "source_commit": "0b92f05c8",
+  "upstream_master": "bfa6337f267fd61d72dacfa936aa144d388c3482",
+  "status": "not PR-ready",
+  "constraints": {
+    "pull_request_opened": false,
+    "pushed_this_session": false,
+    "emulator_sources_modified": false
+  },
+  "hardware": {
+    "arch": "gfx1100",
+    "pci_id": "1002:744c",
+    "family": "Navi31 / Radeon RX 7900"
+  },
+  "validation": {
+    "ruff": "passed",
+    "mypy": "passed (221 source files)",
+    "cpu": {
+      "commit": "9e9bc53c8",
+      "passed": 3919,
+      "skipped": 409,
+      "xfailed": 44,
+      "subtests": 464
+    },
+    "llm_direct": {
+      "commit": "9e9bc53c8",
+      "passed": 59,
+      "subtests": 324
+    },
+    "llm_hip": {
+      "commit": "c2255c0b9",
+      "passed": 56,
+      "skipped": 3,
+      "subtests": 322
+    },
+    "hardware_full": {
+      "commit": "898ca508c",
+      "passed": 1046,
+      "skipped": 66,
+      "subtests": 815,
+      "seconds": 443.0
+    },
+    "half_sine": {
+      "commit": "c2255c0b9",
+      "input_bit_patterns": 65536,
+      "result": "passed"
+    },
+    "cleanup_binary_gates": {
+      "corpus_programs": 82,
+      "result": "byte-identical",
+      "flash_mappings": [
+        "direct factor-two",
+        "HIP ranged",
+        "scratch-backed ranged"
+      ]
+    }
+  },
+  "performance": {
+    "method": "TinyJit, synchronized wall-clock samples, independent NumPy checks before/after timing; paired cases share runtime source",
+    "flash": {
+      "commit": "9e9bc53c8",
+      "shape": {
+        "batch": 1,
+        "heads": 32,
+        "kv_heads": 8,
+        "dim": 128,
+        "kv_length": 2048,
+        "prefill_tokens": 32
+      },
+      "prefill_us": {
+        "direct": 260.314,
+        "hip": 339.794
+      },
+      "decode_attention_us": {
+        "direct": 118.8545,
+        "hip": 116.4545
+      },
+      "replay_batches": [
+        10,
+        50,
+        100
+      ],
+      "replay_outputs": "NumPy-correct for DIRECT and HIP",
+      "note": "Attention only, not complete Llama generation. DIRECT prefill remains opt-in."
+    },
+    "ordinary_wall_us": {
+      "commit": "c2255c0b9",
+      "elementwise": {
+        "direct": 57.895,
+        "hip": 59.775,
+        "llvm": 60.0145
+      },
+      "row_sum": {
+        "direct": 80.4095,
+        "hip": 62.32,
+        "llvm": 61.38
+      },
+      "layernorm": {
+        "direct": 76.5495,
+        "hip": 62.8345,
+        "llvm": 59.49
+      },
+      "divmod_u32": {
+        "direct": 67.11,
+        "hip": 60.165,
+        "llvm": 58.375
+      },
+      "correctness": "all passed; divmod checks 1048576 random uint32 pairs exactly"
+    },
+    "full_model": {
+      "commit": "b9abb2a9b",
+      "model": "Llama 3.2 1B Q6_K",
+      "prompt_tokens": 1024,
+      "generated_tokens": 33,
+      "rounds": 3,
+      "prompt_kind": "synthetic numeric continuation, not a broad language-quality assessment",
+      "chunk32": {
+        "direct_prefill_tokens_per_second": 1400,
+        "hip_prefill_tokens_per_second": 2196,
+        "direct_decode_tokens_per_second": 299.6,
+        "hip_decode_tokens_per_second": 110.9
+      },
+      "chunk1024": {
+        "direct_prefill_tokens_per_second": 990,
+        "hip_prefill_tokens_per_second": 2695,
+        "direct_decode_tokens_per_second": 118,
+        "hip_decode_tokens_per_second": 79.3
+      },
+      "output": "generated tokens exact to HIP in all rounds"
+    }
+  },
+  "known_blockers": [
+    "Size gate fails: 31888 counted lines versus MAX_LINE_COUNT=26500; do not conceal or exclude renderer code to pass.",
+    "Full-model Q6 prefill and short-batch Q6 WMMA are not uniformly HIP-competitive.",
+    "Ordinary reductions and layernorm remain slower than HIP/LLVM on the measured shapes.",
+    "An isolated HIP Q6 t64 timeout and a profiling-enabled subwave experiment replay timeout remain unexplained; subsequent smoke/repeats passed.",
+    "Shared-runtime Python prewait still serializes device work; native-fence-only removal is experimental, not accepted.",
+    "Only gfx1100 hardware validated; no universal LLVM/HIP replacement claim."
+  ],
+  "experiments": [
+    {
+      "branch": "codex/rdna3-subwave-reduce",
+      "commit": "41999a951",
+      "accepted": false,
+      "result": "15 small hardware correctness subtests passed; large wall-clock A/B had no meaningful win; profiling replay hit a timeline timeout."
+    },
+    {
+      "branch": "codex/rdna3-reduce-unroll",
+      "commit": "436fe69c3",
+      "accepted": false,
+      "result": "Existing native unroll hook applied before two missed early returns; compiler tests pass; hardware A/B pending."
+    },
+    {
+      "branch": "codex/rdna3-hcq-native-fence",
+      "commit": "50940a46e",
+      "accepted": false,
+      "result": "CPU fence demonstrably waits without Python-wide prewait; 39 HCQ tests pass. Hardware stalls in flash warmup (100 seconds without reaching the first batch); stopped the isolated test. The candidate retains the Python prewait."
+    }
+  ],
+  "external_review": {
+    "gabriel_rdna3_pr_head": "c5640ec5e",
+    "useful_recent_branches": [
+      "early_estimates (c10dad686)",
+      "unified_stack (0ba9397af)",
+      "remove_range (3ef3c903e)"
+    ],
+    "disposition": "Reviewed for ideas; no wholesale merge. pre_isel_walk is already upstream. No fresh RDNA3 performance data from the newer infrastructure branches.",
+    "compile_profile": "Large Q6 compile ~1029 ms after cleanup; estimates ~22 ms, rewrite ~608 ms. Estimates alone are not the dominant cold-compile bottleneck."
+  }
+}
