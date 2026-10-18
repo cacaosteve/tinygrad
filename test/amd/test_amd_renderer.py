@@ -1141,6 +1141,8 @@ class TestAMDRenderer(unittest.TestCase):
     names = _amd_inst_names(prg)
     self.assertIn("V_WMMA_F32_16X16X16_F16", names)
     self.assertNotIn("V_FMA_MIXHI_F16", names)
+    self.assertEqual(_amd_desc(prg).private_segment_fixed_size, 0)
+    for op in (AMDOps.SLOAD, AMDOps.SSTORE, AMDOps.SPILL, AMDOps.FILL): self.assertNotIn(op, _lin_ops(prg))
 
   def test_q6_halfword_wmma_uses_mixed_dequant(self):
     from tinygrad.llm.kernels.amd import _quant_linear_f16_wmma_kernel

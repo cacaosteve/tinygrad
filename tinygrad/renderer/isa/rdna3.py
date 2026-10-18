@@ -670,6 +670,7 @@ def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
     if u.op is not Ops.INS or _iop(u) not in (AMDOps.SLOAD, AMDOps.SSTORE): continue
     if (base:=_reg_buffer_base(u.src[0])) is None: continue
     bases.add(base)
+    if base in wmma_bufs: continue  # ACC owns the buffer; generic slot policy must not reserve scratch for it.
     # Flash output acc / row stats are REDUCE-carried; promoting them drops loop values.
     # REG_PROMOTE_SKIP_SLOTS folded: flash (ACC_SMALL prefill / VOPD_FMAC decode) promotes
     # slot 2; matmul/other keeps skip {2}.
@@ -677,7 +678,6 @@ def _reg_promotable_buffers(ctx:PreRegAllocContext) -> set[UOp]:
     if (slot:=getattr(base.arg, "slot", None)) is not None and slot in _skip:
       bad.add(base)
       continue
-    if base in wmma_bufs: continue  # handled by WMMA ACC aliasing
     idx = _const_int(u.src[1])
     dt = u.dtype if _iop(u) is AMDOps.SLOAD else u.src[2].dtype
     n = _elem_count(u) if _iop(u) is AMDOps.SLOAD else _elem_count(u.src[2])
