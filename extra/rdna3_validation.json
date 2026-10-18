@@ -1,6 +1,6 @@
 {
   "date": "2026-10-17",
-  "source_commit": "732421e34b97feabe31e8f56054d468b60db5224",
+  "source_commit": "12c1e2c74ab6ddd0186bbe67cc84e2c5c5709d88",
   "upstream_master": "bfa6337f267fd61d72dacfa936aa144d388c3482",
   "status": "not PR-ready",
   "constraints": {
@@ -35,14 +35,15 @@
       "subtests": 326
     },
     "hardware_full": {
-      "commit": "8cd060ae3",
-      "passed": 1049,
-      "skipped": 66,
-      "subtests": 817,
-      "seconds": 469.79
+      "commit": "4632051c7",
+      "passed": 1177,
+      "skipped": 72,
+      "subtests": 830,
+      "seconds": 521.27,
+      "note": "Expanded serial scope includes renderer/DSL, LLM, tensor operations, dtype/ALU, attention, tensor cores, HCQ2, GGUF dequantization and complete IQ lookup tables. This run predates the additional physical scratch-poison test below."
     },
     "spec2_null_ci": {
-      "commit": "5d1d98ca8",
+      "commit": "4632051c7",
       "command": "DEV=NULL SPEC=2 python -m pytest test/null/ -x -q -n12",
       "passed": 1885,
       "skipped": 89,
@@ -50,12 +51,12 @@
       "subtests": 156
     },
     "spec2_cpu_ci": {
-      "commit": "5d1d98ca8",
+      "commit": "4632051c7",
       "command": "DEV=CPU SPEC=2 python -m pytest test/runtime/ test/device/cpu/ -x -q -n12",
-      "passed": 2037,
+      "passed": 2038,
       "skipped": 325,
       "xfailed": 24,
-      "subtests": 318
+      "subtests": 321
     },
     "tensor_core_hcq_llm_gate": {
       "commit": "732421e34",
@@ -99,6 +100,18 @@
       "skipped": 0,
       "subtests": 346,
       "note": "Explicit native renderer: no HIP-default skips. The measured large-Q6 ELF remains byte-identical after tightening identity-writeback and early-read guards."
+    },
+    "native_compiler_and_dsl": {
+      "commit": "4632051c7",
+      "passed": 324,
+      "subtests": 350,
+      "note": "Explicit MOCK+AMD:AMD with -n12; compiler/CPU-emulation evidence, not physical GPU validation. Ruff and mypy (221 files) also pass."
+    },
+    "scratch_poison_regression": {
+      "commit": "12c1e2c74",
+      "hardware_passed": 1,
+      "replays": 3,
+      "note": "Permanent test fills the physical scratch backing with nonzero data before each grouped-WMMA launch. Old frozen ELF fails immediately with about 4.0 error; fixed variants also passed 100 poisoned replays each. Mock execution is intentionally excluded from this physical-state test. No scratch clearing was added to the product."
     },
     "quantized_sharding_contract": {
       "commit": "a1092b4df",
@@ -283,8 +296,20 @@
       }
     }
   },
+  "model_projection_progress": {
+    "measured_commit": "bb9d916a0",
+    "integrated_as": "4632051c7",
+    "model": "Llama 3.2 1B Q6_K, 1024 prompt tokens, chunk 1024, 33 generated tokens",
+    "method": "Seven complete generations; medians of rounds 2 through 6 after eager/JIT warmup. Numeric-prompt continuation is identical in all rounds and matches the earlier HIP reference.",
+    "prefill_tokens_per_second": 1657.22,
+    "decode_tokens_per_second": 227.78,
+    "cold_first_prefill_seconds": 8.835,
+    "earlier_direct_prefill_tokens_per_second": 992,
+    "earlier_direct_decode_tokens_per_second": 116,
+    "note": "Shared GGUF bitfield shifts avoid software division; native policy fully unrolls one bounded 32-value packed block only without an existing expansion. This is not a fresh HIP/LLVM paired model comparison, a general language-quality result, or evidence for every quantization/model."
+  },
   "known_blockers": [
-    "Size gate fails: 31925 counted lines versus MAX_LINE_COUNT=26500; do not conceal or exclude renderer code to pass.",
+    "Size gate fails: 31934 counted lines at 12c1e2c74 versus MAX_LINE_COUNT=26500; do not conceal or exclude renderer code to pass.",
     "Full-model Q6 prefill and short-batch Q6 WMMA are not uniformly HIP-competitive.",
     "Actual Llama 1B prefill uses generic D=64 symbolic attention, not the fast standalone aligned D=128 flash mapping; do not remove the correctness gates to change routing.",
     "Earlier vector divmod GPU timing trailed HIP/LLVM; ordinary reductions are now improved, not a remaining 2x deficit.",
@@ -319,16 +344,34 @@
       "final_commit": "732421e34",
       "accepted": true,
       "result": "Park complete static eight-float fragments only after proving zero initialization, single-fragment ownership, and identity writeback; reject early external reads. Nonzero initial state has a hardware regression test. Large Q6 removes 64 SLOAD and 64 SSTORE with no allocator spills; final private bytes are zero. 82 ordinary compiler fixtures remain byte-identical. Two alternating Q6 A/B rounds pass independent full-output checks: 1024-token 4096x4096 kernel 3185/3198 -> 2165/2155 us, versus same-product HIP 923/905 us. Short 32-token case is unchanged at about 232 us. Those timings precede the final metadata-only private-byte removal. Complete numeric Llama generation remains exact to the prior HIP reference but throughput is unchanged (chunk32 about 1399 prefill / 299 decode tok/s; chunk1024 about 992 / 116). Do not infer an end-to-end speedup from the standalone-kernel win."
+    },
+    {
+      "branch": "codex/rdna3-wmma-init-order",
+      "commit": "163069fcf",
+      "accepted": true,
+      "result": "A prelude WMMA's zero pack was incorrectly sunk into a later unrelated reduction loop, causing uninitialized scratch reads. Restrict sinking to zero-MOV packs whose users all lie inside that loop. Fixed binaries pass 400 nonzero-scratch replays; 82 prior compiler fixtures remain byte-identical."
+    },
+    {
+      "branch": "codex/rdna3-scalar-literals",
+      "commit": "d8d6dce97",
+      "accepted": true,
+      "result": "Materialize one scalar-select arm when both require different literals; reject conflicting literal words in the common AMD encoder. Fixes exact-output failures in IQ1_M, IQ1_S, IQ2_S, IQ2_XS and IQ2_XXS. Complete table and minimal physical-select tests pass; 82 prior compiler fixtures remain byte-identical."
+    },
+    {
+      "branch": "codex/rdna3-memory-reductions",
+      "commit": "49db2bc63",
+      "accepted": false,
+      "result": "Pending combined broad hardware/model gates. Byte-wide GLOBAL alignment reduces the independently checked key projection from 3378/3341 to 1623/1626 us, no spills, VGPR 144 -> 152. Byte offsets 0 through 15 and all runnable GGUF tables/dequantization pass. Contiguous subwave reduction lowers the original D=64 model QK score from 15817/15831 to 9253/9264 us with VGPR 24/private 0 unchanged. Seven symbolic/tail/cache shapes pass full independent references and padding sentinels; 15 small grouping variants pass. Neither isolated timing is an end-to-end performance claim."
     }
   ],
   "external_review": {
     "gabriel_rdna3_pr_head": "c5640ec5e",
     "useful_recent_branches": [
-      "early_estimates (c10dad686)",
+      "early_estimates (495321972)",
       "unified_stack (0ba9397af)",
       "remove_range (3ef3c903e)"
     ],
-    "disposition": "Reviewed for ideas; no wholesale merge. pre_isel_walk is already upstream. No fresh RDNA3 performance data from the newer infrastructure branches.",
+    "disposition": "Master remains bfa6337f2 and is already merged. Reviewed Gabriel's new 5ce8cde50/9fa616e44 per-range estimate cache on early_estimates; it accompanies his estimator rewrite and is not a drop-in runtime fix. No wholesale merge. pre_isel_walk is already upstream. unified_stack no longer appears in remote heads; its earlier local ref is retained for reference. No fresh RDNA3 performance data from the newer infrastructure branches.",
     "compile_profile": "Large Q6 compile ~1029 ms after cleanup; estimates ~22 ms, rewrite ~608 ms. Estimates alone are not the dominant cold-compile bottleneck."
   }
 }
