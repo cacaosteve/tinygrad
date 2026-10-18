@@ -1123,23 +1123,27 @@ AMD_SWIZZLE_PREFIX = "__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__bu
 AMD_PERMLANEX16 = ("__builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__builtin_bit_cast(int, {0}), "
                    "__builtin_bit_cast(int, {0}), 0x76543210, 0xfedcba98, true, false))")
 
-def _warp_group_reduce(x:UOp) -> UOp|None:
-  """Use a wave32 butterfly for an isolated f32 ADD group reduction."""
+def _warp_group_reduce(ctx:tuple[Renderer, UOp], x:UOp) -> UOp|None:
+  """Reduce a contiguous power-of-two lane group without round-tripping through LDS."""
   grouped = [r for r in x.src[1:] if r.op is Ops.RANGE and r.axis_type is AxisType.LOCAL]
   if x.dtype is not dtypes.float32 or not 1 <= x.max_numel() <= 4 or x.arg[0] is not Ops.ADD or len(grouped) != 1 or \
-     _const_value(grouped[0].src[0]) != 32: return None
+     (width:=_const_value(grouped[0].src[0])) not in (2, 4, 8, 16, 32): return None
   group = grouped[0]
-  # The group must map directly to hardware lane id. Mixed local/group layouts retain
-  # the generic LDS reduction, whose addressing and barriers cover those cases.
-  if any(r is not group and r.op is Ops.RANGE and r.axis_type in (AxisType.WARP, AxisType.LOCAL)
-         for r in x.src[0].toposort()): return None
+  # group_gpudims maps its first local axis to lidx0, the contiguous hardware lanes.
+  # Refuse WARP axes and shapes that would require folding/splitting hardware dimensions.
+  ren, sink = ctx
+  locals_ = sorted((r for r in sink.toposort() if r.op is Ops.RANGE and r.axis_type in (AxisType.WARP, AxisType.LOCAL)),
+                   key=lambda r: r.axis_id)
+  if not locals_ or locals_[0] is not group or any(r.axis_type is AxisType.WARP for r in locals_) or \
+     ren.local_max is None or len(locals_) > len(ren.local_max) or \
+     any(r.vmax+1 > bound for r,bound in zip(locals_, ren.local_max)): return None
   remaining = tuple(r for r in x.src[1:] if r is not group)
   val = x.replace(src=(x.src[0],)+remaining) if remaining or x.arg[1] else x.src[0]
   def butterfly(lane_val:UOp) -> UOp:
     # CUSTOM inputs are not part of the generic add-loads matcher. Keep each reduced
     # register value behind an elementwise node so an accumulator AFTER becomes a LOAD.
     lane_val = lane_val + lane_val.const_like(0)
-    for offset in (16, 8, 4, 2, 1):
+    for offset in (1 << bit for bit in reversed(range(width.bit_length()-1))):
       other = UOp(Ops.CUSTOM, src=(lane_val,), arg=(f"{AMD_SWIZZLE_PREFIX}{0x1f | offset<<10}))", dtypes.float))
       lane_val = lane_val + other
     return lane_val
