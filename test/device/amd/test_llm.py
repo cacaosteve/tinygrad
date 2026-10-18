@@ -245,6 +245,18 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     linear.bias = Tensor.full((1,), 0.75).contiguous().realize().int().float()
     np.testing.assert_array_equal(linear(Tensor.ones(1, 128)).numpy(), 0)
 
+  def test_dense_gemv_preserves_float_rounding(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    # 1+2^-12 is not representable in fp16: the declared cast must round it to 1.
+    weight = Tensor.full((1, 128), 1+2**-12, dtype=dtypes.float32).contiguous().realize()
+    bias = Tensor.full((1,), 1+2**-12, dtype=dtypes.float32).contiguous().realize()
+    for widen in (False, True):
+      with self.subTest(widen=widen):
+        linear = Linear(128, 1)
+        linear.weight, linear.bias = weight.half(), bias.half()
+        if widen: linear.weight, linear.bias = linear.weight.float(), linear.bias.float()
+        np.testing.assert_array_equal(linear(Tensor.ones(1, 128)).numpy(), 129)
+
   def test_dense_gemv_float32_range(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     linear = Linear(128, 1, bias=False)
