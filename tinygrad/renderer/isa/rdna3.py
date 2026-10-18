@@ -3716,6 +3716,10 @@ class AMDRenderer(ISARenderer):
     # A four-way split avoids a runtime loop explosion for plain GEMV. Fused projections with
     # multiple packed inputs benefit enough to justify fully unrolling this innermost dimension.
     if small_quant_projection: return 0 if quant_buffers >= 2 else 4
+    # A lone packed input with no existing expansion can expose one complete 32-value
+    # quantization block. Keep the expansion bounded; composed inputs retain the conservative path.
+    if size == 32 and quant_buffers == 1 and isinstance(output_size, int) and output_size >= 1024 and \
+       not any(u.op is Ops.RANGE and u.axis_type is AxisType.UPCAST for u in ast_uops): return 0
     if size <= 3 or len(ast_uops) <= 32: return 0
     return None
 

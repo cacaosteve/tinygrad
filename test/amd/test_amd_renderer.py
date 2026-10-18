@@ -981,6 +981,11 @@ class TestAMDRenderer(unittest.TestCase):
 
     self.assertEqual(_REN.get_reduce_unroll(32, quant_ast(512, 1)), 4)
     self.assertEqual(_REN.get_reduce_unroll(32, quant_ast(512, 2)), 0)
+    batched = quant_ast(1024, 1)
+    self.assertEqual(_REN.get_reduce_unroll(32, batched), 0)
+    self.assertIsNone(_REN.get_reduce_unroll(16, batched))
+    expanded = UOp.sink(*batched.src, UOp.range(4, 0, AxisType.UPCAST))
+    self.assertIsNone(_REN.get_reduce_unroll(32, expanded))
     self.assertIsNone(_REN.get_reduce_unroll(32, quant_ast(1024, 2)))
     self.assertEqual(_REN.get_reduce_unroll(3, quant_ast(1024, 0)), 0)
 
