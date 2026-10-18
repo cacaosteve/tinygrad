@@ -594,7 +594,9 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
 def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
                                   out_features:int, in_features:int, ggml_type:int, direct_isa:bool=False,
                                   rdna4:bool=False) -> UOp:
-  token_tile = (32 if out.shape[0] % 32 == 0 else 16) if ggml_type == Q3_K else \
+  # Mixed Q6 dequant wins short batches; larger prefill needs the wider 64-token layout.
+  mixed_q6 = direct_isa and not rdna4 and ggml_type == Q6_K and resolve(out.shape[0] <= 64, False)
+  token_tile = (32 if out.shape[0] % 32 == 0 else 16) if ggml_type == Q3_K or mixed_q6 else \
     64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
   # On RDNA3, a single Q6 output tile is faster than two for multi-token WMMA.
   output_tiles = 1 if direct_isa and (out_features % 32 or ggml_type in (IQ2_S, IQ3_XXS, IQ4_NL, IQ3_S) or
@@ -628,6 +630,9 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
       elif ggml_type == IQ3_S: scale *= (1+2*((byte(106+subgroup//2) >> ((subgroup%2)*4)) & 15)).float()
       elif ggml_type == IQ3_XXS: scale *= ((_load_u32(raw, base, 66+subgroup*4) >> 28).float()+0.5)*0.5
     words = tuple(_quant_word(raw, base, subgroup, half*4+i, ggml_type, grid) for i in word_indices)
+    if mixed_q6:
+      bias = scale * -zero
+      return tuple(_amd_fma_to_f16(_q6_byte_f32(word, b), scale, bias) for word in words for b in range(4))
     return tuple((((word >> (b*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float()-zero)*scale-minimum).cast(dtypes.half)
                  for word in words for b in range(4))
   return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[ggml_type]//raw.dtype.itemsize,

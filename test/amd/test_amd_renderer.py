@@ -1156,6 +1156,20 @@ class TestAMDRenderer(unittest.TestCase):
     # Scratch may appear under ACC soft-partition; prefer no spill but do not gate ship on it.
     _ = names.count("SCRATCH_STORE_B32")
 
+  def test_q6_halfword_wmma_uses_mixed_dequant(self):
+    from tinygrad.llm.kernels.amd import _quant_linear_f16_wmma_kernel
+    rows, cols = 4096, 4096
+    for tokens in (16, 32, 64):
+      with self.subTest(tokens=tokens):
+        out = UOp.placeholder((tokens, rows), dtypes.float32, 0)
+        raw = UOp.placeholder((rows*cols//256*105,), dtypes.uint16, 1)
+        x = UOp.placeholder((tokens, cols), dtypes.float16, 2)
+        prg = _to_prg(_quant_linear_f16_wmma_kernel(out, raw, x, out_features=rows, in_features=cols, ggml_type=Q6_K, direct_isa=True))
+        names = _amd_inst_names(prg)
+        self.assertIn("V_FMA_MIXHI_F16", names)
+        self.assertNotIn("V_PACK_B32_F16", names)
+        self.assertLessEqual(_amd_desc(prg).private_segment_fixed_size, 32)
+
   def test_q5_wmma_stays_within_vgpr_file(self):
     from tinygrad.llm.kernels.amd import _q5_linear_f16_wmma_kernel
     rows, cols, tokens = 8192, 2048, 32

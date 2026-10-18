@@ -132,6 +132,27 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         np.testing.assert_allclose(linear(Tensor(x)).numpy(), x @ weight.T, rtol=2e-5, atol=1e-5)
         self.assertIsNone(linear.ggml_type)
 
+  def test_q6_short_wmma_dequantization_basis(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    from gguf import dequantize, GGMLQuantizationType
+    rng = np.random.default_rng(1907)
+    scales = np.array([0, 2**-24, -2**-24, 2**-14, -0.00035, .001, .0037, -.125, 1, -4, 8], np.float16)
+    packed = rng.integers(0, 256, (48*3, 210), dtype=np.uint8)
+    packed[:, 208:210] = np.resize(scales, len(packed)).view(np.uint8).reshape(-1, 2)
+    expected = dequantize(packed.flatten(), GGMLQuantizationType(14)).reshape(48, 768).T.astype(np.float16).astype(np.float32)
+    raw = Tensor(np.pad(packed.flatten(), (2, 0))).realize()[2:]
+    linear = Linear(768, 48, bias=False)
+    linear.weight = ggml_data_to_tensor(raw, 48*768, 14).reshape(48, 768)
+    # Check every K position while retaining the small token counts of the specialized path.
+    basis = np.eye(768, dtype=np.float16)
+    for tokens in (16, 32, 64):
+      for first in range(0, 768, tokens):
+        with self.subTest(tokens=tokens, first=first):
+          actual = linear(Tensor(basis[first:first+tokens])).numpy()
+          ref = expected[first:first+tokens]
+          np.testing.assert_array_equal(actual.astype(np.float16), ref.astype(np.float16))
+          np.testing.assert_allclose(actual, ref, rtol=2e-7, atol=2**-36)
+
   def test_mixed_quant_linear_split_k(self):
     for typ in (10, 11, 17, 18, 20, 21, 22):
       with self.subTest(ggml_type=typ):
