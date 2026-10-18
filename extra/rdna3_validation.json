@@ -176,15 +176,19 @@
     "actual_model_prefill_profile": {
       "commit": "cbc2c182f",
       "comparison": "Candidate DIRECT versus candidate HIP, DEBUG=2 synchronized GPU timings; three 1024-token prefill rounds, not a new unprofiled throughput score.",
-      "largest_attention_kernel_mean_us": {
+      "rope_key_projection_mean_us": {
         "direct": 23713.54,
+        "hip": 1154.85
+      },
+      "rope_query_projection_mean_us": {
+        "direct": 8137.96,
         "hip": 6442.64
       },
-      "second_attention_kernel_mean_us": {
+      "qk_attention_score_mean_us": {
         "direct": 11847.08,
         "hip": 5544.47
       },
-      "note": "Llama 1B has D=64 and symbolic lengths. The hand DIRECT flash path is deliberately gated off for those cases. Standalone static aligned D=128 flash parity does not establish this product path's prefill parity. All 66 captured DIRECT programs had zero private bytes; removing more scratch is not the primary next lever for these attention kernels."
+      "note": "AST matching identifies the worst kernel as the generic RoPE-permuted quantized key projection, not softmax; comparing the largest HIP name to the largest DIRECT name would compare different graphs. Llama 1B also has D=64 and symbolic lengths, deliberately gated off from hand DIRECT flash. Standalone static aligned D=128 flash parity does not establish this product path's prefill parity. All 66 captured DIRECT programs had zero private bytes."
     },
     "full_model": {
       "commit": "0ae34935b",

@@ -6,7 +6,7 @@ from tinygrad.dtype import dtypes, DType, AddrSpace
 from tinygrad.helpers import Target, getenv, prod, is_image_shape
 from tinygrad.renderer.isa import ISARenderer, IselContext, LinearContext, PreRegAllocContext, Register, greg
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.amd.dsl import Reg, v, NULL, EXEC, VCC, VCC_LO, Inst
+from tinygrad.renderer.amd.dsl import Reg, v, NULL, EXEC, VCC, VCC_LO, Inst, _needs_literal
 from tinygrad.runtime.autogen.amd.rdna3 import ins as r3
 from tinygrad.codegen.decomp.op import fast_idiv
 from tinygrad.renderer import tc
@@ -1419,6 +1419,9 @@ def _scalarize_uniform_where(m:UOp, a:UOp, b:UOp, x:UOp) -> UOp|None:
     m = m.replace(src=tuple(_bool_flag(s) if s.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) else s for s in m.src))
   if x.dtype not in dtypes.ints+(dtypes.bool,) or \
      not all(_is_uniform_expr(v) for v in (m, a, b)): return None
+  # SOP2 has one shared literal word, not a separate literal for each source.
+  if _needs_literal(av:=_const_value(a)) and _needs_literal(bv:=_const_value(b)) and av != bv:
+    a = UOp(Ops.INS, src=(a,), arg=(AMDOps.MOV, a.dtype))
   # Comparisons carry their result in an implicit flag, so also keep their operands as
   # direct dependencies. Otherwise regalloc may reuse an operand before SWHERE rematerializes it.
   return UOp(Ops.INS, src=(m, a, b, *m.src) if m.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) else (m, a, b),
@@ -3812,8 +3815,12 @@ class AMDRenderer(ISARenderer):
     # inits for two-address accumulate across K (TC_LDS_AB). Unrelated LLOAD elsewhere
     # must not suppress the UNROLL sink.
     if (loop_i := next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), None)) is not None:
-      zero_acc = {u.src[0] for u in lst if u.op is Ops.INS and _iop(u) is AMDOps.WMMA and
-                  _is_wmma_acc_reload_pack(u.src[0]) and not _wmma_ab_from_lds(u)}
+      loop_end = next((i for i,u in enumerate(lst) if u.op is Ops.END and lst[loop_i] in u.src[1:]), len(lst))
+      zero_acc = {u.src[0] for u in lst[loop_i+1:loop_end] if u.op is Ops.INS and _iop(u) is AMDOps.WMMA and
+                  _is_wmma_acc_reload_pack(u.src[0]) and not _wmma_ab_from_lds(u) and
+                  all(s.op is Ops.INS and _iop(s) is AMDOps.MOV for s in u.src[0].src)}
+      # A later unrelated reduction must not pull a prelude WMMA's zero after its use.
+      zero_acc -= {s for u in lst[:loop_i]+lst[loop_end:] for s in u.src}
       move_i = [i for i,u in enumerate(lst) if i < loop_i and u in zero_acc]
       if move_i:
         packs = [lst[i] for i in move_i]

@@ -576,6 +576,12 @@ def _uniform_nested_compare_where_program():
     idx, value, arg=KernelInfo(name="amd_asm_uniform_nested_compare_where"))
   return _to_prg(sink)
 
+def _uniform_literal_where_program():
+  out = UOp.placeholder((2,), dtypes.uint32, 0)
+  idx = UOp.special(2, "gidx0")
+  value = (idx < 1).where(UOp.const(0xffffff00, dtypes.uint32), UOp.const(0xffffff01, dtypes.uint32))
+  return _to_prg(out[idx].store(value).sink(arg=KernelInfo(opts_to_apply=())))
+
 def _mulacc_program():
   out = UOp.placeholder((16,), dtypes.float32, 0)
   inp0 = UOp.placeholder((16,), dtypes.float32, 1)
@@ -1707,6 +1713,22 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(amd_lib._reg_slots(wmmas[0].src[1]), 8)
     self.assertEqual(amd_lib._reg_slots(wmmas[0].src[2]), 8)
     self.assertEqual(greg(wmmas[0]), greg(wmmas[0].src[0]))
+
+  def test_wmma_zero_pack_only_sinks_into_its_own_loop(self):
+    zero = _uop(Ops.INS, dtypes.float32, (UOp.const(0.0, dtypes.float32),), AMDOps.MOV, (Register("zero", 1),))
+    pack = _uop(Ops.INS, dtypes.float32, (zero,)*8, AMDOps.PACK, (Register("acc", 2),))
+    ab = _uop(Ops.INS, dtypes.half, (UOp.const(0, dtypes.uint32),), AMDOps.PACK_F16, (Register("ab", 3),))
+    wmma = _uop(Ops.INS, dtypes.float32, (pack, ab, ab), AMDOps.WMMA, (Register("wmma", 4),))
+    loop = UOp.range(4, 0, AxisType.LOOP)
+    end = UOp(Ops.END, src=(loop, loop))
+    for position in ("before", "inside", "after", "shared"):
+      with self.subTest(position=position):
+        lst = [zero, pack, ab]+([wmma] if position in ("before", "shared") else [])+[loop]
+        if position in ("inside", "shared"): lst.append(wmma)
+        lst += [end]+([wmma] if position == "after" else [])
+        result, _ = _REN.prepare_pre_regalloc(lst)
+        self.assertEqual(result.index(pack) > result.index(loop), position == "inside")
+        self.assertLess(result.index(pack), result.index(wmma))
 
   def _half_matmul_tc_lds_ab_pre_regalloc(self, *, tc_local: int | None = None):
     # LOOP-ended LDS fill + contract. B transpose: scatter LSTORE may outnumber LLOAD ops.
@@ -3729,6 +3751,20 @@ class TestAMDRenderer(unittest.TestCase):
     _check_elf(self, prg)
     self.assertGreaterEqual(_lin_ops(prg).count(AMDOps.SWHERE), 3)
     self.assertIn("S_CSELECT_B32", _amd_inst_names(prg))
+
+  def test_uniform_where_materializes_one_of_two_literals(self):
+    insts = list(_REN._insts_from_linear(_prg_lin(_uniform_literal_where_program())))
+    selects = [i for i in insts if i.op_name == "S_CSELECT_B32"]
+    self.assertEqual(len(selects), 1)
+    self.assertFalse(selects[0].ssrc0 == selects[0].ssrc1 == amd_lib.r3.LIT)
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires native gfx11 runtime")
+  def test_hardware_uniform_where_distinct_literals(self):
+    out = Tensor.empty(2, dtype=dtypes.uint32, device="AMD").realize()
+    prg = _uniform_literal_where_program()
+    for _ in range(3):
+      _amd_rt(prg)(out._buffer(), global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+      self.assertEqual(out.tolist(), [0xffffff00, 0xffffff01])
 
   def test_mulacc_assembles(self):
     raw, fused = _mulacc_program(), _fused_mulacc_program()
