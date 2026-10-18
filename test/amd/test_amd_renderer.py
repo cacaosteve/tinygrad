@@ -7,7 +7,7 @@ from tinygrad.codegen.late.regalloc import LinearScanRegallocContext, pm_regallo
 from tinygrad.codegen.opt import KernelOptError, Opt, OptOps
 from tinygrad.device import Device
 from tinygrad.dtype import AddrSpace, Invalid, dtypes
-from tinygrad.helpers import Context, Target, getenv
+from tinygrad.helpers import Context, Target, DEV, getenv
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Q6_K, Q6_BYTES, _quant_decode_kernel
 from tinygrad.renderer.isa import IselContext, PreRegAllocContext, Register, greg
@@ -1729,6 +1729,31 @@ class TestAMDRenderer(unittest.TestCase):
         result, _ = _REN.prepare_pre_regalloc(lst)
         self.assertEqual(result.index(pack) > result.index(loop), position == "inside")
         self.assertLess(result.index(pack), result.index(wmma))
+
+  @unittest.skipUnless(_has_amd_asm_runtime() and not DEV.interface.startswith("MOCK"), "requires physical gfx11 scratch backing")
+  def test_hardware_grouped_wmma_ignores_prior_scratch(self):
+    import numpy as np
+    from tinygrad.device import Buffer
+    from tinygrad.codegen.opt.postrange import Scheduler
+    from test.helpers import replace_opts
+    from test.runtime.test_linearizer import helper_realized_ast
+    rng = np.random.default_rng(0)
+    a, b = rng.random((16, 64)).astype(np.float16), rng.random((64, 16)).astype(np.float16)
+    ast, bufs = helper_realized_ast(Tensor(a, device="AMD").matmul(Tensor(b, device="AMD"), dtype=dtypes.float32))
+    tc = Opt(OptOps.TC, 0, (-1, 0, 1))
+    sche = Scheduler(ast, _REN)
+    sche.apply_opt(tc)
+    axis = sche.axes_of(AxisType.WEAK, reduce=True)[0]
+    prg = _to_prg(replace_opts(ast, [tc, Opt(OptOps.SPLIT, axis, (4, AxisType.LOCAL, False))]))
+    rt = _amd_rt(prg)
+    rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+    scratch = Device["AMD"].scratch_buffer(128)
+    poison = Buffer("PYTHON", scratch.nbytes, initial_value=np.float32(1.0).tobytes()*(scratch.nbytes//4))
+    for _ in range(3):
+      scratch.copy_from(poison)
+      rt(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+      actual = np.frombuffer(bufs[0].as_memoryview(), dtype=np.float32).reshape(16, 16)
+      np.testing.assert_allclose(actual, a.astype(np.float64) @ b.astype(np.float64), atol=3e-2, rtol=1e-3)
 
   def _half_matmul_tc_lds_ab_pre_regalloc(self, *, tc_local: int | None = None):
     # LOOP-ended LDS fill + contract. B transpose: scatter LSTORE may outnumber LLOAD ops.
