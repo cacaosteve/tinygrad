@@ -344,6 +344,7 @@
   "known_blockers": [
     "Long model replay reproduces a runtime timeout on main be4ce7d04 and trial 2cb40f23e. Captured queues are drained, but timeline regresses (for example target 9007, signal 9005). CPU-visible compute command buffers contain the correct 9006/9007 release values. Submission visibility/ordering remains under investigation; not fixed by retries or the KFD wakeup repair.",
     "Size gate fails: 31862 counted lines at be4ce7d04 versus MAX_LINE_COUNT=26500; do not conceal or exclude renderer code to pass.",
+    "An extra explicit MOCK+AMD:AMD null float4 probe also fails on the parent: its structural counter expects stale INS metadata. The normal NULL/CPU CI scopes pass. Reconcile this extra native scope without weakening physical memory correctness; no test-counter or expectation edits were accepted.",
     "Full-model Q6 prefill and short-batch Q6 WMMA are not uniformly HIP-competitive.",
     "Actual Llama 1B prefill uses generic D=64 symbolic attention, not the fast standalone aligned D=128 flash mapping; do not remove the correctness gates to change routing.",
     "Earlier vector divmod GPU timing trailed HIP/LLVM; ordinary reductions are now improved, not a remaining 2x deficit.",
@@ -409,8 +410,30 @@
       "commit": "51e74800a",
       "accepted": true,
       "result": "Removed 77 renderer lines and the generic merge_memory_loads compiler hook. Both adjacent-load passes were provably inert: they require INDEX then apply get_idx to the INDEX itself, which cannot become ADD/CONST. Generic memory coalescing remains; all 83 fixture binaries are byte-identical and explicit native mock/compiler/DSL/event tests pass. No replacement late optimization or flags added."
+    },
+    {
+      "branch": "codex/rdna3-ib-coherency-20261018",
+      "commit": "93b518db1",
+      "accepted": false,
+      "result": "Candidate changes only gfx11 compute-IB cache-policy bits to bypass; other generations retain their prior bits. Packet test fails before and passes after. Explicit native mock/DSL/event/weight/HCQ gate: 347 passed, 3 skipped, 406 subtests; Ruff/mypy pass. An equivalent external diagnostic completed 120 complete Llama generations with exact repeated output. A fresh explicit LRU control fails at generation 12 (target 2121, signal 2119, drained queues), followed by a passing fresh-process GPU smoke. Further 0/3/0/3 fresh-process controls were still running when connectivity dropped; do not claim their final result or a proven production fix. The smaller alternating non-LLM 5000-cycle probe passes even without bypass, so it is a health check, not a reproducer."
     }
   ],
+  "session_stop": {
+    "reason": "Gaming PC SSH first timed out, then reported Network is unreachable; hardware iteration stopped as requested.",
+    "main_worktree": "/Users/steve/tinygrad-rdna3-pr-candidate-20261018",
+    "main_branch": "codex/rdna3-pr-ready-20261018",
+    "validated_product_commit": "be4ce7d04267d98d55ce335b74a622b628b2b88c",
+    "isolated_runtime_trial": "93b518db1b2ad66b314795c08a250e01e656c000",
+    "remote_state": "Primary checkout last confirmed at be4ce7d04. Trial bundle transfer succeeded, but the SSH command to fetch it/create the trial worktree timed out. Do not assume that worktree exists. The remote control runner may finish if only network connectivity dropped; its final status is unknown.",
+    "local_frozen_failure_backup": "/Users/steve/rdna3-validation-artifacts-20261018/rdna3-model-timeout-buffers-main-failure-20261018.tgz",
+    "resume_order": [
+      "Verify gfx1100 and inspect any still-running prior jobs before starting another GPU job.",
+      "Read resume-1/model-ib-policy-controls-20261018.json/log; preserve every negative control as failed.",
+      "If controls support the candidate, transfer exact 93b518db1 into an isolated worktree and run the full serial suite, fence batches, longer model soak and fresh paired timings without diagnostic monkeypatches.",
+      "Do not merge the symbolic-row policy until submission correctness is resolved and its own full gate passes.",
+      "Keep the emulator checkout untouched; no PR or push."
+    ]
+  },
   "external_review": {
     "gabriel_rdna3_pr_head": "c5640ec5e",
     "useful_recent_branches": [
