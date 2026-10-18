@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HCQ2 fence HW gate: prefill TinyJit multi-submit + sync-each fair timings.
 
-Prints JSON lines. Exit 0 only if fence batch2/batch50 complete without hang.
+Prints JSON lines. Success requires completed batches and NumPy-correct outputs.
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def patterned(shape: tuple[int, ...], dtype=np.float32) -> np.ndarray:
 
 
 def setup(case: str, *, direct: bool):
-  target = "AMD:AMD" if direct else "AMD"
+  target = "AMD:AMD" if direct else "AMD:HIP"
   os.environ["DEV"] = target
   if direct: os.environ["AMD_FLASH_DIRECT"] = "1"
   else: os.environ.pop("AMD_FLASH_DIRECT", None)
@@ -43,35 +43,50 @@ def setup(case: str, *, direct: bool):
   def attention(query: Tensor) -> Tensor:
     return flash_attention(query, cache, physical_n).realize()
 
+  keys, values = (np.repeat(patterned((2, batch, kv_heads, physical_n, dim), np.float16)[i].astype(np.float32),
+                            heads // kv_heads, axis=1) for i in range(2))
+  scores = patterned((batch, heads, tokens, dim)) @ keys.swapaxes(-1, -2) / np.sqrt(dim)
+  if tokens > 1:
+    scores = np.where(np.arange(physical_n)[None, :] <= physical_n-tokens+np.arange(tokens)[:, None], scores, -np.inf)
+  probs = np.exp(scores-scores.max(axis=-1, keepdims=True))
+  expected = probs/probs.sum(axis=-1, keepdims=True) @ values
   runner = TinyJit(attention)
   return {
     "case": case, "direct": direct, "device": Device.DEFAULT, "renderer": ren, "arch": arch,
-    "custom": custom, "tokens": tokens, "physical_n": physical_n, "q": q, "runner": runner,
+    "custom": custom, "tokens": tokens, "physical_n": physical_n, "q": q, "runner": runner, "expected": expected,
   }
+
+
+def check_output(ctx: dict, out: Tensor) -> float:
+  actual = out.numpy()
+  np.testing.assert_allclose(actual, ctx["expected"], atol=2e-3, rtol=2e-3)
+  return float(np.max(np.abs(actual-ctx["expected"])))
 
 
 def fence_probe(ctx: dict, *, batch: int) -> dict:
   q, runner = ctx["q"], ctx["runner"]
   for _ in range(3):
-    runner(q)
+    out = runner(q)
     Device[Device.DEFAULT].synchronize()
+  check_output(ctx, out)
   t0 = time.perf_counter()
   for _ in range(batch):
-    runner(q)
+    out = runner(q)
   Device[Device.DEFAULT].synchronize()
   elapsed_ms = (time.perf_counter() - t0) * 1e3
-  return {"ok": True, "batch": batch, "elapsed_ms": elapsed_ms, "per_call_us": elapsed_ms * 1e3 / batch}
+  return {"ok": True, "batch": batch, "elapsed_ms": elapsed_ms, "per_call_us": elapsed_ms * 1e3 / batch,
+          "max_abs_err": check_output(ctx, out)}
 
 
 def sync_each(ctx: dict, *, warmup: int = 5, samples: int = 30) -> dict:
   q, runner = ctx["q"], ctx["runner"]
   for _ in range(warmup):
-    runner(q)
+    out = runner(q)
     Device[Device.DEFAULT].synchronize()
   xs = []
   for _ in range(samples):
     t0 = time.perf_counter_ns()
-    runner(q)
+    out = runner(q)
     Device[Device.DEFAULT].synchronize()
     xs.append((time.perf_counter_ns() - t0) / 1e3)
   return {
@@ -79,6 +94,7 @@ def sync_each(ctx: dict, *, warmup: int = 5, samples: int = 30) -> dict:
     "best_us": min(xs),
     "mean_us": statistics.mean(xs),
     "samples_us": xs,
+    "max_abs_err": check_output(ctx, out),
   }
 
 
@@ -95,7 +111,7 @@ def main() -> None:
     ctx = setup(case, direct=direct)
     base = {k: ctx[k] for k in ("case", "direct", "device", "renderer", "arch", "custom", "tokens", "physical_n")}
     print(json.dumps({"event": "setup", **base}), flush=True)
-    if args.mode in ("fence", "all") and case == "prefill" and direct:
+    if args.mode in ("fence", "all") and case == "prefill":
       for b in (10, 50, 100):
         r = fence_probe(ctx, batch=b)
         print(json.dumps({"event": "fence", **base, **r}), flush=True)
@@ -103,7 +119,7 @@ def main() -> None:
       r = sync_each(ctx)
       print(json.dumps({"event": "sync_each", **base,
                         "median_us": r["median_us"], "best_us": r["best_us"], "mean_us": r["mean_us"],
-                        "n": len(r["samples_us"])}), flush=True)
+                        "n": len(r["samples_us"]), "max_abs_err": r["max_abs_err"]}), flush=True)
 
 
 if __name__ == "__main__":
