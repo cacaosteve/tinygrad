@@ -1920,8 +1920,7 @@ _MASKED_MEM = (AMDOps.LOAD, AMDOps.STORE, AMDOps.LLOAD, AMDOps.LSTORE, AMDOps.SL
 
 # --- emit: per-UOp instruction lowering ---
 def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_cache:_StoreAddrCache|None=None,
-                  d16_hi_lo:dict[UOp, UOp]|None=None, byte_scaled:set[int]|None=None,
-                  fma_hi_lo:dict[UOp, UOp]|None=None, fma_pair_dst:dict[UOp, Reg]|None=None):
+                  byte_scaled:set[int]|None=None, fma_hi_lo:dict[UOp, UOp]|None=None, fma_pair_dst:dict[UOp, Reg]|None=None):
   if u.op is not Ops.INS or (skip and u in skip): return []
   if isinstance(_iop(u), Inst): return [_iop(u)]
   match _iop(u):
@@ -1946,7 +1945,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       # Peel MOV/CAST chains to inline float/int literals (flash zero/-inf broadcasts).
       # Avoids VGPR←VGPR copies of shared const mid-regs; enables more imm0 VOPD.
       if greg(u).index < 256: return [r3.s_mov_b32(_dst(u), _src(u.src[0]))]
-      src = _mov_imm_or_src(u.src[0]) if True else _src(u.src[0])
+      src = _mov_imm_or_src(u.src[0])
       return [r3.v_mov_b32_e32(_dst(u), src)]
     case AMDOps.PACK:
       if u.dtype is not dtypes.float32: raise CompileError(f"f32 pack only, got {u.dtype}")
@@ -2197,8 +2196,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
     case AMDOps.LOAD:
       if _is_scratch_ref(u.src[0]):
         return insts_for_uop(u.replace(arg=(AMDOps.SLOAD, u.dtype)), skip, masked, store_addr_cache,
-                             d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst)
-      # AMD_D16_HI emit path removed.
+                             byte_scaled, fma_hi_lo, fma_pair_dst)
       itemsize, byte_off = (1 if _is_byte_addr_load(u) else _mem_itemsize(u.dtype)), _mem_byte_off(u)
       compact_idx = _src(u.src[1])
       # Compact B: in-place <<1 on page-idx UOp once (track by UOp id, not phys VGPR —
@@ -2221,7 +2219,7 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       # Defensive: REG/ALLOC scratch that missed SSTORE isel (e.g. Ops.ALLOC before ALLOC-aware _buf_ref).
       if _is_scratch_ref(u.src[0]):
         return insts_for_uop(u.replace(arg=(AMDOps.SSTORE, dtypes.void)), skip, masked, store_addr_cache,
-                             d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst)
+                             byte_scaled, fma_hi_lo, fma_pair_dst)
       itemsize, byte_off = _mem_itemsize(u.src[2].dtype), _mem_byte_off(u)
       if store_addr_cache is not None and not masked:
         pre, addr, byte_off = store_addr_cache.addr(u.src[1], itemsize, byte_off)
@@ -2494,8 +2492,8 @@ def _hoist_gated_fmac_loads(ops:list[UOp]) -> list[UOp]:
 def _vmem_schedulable_load(u:UOp) -> bool:
   return _sched.vmem_schedulable_load(u)
 
-def _schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:bool|None=None) -> list[UOp]:
-  return _sched.schedule_scalar_vmem(ops, d16_hi_lo, alu_breadth)
+def _schedule_scalar_vmem(ops:list[UOp], alu_breadth:bool|None=None) -> list[UOp]:
+  return _sched.schedule_scalar_vmem(ops, alu_breadth)
 
 def _schedule_fmac_add_pairs(ops:list[UOp]) -> list[UOp]:
   return _sched.schedule_fmac_add_pairs(ops)
@@ -2859,7 +2857,7 @@ def _fused_lds_2addr_b64(uops:list[UOp], i:int) -> tuple[int, list, set[int]]|No
   if ra.index + 2 != rb.index or _reg_slots(a) != 2 or _reg_slots(b) != 2: return None
   off0, off1 = _lds_byte_off(a), _lds_byte_off(b)
   if off0 % 8 or off1 % 8: return None
-  fold = min(off0, off1) if True else 0
+  fold = min(off0, off1)
   q0, q1 = (off0 - fold) // 8, (off1 - fold) // 8
   if not (0 <= q0 <= 0xff and 0 <= q1 <= 0xff): return None
   # 2addr offsets are qword indices (not byte ds_off) — bake slot base + fold into one
@@ -2962,9 +2960,8 @@ def _fused_lds_reduce_loop(uops:list[UOp], i:int) -> tuple[int, list]|None:
 def insts_from_linear(lin:UOp):
   _FMAC_DELAY_N[0] = 0
   ops = list(lin.src)
-  skip = _compute_amd_skip(ops)  # fused d16 hi LOADs still emit (d16_hi into lo)
+  skip = _compute_amd_skip(ops)
   skip |= _half2_global_hi_skip(ops)
-  d16_hi_lo: dict[UOp, UOp] = {}  # AMD_D16_HI removed — map always empty
   fma_hi_lo = _fma_mixhi_lo_map(ops)
   fma_pair_dst: dict[UOp, Reg] = {}
   mask_depth = 0
@@ -3027,8 +3024,7 @@ def insts_from_linear(lin:UOp):
     # Physical operands are not value identities: regalloc may redefine the same
     # VGPR between two predicates. Keep every explicitly rematerialized comparison.
     return list(insts_for_uop(u, skip, masked, store_addr_cache if with_store_cache else None,
-                              d16_hi_lo, byte_scaled, fma_hi_lo, fma_pair_dst))
-  # Required: d16 lo-before-hi (no-op — AMD_D16_HI removed). Optional: WMMA hoist/sink + emit-time store cluster.
+                              byte_scaled, fma_hi_lo, fma_pair_dst))
   scheduled = _hoist_loads_before_wmma(_sink_wmma_past_loads(ops))
   # Post-regalloc UOp-only reordering is unsound: regalloc reuses VGPRs, so SSA-independent
   # ops can still conflict in phys regs (load A→use; load B both in v5 → batch clobbers A).
@@ -3524,23 +3520,14 @@ def insts_from_linear(lin:UOp):
         continue
     # Cluster scalar half loads: dest-as-addr scales, then s_clause + tight VMEM (LLVM-style B).
     # Quant decode uses the same pattern for packed u32 weight reads (linear_q6).
-    # Always on. With AMD_D16_HI lo+…hi+ batch: extend the clause through following d16_his
-    # (u16+d16_hi in one s_clause); do not hard-flush on lo mid-clause.
-    if u not in d16_hi_lo and _clauseable_scalar_vmem_gload(u, skip, mask_depth):
+    if _clauseable_scalar_vmem_gload(u, skip, mask_depth):
       j = oi + 1
-      while j < len(scheduled) and scheduled[j] not in d16_hi_lo and \
-            _clauseable_scalar_vmem_gload(scheduled[j], skip, mask_depth) and \
+      while j < len(scheduled) and _clauseable_scalar_vmem_gload(scheduled[j], skip, mask_depth) and \
             _vopd_scan_safe(scheduled[j], scheduled[oi:j]): j += 1
-      j_hi = j
-      if d16_hi_lo and j > oi:
-        while j_hi < len(scheduled) and scheduled[j_hi] in d16_hi_lo: j_hi += 1
-      end = j_hi if j_hi - j >= 2 else j
-      if end - oi >= 2:
+      if j - oi >= 2:
         scale_snapshot = byte_scaled.copy()
-        parts = [_emit_uop(scheduled[k]) for k in range(oi, end)]
-        hi_ok = all(k < j or (not any(getattr(i, "vdst", None) == TMP_VDATA for i in parts[k - oi]))
-                    for k in range(j, end))
-        if hi_ok and all(_vm_load_count(p) == 1 for p in parts):
+        parts = [_emit_uop(scheduled[k]) for k in range(oi, j)]
+        if all(_vm_load_count(p) == 1 for p in parts):
           store_addr_cache.clear()
           raw_scales, loads = [], []
           for p in parts:
@@ -3553,15 +3540,12 @@ def insts_from_linear(lin:UOp):
             for inst in raw_scales: emit(inst)
             emit(r3.s_clause(simm16=len(loads) - 1))
             for inst in loads: emit(inst)
-            for k, p in enumerate(parts):
-              su = scheduled[oi + k]
-              note_vm(_reg_idxs(d16_hi_lo[su]) if su in d16_hi_lo else _reg_idxs(su), p)
-            oi = end
+            for k, p in enumerate(parts): note_vm(_reg_idxs(scheduled[oi + k]), p)
+            oi = j
             continue
         # A rejected clause is only a preview: the normal path must still scale its indices.
         byte_scaled.clear()
         byte_scaled.update(scale_snapshot)
-    if u in d16_hi_lo: flush_regs(_reg_idxs(d16_hi_lo[u]))
     is_mem_addr_cse = u.op is Ops.INS and _iop(u) in (AMDOps.STORE, AMDOps.SSTORE, AMDOps.SLOAD, AMDOps.LSTORE, AMDOps.LLOAD)
     # Scratch SPILL/FILL always clobber TMP_VADDR (page base). Clear before emit so a
     # following STORE/SLOAD CSE cannot reuse a stale TMP_VADDR across spill-on-evict.
@@ -3570,8 +3554,6 @@ def insts_from_linear(lin:UOp):
     # VALU copy of an outstanding VMEM/LDS dest must wait first (PACK/MOV across pools).
     if emitted and u.op is Ops.INS and _iop(u) in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV):
       src = set().union(*(_reg_idxs(s) for s in u.src))
-      for s in u.src:
-        if s in d16_hi_lo: src |= _reg_idxs(d16_hi_lo[s])
       if src and _pending_src(src): flush_regs(src)
     # EXTRACT between C-stores often emits nothing (pack+lane alias); only clobber CSE on real emits.
     # Keep page CSE across CAST (uses TMP_VDATA, not TMP_VADDR) — cast-before-store otherwise
@@ -3598,7 +3580,7 @@ def insts_from_linear(lin:UOp):
         vm_after_wait.append(inst)
     if u.op is Ops.INS and _iop(u) is AMDOps.END_MASK: mask_depth -= 1
     if (domain:=_wait_domain_for_load(u)) is not None:
-      regs = _reg_idxs(d16_hi_lo[u]) if u in d16_hi_lo else _reg_idxs(u)
+      regs = _reg_idxs(u)
       if domain == "vm": note_vm(regs, vm_after_wait if saw_vm_wait0 else emitted)
       elif domain == "lgkm": note_lgkm(regs, emitted)
       else: pending[domain] |= regs
@@ -4173,8 +4155,8 @@ class AMDRenderer(ISARenderer):
     """
     lst = _lower_fma_mix_f32(lst)
     lst = _schedule_fma_mixhi_pairs(lst)
-    lst = _prefetch_a_after_packed_quant(lst) if True else lst
-    lst = _prefetch_late_iq4_a_before_mix(lst) if True else lst
+    lst = _prefetch_a_after_packed_quant(lst)
+    lst = _prefetch_late_iq4_a_before_mix(lst)
     lst = _prefetch_next_bu16_before_pack(_hoist_b_between_a_and_pack(lst))
     uses: dict[UOp, list[UOp]] = {}
     for u in lst:
@@ -4194,12 +4176,10 @@ class AMDRenderer(ISARenderer):
         if u in store_cast: out.append(store_cast[u])
         out.append(u)
       lst = out
-    d16_hi_lo: dict[UOp, UOp] = {}  # AMD_D16_HI removed
-    # _order_d16_lo_before_hi no-op under empty map
     lst = _hoist_gated_fmac_loads(lst)
-    lst = _schedule_scalar_vmem(lst, d16_hi_lo)
+    lst = _schedule_scalar_vmem(lst)
     # After scalar VMEM (it otherwise reopens the weight→A gap). Default on; AMD_PREFETCH_Q6_A=0 opts out.
-    lst = _prefetch_a_before_dequant_mix(lst) if True else lst
+    lst = _prefetch_a_before_dequant_mix(lst)
     # LLOAD hoist before phys assignment (emit-time hoist hits the same VGPR-reuse hazard as SLOAD batch).
     lst = _hoist_lloads_before_extracts(lst)
     # AMD_HOIST_PACK_AFTER_LLOAD / AMD_CLUSTER_PACK_LLOAD removed (checksum−3.375 / fair regress).

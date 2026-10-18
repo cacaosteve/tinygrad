@@ -1282,7 +1282,7 @@ class TestAMDRenderer(unittest.TestCase):
     use0 = _uop(Ops.INS, dtypes.uint32, (load0, UOp.const(1, dtypes.uint32)), AMDOps.ADD, (Register("use0", 271),))
     load1 = _uop(Ops.INS, dtypes.uint32, (base, idx1), AMDOps.LOAD, (Register("load1", 272),))
     use1 = _uop(Ops.INS, dtypes.uint32, (load1, UOp.const(1, dtypes.uint32)), AMDOps.ADD, (Register("use1", 273),))
-    scheduled = amd_lib._schedule_scalar_vmem([load0, use0, idx1, load1, use1], {})
+    scheduled = amd_lib._schedule_scalar_vmem([load0, use0, idx1, load1, use1])
     self.assertEqual(scheduled, [load0, idx1, load1, use0, use1])
 
   def test_scalar_vmem_scheduler_hoists_half_b64_load(self):
@@ -1294,7 +1294,7 @@ class TestAMDRenderer(unittest.TestCase):
     use0 = _uop(Ops.INS, dtypes.half, (load0, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("use0", 271),))
     load1 = _uop(Ops.INS, dtypes.half, (base, idx1, count), AMDOps.LOAD, (Register("load1", 272),))
     use1 = _uop(Ops.INS, dtypes.half, (load1, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("use1", 273),))
-    scheduled = amd_lib._schedule_scalar_vmem([load0, use0, idx1, load1, use1], {})
+    scheduled = amd_lib._schedule_scalar_vmem([load0, use0, idx1, load1, use1])
     self.assertEqual(scheduled, [load0, idx1, load1, use0, use1])
     self.assertTrue(amd_lib._vmem_schedulable_load(load0))
 
@@ -1332,7 +1332,7 @@ class TestAMDRenderer(unittest.TestCase):
     load0 = _uop(Ops.INS, dtypes.uint8, (base, idx0), AMDOps.LOAD, (Register("load0", 270),))
     noop = _uop(Ops.NOOP, dtypes.int8, (load0,))
     load1 = _uop(Ops.INS, dtypes.uint32, (base, idx1), AMDOps.LOAD, (Register("load1", 272),))
-    self.assertEqual(amd_lib._schedule_scalar_vmem([load0, noop, idx1, load1], {}), [load0, idx1, load1, noop])
+    self.assertEqual(amd_lib._schedule_scalar_vmem([load0, noop, idx1, load1]), [load0, idx1, load1, noop])
 
   def test_scalar_vmem_scheduler_interleaves_independent_alu_chains(self):
     base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
@@ -1344,7 +1344,7 @@ class TestAMDRenderer(unittest.TestCase):
     mul0 = _uop(Ops.INS, dtypes.float32, (cast0, UOp.const(2.0, dtypes.float32)), AMDOps.MUL, (Register("mul0", 273),))
     cast1 = _uop(Ops.INS, dtypes.float32, (load1,), AMDOps.CAST, (Register("cast1", 274),))
     mul1 = _uop(Ops.INS, dtypes.float32, (cast1, UOp.const(3.0, dtypes.float32)), AMDOps.MUL, (Register("mul1", 275),))
-    scheduled = amd_lib._schedule_scalar_vmem([load0, load1, cast0, mul0, cast1, mul1], {}, alu_breadth=True)
+    scheduled = amd_lib._schedule_scalar_vmem([load0, load1, cast0, mul0, cast1, mul1], alu_breadth=True)
     self.assertEqual([id(x) for x in scheduled], [id(x) for x in (load0, load1, cast0, cast1, mul0, mul1)])
 
   def test_scalar_vmem_scheduler_hoists_packed_byte_load(self):
@@ -1357,7 +1357,7 @@ class TestAMDRenderer(unittest.TestCase):
     lane0 = _uop(Ops.INS, dtypes.uint32, (load0, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane0", 274),))
     load1 = _uop(Ops.INS, dtypes.uint32, (base, idx1, count, byte_off), AMDOps.LOAD, (Register("load1", 275),))
     lane1 = _uop(Ops.INS, dtypes.uint32, (load1, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane1", 279),))
-    scheduled = amd_lib._schedule_scalar_vmem([load0, lane0, idx1, load1, lane1], {})
+    scheduled = amd_lib._schedule_scalar_vmem([load0, lane0, idx1, load1, lane1])
     self.assertEqual(scheduled, [load0, idx1, load1, lane0, lane1])
 
   def test_scalar_vmem_scheduler_hoists_packed_word_loads_before_wmma(self):
@@ -1371,7 +1371,7 @@ class TestAMDRenderer(unittest.TestCase):
     lane1 = _uop(Ops.INS, dtypes.uint32, (load1, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane1", 279),))
     wmma = _uop(Ops.INS, dtypes.float32, (lane0, lane1, lane0), AMDOps.WMMA, (Register("wmma", 280),))
     original = [load0, lane0, idx1, load1, lane1, wmma]
-    self.assertEqual(amd_lib._schedule_scalar_vmem(original, {}), [load0, idx1, load1, lane0, lane1, wmma])
+    self.assertEqual(amd_lib._schedule_scalar_vmem(original), [load0, idx1, load1, lane0, lane1, wmma])
 
   def test_scalar_vmem_scheduler_hoists_wide_f32_load(self):
     base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
@@ -1382,7 +1382,7 @@ class TestAMDRenderer(unittest.TestCase):
     lane0 = _uop(Ops.INS, dtypes.float32, (load0, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane0", 274),))
     load1 = _uop(Ops.INS, dtypes.float32, (base, idx1, count), AMDOps.LOAD, (Register("load1", 275),))
     lane1 = _uop(Ops.INS, dtypes.float32, (load1, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane1", 279),))
-    scheduled = amd_lib._schedule_scalar_vmem([load0, lane0, idx1, load1, lane1], {})
+    scheduled = amd_lib._schedule_scalar_vmem([load0, lane0, idx1, load1, lane1])
     self.assertEqual(scheduled, [load0, idx1, load1, lane0, lane1])
 
   def test_float_gemv_issues_wide_loads_before_fma_chain(self):
@@ -1399,7 +1399,7 @@ class TestAMDRenderer(unittest.TestCase):
     update = _uop(Ops.INS, dtypes.void, (acc, load0), AMDOps.REG_STORE)
     load1 = _uop(Ops.INS, dtypes.uint32, (base, idx), AMDOps.LOAD, (Register("load1", 271),))
     # REG_STORE mutates acc implicitly; the later load must not cross that boundary.
-    self.assertEqual(amd_lib._schedule_scalar_vmem([load0, update, load1], {}), [load0, update, load1])
+    self.assertEqual(amd_lib._schedule_scalar_vmem([load0, update, load1]), [load0, update, load1])
 
   def test_scalar_vmem_scheduler_preserves_void_noop_gate(self):
     base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
@@ -1408,7 +1408,7 @@ class TestAMDRenderer(unittest.TestCase):
     load0 = _uop(Ops.INS, dtypes.uint32, (base, idx0), AMDOps.LOAD, (Register("load0", 270),))
     gate = _uop(Ops.NOOP, dtypes.void, (load0,))
     load1 = _uop(Ops.INS, dtypes.uint32, (base, idx1), AMDOps.LOAD, (Register("load1", 271),))
-    self.assertEqual(amd_lib._schedule_scalar_vmem([load0, gate, idx1, load1], {}), [load0, gate, idx1, load1])
+    self.assertEqual(amd_lib._schedule_scalar_vmem([load0, gate, idx1, load1]), [load0, gate, idx1, load1])
 
   def test_global_store_drains_vscnt_before_end(self):
     # RDNA3 vector stores complete on vscnt; must drain before s_endpgm.
@@ -3190,7 +3190,7 @@ class TestAMDRenderer(unittest.TestCase):
       other = next(u for u in compacts[1:] if u.src[1] is not u0.src[1])
       byte_scaled: set[int] = set()
       def n_scale(u):
-        return sum(1 for i in amd_lib.insts_for_uop(u, set(), False, None, None, byte_scaled)
+        return sum(1 for i in amd_lib.insts_for_uop(u, set(), False, None, byte_scaled)
                    if getattr(i, "op_name", "") == "V_LSHLREV_B32_E64")
       self.assertEqual(n_scale(u0), 1)
       self.assertEqual(n_scale(same), 0)   # same idx UOp: already scaled

@@ -591,7 +591,7 @@ def vmem_schedulable_load(u:UOp) -> bool:
   return slots == 1 or (u.dtype is dtypes.half and slots == 2) or \
     (u.dtype in (dtypes.uint8, dtypes.float32, dtypes.uint32, dtypes.int32) and slots <= 4)
 
-def schedule_scalar_vmem(ops:list[UOp], d16_hi_lo:dict[UOp, UOp], alu_breadth:bool|None=None) -> list[UOp]:
+def schedule_scalar_vmem(ops:list[UOp], alu_breadth:bool|None=None) -> list[UOp]:
   """Hoist independent global reads inside conservative straight-line segments.
 
   Run before register allocation so independent reads receive distinct live registers.
