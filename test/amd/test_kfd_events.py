@@ -18,7 +18,8 @@ class TestKFDEvents(unittest.TestCase):
     with patch.object(KFDIface, "event_page", Mock(), create=True), \
          patch.object(kfd, "AMDKFD_IOC_CREATE_EVENT", side_effect=events) as create, \
          patch("tinygrad.runtime.ops_amd.UOp.from_buffer", return_value=page):
-      self.assertEqual(iface.queue_event, (page.index(7), 11))
+      self.assertEqual(iface.queue_event, (page[7:8], 11))
+      self.assertEqual(iface.queue_event[0].getaddr("AMD").op, Ops.GETADDR)
       self.assertEqual([e.event_id for e in iface.queue_event_arr], [11, 12, 13])
       self.assertIs(iface.queue_event, iface.queue_event)
       self.assertEqual(create.call_count, 3)

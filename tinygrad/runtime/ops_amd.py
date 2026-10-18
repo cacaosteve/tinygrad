@@ -658,7 +658,8 @@ class KFDIface:
     events = [kfd.AMDKFD_IOC_CREATE_EVENT(KFDIface.kfd, event_type=t, auto_reset=int(t == kfd.KFD_IOC_EVENT_SIGNAL))
               for t in (kfd.KFD_IOC_EVENT_SIGNAL, kfd.KFD_IOC_EVENT_MEMORY, kfd.KFD_IOC_EVENT_HW_EXCEPTION)]
     self.queue_event_arr = (kfd.struct_kfd_event_data * 3)(*[kfd.struct_kfd_event_data(event_id=e.event_id) for e in events])
-    return UOp.from_buffer(KFDIface.event_page, dtypes.uint64).index(events[0].event_slot_index), events[0].event_id
+    slot = events[0].event_slot_index
+    return UOp.from_buffer(KFDIface.event_page, dtypes.uint64)[slot:slot+1], events[0].event_id
 
   def create_queue(self, queue_type, ring, gart, rptr, wptr, eop_buffer=None, cwsr_buffer=None, ctl_stack_size=0, ctx_save_restore_size=0,
                    xcc_id=0, idx=0):
