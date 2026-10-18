@@ -144,6 +144,17 @@ class TestGGUF(unittest.TestCase):
   def test_dequantization_q4_k(self): self._test_dequantization(GGMLQuantizationType.Q4_K)
   def test_dequantization_q5_k(self): self._test_dequantization(GGMLQuantizationType.Q5_K)
   def test_dequantization_q6_k(self): self._test_dequantization(GGMLQuantizationType.Q6_K)
+  def test_dequantization_exhaustive_packed_bytes(self):
+    # Exercise each byte value in every packed field, including 1-, 2-, and 4-bit extraction.
+    for typ in (GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q5_0, GGMLQuantizationType.Q6_K):
+      with self.subTest(quant=typ.name):
+        count, size = GGML_QUANT_SIZES[typ]
+        packed = np.broadcast_to(np.arange(256, dtype=np.uint8)[:, None], (256, size)).copy()
+        offset = size-2 if typ == GGMLQuantizationType.Q6_K else 0
+        packed[:, offset:offset+2] = np.array([1.0], dtype=np.float16).view(np.uint8)
+        expected = dequantize(packed, typ).reshape(-1)
+        actual = ggml_data_to_tensor(Tensor(packed.flatten()), 256*count, typ.value).numpy()
+        np.testing.assert_array_equal(actual, expected)
   def test_dequantization_iq2_xxs(self): self._test_dequantization(GGMLQuantizationType.IQ2_XXS)
   def test_dequantization_iq2_xs(self): self._test_dequantization(GGMLQuantizationType.IQ2_XS)
   def test_dequantization_iq3_xxs(self): self._test_dequantization(GGMLQuantizationType.IQ3_XXS)
