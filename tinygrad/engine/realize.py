@@ -190,10 +190,11 @@ def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
   slots = {d: cast(Buffer, call.src[1 + i].buffer) for d, i in info.slots}
   for d in {d for d, _, _, prof, *_ in info.kernels if prof and (slots[d], prof[0]) in Device[d].prof_ents}: Device[d].synchronize()
   # Retire prior work before re-arming a schedule; long flash batches can race the HCQ timeline.
-  for device in info.device:
-    d = cast(Any, Device[device])
-    tl = d.timeline.host.view(fmt='Q')
-    d._wait_signal(tl, int(tl[1]))
+  if not info.skip_wait:
+    for device in info.device:
+      d = cast(Any, Device[device])
+      tl = d.timeline.host.view(fmt='Q')
+      d._wait_signal(tl, int(tl[1]))
   ets = exec_kernel(ctx, call, ast, devices=(Device[info.device[0]].host,))
   if not (ctx.wait or PROFILE): return ets
 

@@ -2,15 +2,31 @@ import unittest
 from typing import cast
 from types import SimpleNamespace
 from collections import defaultdict
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes
 from tinygrad.device import Buffer, Compiled, ProfileGraphEvent
 from tinygrad.helpers import Context, unwrap, to_tuple
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
-from tinygrad.engine.realize import compile_linear, link_linear, get_call_arg_uops, lower_and_compile, run_linear
+from tinygrad.engine.realize import ExecContext, exec_hcq, compile_linear, link_linear, get_call_arg_uops, lower_and_compile, run_linear
 import tinygrad.runtime.support.hcq2 as hcq2
 from tinygrad.runtime.support.hcq2 import HCQInfo
+
+class TestHCQ2HostFence(unittest.TestCase):
+  def test_rearm_wait_honors_skip_wait(self):
+    # An RDMA batch may require a peer submission before its timeline can complete.
+    for skip in (False, True):
+      with self.subTest(skip_wait=skip), Context(PROFILE=0):
+        body = UOp.sink(arg=KernelInfo("host_fence"))
+        call = body.call(aux=HCQInfo(("AMD",), skip_wait=skip))
+        dev = Mock(var_vals={}, host="CPU")
+        dev.timeline.host.view.return_value = (5, 5)
+        with patch("tinygrad.engine.realize.Device") as devices, patch("tinygrad.engine.realize.exec_kernel", return_value=[]) as submit:
+          devices.__getitem__.return_value = dev
+          self.assertEqual(exec_hcq(ExecContext(), call, body), [])
+        self.assertEqual(dev._wait_signal.call_count, 0 if skip else 1)
+        submit.assert_called_once()
+        dev.synchronize.assert_not_called()
 
 def lower_hcq(*body:UOp) -> UOp: # body through lower_call, as a linear
   return UOp(Ops.LINEAR, src=(unwrap(hcq2.lower_call(UOp.sink(*body, arg=KernelInfo("test", optimized=True)).call(aux=HCQInfo(("CPU",))))),))
