@@ -435,37 +435,25 @@ def _is_identity_load(val:UOp, addr:UOp) -> bool:
   return _reg_mem_key(load_addr.src[0], load_addr.src[1]) == _reg_mem_key(addr.src[0], addr.src[1])
 
 def _compute_amd_skip(uops:list[UOp]) -> set[UOp]:
-  buffer_offset_stores: dict[tuple[UOp, int], list[tuple[UOp, bool, bool]]] = {}
-  # A dynamic REG access can alias every constant offset in its buffer. In particular,
-  # hand WMMA kernels zero each accumulator slot with constant stores, then access the
-  # tile through loop-varying indices. Those zero stores are live across outer loops.
-  dynamic_buffers = {buf for u in uops if u.op is Ops.INS and _iop(u) in (AMDOps.SLOAD, AMDOps.SSTORE) and len(u.src) >= 2 and
-                     (buf:=_reg_buffer_base(u.src[0])) is not None and _const_int(u.src[1]) is None}
+  skip: set[UOp] = set()
+  identity_loads: set[UOp] = set()
+  # A load followed by a store of the same value cannot change a REG slot. A zero
+  # initializer is not dead merely because the slot has no other writes: later reads
+  # must still observe that zero (for example, an untouched scatter/reduction row).
   for u in uops:
     if u.op is Ops.INS and _iop(u) is AMDOps.SSTORE and len(u.src) >= 3:
       if (key:=_reg_mem_key(u.src[0], u.src[1], _lds_byte_off(u), u.src[2].dtype.itemsize)) is None: continue
       val = u.src[2]
-      is_identity, is_zero = _is_identity_sload(val, key), _is_zero_val(val)
+      if not _is_identity_sload(val, key): continue
     elif u.op is Ops.STORE and len(u.src) >= 2:
       addr = u.src[0]
       if addr.op not in (Ops.INDEX, Ops.SHRINK): continue
       if (key:=_reg_mem_key(addr.src[0], addr.src[1])) is None: continue
       val = u.src[1]
-      is_identity, is_zero = _is_identity_load(val, addr), _is_zero_val(val)
+      if not _is_identity_load(val, addr): continue
     else: continue
-    buffer_offset_stores.setdefault(key, []).append((u, is_identity, is_zero))
-  dead_offsets = {key for key, stores in buffer_offset_stores.items()
-                  if key[0] not in dynamic_buffers and all(is_identity or is_zero for _, is_identity, is_zero in stores)}
-  skip: set[UOp] = set()
-  identity_loads: set[UOp] = set()
-  for key, stores in buffer_offset_stores.items():
-    for store, is_identity, is_zero in stores:
-      if is_identity:
-        skip.add(store)
-        val = store.src[2] if store.op is Ops.INS else store.src[1]
-        if val.op is Ops.INS and _iop(val) is AMDOps.SLOAD: identity_loads.add(val)
-        elif val.op is Ops.LOAD: identity_loads.add(val)
-      elif key in dead_offsets and is_zero: skip.add(store)
+    skip.add(u)
+    if val.op is Ops.LOAD or (val.op is Ops.INS and _iop(val) is AMDOps.SLOAD): identity_loads.add(val)
   for u in uops:
     for src in u.src:
       if src in identity_loads and u not in skip: identity_loads.discard(src)

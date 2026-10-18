@@ -4130,6 +4130,44 @@ class TestAMDRenderer(unittest.TestCase):
     update = _uop(Ops.INS, dtypes.void, (scratch, idx, load + UOp.const(1.0, dtypes.float32)), AMDOps.SSTORE)
     self.assertNotIn(init, amd_lib._compute_amd_skip([init, idx, load, update]))
 
+  def test_readonly_reg_slot_keeps_zero_init(self):
+    scratch = UOp.placeholder((4,), dtypes.float32, slot=1, addrspace=AddrSpace.REG)
+    idx, zero = UOp.const(3, dtypes.int32), UOp.const(0.0, dtypes.float32)
+    for instruction_space in (False, True):
+      with self.subTest(instruction_space=instruction_space):
+        if instruction_space:
+          init = _uop(Ops.INS, dtypes.void, (scratch, idx, zero), AMDOps.SSTORE)
+          load = _uop(Ops.INS, dtypes.float32, (scratch.after(init), idx, UOp.const(True, dtypes.bool)), AMDOps.SLOAD)
+          identity = _uop(Ops.INS, dtypes.void, (scratch, idx, load), AMDOps.SSTORE)
+        else:
+          init = scratch.index(idx).store(zero)
+          load = scratch.after(init).index(idx).load()
+          identity = scratch.index(idx).store(load)
+        skip = amd_lib._compute_amd_skip([init, load, identity, load + UOp.const(1.0, dtypes.float32)])
+        self.assertNotIn(init, skip)
+        self.assertNotIn(load, skip)
+        self.assertIn(identity, skip)
+
+  def test_scatter_untouched_rows_keep_initialized_reduction(self):
+    with Context(BEAM=0):
+      source = Tensor.empty(4, 5, 6, dtype=dtypes.float32, device="AMD")
+      indices = Tensor.empty(3, 4, 5, dtype=dtypes.int32, device="AMD")
+      ast = source.scatter(1, indices, float("inf"), reduce="add").schedule_linear().src[-1].body
+      prg = _to_prg(ast)
+    self.assertNotIn(AMDOps.SLOAD, _lin_ops(prg))
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_scatter_preserves_unselected_rows(self):
+    import numpy as np
+    rng = np.random.default_rng(0)
+    source = rng.normal(size=(4, 5, 6)).astype(np.float32)
+    indices = rng.integers(0, 3, size=(3, 4, 5), dtype=np.int32)
+    expected = source.copy()
+    for row, col, lane in itertools.product(range(3), range(4), range(5)):
+      expected[row, indices[row, col, lane], lane] = np.inf
+    actual = Tensor(source, device="AMD").scatter(1, Tensor(indices, device="AMD"), float("inf"), reduce="add").numpy()
+    np.testing.assert_array_equal(actual, expected)
+
   def test_gated_store_materialized_bool_rebuilds_vcc(self):
     inst_names = [getattr(i, "op_name", "") for i in _REN._insts_from_linear(_late_gated_store_linear(True))]
     self.assertLess(inst_names.index("V_CMP_NE_U32_E32"), inst_names.index("S_AND_SAVEEXEC_B64"))
