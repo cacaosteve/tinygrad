@@ -1695,6 +1695,26 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertLess(load_i, wait_i)
     self.assertLess(wait_i, mul_i)
 
+  def test_copy_destination_waits_for_outstanding_load(self):
+    base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("base", 6),))
+    local = _uop(Ops.INS, dtypes.uint32, (UOp.const(64), UOp.const(0)), AMDOps.LDS_BASE)
+    idx = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx", 266),))
+    for domain, pointer, load_op in (("VM", base, AMDOps.LOAD), ("LGKM", local, AMDOps.LLOAD)):
+      for paired in (False, True):
+        with self.subTest(domain=domain, paired=paired):
+          dst = 263 if paired else 262
+          load = _uop(Ops.INS, dtypes.float, (pointer, idx), load_op, (Register("dead", dst),))
+          copies = [_uop(Ops.INS, dtypes.float, (UOp.const(0.0, dtypes.float),), AMDOps.MOV, (Register(f"zero{i}", 262+i),))
+                    for i in range(2 if paired else 1)]
+          insts = _REN._insts_from_linear(UOp(Ops.LINEAR, src=(load, *copies)))
+          names = [getattr(i, "op_name", "") for i in insts]
+          load_i = names.index("GLOBAL_LOAD_B32" if domain == "VM" else "DS_LOAD_B32")
+          copy_i = next(i for i in range(load_i+1, len(insts)) if any(
+            getattr(getattr(insts[i], field, None), "offset", None) == dst for field in ("vdst", "vdstx", "vdsty")))
+          wait_i = names.index("S_WAITCNT_VMCNT" if domain == "VM" else "S_WAITCNT_LGKMCNT", load_i+1)
+          self.assertLess(wait_i, copy_i)
+          if paired: self.assertTrue(hasattr(insts[copy_i], "vdstx"))
+
   def test_matmul_reg_accumulators_promote_off_scratch(self):
     prg = _matmul64_program()
     linear_ops = _lin_ops(prg)

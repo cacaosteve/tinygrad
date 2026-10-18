@@ -2996,8 +2996,9 @@ def insts_from_linear(lin:UOp):
       continue
     if mask_depth == 0 and (paired:=_vopd.find_pair(scheduled, oi, early_emitted)) is not None:
       partner_i, vopd = paired
-      src = set().union(*(_reg_idxs(s) for s in u.src)) | set().union(*(_reg_idxs(s) for s in scheduled[partner_i].src))
-      if src and _pending_src(src): flush_regs(src)
+      partner = scheduled[partner_i]
+      regs = set().union(_reg_idxs(u), _reg_idxs(partner), *(_reg_idxs(s) for s in u.src+partner.src))
+      if regs and _pending_src(regs): flush_regs(regs)
       for inst in vopd: emit(inst)
       early_emitted.add(partner_i)
       oi += 1
@@ -3374,10 +3375,10 @@ def insts_from_linear(lin:UOp):
     # following STORE/SLOAD CSE cannot reuse a stale TMP_VADDR across spill-on-evict.
     if u.op is Ops.INS and _iop(u) in (AMDOps.SPILL, AMDOps.FILL): store_addr_cache.clear()
     emitted = _emit_uop(u, masked, with_store_cache=is_mem_addr_cse)
-    # VALU copy of an outstanding VMEM/LDS dest must wait first (PACK/MOV across pools).
+    # Copies must also wait before overwriting a dead-but-pending VMEM/LDS destination.
     if emitted and u.op is Ops.INS and _iop(u) in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV):
-      src = set().union(*(_reg_idxs(s) for s in u.src))
-      if src and _pending_src(src): flush_regs(src)
+      regs = set().union(_reg_idxs(u), *(_reg_idxs(s) for s in u.src))
+      if regs and _pending_src(regs): flush_regs(regs)
     # EXTRACT between C-stores often emits nothing (pack+lane alias); only clobber CSE on real emits.
     # Keep page CSE across CAST (uses TMP_VDATA, not TMP_VADDR) — cast-before-store otherwise
     # re-scales the C base for every half store (~100 extra V_LSHL_ADD).

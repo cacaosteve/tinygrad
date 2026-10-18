@@ -394,6 +394,25 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     out = flash_attention(q, assigned, 1).realize()
     np.testing.assert_allclose(out.numpy(), v.expand(1, 2, 1, 32).numpy(), rtol=2e-2, atol=2e-2)
 
+  def test_flash_decode_nonfinite_cache_tail(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("AMD hand attention required")
+    rng = np.random.default_rng(10518)
+    for dim in (32, 64, 128):
+      for valid in (1, 5, 33):
+        q = rng.normal(size=(1, 2, 1, dim)).astype(np.float16)
+        live = rng.normal(size=(2, 1, 1, valid, dim)).astype(np.float16)
+        k, v = (np.repeat(x.astype(np.float64), 2, axis=1) for x in live)
+        scores = q.astype(np.float64) @ k.swapaxes(-1, -2) / np.sqrt(dim)
+        probs = np.exp(scores - scores.max(-1, keepdims=True))
+        expected = (probs / probs.sum(-1, keepdims=True)) @ v
+        for tail in (np.nan, np.inf, -np.inf):
+          with self.subTest(dim=dim, valid=valid, tail=tail):
+            cache = np.full((2, 1, 1, 256, dim), tail, dtype=np.float16)
+            cache[:, :, :, :valid] = live
+            out = flash_attention(Tensor(q), Tensor(cache).realize(), valid).numpy()
+            self.assertTrue(np.isfinite(out).all())
+            np.testing.assert_allclose(out, expected, rtol=2e-3, atol=2e-3)
+
   def test_prefill_attention_multiple_tiles(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     q = Tensor.zeros(1, 4, 32, 128)
