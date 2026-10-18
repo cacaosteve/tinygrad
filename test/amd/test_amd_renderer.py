@@ -186,7 +186,9 @@ def _float3_add_program():
 def _float4_lds_program():
   with Context(BEAM=0):
     ast = (Tensor.empty(1, 64, device="AMD").contiguous() @ Tensor.empty(64, 64, device="AMD").contiguous()).schedule_linear().src[0].src[0]
-  return _to_prg(ast)
+  # A 64-lane group genuinely needs LDS; smaller groups now use a wave butterfly.
+  opts = (Opt(OptOps.SPLIT, 1, (64, AxisType.LOCAL)), Opt(OptOps.SPLIT, 0, (4, AxisType.UPCAST)))
+  return _to_prg(ast.replace(arg=replace(ast.arg, opts_to_apply=opts)))
 
 def _half_add_program():
   with Context(BEAM=0):
@@ -1027,12 +1029,27 @@ class TestAMDRenderer(unittest.TestCase):
         self.assertEqual(opts[-1].arg, (4 if square else 8, AxisType.UPCAST))
         self.assertTrue(any(o.arg[1] is AxisType.LOCAL for o in opts))
 
-  def test_group16_final_reduce_uses_wide_lds_loads(self):
+  def test_group16_final_reduce_uses_subwave_butterfly(self):
     with Context(DEV="MOCKKFD+AMD:AMD"):
       ast = Tensor.empty(10_000_000).sum().schedule_linear().src[0].src[0]
     names = _amd_inst_names(to_program(ast, _REN))
-    # Ship may scalarize the final LDS reduce (B32) when B128 packing does not fire.
-    self.assertGreaterEqual(names.count("DS_LOAD_B128") + names.count("DS_LOAD_B32"), 1)
+    self.assertEqual(names.count("DS_SWIZZLE_B32"), 4)
+    self.assertNotIn("DS_LOAD_B128", names)
+    self.assertNotIn("DS_LOAD_B32", names)
+
+  def test_row_reduce_uses_independent_eight_lane_butterflies(self):
+    with Context(BEAM=0):
+      ast = Tensor.empty(4096, 1024, device="AMD").square().sum(-1).schedule_linear().src[-1].src[0]
+    names = _amd_inst_names(to_program(ast, _REN))
+    self.assertEqual(names.count("DS_SWIZZLE_B32"), 12)
+    self.assertNotIn("S_BARRIER", names)
+    self.assertNotIn("DS_STORE_B128", names)
+
+  def test_subwave_reduce_rejects_noncontiguous_group(self):
+    lane, row = UOp.range(4, 0, AxisType.LOCAL), UOp.range(8, 1, AxisType.LOCAL)
+    data = UOp.placeholder((4, 8), dtypes.float32, 0)
+    reduced = data[lane, row].reduce(row, arg=(Ops.ADD, 0))
+    self.assertIsNone(amd_lib._warp_group_reduce((_REN, reduced.sink()), reduced))
 
   def test_group16_mixed_dot4_uses_wide_global_loads(self):
     with Context(BEAM=0, DEV="MOCKKFD+AMD:AMD"):
@@ -2936,6 +2953,16 @@ class TestAMDRenderer(unittest.TestCase):
         insts = _REN._insts_from_linear(_uop(Ops.LINEAR, src=(first, read, candidate)))
         self.assertEqual([i.op_name for i in insts], [name]*3)
 
+  def test_vopd_add_pair_rejects_transitive_dependency(self):
+    from tinygrad.renderer.isa.rdna3_vopd import try_vopd_add_pair
+    def value(reg): return _uop(Ops.INS, dtypes.float32, arg=AMDOps.MOV, tag=(Register(str(reg), 256+reg),))
+    scale, a, b = (value(reg) for reg in (8, 10, 11))
+    first = _uop(Ops.INS, dtypes.float32, (scale, a), AMDOps.ADD, (Register("first", 272),))
+    second = _uop(Ops.INS, dtypes.float32, (scale, b), AMDOps.ADD, (Register("second", 273),))
+    self.assertIsNotNone(try_vopd_add_pair(first, second))
+    indirect = b.replace(src=(first,))
+    self.assertIsNone(try_vopd_add_pair(first, second.replace(src=(scale, indirect))))
+
   def test_regalloc_rewrites_surviving_shrink(self):
     renderer = _REN
     src = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32).rtag(),), AMDOps.MOV,
@@ -3031,12 +3058,26 @@ class TestAMDRenderer(unittest.TestCase):
     inst_names = _amd_inst_names(_offset_u8_vector_load_program(4))
     self.assertEqual(inst_names.count("GLOBAL_LOAD_B128"), 1)
 
-  def test_sub_dword_u8_offset_stays_narrow_until_aligned(self):
-    inst_names = _amd_inst_names(_offset_u8_vector_load_program(1))
-    # Odd byte offset: keep sub-dword loads (u16 pairs), never promote to B128.
-    self.assertEqual(inst_names.count("GLOBAL_LOAD_U16"), 8)
-    self.assertNotIn("GLOBAL_LOAD_B128", inst_names)
-    self.assertNotIn("GLOBAL_LOAD_B32", inst_names)
+  def test_sub_dword_u8_offset_uses_b128(self):
+    for offset in (1, 2, 3):
+      with self.subTest(offset=offset):
+        inst_names = _amd_inst_names(_offset_u8_vector_load_program(offset))
+        self.assertEqual(inst_names.count("GLOBAL_LOAD_B128"), 1)
+        self.assertNotIn("GLOBAL_LOAD_U16", inst_names)
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires RDNA3 assembly runtime")
+  def test_hardware_unaligned_global_byte_vectors(self):
+    from tinygrad.device import Buffer
+    data = bytes((i*37+19)&255 for i in range(64))
+    inp = Buffer("AMD", 64, initial_value=data)
+    for offset in range(16):
+      with self.subTest(offset=offset):
+        prg = _offset_u8_vector_load_program(offset)
+        self.assertEqual(_amd_inst_names(prg).count("GLOBAL_LOAD_B128"), 1)
+        out = Buffer("AMD", 16, preallocate=True)
+        for _ in range(3):
+          _amd_rt(prg)(out, inp, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+          self.assertEqual(bytes(out.as_memoryview()), data[offset:offset+16])
 
   def test_uniform_packed_u8_uses_scalar_extracts(self):
     rows, cols = 16384, 2048
@@ -4766,6 +4807,22 @@ class TestAMDRenderer(unittest.TestCase):
   def test_hardware_group16_final_reduce(self):
     inp = Tensor.ones(1_000_000, device="AMD").contiguous().realize()
     self.assertEqual(inp.sum().item(), 1_000_000.0)
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_subwave_reduce_independent_rows(self):
+    for width in (2, 4, 8, 16, 32):
+      for groups in (1, 3, 4):
+        with self.subTest(width=width, groups=groups):
+          values = [((i*17)%101-50)*0.125 for i in range(2*groups*width)]
+          inp = Tensor(values, dtype=dtypes.float32, device="AMD").contiguous().realize()
+          out = Tensor.empty(2*groups, dtype=dtypes.float32, device="AMD").contiguous().realize()
+          dst, src = UOp.placeholder((2*groups,), dtypes.float32, 0), UOp.placeholder((2*groups, width), dtypes.float32, 1)
+          lane, row, block = UOp.range(width, 0, AxisType.LOCAL), UOp.range(groups, 1, AxisType.LOCAL), UOp.range(2, 0, AxisType.GLOBAL)
+          reduced = src[block*groups+row, lane].load().reduce(lane, arg=(Ops.ADD, 0))
+          prg = _to_prg(dst[block*groups+row].store(reduced).end(row, block).sink(arg=KernelInfo(opts_to_apply=())))
+          _amd_rt(prg)(*[x._buffer().ensure_allocated() for x in (out, inp)], global_size=prg.arg.global_size,
+                       local_size=prg.arg.local_size, vals=(), wait=True)
+          self.assertEqual(out.tolist(), [sum(values[i:i+width]) for i in range(0, len(values), width)])
 
   @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
   def test_hardware_group16_mixed_dot4(self):

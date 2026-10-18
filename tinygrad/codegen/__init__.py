@@ -358,7 +358,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
 
   # ISA renderers may lower narrowly supported group reductions to native wave operations.
   if (pm := getattr(ren, "pm_group_reduce", None)) is not None:
-    sink = graph_rewrite(sink, pm, name="native group reduce")
+    sink = graph_rewrite(sink, pm, ctx=(ren, sink), name="native group reduce")
 
   slots = itertools.count(max([u.arg.slot+1 for u in sink.toposort() if u.op in {Ops.BUFFER, Ops.ALLOC}], default=0))
 
