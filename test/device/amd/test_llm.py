@@ -719,4 +719,24 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
       with self.subTest(factor=factor), self.assertRaisesRegex(AssertionError, "validated"):
         _amd_flash_attention(o, q, kv, valid_kv_len=64, acc_small=True, k_unroll=factor)
 
+  def test_flash_graph_policy_is_explicit(self):
+    # Compiler partition settings must not silently change an already-cached kernel graph.
+    from unittest.mock import patch
+    import os
+    from tinygrad.helpers import getenv
+    args = (UOp.placeholder((32, 32, 128), dtypes.float32, 0), UOp.placeholder((32, 32, 128), dtypes.float16, 1),
+            UOp.placeholder((2, 1, 8, 64, 128), dtypes.float16, 2))
+    graphs = []
+    try:
+      for setting in ("0", "1"):
+        with patch.dict(os.environ, {"AMD_FLASH_ACC_SMALL": setting, "AMD_WMMA_ACC_SMALL": setting}), \
+             patch("tinygrad.llm.kernels.amd._reg_swizzle_slot", 64):
+          getenv.cache_clear()
+          _amd_flash_attention.cache_clear()
+          graphs.append(_amd_flash_attention(*args, valid_kv_len=64, acc_small=False))
+      self.assertIs(graphs[0], graphs[1])
+    finally:
+      getenv.cache_clear()
+      _amd_flash_attention.cache_clear()
+
 if __name__ == "__main__": unittest.main()

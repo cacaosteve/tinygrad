@@ -931,7 +931,7 @@ def _wmma_fragment(fragment:UOp, lane:UOp, rdna4:bool) -> UOp:
 
 @functools.cache
 def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None,
-                         acc_small:bool=False, k_unroll:int=0, acc_vgpr:bool=False, hoist_q:bool=False,
+                         acc_small:bool=False, k_unroll:int=0,
                          phase_dumps: tuple[tuple[str, UOp], ...]=()) -> UOp:
   """Hand flash-attn. Optional phase_dumps=(("qk", buf), ...) for diagnostics.
 
@@ -975,22 +975,16 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   Q_lds = UOp.placeholder((BLOCK_M, D + LDS_PAD), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)[:, :D]
   KV_lds = UOp.placeholder((BLOCK_N, D + LDS_PAD), dtypes.half, slot=1, addrspace=AddrSpace.LOCAL)[:, :D]
   # The accumulator can stay in promoted VGPRs or use the scratch-backed REG buffer.
-  if acc_vgpr:
-    acc = _reg((TM, TD), 19, 0)
-  else:
-    acc = _reg((TM, TD), 2, 0)
+  acc = _reg((TM, TD), 19 if acc_small else 2, 0)
   m_i, l_i = _reg((TM,), 3, -math.inf), _reg((TM,), 4, 0)
-  # AMD_FLASH_HOIST_Q: Q LDS (slot 0) is never overwritten by K/V/P — load once before
+  # Q LDS (slot 0) is never overwritten by K/V/P — load once before
   # the n_tile REDUCE instead of reloading every KV tile (~64× for S=2048).
-  _hoist_q = bool(hoist_q)
-  Q_hoisted = None
-  if _hoist_q:
+  if acc_small:
     Q_hoisted = Q_lds.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid].store(
       q.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid])
     Q_lds = Q_lds.after(UOp.barrier(Q_hoisted))
   n_tile = UOp.range((q_base + (block_m + 1) * BLOCK_M + BLOCK_N - 1) // BLOCK_N, 100, AxisType.LOOP)
-  if _hoist_q:
-    assert Q_hoisted is not None
+  if acc_small:
     # Unroll K global→LDS (HIP-like static gload count). Opt out: AMD_FLASH_UNROLL_KV=0.
     k_flat = k.reshape(physical_n * D)
     k_dst = KV_lds.after(n_tile).reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)
@@ -1038,7 +1032,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # ACC_SEP hardcoded: keep WMMA C in ACC; copy out to const-indexed soft before softmax.
   # Park one ACC pack per column (python-unrolled WMMA). Flash-only — AMD_WMMA_ACC_SMALL
   # also parks ≤64 quant tiles and breaks Q4/Q6; prefer AMD_FLASH_ACC_SMALL / acc_small arg.
-  _acc_small = bool(acc_small or getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 0))
+  _acc_small = acc_small
   S_view = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)
   Q_view = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)
   K_view = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)
@@ -1354,9 +1348,6 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # Build+realize under ACC_SMALL remat + ALLOW_UPCAST16=0 (must wrap custom_kernel).
   # Read SKIP_SLOTS only after compile_env re-applies prefill policy (decode leaves sticky "").
   with _flash_direct_compile_env(flash_acc_small=use_acc_small):
-    # Ship prefill: ACC_VGPR + HOIST_Q; SKIP clears slot 2 under ACC_VGPR.
-    use_acc_vgpr = bool(use_acc_small)  # ACC_VGPR hardcoded on with ACC_SMALL
-    use_hoist_q = bool(use_acc_small)  # HOIST_Q hardcoded on with ACC_SMALL
     if isinstance(T_real, UOp):
       # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
       T_pad = q.max_shape[2]
@@ -1365,8 +1356,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     B, H, T, D = q.shape
     out = Tensor.empty(B*H, T, D, dtype="float32", device=q.device)
     fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start,
-                            acc_small=use_acc_small, k_unroll=use_k_unroll,
-                            acc_vgpr=use_acc_vgpr, hoist_q=use_hoist_q)
+                            acc_small=use_acc_small, k_unroll=use_k_unroll)
     fxn = functools.partial(_flash_kernel, fxn)
     q_input = q.half().reshape(B*H, T, D)
     if isinstance(valid_end, UOp) or isinstance(q_start, UOp):
