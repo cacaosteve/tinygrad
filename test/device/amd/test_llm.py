@@ -153,6 +153,23 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
           np.testing.assert_array_equal(actual.astype(np.float16), ref.astype(np.float16))
           np.testing.assert_allclose(actual, ref, rtol=2e-7, atol=2**-36)
 
+  def test_wmma_preserves_nonzero_initial_accumulator(self):
+    from tinygrad.dtype import AddrSpace
+    from tinygrad.llm.kernels.amd import _quant_linear_f16_wmma_kernel
+    from tinygrad.uop import Ops
+    if not amd_custom_kernels_supported(device:=Tensor.empty(1).device) or _wmma_rdna4(device): self.skipTest("RDNA3 required")
+    # The resident-ACC optimization may replace only proven zero initializers.
+    def kernel(o, w, x):
+      graph = _quant_linear_f16_wmma_kernel(o, w, x, out_features=32, in_features=256, ggml_type=14, direct_isa=amd_direct_isa(device))
+      initial = [u for u in graph.toposort() if u.op is Ops.STORE and u.src[0].op is Ops.ALLOC and
+                 u.src[0].addrspace is AddrSpace.REG and u.src[1].vmin == u.src[1].vmax == 0]
+      self.assertTrue(initial)
+      return graph.substitute({u:u.replace(src=(u.src[0], u.src[1].const_like(1.0))) for u in initial})
+    out = Tensor.empty(128, 32, dtype=dtypes.float32)
+    raw, x = Tensor.zeros(32*105, dtype=dtypes.uint16).realize(), Tensor.zeros(128, 256, dtype=dtypes.half).realize()
+    result = Tensor.custom_kernel(out, raw, x, fxn=kernel)[0].numpy()
+    np.testing.assert_array_equal(result, np.ones((128, 32), dtype=np.float32))
+
   def test_mixed_quant_linear_split_k(self):
     for typ in (10, 11, 17, 18, 20, 21, 22):
       with self.subTest(ggml_type=typ):

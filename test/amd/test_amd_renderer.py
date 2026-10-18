@@ -2400,6 +2400,13 @@ class TestAMDRenderer(unittest.TestCase):
     w2 = _uop(Ops.INS, dtypes.float32, (p2,p2,p2), AMDOps.WMMA, p2.tag)
     self.assertIsNone(_single_wmma_fragment_base(packs[0], uops+[*p2.src, p2, w2]))
     self.assertIsNone(_single_wmma_fragment_base(packs[0], stores+[loop, stores[0]]+body))
+    wmma = body[9]
+    for lane in (0, 1):
+      ext = _uop(Ops.INS, dtypes.float32, (wmma, indices[lane]), AMDOps.EXTRACT, (Register("stored_lane", 250),))
+      store = _uop(Ops.INS, dtypes.void, (bufs[0], indices[0], ext), AMDOps.SSTORE)
+      self.assertEqual(_single_wmma_fragment_base(packs[0], uops+[store]) is bufs[0], lane == 0)
+    early_read = packs[0].src[0].replace(tag=(Register("early_read", 251),))
+    self.assertIsNone(_single_wmma_fragment_base(packs[0], stores+[loop, early_read]+body))
 
   def test_wmma_acc_small_buf_tiles_separate_buffers(self):
     # Flash ACC_SEP: S_reg (16) then pv_acc (32) both park ACC with dynamic SLOAD indices.

@@ -512,6 +512,9 @@ def _single_wmma_fragment_base(pack:UOp, uops:list[UOp]) -> UOp|None:
   owners = {u.src[0] for u in uops if u.op is Ops.INS and _iop(u) is AMDOps.WMMA and
             any(s.op is Ops.INS and _iop(s) is AMDOps.SLOAD and _reg_buffer_base(s.src[0]) is base for s in u.src[0].src)}
   if owners != {pack}: return None
+  last_wmma = max(i for i,u in enumerate(uops) if u.op is Ops.INS and _iop(u) is AMDOps.WMMA)
+  if any(i < last_wmma and u.op is Ops.INS and _iop(u) is AMDOps.SLOAD and
+         _reg_buffer_base(u.src[0]) is base and u not in pack.src for i,u in enumerate(uops)): return None
   loop = next((i for i,u in enumerate(uops) if u.op is Ops.RANGE), len(uops))
   initialized = set()
   for i,u in enumerate(uops):
@@ -521,7 +524,10 @@ def _single_wmma_fragment_base(pack:UOp, uops:list[UOp]) -> UOp|None:
     if i < loop and _is_zero_val(u.src[2]): initialized.add(key[1])
     else:
       val = u.src[2]
-      if val.op is Ops.INS and _iop(val) is AMDOps.EXTRACT: val = val.src[0]
+      if val.op is not Ops.INS or _iop(val) is not AMDOps.EXTRACT: return None
+      lane = _const_int(val.src[1])
+      if lane is None or not 0 <= lane < 8 or key[1] != _const_int(pack.src[lane].src[1]): return None
+      val = val.src[0]
       if val.op is not Ops.INS or _iop(val) is not AMDOps.WMMA: return None
       while val.op is Ops.INS and _iop(val) is AMDOps.WMMA: val = val.src[0]
       if val is not pack: return None
