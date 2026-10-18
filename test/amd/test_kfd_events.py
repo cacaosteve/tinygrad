@@ -58,7 +58,9 @@ class TestKFDEvents(unittest.TestCase):
                                       wait_for_all=0, timeout=timeout).wait_result
     x = Tensor([1, 2, 3, 4], device=dev.device).realize()
     run = TinyJit(lambda a:(a*3+1).realize())
-    for _ in range(3): out = run(x); dev.synchronize()
+    for _ in range(3):
+      out = run(x)
+      dev.synchronize()
     src = Buffer(dev.device, 64, initial_value=bytes(range(64)))
     dst = Buffer("CPU", 64, preallocate=True)
     copy = UOp(Ops.LINEAR, src=(UOp.from_buffer(dst, dtypes.uint8).store_call(UOp.from_buffer(src, dtypes.uint8)),))
