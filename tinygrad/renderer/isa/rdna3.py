@@ -3693,7 +3693,10 @@ class AMDRenderer(ISARenderer):
   def get_grouped_reduce_unroll(self, k) -> int|None:
     # GROUPTOP returns before the generic reduce-unroll heuristic. LLVM subsequently vectorizes simple inner
     # reduction loops, but direct ISA needs those adjacent iterations exposed while coalescing is still possible.
-    unroll, ast_uops = 8, k.ast.toposort()  # AMD_GROUPED_REDUCE_UNROLL hardcoded
+    # Bound the total expanded values, not only the loop factor: four output rows
+    # already consume a quarter of the expansion budget before the reduction unroll.
+    unroll = next((u for u in (8, 4, 2) if k.upcast_size()*u <= 16), 0)
+    ast_uops = k.ast.toposort()
     if not unroll or k.reduceop is None or k.reduceop.arg[0] not in (Ops.ADD, Ops.MAX) or \
        (k.reduceop.arg[0] is Ops.ADD and len(ast_uops) > 32) or \
        any(u.op is Ops.PARAM and u.dtype is dtypes.uint8 for u in ast_uops) or not k.upcastable_dims(reduce=True): return None
