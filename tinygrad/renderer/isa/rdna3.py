@@ -6,7 +6,7 @@ from tinygrad.dtype import dtypes, DType, AddrSpace
 from tinygrad.helpers import Target, getenv, prod, is_image_shape
 from tinygrad.renderer.isa import ISARenderer, IselContext, LinearContext, PreRegAllocContext, Register, greg
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.amd.dsl import Reg, v, NULL, EXEC, VCC, VCC_LO, Inst
+from tinygrad.renderer.amd.dsl import Reg, v, NULL, EXEC, VCC, VCC_LO, Inst, _needs_literal
 from tinygrad.runtime.autogen.amd.rdna3 import ins as r3
 from tinygrad.codegen.decomp.op import fast_idiv
 from tinygrad.renderer import tc
@@ -1419,6 +1419,9 @@ def _scalarize_uniform_where(m:UOp, a:UOp, b:UOp, x:UOp) -> UOp|None:
     m = m.replace(src=tuple(_bool_flag(s) if s.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) else s for s in m.src))
   if x.dtype not in dtypes.ints+(dtypes.bool,) or \
      not all(_is_uniform_expr(v) for v in (m, a, b)): return None
+  # SOP2 has one shared literal word, not a separate literal for each source.
+  if _needs_literal(av:=_const_value(a)) and _needs_literal(bv:=_const_value(b)) and av != bv:
+    a = UOp(Ops.INS, src=(a,), arg=(AMDOps.MOV, a.dtype))
   # Comparisons carry their result in an implicit flag, so also keep their operands as
   # direct dependencies. Otherwise regalloc may reuse an operand before SWHERE rematerializes it.
   return UOp(Ops.INS, src=(m, a, b, *m.src) if m.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) else (m, a, b),

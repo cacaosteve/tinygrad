@@ -327,7 +327,9 @@ class Inst:
     for name, field in self._fields:
       val = vals[name]
       if isinstance(field, SrcField) and val is not None and _needs_literal(val):
-        literal_val = _f32(val) if isinstance(val, float) else val & 0xFFFFFFFF
+        value = _f32(val) if isinstance(val, float) else val & 0xFFFFFFFF
+        if literal_val is not None and literal_val != value: raise ValueError("multiple distinct literals in one instruction")
+        literal_val = value
     if literal_val is not None and 'literal' in vals:
       vals['literal'] = literal_val
     # Set all field values

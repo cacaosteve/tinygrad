@@ -4,6 +4,18 @@ from tinygrad.renderer.amd.dsl import VDSTYField
 from tinygrad.runtime.autogen.amd.rdna3.enum import VOP1Op, VOP2Op
 from tinygrad.runtime.autogen.amd.rdna3.ins import VOP1
 
+class TestLiteralOperands(unittest.TestCase):
+  def test_distinct_literals_rejected(self):
+    from tinygrad.runtime.autogen.amd.rdna3 import ins as r3
+    for make in (lambda: r3.s_cselect_b32(s[0], 0xffffff00, 0xffffff01),
+                 lambda: r3.v_add_f32_e64(v[0], 1000.0, 1001.0)):
+      with self.assertRaisesRegex(ValueError, "multiple distinct literals"): make()
+
+  def test_shared_literal_bits_and_inline_constant(self):
+    from tinygrad.runtime.autogen.amd.rdna3 import ins as r3
+    self.assertEqual(r3.s_cselect_b32(s[0], -256, 0xffffff00).literal, 0xffffff00)
+    self.assertEqual(r3.s_cselect_b32(s[0], 1, 0xffffff00).literal, 0xffffff00)
+
 class TestRegisters(unittest.TestCase):
   def test_vgpr_single(self):
     self.assertEqual(repr(v[5]), "v[5]")
