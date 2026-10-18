@@ -35,12 +35,12 @@
       "subtests": 326
     },
     "hardware_full": {
-      "commit": "cf95684e7",
-      "passed": 1185,
+      "commit": "be4ce7d04",
+      "passed": 1190,
       "skipped": 72,
-      "subtests": 882,
-      "seconds": 528.58,
-      "note": "Serial gfx1100 scope includes renderer/DSL, physical scratch poisoning, KFD events, LLM, operations, dtype/ALU, attention, tensor cores, HCQ2, GGUF dequantization and complete IQ tables. The later VOPD deduplication preserves all 83 compiler-fixture binaries and has a separate compiler gate."
+      "subtests": 890,
+      "seconds": 500.73,
+      "note": "Serial gfx1100 scope includes renderer/DSL, physical scratch poisoning, KFD events and compute-first startup, LLM and weight rounding, operations, dtype/ALU, attention, tensor cores, HCQ2, GGUF dequantization, complete IQ tables and upstream sqrt edge cases. Process exits zero. This bounded suite passes but does not explain the separately reproduced long-model timeline regression."
     },
     "spec2_null_ci": {
       "commit": "be4ce7d04",
