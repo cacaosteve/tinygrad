@@ -9,7 +9,7 @@ from tinygrad.device import Device
 from tinygrad.dtype import AddrSpace, Invalid, dtypes
 from tinygrad.helpers import Context, Target, getenv
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import Q6_K, Q6_WORDS, _quant_decode_kernel
+from tinygrad.llm.kernels.amd import Q6_K, Q6_BYTES, _quant_decode_kernel
 from tinygrad.renderer.isa import IselContext, PreRegAllocContext, Register, greg
 from tinygrad.renderer.amd.dsl import s as scalar_regs
 from tinygrad.renderer.isa.rdna3 import _loop_label
@@ -1069,19 +1069,19 @@ class TestAMDRenderer(unittest.TestCase):
   def test_q6_decode_folds_all_zero_store_predicate(self):
     out_features, in_features, chunks = 64, 2048, 2
     out = UOp.placeholder((1, out_features, chunks), dtypes.float32, 0)
-    raw = UOp.placeholder((out_features * in_features // 256 * Q6_WORDS,), dtypes.uint32, 1)
+    raw = UOp.placeholder((out_features * in_features // 256 * (Q6_BYTES//2),), dtypes.uint16, 1)
     xq = UOp.placeholder((1, in_features // 32, 8), dtypes.uint32, 2)
     xd = UOp.placeholder((1, in_features // 32), dtypes.float32, 3)
     xs = UOp.placeholder((1, in_features // 32, 2), dtypes.float32, 4)
     prg = _to_prg(_quant_decode_kernel(out, raw, xq, xd, xs, out_features=out_features, in_features=in_features, ggml_type=Q6_K))
     names = _amd_inst_names(prg)
-    self.assertEqual(names.count("V_OR_B32_E32"), 3)
+    # Halfword storage needs additional unpack ORs; count the predicate compares, not data operations.
     self.assertEqual(names.count("V_CMP_NE_U32_E32"), 2)
 
   def test_q6_decode_clusters_weight_loads(self):
     out_features, in_features, chunks = 8192, 2048, 4
     out = UOp.placeholder((1, out_features, chunks), dtypes.float32, 0)
-    raw = UOp.placeholder((out_features * in_features // 256 * Q6_WORDS,), dtypes.uint32, 1)
+    raw = UOp.placeholder((out_features * in_features // 256 * (Q6_BYTES//2),), dtypes.uint16, 1)
     xq = UOp.placeholder((1, in_features // 32, 8), dtypes.uint32, 2)
     xd = UOp.placeholder((1, in_features // 32), dtypes.float32, 3)
     xs = UOp.placeholder((1, in_features // 32, 2), dtypes.float32, 4)
@@ -1094,7 +1094,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_q6_decode_hoists_and_fuses_kernargs(self):
     out_features, in_features, chunks = 8192, 2048, 4
     out = UOp.placeholder((1, out_features, chunks), dtypes.float32, 0)
-    raw = UOp.placeholder((out_features * in_features // 256 * Q6_WORDS,), dtypes.uint32, 1)
+    raw = UOp.placeholder((out_features * in_features // 256 * (Q6_BYTES//2),), dtypes.uint16, 1)
     xq = UOp.placeholder((1, in_features // 32, 8), dtypes.uint32, 2)
     xd = UOp.placeholder((1, in_features // 32), dtypes.float32, 3)
     xs = UOp.placeholder((1, in_features // 32, 2), dtypes.float32, 4)
@@ -1121,40 +1121,16 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertIn(Opt(OptOps.SPLIT, 0, (3, AxisType.UPCAST)), prg.src[0].arg.applied_opts)
     self.assertEqual(_amd_inst_names(prg).count("GLOBAL_LOAD_B96"), 1)
 
-  def test_q6_wmma_uses_wide_quant_loads(self):
-    from tinygrad.llm.kernels.amd import _q6_linear_f16_wmma_kernel
-    rows, cols, tokens = 8192, 2048, 16
+  def test_q6_large_prefill_keeps_existing_layout(self):
+    from tinygrad.llm.kernels.amd import _quant_linear_f16_wmma_kernel
+    rows, cols, tokens = 4096, 4096, 1024
     out = UOp.placeholder((tokens, rows), dtypes.float32, 0)
-    raw = UOp.placeholder((rows*cols//256*53,), dtypes.uint32, 1)
+    raw = UOp.placeholder((rows*cols//256*(Q6_BYTES//2),), dtypes.uint16, 1)
     x = UOp.placeholder((tokens, cols), dtypes.float16, 2)
-    prg = _to_prg(_q6_linear_f16_wmma_kernel(out, raw, x, rows, cols, direct_isa=True))
+    prg = _to_prg(_quant_linear_f16_wmma_kernel(out, raw, x, out_features=rows, in_features=cols, ggml_type=Q6_K, direct_isa=True))
     names = _amd_inst_names(prg)
-    # Four packed quant loads plus four activation loads; only scale and d remain scalar.
-    self.assertEqual(names.count("GLOBAL_LOAD_B128"), 8)
-    self.assertEqual(names.count("GLOBAL_LOAD_B32"), 2)
-    self.assertEqual(names.count("V_FMA_MIXHI_F16"), 16)
-    self.assertNotIn("V_PACK_B32_F16", names)
-    # Scratch under ACC soft-partition is acceptable for this shape.
-    _ = names.count("SCRATCH_STORE_B32")
-
-  def test_q6_wmma_prefetches_a_before_dequant_mix(self):
-    from tinygrad.llm.kernels.amd import _q6_linear_f16_wmma_kernel
-    rows, cols, tokens = 8192, 2048, 32
-    out = UOp.placeholder((tokens, rows), dtypes.float32, 0)
-    raw = UOp.placeholder((rows*cols//256*53,), dtypes.uint32, 1)
-    x = UOp.placeholder((tokens, cols), dtypes.float16, 2)
-    prg = _to_prg(_q6_linear_f16_wmma_kernel(out, raw, x, rows, cols, direct_isa=True))
-    names = _amd_inst_names(prg)
-    wide = [i for i,name in enumerate(names) if name == "GLOBAL_LOAD_B128"]
-    # Packed weights first, then activation B128s before unpack/mix (overlap weight wait).
-    self.assertGreaterEqual(len(wide), 12)
-    self.assertLess(wide[-1], names.index("V_FMA_MIXLO_F16"))
-    self.assertLess(wide[-1], names.index("V_CVT_F32_UBYTE0_E32"))
-    # A burst should start before the post-weight vmcnt drain's consumer movs finish —
-    # at least before ubyte unpack, with the first A tile among the early B128s.
-    self.assertLess(wide[4], names.index("V_CVT_F32_UBYTE0_E32"))
-    # Scratch may appear under ACC soft-partition; prefer no spill but do not gate ship on it.
-    _ = names.count("SCRATCH_STORE_B32")
+    self.assertIn("V_WMMA_F32_16X16X16_F16", names)
+    self.assertNotIn("V_FMA_MIXHI_F16", names)
 
   def test_q6_halfword_wmma_uses_mixed_dequant(self):
     from tinygrad.llm.kernels.amd import _quant_linear_f16_wmma_kernel

@@ -23,8 +23,7 @@ def flash_tile_dims(D:int=128) -> tuple[int, int, int]:
 GGML_BLOCK_SIZE, Q8_GROUP_SIZE = 256, 32
 Q2_K, Q3_K, Q4_K, Q5_K, Q6_K = 10, 11, 12, 13, 14
 IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS = 17, 18, 20, 21, 22, 23
-# Legacy padded Q6 word count kept for unused DIRECT Q6-WMMA helpers; decode uses Q6_BYTES u16 views.
-Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS, Q6_WORDS = 36, 44, 210, 34, 53
+Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS = 36, 44, 210, 34
 QUANT_SIZES = {Q2_K: 84, Q3_K: 110, Q4_K: 144, Q5_K: 176, Q6_K: 210, IQ2_XS: 74,
                IQ3_XXS: 98, IQ4_NL: 144, IQ3_S: 110, IQ2_S: 82, IQ4_XS: 136}  # bytes per 256 weights
 HALFWORD_QUANTS = (Q6_K, Q2_K, Q3_K, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S)
@@ -497,53 +496,9 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
                             layout, dequant, f"linear_q{4 if ggml_type == Q4_K else 5}_k_f16_wmma",
                             swizzle_stores=direct_isa, rdna4=rdna4)
 
-def _q6_scale_raw(raw:UOp, base:UOp, idx:UOp) -> UOp:
-  return ((raw[base+48+idx//4] >> ((idx%4)*8).cast(dtypes.uint32)) & 255).cast(dtypes.uint8).bitcast(dtypes.int8).float()
-
-def _q6_packed_word(low:UOp, high:UOp, lo_shift:UOp, hi_shift:UOp) -> UOp:
-  # Match pre-isel LSHL_OR: OR(AND(low, mask), SHL(AND(high, mask2), 4))
-  lo = (low >> lo_shift) & 0x0f0f0f0f
-  hi = ((high >> hi_shift) & 0x03030303) << 4
-  return lo | hi
-
 def _q6_byte_f32(word:UOp, byte:int) -> UOp:
   # Pre-isel folds CAST(AND(SHR(word, shift), 255)) → V_CVT_F32_UBYTEn
   return ((word >> UOp.const(byte*8, dtypes.uint32)) & 255).cast(dtypes.float32)
-
-def _q6_wmma_words(ql4:UOp, qh4:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
-  # All four words in a half share lo/hi shifts (within steps by 4 do not cross 64/32 boundaries).
-  within0 = (subgroup*32 + half*16) % 128
-  lo_shift, hi_shift = (within0//64)*4, (within0//32)*2
-  lo_s, hi_s = lo_shift.cast(dtypes.uint32), hi_shift.cast(dtypes.uint32)
-  return tuple(_q6_packed_word(ql4[i], qh4[i], lo_s, hi_s) for i in range(4))
-
-def _q6_wmma_frags(words:tuple[UOp, ...], scale:UOp, d:UOp, direct_isa:bool) -> tuple[UOp, ...]:
-  if direct_isa:
-    scaled, bias = scale*d, scale*d*-32
-    return tuple(_amd_fma_to_f16(_q6_byte_f32(word, byte), scaled, bias) for word in words for byte in range(4))
-  return tuple((((word >> (byte*8) & 255).float()-32)*scale*d).cast(dtypes.float16) for word in words for byte in range(4))
-
-@functools.cache
-def _q6_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, direct_isa:bool=False, rdna4:bool=False) -> UOp:
-  token_tile = 32 if out.shape[0] % 32 == 0 else 16
-  def dequant(base:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
-    scale_idx = subgroup*2 + half
-    scale = ((raw[base+48+scale_idx//4] >> ((scale_idx%4)*8).cast(dtypes.uint32)) & 255).cast(dtypes.uint8).bitcast(dtypes.int8).float()
-    d = _half(raw[base+52] & 0xffff)
-    ql = _amd_load(raw[base+(subgroup//4)*16+(subgroup%2)*8+half*4], 4, packed_u32=direct_isa)
-    qh = _amd_load(raw[base+32+(subgroup//4)*8+half*4], 4, packed_u32=direct_isa)
-    return _q6_wmma_frags(_q6_wmma_words(ql, qh, subgroup, half), scale, d, direct_isa)
-  def dequant_halves(base:UOp, subgroup:UOp) -> tuple[tuple[UOp, ...], tuple[UOp, ...]]:
-    d = _half(raw[base+52] & 0xffff)
-    scale0, scale1 = _q6_scale_raw(raw, base, subgroup*2), _q6_scale_raw(raw, base, subgroup*2+1)
-    ql_off, qh_off = (subgroup//4)*16 + (subgroup%2)*8, 32 + (subgroup//4)*8
-    ql0, ql1 = _amd_load(raw[base+ql_off], 4, packed_u32=True), _amd_load(raw[base+ql_off+4], 4, packed_u32=True)
-    qh0, qh1 = _amd_load(raw[base+qh_off], 4, packed_u32=True), _amd_load(raw[base+qh_off+4], 4, packed_u32=True)
-    return (_q6_wmma_frags(_q6_wmma_words(ql0, qh0, subgroup, 0), scale0, d, True),
-            _q6_wmma_frags(_q6_wmma_words(ql1, qh1, subgroup, 1), scale1, d, True))
-  return _quant_linear_wmma(out, x, out_features, in_features, Q6_WORDS, _wmma_layout(out, out_features, token_tile, 1),
-                            dequant, "linear_q6_k_f16_wmma", swizzle_stores=direct_isa,
-                            dequant_halves=dequant_halves if direct_isa else None, rdna4=rdna4)
 
 @functools.cache
 def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int,
