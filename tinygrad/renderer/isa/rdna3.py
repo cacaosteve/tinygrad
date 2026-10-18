@@ -3807,8 +3807,12 @@ class AMDRenderer(ISARenderer):
     # inits for two-address accumulate across K (TC_LDS_AB). Unrelated LLOAD elsewhere
     # must not suppress the UNROLL sink.
     if (loop_i := next((i for i,u in enumerate(lst) if u.op is Ops.RANGE), None)) is not None:
-      zero_acc = {u.src[0] for u in lst if u.op is Ops.INS and _iop(u) is AMDOps.WMMA and
-                  _is_wmma_acc_reload_pack(u.src[0]) and not _wmma_ab_from_lds(u)}
+      loop_end = next((i for i,u in enumerate(lst) if u.op is Ops.END and lst[loop_i] in u.src[1:]), len(lst))
+      zero_acc = {u.src[0] for u in lst[loop_i+1:loop_end] if u.op is Ops.INS and _iop(u) is AMDOps.WMMA and
+                  _is_wmma_acc_reload_pack(u.src[0]) and not _wmma_ab_from_lds(u) and
+                  all(s.op is Ops.INS and _iop(s) is AMDOps.MOV for s in u.src[0].src)}
+      # A later unrelated reduction must not pull a prelude WMMA's zero after its use.
+      zero_acc -= {s for u in lst[:loop_i]+lst[loop_end:] for s in u.src}
       move_i = [i for i,u in enumerate(lst) if i < loop_i and u in zero_acc]
       if move_i:
         packs = [lst[i] for i in move_i]

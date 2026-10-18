@@ -1703,6 +1703,22 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(amd_lib._reg_slots(wmmas[0].src[2]), 8)
     self.assertEqual(greg(wmmas[0]), greg(wmmas[0].src[0]))
 
+  def test_wmma_zero_pack_only_sinks_into_its_own_loop(self):
+    zero = _uop(Ops.INS, dtypes.float32, (UOp.const(0.0, dtypes.float32),), AMDOps.MOV, (Register("zero", 1),))
+    pack = _uop(Ops.INS, dtypes.float32, (zero,)*8, AMDOps.PACK, (Register("acc", 2),))
+    ab = _uop(Ops.INS, dtypes.half, (UOp.const(0, dtypes.uint32),), AMDOps.PACK_F16, (Register("ab", 3),))
+    wmma = _uop(Ops.INS, dtypes.float32, (pack, ab, ab), AMDOps.WMMA, (Register("wmma", 4),))
+    loop = UOp.range(4, 0, AxisType.LOOP)
+    end = UOp(Ops.END, src=(loop, loop))
+    for position in ("before", "inside", "after", "shared"):
+      with self.subTest(position=position):
+        lst = [zero, pack, ab]+([wmma] if position in ("before", "shared") else [])+[loop]
+        if position in ("inside", "shared"): lst.append(wmma)
+        lst += [end]+([wmma] if position == "after" else [])
+        result, _ = _REN.prepare_pre_regalloc(lst)
+        self.assertEqual(result.index(pack) > result.index(loop), position == "inside")
+        self.assertLess(result.index(pack), result.index(wmma))
+
   def _half_matmul_tc_lds_ab_pre_regalloc(self, *, tc_local: int | None = None):
     # LOOP-ended LDS fill + contract. B transpose: scatter LSTORE may outnumber LLOAD ops.
     # Assert on isel+pre_regalloc only — full wide regalloc for N=256 OOMs/times out CI workers.
