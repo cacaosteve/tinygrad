@@ -421,6 +421,10 @@ class AMDComputeQueue(HWQueue):
     with self.pred_exec(xcc_mask=0b1):
       self.release_mem(signal.getaddr(self.devs), value, self.pm4.data_sel__mec_release_mem__send_32_bit_low,
                        self.pm4.int_sel__mec_release_mem__send_interrupt_after_write_confirm, cache_flush=True)
+      if isinstance(self.dev.iface, KFDIface) and signal.buf_uop.tag == "timeline" and signal.device == self.devs[0]:
+        mailbox, event_id = self.dev.iface.queue_event
+        self.release_mem(mailbox.getaddr(self.devs), event_id, self.pm4.data_sel__mec_release_mem__send_32_bit_low,
+                         self.pm4.int_sel__mec_release_mem__send_interrupt_after_write_confirm, ctxid=event_id)
 
   def submit(self, cmdbuf:UOp) -> UOp: # the ring gets an indirect buffer packet: 4 dwords, put stays aligned so it never wraps mid packet
     base, off = unwrap_view(cmdbuf)
@@ -497,6 +501,9 @@ class AMDSDMAQueue(HWQueue):
   def signal(self, signal:UOp, value:UOp):
     op = self.sdma.SDMA_OP_FENCE | (self.sdma.SDMA_PKT_FENCE_HEADER_MTYPE(3) if self.target[0] != 9 else 0)
     self.q(op, signal.getaddr(self.devs), value.cast(dtypes.uint32), self.sdma.SDMA_OP_TRAP, 0)
+    if isinstance(self.dev.iface, KFDIface) and signal.buf_uop.tag == "timeline" and signal.device == self.devs[0]:
+      mailbox, event_id = self.dev.iface.queue_event
+      self.q(op, mailbox.getaddr(self.devs), event_id, self.sdma.SDMA_OP_TRAP, self.sdma.SDMA_PKT_TRAP_INT_CONTEXT_INT_CONTEXT(event_id))
 
   def submit(self, cmdbuf:UOp) -> UOp: return amd_sdma_submit(cmdbuf, *_queue_args(self, unwrap(self.dev.sdma_queue(int(self.queue.split(":")[1])))))
 
@@ -641,17 +648,21 @@ class KFDIface:
     stm = kfd.AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU(self.kfd, handle=handle, device_ids_array_ptr=ctypes.addressof(gpus), n_devices=1)
     assert stm.n_success == 1
 
+  @functools.cached_property
+  def queue_event(self) -> tuple[UOp, int]:
+    if not hasattr(KFDIface, 'event_page'):
+      KFDIface.event_page = Buffer(self.dev.device, 0x8000, options=BufferSpec(uncached=True), preallocate=True)
+      kfd.AMDKFD_IOC_CREATE_EVENT(KFDIface.kfd, event_page_offset=KFDIface.event_page.meta.handle)
+
+    KFDIface.event_page.get_buf(self.dev.device)
+    events = [kfd.AMDKFD_IOC_CREATE_EVENT(KFDIface.kfd, event_type=t, auto_reset=int(t == kfd.KFD_IOC_EVENT_SIGNAL))
+              for t in (kfd.KFD_IOC_EVENT_SIGNAL, kfd.KFD_IOC_EVENT_MEMORY, kfd.KFD_IOC_EVENT_HW_EXCEPTION)]
+    self.queue_event_arr = (kfd.struct_kfd_event_data * 3)(*[kfd.struct_kfd_event_data(event_id=e.event_id) for e in events])
+    return UOp.from_buffer(KFDIface.event_page, dtypes.uint64).index(events[0].event_slot_index), events[0].event_id
+
   def create_queue(self, queue_type, ring, gart, rptr, wptr, eop_buffer=None, cwsr_buffer=None, ctl_stack_size=0, ctx_save_restore_size=0,
                    xcc_id=0, idx=0):
-    if not hasattr(self, 'queue_event_arr'):
-      if not hasattr(KFDIface, 'event_page'):
-        KFDIface.event_page = Buffer(self.dev.device, 0x8000, options=BufferSpec(uncached=True), preallocate=True)
-        kfd.AMDKFD_IOC_CREATE_EVENT(KFDIface.kfd, event_page_offset=KFDIface.event_page.meta.handle)
-
-      KFDIface.event_page.get_buf(self.dev.device)
-      self.queue_event_arr = (kfd.struct_kfd_event_data * 3)(*[kfd.struct_kfd_event_data(event_id=kfd.AMDKFD_IOC_CREATE_EVENT(
-        KFDIface.kfd, event_type=t, auto_reset=int(t == kfd.KFD_IOC_EVENT_SIGNAL)).event_id)
-        for t in (kfd.KFD_IOC_EVENT_SIGNAL, kfd.KFD_IOC_EVENT_MEMORY, kfd.KFD_IOC_EVENT_HW_EXCEPTION)])
+    _ = self.queue_event # initialize completion and fault events before the queue can run
 
     queue = kfd.AMDKFD_IOC_CREATE_QUEUE(KFDIface.kfd, ring_base_address=ring._buf, ring_size=ring.nbytes, gpu_id=self.gpu_id,
       queue_type=queue_type, queue_percentage=kfd.KFD_MAX_QUEUE_PERCENTAGE|(xcc_id<<8), queue_priority=getenv("AMD_KFD_QUEUE_PRIORITY", 7),
