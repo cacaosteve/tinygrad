@@ -3857,7 +3857,7 @@ class AMDRenderer(ISARenderer):
   pm_group_reduce = pm_warp_group_reduce
   pm_stage_wmma_ab = pm_stage_wmma_ab
   extra_expander = pm_expand_wmma_lds
-  _code_ops = (Ops.ADD, Ops.SUB, Ops.MUL, Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.TRUNC, Ops.SIN, Ops.MAX,
+  _code_ops = (Ops.ADD, Ops.SUB, Ops.MUL, Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.TRUNC, Ops.MAX,
                Ops.SHL, Ops.SHR, Ops.AND, Ops.OR, Ops.XOR, Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ)
   code_for_op = {op: (lambda: None) for op in _code_ops}
 

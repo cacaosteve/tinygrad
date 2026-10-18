@@ -3454,10 +3454,10 @@ class TestAMDRenderer(unittest.TestCase):
     prg = _float16_unary_program()
     _check_elf(self, prg)
     linear_ops = _lin_ops(prg)
-    for op in (AMDOps.CAST, AMDOps.SQRT, AMDOps.LOG2, AMDOps.TRUNC, AMDOps.RECIPROCAL, AMDOps.SIN):
+    for op in (AMDOps.CAST, AMDOps.SQRT, AMDOps.LOG2, AMDOps.TRUNC, AMDOps.RECIPROCAL):
       self.assertIn(op, linear_ops)
     inst_names = _amd_inst_names(prg)
-    for name in ("V_CVT_F32_F16_E32", "V_CVT_F16_F32_E32", "V_SIN_F32_E32"):
+    for name in ("V_CVT_F32_F16_E32", "V_CVT_F16_F32_E32"):
       self.assertIn(name, inst_names)
 
   def test_half_cast_encoding_preserves_high_vgprs(self):
@@ -3726,30 +3726,21 @@ class TestAMDRenderer(unittest.TestCase):
     for name in ("V_SQRT_F32_E32", "V_LOG_F32_E32", "V_TRUNC_F32_E32"):
       self.assertIn(name, inst_names)
 
-  def test_sin_assembles_with_inline_cody_waite_reduction(self):
+  def test_sin_uses_shared_full_range_decomposition(self):
     prg = _sin_program()
     _check_elf(self, prg)
-    linear_ops = _lin_ops(prg)
-    self.assertIn(AMDOps.SIN, linear_ops)
-    insts = list(_REN._insts_from_linear(_prg_lin(prg)))
-    reduce_insts = [i for i in insts if getattr(i, "op_name", "") in
-                    ("V_MUL_F32_E32", "V_ADD_F32_E32", "V_FRACT_F32_E32", "V_SUB_F32_E32", "V_SIN_F32_E32")]
-    self.assertEqual([getattr(i, "op_name", "") for i in reduce_insts],
-                     ["V_MUL_F32_E32", "V_ADD_F32_E32", "V_FRACT_F32_E32", "V_SUB_F32_E32", "V_MUL_F32_E32",
-                      "V_SUB_F32_E32", "V_MUL_F32_E32", "V_SUB_F32_E32", "V_MUL_F32_E32", "V_SIN_F32_E32"])
-    scale, bias, _, floor_turns, hi_mul, hi_sub, lo_mul, lo_sub, final_scale, sin = reduce_insts
-    self.assertEqual(scale.vdst, amd_lib.TMP_VDATA)
-    self.assertEqual(bias.vdst, amd_lib.TMP_VDATA)
-    self.assertEqual(floor_turns.vdst, amd_lib.TMP_VDATA)
-    self.assertEqual(hi_sub.vdst, amd_lib.TMP_VADDR)
-    self.assertEqual(lo_sub.vdst, amd_lib.TMP_VADDR)
-    self.assertEqual(final_scale.vdst, amd_lib.TMP_VDATA)
-    self.assertEqual(sin.src0, amd_lib.TMP_VDATA)
-    self.assertAlmostEqual(struct.unpack("f", struct.pack("I", scale.literal))[0], 1.0 / (2.0 * math.pi))
-    self.assertAlmostEqual(struct.unpack("f", struct.pack("I", final_scale.literal))[0], 1.0 / (2.0 * math.pi))
-    self.assertEqual(str(bias.src0), "0.5")
-    self.assertAlmostEqual(struct.unpack("f", struct.pack("I", hi_mul.literal))[0], 6.28125)
-    self.assertAlmostEqual(struct.unpack("f", struct.pack("I", lo_mul.literal))[0], 0.0019353071795864769)
+    self.assertNotIn(Ops.SIN, _REN.code_for_op)
+    self.assertNotIn(AMDOps.SIN, _lin_ops(prg))
+    self.assertNotIn("V_SIN_F32_E32", _amd_inst_names(prg))
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires DEV=AMD:AMD or DEV=MOCKKFD+AMD:AMD on gfx11")
+  def test_hardware_sin_full_float32_range(self):
+    import numpy as np
+    bits = np.random.default_rng(1701).integers(0, 0xffffffff, 1024, dtype=np.uint32)
+    values = bits.view(np.float32)
+    values = np.concatenate([values[np.isfinite(values)], np.array([1e6, -1e12, 1e20, -1e32, np.inf, -np.inf, np.nan], np.float32)])
+    with np.errstate(invalid="ignore"): expected = np.sin(values)
+    np.testing.assert_allclose(Tensor(values, device="AMD").sin().numpy(), expected, atol=1e-6, rtol=1e-5, equal_nan=True)
 
   def test_uint32_wrap_literal_assembles(self):
     prg = _uint_wrap_program()
