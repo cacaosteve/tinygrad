@@ -39,7 +39,7 @@ _FMAC_DELAY_N = [0]
 _F32_UNARY = {AMDOps.RECIPROCAL: r3.v_rcp_f32_e32, AMDOps.EXP2: r3.v_exp_f32_e32, AMDOps.LOG2: r3.v_log_f32_e32,
               AMDOps.SQRT: r3.v_sqrt_f32_e32, AMDOps.TRUNC: r3.v_trunc_f32_e32}
 _ISEL_UNARY = {Ops.RECIPROCAL: AMDOps.RECIPROCAL, Ops.EXP2: AMDOps.EXP2, Ops.LOG2: AMDOps.LOG2, Ops.SQRT: AMDOps.SQRT,
-               Ops.TRUNC: AMDOps.TRUNC, Ops.SIN: AMDOps.SIN}
+               Ops.TRUNC: AMDOps.TRUNC}
 
 def _mem_itemsize(dt:DType) -> int: return dt.itemsize
 
@@ -1522,7 +1522,7 @@ pre_isel_matcher = PatternMatcher([
    name="x"), _lshl_add),
   (UPat(Ops.CUSTOMI, name="x"), _nontemporal_load),
   (UPat(Ops.INDEX, name="addr").load(UPat.var("alt"), UPat.var("gate", dtype=dtypes.bool), name="x"), _gated_load),
-  (UPat((Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.TRUNC, Ops.SIN), dtype=dtypes.float16, src=(UPat.var("d"),), name="x"),
+  (UPat((Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.TRUNC), dtype=dtypes.float16, src=(UPat.var("d"),), name="x"),
    _promote_f16_unary),
   (UPat(Ops.CDIV, src=(UPat.var("x", dtypes.ints), UPat.cvar().cast(name="c"))), _const_cdiv),
   (UPat(Ops.CMOD, src=(UPat.var("x", dtypes.ints), UPat.cvar().cast(name="c"))), _pow2_cmod),
@@ -2137,20 +2137,6 @@ def insts_for_uop(u:UOp, skip:set[UOp]|None=None, masked:bool=False, store_addr_
       if u.dtype is not dtypes.float32: raise CompileError(f"f32 {_iop(u).name} only, got {u.dtype}")
       pre, val = _vgpr_data(TMP_VDATA, u.src[0])
       return pre + [_F32_UNARY[_iop(u)](_dst(u), val)]
-    case AMDOps.SIN:
-      if u.dtype is not dtypes.float32: raise CompileError(f"f32 sin only, got {u.dtype}")
-      val = _src(u.src[0])
-      pre = [] if isinstance(val, Reg) and val == TMP_VADDR else [r3.v_mov_b32_e32(TMP_VADDR, val)]
-      return pre + [r3.v_mul_f32_e32(TMP_VDATA, 0.15915494309189535, TMP_VADDR),
-                    r3.v_add_f32_e32(TMP_VDATA, 0.5, TMP_VDATA),
-                    r3.v_fract_f32_e32(_dst(u), TMP_VDATA),
-                    r3.v_sub_f32_e32(TMP_VDATA, TMP_VDATA, _dst(u)),
-                    r3.v_mul_f32_e32(_dst(u), 6.28125, TMP_VDATA),
-                    r3.v_sub_f32_e32(TMP_VADDR, TMP_VADDR, _dst(u)),
-                    r3.v_mul_f32_e32(_dst(u), 0.0019353071795864769, TMP_VDATA),
-                    r3.v_sub_f32_e32(TMP_VADDR, TMP_VADDR, _dst(u)),
-                    r3.v_mul_f32_e32(TMP_VDATA, 0.15915494309189535, TMP_VADDR),
-                    r3.v_sin_f32_e32(_dst(u), TMP_VDATA)]
     case AMDOps.MAX:
       return _max(u)
     case AMDOps.SHL:
