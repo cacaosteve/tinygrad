@@ -2984,12 +2984,26 @@ class TestAMDRenderer(unittest.TestCase):
     inst_names = _amd_inst_names(_offset_u8_vector_load_program(4))
     self.assertEqual(inst_names.count("GLOBAL_LOAD_B128"), 1)
 
-  def test_sub_dword_u8_offset_stays_narrow_until_aligned(self):
-    inst_names = _amd_inst_names(_offset_u8_vector_load_program(1))
-    # Odd byte offset: keep sub-dword loads (u16 pairs), never promote to B128.
-    self.assertEqual(inst_names.count("GLOBAL_LOAD_U16"), 8)
-    self.assertNotIn("GLOBAL_LOAD_B128", inst_names)
-    self.assertNotIn("GLOBAL_LOAD_B32", inst_names)
+  def test_sub_dword_u8_offset_uses_b128(self):
+    for offset in (1, 2, 3):
+      with self.subTest(offset=offset):
+        inst_names = _amd_inst_names(_offset_u8_vector_load_program(offset))
+        self.assertEqual(inst_names.count("GLOBAL_LOAD_B128"), 1)
+        self.assertNotIn("GLOBAL_LOAD_U16", inst_names)
+
+  @unittest.skipUnless(_has_amd_asm_runtime(), "requires RDNA3 assembly runtime")
+  def test_hardware_unaligned_global_byte_vectors(self):
+    from tinygrad.device import Buffer
+    data = bytes((i*37+19)&255 for i in range(64))
+    inp = Buffer("AMD", 64, initial_value=data)
+    for offset in range(16):
+      with self.subTest(offset=offset):
+        prg = _offset_u8_vector_load_program(offset)
+        self.assertEqual(_amd_inst_names(prg).count("GLOBAL_LOAD_B128"), 1)
+        out = Buffer("AMD", 16, preallocate=True)
+        for _ in range(3):
+          _amd_rt(prg)(out, inp, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
+          self.assertEqual(bytes(out.as_memoryview()), data[offset:offset+16])
 
   def test_uniform_packed_u8_uses_scalar_extracts(self):
     rows, cols = 16384, 2048
