@@ -383,7 +383,6 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
 
   # do memory coalescing (late)
   sink = memory_coalescing(sink, ren)
-  if (merge:=getattr(ren, 'merge_memory_loads', None)) is not None: sink = merge(sink)
   sink = graph_rewrite(sink, symbolic_simple+ew_devectorizer+pm_simplify_add_image,
                        name="add images", ctx=({}, ren), bottom_up=True)
 
