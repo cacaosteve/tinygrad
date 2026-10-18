@@ -153,7 +153,7 @@ class TestGGUF(unittest.TestCase):
         offset = size-2 if typ == GGMLQuantizationType.Q6_K else 0
         packed[:, offset:offset+2] = np.array([1.0], dtype=np.float16).view(np.uint8)
         expected = dequantize(packed, typ).reshape(-1)
-        actual = ggml_data_to_tensor(Tensor(packed.flatten()), 256*count, typ.value).numpy()
+        actual = ggml_data_to_tensor(Tensor(packed.flatten()), 256*count, typ.value).reshape(-1).numpy()
         np.testing.assert_array_equal(actual, expected)
   def test_dequantization_iq2_xxs(self): self._test_dequantization(GGMLQuantizationType.IQ2_XXS)
   def test_dequantization_iq2_xs(self): self._test_dequantization(GGMLQuantizationType.IQ2_XS)
