@@ -1,4 +1,4 @@
-import contextlib, ctypes, subprocess, sys, unittest
+import contextlib, ctypes, struct, subprocess, sys, unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from tinygrad import Device, Tensor, TinyJit, UOp, dtypes
@@ -6,10 +6,36 @@ from tinygrad.device import Buffer
 from tinygrad.engine.realize import run_linear
 from tinygrad.uop import Ops
 from tinygrad.runtime.autogen import kfd
+from tinygrad.runtime.autogen.am import pm4_nv
 from tinygrad.runtime.ops_amd import AMDAllocator, AMDComputeQueue, AMDSDMAQueue, KFDIface
 from tinygrad.runtime.support.hcq2 import timeline
 
 class TestKFDEvents(unittest.TestCase):
+  def test_gfx11_flushes_host_writes_before_fetching_indirect_buffer(self):
+    base = UOp.placeholder((96,), dtypes.uint8, device="AMD")
+    cmdbuf = base[16:80]
+    for major in (9, 10, 11, 12):
+      with self.subTest(major=major):
+        q = object.__new__(AMDComputeQueue)
+        q.dev, q.devs, q.queue, q.target = SimpleNamespace(host="CPU", compute_queue=object()), ("AMD",), "COMPUTE:0", (major, 0, 0)
+        q.pm4, q.prof_bump, q.blob, q.patches = pm4_nv, lambda buf:buf, bytearray(b"body"), []
+        q.nbio = SimpleNamespace(version=(7, 11), regBIF_BX_PF1_GPU_HDP_FLUSH_REQ=SimpleNamespace(addr=(100,)),
+                                 regBIF_BX_PF1_GPU_HDP_FLUSH_DONE=SimpleNamespace(addr=(104,)))
+        with patch("tinygrad.runtime.ops_amd._queue_args", return_value=[]), \
+             patch("tinygrad.runtime.ops_amd.patch", return_value=cmdbuf) as patcher, patch("tinygrad.runtime.ops_amd.amd_push"):
+          q.submit(cmdbuf)
+        buf, rows, blob = patcher.call_args.args
+        words = struct.unpack(f"{len(blob)//4}I", blob)
+        self.assertEqual(words[-4:], (pm4_nv.PACKET3(pm4_nv.PACKET3_INDIRECT_BUFFER, 2), 0, 0, 16 | pm4_nv.INDIRECT_BUFFER_VALID))
+        self.assertEqual(buf.shape, (len(blob),))
+        self.assertEqual(rows, [(len(blob)-12, base.getaddr(q.devs) + 16)])
+        if major == 11:
+          self.assertEqual(len(blob), 76)
+          self.assertEqual(words[:7], (pm4_nv.PACKET3(pm4_nv.PACKET3_WAIT_REG_MEM, 5),
+                                      pm4_nv.WAIT_REG_MEM_OPERATION(1) | pm4_nv.WAIT_REG_MEM_FUNCTION(5), 100, 104, 0xffffffff, 0xffffffff, 4))
+          self.assertEqual(words[7], pm4_nv.PACKET3(pm4_nv.PACKET3_ACQUIRE_MEM, 6))
+        else: self.assertEqual(len(blob), 16)
+
   def test_event_page_allocation_does_not_create_queues(self):
     iface = object.__new__(KFDIface)
     class Dev:

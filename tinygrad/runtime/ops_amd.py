@@ -426,11 +426,17 @@ class AMDComputeQueue(HWQueue):
         self.release_mem(mailbox.getaddr(self.devs), event_id, self.pm4.data_sel__mec_release_mem__send_32_bit_low,
                          self.pm4.int_sel__mec_release_mem__send_interrupt_after_write_confirm, ctxid=event_id)
 
-  def submit(self, cmdbuf:UOp) -> UOp: # the ring gets an indirect buffer packet: 4 dwords, put stays aligned so it never wraps mid packet
+  def submit(self, cmdbuf:UOp) -> UOp: # ring-side setup precedes the indirect buffer dispatch
     base, off = unwrap_view(cmdbuf)
-    blob = struct.pack("IIII", self.pm4.PACKET3(self.pm4.PACKET3_INDIRECT_BUFFER, 2), 0, 0, cmdbuf.max_numel() // 4 | self.pm4.INDIRECT_BUFFER_VALID)
-    ib = UOp.alloc((16,), dtypes.uint8, device=self.dev.host).rtag(to_name("ib", self.queue))
-    return amd_push(self.prof_bump(cmdbuf), patch(ib, [(4, base.getaddr(self.devs) + off)], blob), *_queue_args(self, self.dev.compute_queue))
+    # Flush host-patched VRAM before fetching the IB, not only from inside that same IB.
+    start = len(self.blob)
+    if self.target[0] == 11: self.memory_barrier()
+    prefix = bytes(self.blob[start:])
+    blob = prefix + struct.pack("IIII", self.pm4.PACKET3(self.pm4.PACKET3_INDIRECT_BUFFER, 2), 0, 0,
+                                cmdbuf.max_numel() // 4 | self.pm4.INDIRECT_BUFFER_VALID)
+    ib = UOp.alloc((len(blob),), dtypes.uint8, device=self.dev.host).rtag(to_name("ib", self.queue))
+    return amd_push(self.prof_bump(cmdbuf), patch(ib, [(len(prefix)+4, base.getaddr(self.devs) + off)], blob),
+                    *_queue_args(self, self.dev.compute_queue))
 
 class AMDComputeAQLQueue(AMDComputeQueue): # the ring holds 64 byte aql packets: a dispatch per kernel, the pm4 between them wrapped as an ib
   def __init__(self, submit):
