@@ -649,9 +649,9 @@ def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_
   return out[token, out_row.valid(lane.eq(0))].store(total).end(token, out_row, lane).sink(arg=KernelInfo(name="linear_f16_gemv", opts_to_apply=()))
 
 def _view_back(t:Tensor) -> Tensor:
-  """Strip only float-to-float casts from a lazy weight, which can be applied by the kernel load."""
+  # Widening half to float is exact; preserve casts that round or change the values.
   uop = t.uop
-  while uop.op is Ops.CAST and dtypes.is_float(uop.dtype) and dtypes.is_float(uop.src[0].dtype): uop = uop.src[0]
+  while uop.op is Ops.CAST and uop.dtype == dtypes.float32 and uop.src[0].dtype in (dtypes.half, dtypes.bfloat16): uop = uop.src[0]
   return Tensor(uop).reshape(t.shape)
 
 def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
