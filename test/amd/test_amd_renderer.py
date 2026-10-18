@@ -3214,6 +3214,33 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertTrue(amd_lib._tmp_vaddr_clause_safe([scale(), scale()], [load_other]))
     self.assertFalse(amd_lib._tmp_vaddr_clause_safe([scale(), scale()], [load_tmp, load_tmp]))
 
+  def test_scalar_load_clause_preserves_reused_address_register(self):
+    half_base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.KERNARG, tag=(Register("half_base", 8, size=8),))
+    float_base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.KERNARG, tag=(Register("float_base", 10, size=8),))
+    idx = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.MOV, tag=(Register("idx", 263),))
+    other_idx = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.MOV, tag=(Register("other_idx", 262),))
+    count = UOp.const(1, dtypes.int32)
+    halves = [_uop(Ops.INS, dtypes.half, (half_base, idx, count, UOp.const(off, dtypes.int32).rtag("b_compact")),
+                   AMDOps.LOAD, (Register(f"h{i}", 264+i),)) for i, off in enumerate((12, 4))]
+    word = _uop(Ops.INS, dtypes.float32, (float_base, other_idx, count), AMDOps.LOAD, (Register("word", 263),))
+    insts = list(_REN._insts_from_linear(UOp(Ops.LINEAR, src=(*halves, word))))
+    # The half clause uses v7<<1; the following float load must recompute v7=v6<<2.
+    float_load = next(i for i, ins in enumerate(insts) if ins.op_name == "GLOBAL_LOAD_B32")
+    self.assertEqual(str(insts[float_load-1]), "v_lshlrev_b32_e64(v[7], 2, v[6])")
+    self.assertEqual(sum(ins.op_name == "V_LSHLREV_B32_E64" for ins in insts), 2)
+
+  def test_rejected_scalar_clause_keeps_compact_index_scale(self):
+    base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.KERNARG, tag=(Register("base", 8, size=8),))
+    indices = [_uop(Ops.INS, dtypes.uint32, arg=AMDOps.MOV, tag=(Register(f"idx{i}", 263-i),)) for i in range(3)]
+    half = _uop(Ops.INS, dtypes.half, (base, indices[0], UOp.const(1, dtypes.int32), UOp.const(4, dtypes.int32).rtag("b_compact")),
+                AMDOps.LOAD, (Register("half", 264),))
+    words = [_uop(Ops.INS, dtypes.float32, (base, idx, UOp.const(4, dtypes.int32)), AMDOps.LOAD,
+                  (Register(f"words{i}", 268+4*i),)) for i, idx in enumerate(indices[1:])]
+    insts = list(_REN._insts_from_linear(UOp(Ops.LINEAR, src=(half, *words))))
+    # Both wide loads need TMP_VADDR, so the clause is rejected; previewing it must not consume the half's scale.
+    self.assertEqual(str(insts[0]), "v_lshlrev_b32_e64(v[7], 1, v[7])")
+    self.assertEqual(insts[1].op_name, "GLOBAL_LOAD_U16")
+
   def test_wmma_ab_from_lds_only_on_lds_operands(self):
     # UNROLL ACC sink must key off WMMA A/B LDS staging, not any LLOAD in the kernel.
     import os

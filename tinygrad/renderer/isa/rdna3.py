@@ -2976,7 +2976,7 @@ def insts_from_linear(lin:UOp):
   items, targets = [], {}
   store_addr_cache = _StoreAddrCache()
   # Compact B: page-idx UOps already shifted to bytes (in-place <<1 once per idx UOp).
-  byte_scaled: set[int]|None = set()  # always-on compact B page-idx <<1
+  byte_scaled: set[int] = set()  # always-on compact B page-idx <<1
   def emit(inst):
     items.append(inst)
   def wait_vm(allow:int=0):
@@ -3529,12 +3529,14 @@ def insts_from_linear(lin:UOp):
     if u not in d16_hi_lo and _clauseable_scalar_vmem_gload(u, skip, mask_depth):
       j = oi + 1
       while j < len(scheduled) and scheduled[j] not in d16_hi_lo and \
-            _clauseable_scalar_vmem_gload(scheduled[j], skip, mask_depth): j += 1
+            _clauseable_scalar_vmem_gload(scheduled[j], skip, mask_depth) and \
+            _vopd_scan_safe(scheduled[j], scheduled[oi:j]): j += 1
       j_hi = j
       if d16_hi_lo and j > oi:
         while j_hi < len(scheduled) and scheduled[j_hi] in d16_hi_lo: j_hi += 1
       end = j_hi if j_hi - j >= 2 else j
       if end - oi >= 2:
+        scale_snapshot = byte_scaled.copy()
         parts = [_emit_uop(scheduled[k]) for k in range(oi, end)]
         hi_ok = all(k < j or (not any(getattr(i, "vdst", None) == TMP_VDATA for i in parts[k - oi]))
                     for k in range(j, end))
@@ -3548,16 +3550,7 @@ def insts_from_linear(lin:UOp):
           # Float×4 UPCAST B128s scale distinct byte offsets into TMP_VADDR; hoisting+dedup
           # would clobber addr (both loads read slot0). Compact B half: one <<1 is OK.
           if _tmp_vaddr_clause_safe(raw_scales, loads):
-            scales, seen_scale = [], set()
-            for s in raw_scales:
-              # Compact B: one in-place <<1 per page idx; drop duplicate scales in the hoist.
-              dst = getattr(s, "vdst", None)
-              key = getattr(dst, "offset", None)
-              if key is not None:
-                if key in seen_scale: continue
-                seen_scale.add(key)
-              scales.append(s)
-            for inst in scales: emit(inst)
+            for inst in raw_scales: emit(inst)
             emit(r3.s_clause(simm16=len(loads) - 1))
             for inst in loads: emit(inst)
             for k, p in enumerate(parts):
@@ -3565,6 +3558,9 @@ def insts_from_linear(lin:UOp):
               note_vm(_reg_idxs(d16_hi_lo[su]) if su in d16_hi_lo else _reg_idxs(su), p)
             oi = end
             continue
+        # A rejected clause is only a preview: the normal path must still scale its indices.
+        byte_scaled.clear()
+        byte_scaled.update(scale_snapshot)
     if u in d16_hi_lo: flush_regs(_reg_idxs(d16_hi_lo[u]))
     is_mem_addr_cse = u.op is Ops.INS and _iop(u) in (AMDOps.STORE, AMDOps.SSTORE, AMDOps.SLOAD, AMDOps.LSTORE, AMDOps.LLOAD)
     # Scratch SPILL/FILL always clobber TMP_VADDR (page base). Clear before emit so a
