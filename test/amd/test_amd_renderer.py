@@ -2953,6 +2953,16 @@ class TestAMDRenderer(unittest.TestCase):
         insts = _REN._insts_from_linear(_uop(Ops.LINEAR, src=(first, read, candidate)))
         self.assertEqual([i.op_name for i in insts], [name]*3)
 
+  def test_vopd_add_pair_rejects_transitive_dependency(self):
+    from tinygrad.renderer.isa.rdna3_vopd import try_vopd_add_pair
+    def value(reg): return _uop(Ops.INS, dtypes.float32, arg=AMDOps.MOV, tag=(Register(str(reg), 256+reg),))
+    scale, a, b = (value(reg) for reg in (8, 10, 11))
+    first = _uop(Ops.INS, dtypes.float32, (scale, a), AMDOps.ADD, (Register("first", 272),))
+    second = _uop(Ops.INS, dtypes.float32, (scale, b), AMDOps.ADD, (Register("second", 273),))
+    self.assertIsNotNone(try_vopd_add_pair(first, second))
+    indirect = b.replace(src=(first,))
+    self.assertIsNone(try_vopd_add_pair(first, second.replace(src=(scale, indirect))))
+
   def test_regalloc_rewrites_surviving_shrink(self):
     renderer = _REN
     src = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32).rtag(),), AMDOps.MOV,

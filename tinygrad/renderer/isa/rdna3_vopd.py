@@ -156,24 +156,7 @@ def try_vopd_fmac_alu_pair(u0:UOp, u1:UOp) -> list|None:
   return None
 
 def try_vopd_add_pair(u0:UOp, u1:UOp) -> list|None:
-  """Pack two independent float32 ADDs into VOPD when dest/src banks allow."""
-  if u0.op is not Ops.INS or u1.op is not Ops.INS: return None
-  if _iop(u0) is not AMDOps.ADD or _iop(u1) is not AMDOps.ADD: return None
-  if u0.dtype is not dtypes.float32 or u1.dtype is not dtypes.float32: return None
-  if not independent(u0, u1): return None
-  ops0, ops1 = _add_operands(u0), _add_operands(u1)
-  if ops0 is None or ops1 is None: return None
-  d0, d1 = _dst(u0), _dst(u1)
-  n0, n1 = _vgpr_num(d0), _vgpr_num(d1)
-  if n0 is not None and n1 is not None and n1 % 2 == 0 and n0 == n1 + 1:
-    u0, u1, ops0, ops1, d0, d1, n0, n1 = u1, u0, ops1, ops0, d1, d0, n1, n0
-  if n0 is None or n1 != n0 + 1 or n0 % 2 != 0: return None
-  (a0, b0), (a1, b1) = ops0, ops1
-  bn0, bn1 = (_vgpr_num(b0) if isinstance(b0, Reg) else None), (_vgpr_num(b1) if isinstance(b1, Reg) else None)
-  if bn0 is None or bn1 != bn0 + 1 or bn0 % 2 != 0: return None
-  if not _vopd_src0_ok(a0, a1): return None
-  return [r3.v_dual_add_f32(opy=VOPDOp.V_DUAL_ADD_F32, vdstx=d0, vdsty=d1,
-                            srcx0=a0, srcy0=a1, vsrcx1=b0, vsrcy1=b1)]
+  return _try_vopd_bin_pair(u0, u1, AMDOps.ADD, r3.v_dual_add_f32, VOPDOp.V_DUAL_ADD_F32)
 
 def _try_vopd_bin_pair(u0:UOp, u1:UOp, op:AMDOps, emit, opy:VOPDOp) -> list|None:
   """Pack two independent float32 binary ALU ops into VOPD when dest/src banks allow."""
@@ -181,6 +164,8 @@ def _try_vopd_bin_pair(u0:UOp, u1:UOp, op:AMDOps, emit, opy:VOPDOp) -> list|None
   if _iop(u0) is not op or _iop(u1) is not op: return None
   if u0.dtype is not dtypes.float32 or u1.dtype is not dtypes.float32: return None
   if u1 in u0.src or u0 in u1.src: return None
+  # ADD scans retain the stronger transitive dependency check; MUL/MAX scan direct uses.
+  if op is AMDOps.ADD and not independent(u0, u1): return None
   ops0, ops1 = _add_operands(u0), _add_operands(u1)
   if ops0 is None or ops1 is None: return None
   d0, d1 = _dst(u0), _dst(u1)
