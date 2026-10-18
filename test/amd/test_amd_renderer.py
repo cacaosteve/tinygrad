@@ -1013,7 +1013,7 @@ class TestAMDRenderer(unittest.TestCase):
         inp = Tensor.empty(4096, 1024, device="AMD")
         ast = (inp.square() if square else inp).sum(-1).schedule_linear().src[-1].src[0]
         opts = to_program(ast, _REN).src[0].arg.applied_opts
-        self.assertEqual(opts[-1].arg, (8, AxisType.UPCAST))
+        self.assertEqual(opts[-1].arg, (4 if square else 8, AxisType.UPCAST))
         self.assertTrue(any(o.arg[1] is AxisType.LOCAL for o in opts))
 
   def test_group16_final_reduce_uses_wide_lds_loads(self):
