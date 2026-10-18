@@ -1036,13 +1036,11 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
       k_lds_stores.append(dk[block_bh, block_m, n_tile, krow, dcol].store(KV_lds_k[krow, dcol].float()))
     KV_lds_k = KV_lds_k.after(UOp.group(*k_lds_stores))
   S_reg = _reg((TM, TN), 6, 0, n_tile)
-  # AMD_FLASH_UNROLL: 0=off; 1 or 6=soft+corr python-unroll (const REG slots). WMMA stays ranged —
-  # frag.after(store) cin was wrong; const_like(0) chains break direct-ISA emit (half2 LDS).
+  # Unroll softmax and accumulator updates so REG indices remain constant.
   # ACC_SEP hardcoded: keep WMMA C in ACC; copy out to const-indexed soft before softmax.
   # Park one ACC pack per column (python-unrolled WMMA). Flash-only — AMD_WMMA_ACC_SMALL
   # also parks ≤64 quant tiles and breaks Q4/Q6; prefer AMD_FLASH_ACC_SMALL / acc_small arg.
   _acc_small = bool(acc_small or getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 0))
-  _fu = 6  # FLASH_UNROLL hardcoded: soft+corr const REG indices
   S_view = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)
   Q_view = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)
   K_view = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)
@@ -1176,35 +1174,20 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
         # Gate on an index axis (not INDEX.valid) so STORE stays INDEX+value.
         qk_stores.append(dq[block_bh, block_m, n_tile, qrow, kcol.valid(wave_n.eq(0))].store(S_reg[ri, rj]))
     S_reg = S_reg.after(UOp.group(*qk_stores))
-  if _fu & 2:
-    m_ij = _reg((TM,), 7, -math.inf, n_tile)
-    for rn_i in range(TN):
-      m_ij = m_ij.after(m_ij.store(m_ij.maximum(S_reg[:, rn_i])))
-    # Batch TM keys so same-stage ds_swizzle share one lgkm wait (HIP pattern).
-    _m_red = warp_reduce_many([m_ij[ri] for ri in range(TM)], maximum=True)
-    m_ij = m_ij.after(UOp.group(*[m_ij[ri].store(_m_red[ri]) for ri in range(TM)]))
-    tile_max = m_ij.reshape(TM, 1).expand(TM, TN).maximum(-1e30)
-    S_reg = S_reg.after(S_reg.store(((S_reg - tile_max) * LOG2E).exp2()))
-    p_local = _reg((TM,), 8, 0, n_tile)
-    _p_vals = [S_reg[ri, rn_i] for ri in range(TM) for rn_i in range(TN)]
-    _p_red = warp_reduce_many(_p_vals)
-    p_sum = p_local.after(UOp.group(*[
-      p_local[ri].store(sum((_p_red[ri * TN + rn_i] for rn_i in range(TN)), S_reg.const_like(0)))
-      for ri in range(TM)]))
-  else:
-    m_ij, rm2 = _reg((TM,), 7, -math.inf, n_tile), UOp.range(TN, 261, AxisType.LOOP)
-    m_ij = m_ij.after(m_ij.store(m_ij.after(rm2).maximum(S_reg[:, rm2])).end(rm2))
-    # Ranged soft path: still batch the TM max reduces when the range is unrolled away.
-    _m_red = warp_reduce_many([m_ij[ri] for ri in range(TM)], maximum=True)
-    m_ij = m_ij.after(UOp.group(*[m_ij[ri].store(_m_red[ri]) for ri in range(TM)]))
-    tile_max = m_ij.reshape(TM, 1).expand(TM, TN).maximum(-1e30)
-    S_reg = S_reg.after(S_reg.store(((S_reg - tile_max) * LOG2E).exp2()))
-    p_local = _reg((TM,), 8, 0, n_tile)
-    _p_vals = [S_reg[ri, rn] for ri in range(TM) for rn in range(TN)]
-    _p_red = warp_reduce_many(_p_vals)
-    p_sum = p_local.after(UOp.group(*[
-      p_local[ri].store(sum((_p_red[ri * TN + rn] for rn in range(TN)), S_reg.const_like(0)))
-      for ri in range(TM)]))
+  m_ij = _reg((TM,), 7, -math.inf, n_tile)
+  for rn_i in range(TN):
+    m_ij = m_ij.after(m_ij.store(m_ij.maximum(S_reg[:, rn_i])))
+  # Batch TM keys so same-stage ds_swizzle share one lgkm wait (HIP pattern).
+  _m_red = warp_reduce_many([m_ij[ri] for ri in range(TM)], maximum=True)
+  m_ij = m_ij.after(UOp.group(*[m_ij[ri].store(_m_red[ri]) for ri in range(TM)]))
+  tile_max = m_ij.reshape(TM, 1).expand(TM, TN).maximum(-1e30)
+  S_reg = S_reg.after(S_reg.store(((S_reg - tile_max) * LOG2E).exp2()))
+  p_local = _reg((TM,), 8, 0, n_tile)
+  _p_vals = [S_reg[ri, rn_i] for ri in range(TM) for rn_i in range(TN)]
+  _p_red = warp_reduce_many(_p_vals)
+  p_sum = p_local.after(UOp.group(*[
+    p_local[ri].store(sum((_p_red[ri * TN + rn_i] for rn_i in range(TN)), S_reg.const_like(0)))
+    for ri in range(TM)]))
   # Diagnostic: softmax max/sum → logical BLOCK_M rows. One writer per row (wave_n=0, lane_n=0).
   if dumps and any(k in dumps for k in ("soft_m", "soft_l")):
     soft_stores: list[UOp] = []
@@ -1243,7 +1226,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # V load (keeps latency hiding). Soft/stats buffers already promote on their own.
   # EARLY_V hardcoded on with ACC_SMALL (ship prefill).
   _early_v = bool(_acc_small)
-  _acc_work = bool(use_acc_work and (_fu & 4) and _acc_small)
+  _acc_work = bool(use_acc_work and _acc_small)
   acc_work = UOp.placeholder((TM, TD), dtypes.float, slot=19, addrspace=AddrSpace.REG) if _acc_work else None
   # Slot 1 reuses K's LDS after QK (OVERLAP_V dedicated slot-7 removed).
   V_lds = UOp.placeholder((D, BLOCK_N + LDS_PAD), dtypes.half, slot=1,
@@ -1268,39 +1251,30 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     return UOp.group(*stores)
   if _early_v:
     V_store = _v_store_unrolled(V_lds.after(lds_reuse_barrier))
-  if _fu & 4:
-    acc_c, l_c, m_c = acc.after(n_tile), l_i.after(n_tile), m_i.after(n_tile)
-    if _acc_work:
-      assert acc_work is not None
-      # float4 copy: fewer scratch ops than 32 scalar SLOAD/SSTORE (promoted dst still VGPR).
-      if (TM * TD) % 4 == 0:
-        src, dst = acc_c.reshape(TM * TD), acc_work.reshape(TM * TD)
-        acc_work = acc_work.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)]))
-      else:
-        acc_work = acc_work.after(UOp.group(*[acc_work[ri, rj].store(acc_c[ri, rj]) for ri in range(TM) for rj in range(TD)]))
-      work = acc_work
+  acc_c, l_c, m_c = acc.after(n_tile), l_i.after(n_tile), m_i.after(n_tile)
+  if _acc_work:
+    assert acc_work is not None
+    # float4 copy: fewer scratch ops than 32 scalar SLOAD/SSTORE (promoted dst still VGPR).
+    if (TM * TD) % 4 == 0:
+      src, dst = acc_c.reshape(TM * TD), acc_work.reshape(TM * TD)
+      acc_work = acc_work.after(UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)]))
     else:
-      work = acc_c
-    corr = []
-    for ri in range(TM):
-      m_new = m_c[ri].maximum(m_ij[ri])
-      alpha_val, beta_val = ((m_c[ri] - m_new) * LOG2E).exp2(), ((m_ij[ri] - m_new) * LOG2E).exp2()
-      corr.append(UOp.group(*[work[ri, rj].store(alpha_val * work[ri, rj]) for rj in range(TD)],
-                           l_c[ri].store(alpha_val * l_c[ri] + beta_val * p_sum[ri]),
-                           m_c[ri].store(m_new), beta_i[ri].store(beta_val)))
-    correction = UOp.group(*corr)
-    if _acc_work:
-      acc_work = work.after(correction)
-      acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
-    else:
-      acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
+      acc_work = acc_work.after(UOp.group(*[acc_work[ri, rj].store(acc_c[ri, rj]) for ri in range(TM) for rj in range(TD)]))
+    work = acc_work
   else:
-    ri4, rj4 = UOp.range(TM, 330), UOp.range(TD, 331)
-    m_new = m_i[ri4].maximum(m_ij[ri4])
-    alpha_val, beta_val = ((m_i[ri4] - m_new) * LOG2E).exp2(), ((m_ij[ri4] - m_new) * LOG2E).exp2()
-    correction = UOp.group(acc[ri4, rj4].store(alpha_val * acc[ri4, rj4]).end(rj4),
-                           l_i[ri4].store(alpha_val * l_i[ri4] + beta_val * p_sum[ri4]),
-                           m_i[ri4].store(m_new), beta_i[ri4].store(beta_val)).end(ri4)
+    work = acc_c
+  corr = []
+  for ri in range(TM):
+    m_new = m_c[ri].maximum(m_ij[ri])
+    alpha_val, beta_val = ((m_c[ri] - m_new) * LOG2E).exp2(), ((m_ij[ri] - m_new) * LOG2E).exp2()
+    corr.append(UOp.group(*[work[ri, rj].store(alpha_val * work[ri, rj]) for rj in range(TD)],
+                         l_c[ri].store(alpha_val * l_c[ri] + beta_val * p_sum[ri]),
+                         m_c[ri].store(m_new), beta_i[ri].store(beta_val)))
+  correction = UOp.group(*corr)
+  if _acc_work:
+    acc_work = work.after(correction)
+    acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
+  else:
     acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
   if not _early_v:
     # after(qk_done) is per-wave only; lds_reuse_barrier syncs the workgroup so K is not
@@ -1416,32 +1390,28 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   # Post-copy dump: slot-17 soft buffer (or still slot-10 if PV_ACC_DIRECT).
   if dumps and "pv" in dumps:
     pv_acc = pv_acc.after(UOp.group(*_pv_logical_stores(dumps["pv"], pv_acc)))
-  ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
   # When ACC_WORK is on, normalize from the last tile's VGPR work copy so the epilogue
   # does not reload slot-2 scratch (writeback still feeds the next n_tile iter).
   acc_work_final: UOp|None = None
-  if _fu & 4:  # ACC_UNROLL hardcoded on with soft/corr
-    # Const-index acc update. Slot 2 stays unpromoted (REDUCE-carried); soft/stats promote.
-    acc_c = acc.after(n_tile)
-    if _acc_work:
-      assert acc_work is not None
-      work = acc_work
-      acc_up = UOp.group(*[work[ri, rj].store(work[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
-                           for ri in range(TM) for rj in range(TD)])
-      work = work.after(acc_up)
-      if (TM * TD) % 4 == 0:
-        src, dst = work.reshape(TM * TD), acc_c.reshape(TM * TD)
-        writeback = UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)])
-      else:
-        writeback = UOp.group(*[acc_c[ri, rj].store(work[ri, rj]) for ri in range(TM) for rj in range(TD)])
-      n_tile_end = writeback.barrier().end(n_tile)
-      acc_work_final = work.after(n_tile_end)
+  # Const-index acc update. Slot 2 stays unpromoted (REDUCE-carried); soft/stats promote.
+  acc_c = acc.after(n_tile)
+  if _acc_work:
+    assert acc_work is not None
+    work = acc_work
+    acc_up = UOp.group(*[work[ri, rj].store(work[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
+                         for ri in range(TM) for rj in range(TD)])
+    work = work.after(acc_up)
+    if (TM * TD) % 4 == 0:
+      src, dst = work.reshape(TM * TD), acc_c.reshape(TM * TD)
+      writeback = UOp.group(*[dst[i:i+4].store(src[i:i+4]) for i in range(0, TM * TD, 4)])
     else:
-      acc_up = UOp.group(*[acc_c[ri, rj].store(acc_c[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
-                           for ri in range(TM) for rj in range(TD)])
-      n_tile_end = acc_up.barrier().end(n_tile)
+      writeback = UOp.group(*[acc_c[ri, rj].store(work[ri, rj]) for ri in range(TM) for rj in range(TD)])
+    n_tile_end = writeback.barrier().end(n_tile)
+    acc_work_final = work.after(n_tile_end)
   else:
-    n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).barrier().end(n_tile)
+    acc_up = UOp.group(*[acc_c[ri, rj].store(acc_c[ri, rj] + beta_i[ri] * pv_acc[ri, rj])
+                         for ri in range(TM) for rj in range(TD)])
+    n_tile_end = acc_up.barrier().end(n_tile)
   acc, l_i, m_i = acc.after(n_tile_end), l_i.after(n_tile_end), m_i.after(n_tile_end)
   # Diagnostic: pre-normalize accumulator → logical (BLOCK_M, D).
   if dumps and "acc" in dumps:
