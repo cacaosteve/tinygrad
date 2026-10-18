@@ -599,23 +599,21 @@ def schedule_scalar_vmem(ops:list[UOp], alu_breadth:bool|None=None) -> list[UOp]
   architectural state or memory side effects are hard boundaries.
   """
   # Custom quantized WMMA kernels use independent packed u32x4 reads, but also contain
-  # wide activation reads that must remain hard scheduling boundaries.  Schedule only
-  # the compatible straight-line subsegments; AMD_SCHEDULE_QUANT_WMMA=0 opts out.
-  schedule_wmma_segments = True and \
+  # wide activation reads that must remain hard scheduling boundaries. Schedule only
+  # the compatible straight-line subsegments.
+  schedule_wmma_segments = \
     any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops) and \
     any(u.op is Ops.INS and _iop(u) is AMDOps.LOAD and u.dtype is dtypes.uint32 and _reg_slots(u) == 4 for u in ops)
   # Q6/Q4 decode (linear_q6): many scalar packed-weight reads + dp4a/BFE chains between LLOADs.
-  schedule_decode_segments = True and not schedule_wmma_segments and \
+  schedule_decode_segments = not schedule_wmma_segments and \
     any(u.op is Ops.INS and _iop(u) is AMDOps.DOT4 for u in ops) and \
     sum(1 for u in ops if u.op is Ops.INS and _iop(u) is AMDOps.LOAD and u.dtype in (dtypes.uint, dtypes.uint32)) >= 8
   if not schedule_wmma_segments and not schedule_decode_segments and \
      any(u.op is Ops.INS and (_iop(u) is AMDOps.WMMA or (_iop(u) is AMDOps.LOAD and not vmem_schedulable_load(u))) for u in ops): return ops
-  fused_d16: set[UOp] = set()  # AMD_D16_HI removed
-
   def schedulable(u:UOp) -> bool:
     if u.op is Ops.BITCAST or (u.op is Ops.NOOP and u.dtype is not dtypes.void): return True  # value alias, never a void ordering gate
     if u.op is Ops.AFTER and u.addrspace is AddrSpace.REG: return True  # register accumulator binding, not a memory/state boundary
-    if u in fused_d16 or u.op is not Ops.INS or _iop(u) not in VMEM_SCHEDULABLE: return False
+    if u.op is not Ops.INS or _iop(u) not in VMEM_SCHEDULABLE: return False
     # Flash decode promote: full ALU-in-segment lets loads cross online-softmax RMW → NaN/MMU.
     # SCHEDULE_VMEM_ALU folded into VOPD_FMAC invert (decode ship ALU=0; else 1). Mode 2 removed.
     alu_mode = 0 if getenv("AMD_VOPD_FMAC", 0) else 1

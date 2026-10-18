@@ -211,13 +211,7 @@ def _needs_vm_flush(u:UOp) -> bool:
   # Packs/extracts have their own emitted-instruction dependency check below. General
   # ALU must enter flush_regs: independent address ALU still overlaps VMEM, while an
   # integer consumer of a dest-as-address LOAD must wait before reading that VGPR.
-  if u.op is not Ops.INS: return False
-  if _iop(u) in (AMDOps.WMMA, AMDOps.STORE, AMDOps.ATOMIC_ADD, AMDOps.SSTORE, AMDOps.SPILL): return True
-  if _iop(u) in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV): return False
-  if _iop(u) in (AMDOps.SHL, AMDOps.SHR, AMDOps.AND, AMDOps.OR, AMDOps.XOR, AMDOps.ADD, AMDOps.SUB, AMDOps.MUL,
-               AMDOps.CMP_GE, AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ):
-    return True
-  return True
+  return u.op is Ops.INS and _iop(u) not in (AMDOps.PACK_F16, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.MOV)
 
 _SCALAR_LOAD = {
   dtypes.bool: (r3.global_load_u8, r3.scratch_load_u8, r3.ds_load_u8),
@@ -3571,29 +3565,20 @@ def apply_tc_hand_opts(tk, rngs):
   if _wmma_has_fused_float_to_half_cast(tk):
     raise KernelOptError("RDNA3 DIRECT: fused float→half CAST into WMMA MMU-faults")
   if not getenv("TC_LDS_AB", 0): return apply_register_tc_hand_opts(tk, rngs)
-  lds_ab = getenv("TC_LDS_AB", 0)
   up_cap = getenv("TC_UPCAST", 4)
-  loc_cap = getenv("TC_LOCAL", 2 if lds_ab else 4)
+  loc_cap = getenv("TC_LOCAL", 2)
   up16 = allow_upcast16()
   max_tiles = min(getenv("TC_UPCAST_TILES", 16 if up16 else 8), 8 if not up16 else 10**9)
-  if lds_ab:
-    # ALLOW_LDS_PRODUCT8=1 (default): cap expand budget at product-8. =0: tighter (≤4).
-    if getenv("ALLOW_LDS_PRODUCT8", 1) == 0:
-      up_cap, max_tiles = min(up_cap, 2), min(max_tiles, 4)
-    else:
-      max_tiles = min(max_tiles, 8)
-  local_dims, loc_szs = ([0, 1], [8, 4, 2]) if lds_ab else ([0], [4, 2])
+  # Cap the LDS expand budget at product-8, or use the tighter product-4 policy.
+  if getenv("ALLOW_LDS_PRODUCT8", 1) == 0:
+    up_cap, max_tiles = min(up_cap, 2), min(max_tiles, 4)
+  else:
+    max_tiles = min(max_tiles, 8)
   def do_local():
-    if lds_ab:
-      # Asymmetric LOCAL (≤loc_cap × ≤2). Symmetric 4×4 TDRs on display GPUs.
-      for tc_dim, cap in ((0, loc_cap), (1, min(2, loc_cap) if loc_cap else 0)):
-        if not cap: continue
-        if (szs := [sz for sz in loc_szs if sz <= cap and rngs[tc_dim].src[0].divides(sz) is not None]):
-          try: rngs[tc_dim] = tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[tc_dim]), (szs[0], AxisType.LOCAL)))[0]
-          except KernelOptError: pass
-      return
-    for tc_dim in local_dims:
-      if (szs := [sz for sz in loc_szs if sz <= loc_cap and rngs[tc_dim].src[0].divides(sz) is not None]):
+    # Asymmetric LOCAL (≤loc_cap × ≤2). Symmetric 4×4 TDRs on display GPUs.
+    for tc_dim, cap in ((0, loc_cap), (1, min(2, loc_cap) if loc_cap else 0)):
+      if not cap: continue
+      if (szs := [sz for sz in [8, 4, 2] if sz <= cap and rngs[tc_dim].src[0].divides(sz) is not None]):
         try: rngs[tc_dim] = tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[tc_dim]), (szs[0], AxisType.LOCAL)))[0]
         except KernelOptError: pass
   def do_upcast() -> int:
@@ -3612,17 +3597,12 @@ def apply_tc_hand_opts(tk, rngs):
         rngs[tc_dim] = tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[tc_dim]), (szs[0], AxisType.UPCAST)))[0]
         tiles *= szs[0]
     return tiles
-  if lds_ab:
-    do_local()
-    tiles = do_upcast()
-    # UNROLL multiplies WMMA STACK tiles; past max_tiles expand soft-fails then unroll_axis
-    # IndexErrors. Only apply when the upcast×unroll product still fits the LDS expand budget.
-    if (ku := getenv("TC_LDS_UNROLL", 0)) and tk.upcastable_dims(reduce=True) and tiles * ku <= max_tiles:
-      try: tk.apply_opt(Opt(OptOps.SPLIT, tk.upcastable_dims(reduce=True)[0], (ku, AxisType.UPCAST)))
-      except KernelOptError: pass
-  else:
-    do_upcast()
-    do_local()
+  do_local()
+  tiles = do_upcast()
+  # Only unroll when the upcast×unroll product still fits the LDS expand budget.
+  if (ku := getenv("TC_LDS_UNROLL", 0)) and tk.upcastable_dims(reduce=True) and tiles * ku <= max_tiles:
+    try: tk.apply_opt(Opt(OptOps.SPLIT, tk.upcastable_dims(reduce=True)[0], (ku, AxisType.UPCAST)))
+    except KernelOptError: pass
   # TC_LDS_GROUP omitted: GROUP≥2 on WMMA half GEMM needs >64KB LDS (always KernelOptError).
 
 def apply_register_tc_hand_opts(tk, rngs):
