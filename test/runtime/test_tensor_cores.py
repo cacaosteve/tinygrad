@@ -9,9 +9,10 @@ from tinygrad.device import Buffer
 from tinygrad.helpers import Context, TC_SELECT, TC_OPT
 from test.helpers import slow, replace_opts, buffer_uops
 from tinygrad.engine.realize import run_linear
-from tinygrad.codegen import to_program
+from tinygrad.codegen import to_program, full_rewrite_to_sink
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.codegen.opt.postrange import Scheduler
+from tinygrad.codegen.late.linearizer import linearize
 from tinygrad.renderer.tc import amd_cdna_1616128
 from tinygrad.renderer.llvmir import LLVMRenderer, AMDLLVMRenderer
 
@@ -38,6 +39,10 @@ def tc_reduce_axis(r:Tensor) -> int:
   sche.apply_opt(Opt(OptOps.TC, 0, (TC_SELECT.value, TC_OPT.value, 1)))
   return sche.axes_of(AxisType.WEAK, reduce=True)[0]
 
+def wmma_uops(ast:UOp) -> list[UOp]:
+  # Check semantic accumulator dependencies before ISA backends replace WMMA with instructions.
+  return [u for u in linearize(full_rewrite_to_sink(ast, Device[Device.DEFAULT].renderer)) if u.op is Ops.WMMA]
+
 def helper_tc_ensure_uops_and_opts_count(N: int, M:int, K:int, dtype_in:DType, dtype_out:DType, axis:int=0, tc_select:int=-1, tc_opt:int=0,
                                          ensure_triggered:bool=True):
   _skip_unsupported_tc_dtypes(dtype_in, dtype_out)
@@ -49,7 +54,7 @@ def helper_tc_ensure_uops_and_opts_count(N: int, M:int, K:int, dtype_in:DType, d
 
   if ensure_triggered:
     program = to_program(replace_opts(realized_ast, opts_to_apply), Device[Device.DEFAULT].renderer)
-    wmmas = len([uop for uop in tuple(program.src[1].src) if uop.op is Ops.WMMA])
+    wmmas = len(wmma_uops(replace_opts(realized_ast, opts_to_apply)))
     tcs = len([x for x in program.src[0].arg.applied_opts if x.op is OptOps.TC])
     assert wmmas > 0, "tensor core not triggered"
     assert tcs == 1, "tensor core opt not included"
@@ -123,7 +128,7 @@ class TestTensorCores(unittest.TestCase):
           a = _tc_rand(tc.dims[1]*8, tc.dims[2]*8, dtype=tc.dtype_in)
           b = _tc_rand(tc.dims[2]*8, tc.dims[0]*8, dtype=tc.dtype_in)
           ast = a.matmul(b, dtype=tc.dtype_out).schedule_linear().src[-1].src[0]
-          wmmas = [u for u in to_program(ast, Device[Device.DEFAULT].renderer).src[1].src if u.op is Ops.WMMA]
+          wmmas = wmma_uops(ast)
         self.assertGreater(len(wmmas), 0)
         for u in wmmas: self.assertTrue(any(x.op is Ops.LOAD for x in u.src[2].toposort()), f"accumulator is {u.src[2]}")
 
@@ -323,7 +328,7 @@ class TestTensorCores(unittest.TestCase):
     opts = [Opt(OptOps.TC, 0, (-1, 0, 1)), Opt(OptOps.SPLIT, tc_reduce_axis(x.matmul(y, dtype=tc.dtype_out)), (2, AxisType.UPCAST))]
     r = x.matmul(y, dtype=tc.dtype_out)
     ast = helper_linearizer_opt(r, [opts[1:]], apply_tc=True, atol=3e-2, rtol=1e-3, check_default_opt=False)
-    wmmas = [u for u in tuple(to_program(replace_opts(ast, opts), Device[Device.DEFAULT].renderer).src[1].src) if u.op is Ops.WMMA]
+    wmmas = wmma_uops(replace_opts(ast, opts))
     self.assertGreater(len(wmmas), 0)
     for u in wmmas: assert u.src[-1].src[0].op != Ops.STORE
 
@@ -337,7 +342,7 @@ class TestTensorCores(unittest.TestCase):
     opts = [Opt(OptOps.TC, 0, (-1, 0, 1)), Opt(OptOps.SPLIT, tc_reduce_axis(x.matmul(y, dtype=tc.dtype_out)), (2, AxisType.UPCAST))]
     r = x.matmul(y, dtype=tc.dtype_out)
     ast = helper_linearizer_opt(r, [opts[1:]], apply_tc=True, atol=3e-2, rtol=1e-3, check_default_opt=False)
-    wmmas = [u for u in tuple(to_program(replace_opts(ast, opts), Device[Device.DEFAULT].renderer).src[1].src) if u.op is Ops.WMMA]
+    wmmas = wmma_uops(replace_opts(ast, opts))
     self.assertGreater(len(wmmas), 0)
     for u in wmmas: assert u.src[-1].src[0].op != Ops.STORE
 
@@ -352,7 +357,7 @@ class TestTensorCores(unittest.TestCase):
     opts = [Opt(OptOps.TC, 0, (-1, 0, 1)), Opt(OptOps.SPLIT, tc_reduce_axis(x.matmul(y, dtype=tc.dtype_out).relu()), (2, AxisType.UPCAST))]
     r = x.matmul(y, dtype=tc.dtype_out).relu()
     ast = helper_linearizer_opt(r, [opts[1:]], apply_tc=True, atol=3e-2, rtol=1e-3, check_default_opt=False)
-    wmmas = [u for u in tuple(to_program(replace_opts(ast, opts), Device[Device.DEFAULT].renderer).src[1].src) if u.op is Ops.WMMA]
+    wmmas = wmma_uops(replace_opts(ast, opts))
     self.assertGreater(len(wmmas), 0)
     for u in wmmas: assert u.src[-1].src[0].op != Ops.STORE
 
