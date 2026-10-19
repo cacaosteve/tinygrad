@@ -503,8 +503,9 @@ def _q6_byte_f32(word:UOp, byte:int) -> UOp:
 @functools.cache
 def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int,
                                 direct_isa:bool=False, rdna4:bool=False) -> UOp:
+  # Direct gfx11 uses two 64-token tiles rather than the incorrect 128-token layout at wide outputs.
   token_tile = 32 if out_features <= 1024 and out.shape[0] % 32 == 0 else 64 if out.shape[0] % 64 == 0 and \
-    out_features <= 6144 else 128 if out.shape[0] % 128 == 0 else \
+    (out_features <= 6144 or direct_isa) else 128 if out.shape[0] % 128 == 0 else \
     32 if out.shape[0] % 32 == 0 else 16
   # Dual output tiles inflated LUT dequant VGPR live ranges — single tile only.
   output_tiles = 1
@@ -605,8 +606,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   extra = (_iq_grid(x.device, layer.ggml_type),) if layer.ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) else ()
   local_out = out_features // len(dev) if isinstance(dev:=layer.weight.device, tuple) and layer.shard_axis == 0 else out_features
   direct = amd_direct_isa(x.device)
-  # The direct IQ4_XS WMMA path returns zero on RDNA3; keep this format correct via quantized decode.
-  if tokens % 16 == 0 and local_out % 16 == 0 and not (direct and layer.ggml_type == IQ4_XS):
+  if tokens % 16 == 0 and local_out % 16 == 0:
     rdna4 = _wmma_rdna4(x.device)
     if layer.ggml_type == IQ4_XS:
       fxn = functools.partial(_iq4_linear_f16_wmma_kernel, direct_isa=direct, rdna4=rdna4)

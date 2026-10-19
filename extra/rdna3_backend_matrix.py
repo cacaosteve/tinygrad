@@ -189,7 +189,7 @@ arr = out.numpy()
 raw_ref = Tensor(np.pad(qdata, (4, 0)), device="CPU").contiguous().realize()[4:]
 weights = ggml_data_to_tensor(raw_ref, rows*cols, ggml_type).reshape(rows, cols).numpy()
 custom = linear.ggml_type is not None
-wmma = custom and tokens % 16 == 0 and rows % 16 == 0 and not (os.environ["BACKEND"] == "direct" and qtype == "IQ4_XS")
+wmma = custom and tokens % 16 == 0 and rows % 16 == 0
 ref_x = x_np.astype(np.float16).astype(np.float32) if wmma else x_np
 if custom and not wmma:
   grouped = ref_x.reshape(tokens, -1, 32)

@@ -79,7 +79,6 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_wmma_linear_symbolic(self):
     with patch("tinygrad.llm.kernels.amd.q8_quantize", side_effect=AssertionError("expected WMMA")):
       for typ in QUANT_SIZES:
-        if typ == 23 and amd_direct_isa(Tensor.empty(1).device): continue  # direct IQ4_XS uses quantized decode
         self._test_quant_linear(typ, QUANT_SIZES[typ], in_features=256, out_features=48, token_counts=(3, 17), bias=True, symbolic=True)
 
   def test_mixed_quant_linear_wmma_tiles(self):
@@ -95,7 +94,6 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     identity = Tensor(np.eye(768, dtype=np.float16)).realize()
     for typ, size in QUANT_SIZES.items():
       with self.subTest(ggml_type=typ):
-        if typ == 23 and amd_direct_isa(identity.device): continue  # direct IQ4_XS uses the correct decode fallback
         packed = rng.integers(0, 256, (48*3, size), dtype=np.uint8)
         blocks = packed.reshape(-1, 18) if typ == 20 else packed
         offset = size-2 if typ in (11, 14) else 80 if typ == 10 else 0

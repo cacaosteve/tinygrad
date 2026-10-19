@@ -1,7 +1,7 @@
 import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, amd_direct_isa, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
@@ -34,8 +34,7 @@ class QuantLinearMixin:
       with self.subTest(tokens=tokens):
         x = rng.normal(size=(tokens, in_features)).astype(np.float32 if tokens == 3 else np.float16)
         reference_x = x.astype(np.float32)
-        wmma = custom and (32 if symbolic else tokens) % 16 == 0 and out_features % 16 == 0 and \
-          not (ggml_type == 23 and amd_direct_isa(Tensor.empty(1).device))
+        wmma = custom and (32 if symbolic else tokens) % 16 == 0 and out_features % 16 == 0
         if wmma: reference_x = x.astype(np.float16).astype(np.float32)
         rounding_bound = None
         if custom and not wmma:
