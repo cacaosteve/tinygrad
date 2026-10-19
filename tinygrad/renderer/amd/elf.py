@@ -2,7 +2,7 @@
 import ctypes
 from tinygrad.helpers import ceildiv, round_up
 from tinygrad.dtype import AddrSpace
-from tinygrad.uop.ops import UOp, Ops
+from tinygrad.uop.ops import UOp, Ops, AxisType
 from tinygrad.runtime.autogen import amdgpu_kd, hsa, libc
 from tinygrad.runtime.autogen.amd.rdna3.ins import s_code_end # same encoding as RDNA4
 from tinygrad.runtime.autogen.amd.cdna.ins import s_nop as s_nop_cdna
@@ -43,7 +43,7 @@ def scan_elf_regs(insts, scratch_size_fn=scratch_inst_size):
       elif val.offset < 106: max_sgpr = max(max_sgpr, val.offset + val.sz)
   return max_vgpr, max_sgpr, max_accvgpr, private_segment_size
 
-def scan_elf_meta(prg:UOp, private_segment_size:int=0):
+def scan_elf_meta(prg:UOp, private_segment_size:int=0, wave32:bool=True):
   sink, n_bufs, n_vars, kernarg_size, param_sizes, lds_size, gids, lids = prg.src[0], 0, 0, 0, {}, 0, set(), set()
   for u in sink.toposort():
     if u.op is Ops.PARAM and u.addrspace is AddrSpace.ALU:
@@ -58,24 +58,29 @@ def scan_elf_meta(prg:UOp, private_segment_size:int=0):
       private_segment_size = max(private_segment_size, u.src[0].val)
     elif u.op is Ops.BUFFER and u.addrspace is AddrSpace.LOCAL:
       lds_size += u.max_numel() * u.dtype.itemsize
+    elif u.op is Ops.ALLOC and u.addrspace is AddrSpace.GLOBAL and u.arg.name == "scratch":
+      private_segment_size = max(private_segment_size, u.max_numel() * u.dtype.itemsize)
     elif u.op is Ops.INS and getattr(u.arg[0], "name", None) == "LDS_BASE":
       lds_size = max(lds_size, (u.src[1].val if len(u.src) > 1 else lds_size) + u.src[0].val)
     elif u.op is Ops.SPECIAL and u.arg.startswith("gidx"): gids.add(int(u.arg[-1]))
     elif u.op is Ops.SPECIAL and u.arg.startswith("lidx") and u.vmax > 0: lids.add(int(u.arg[-1]))
+    elif u.op is Ops.RANGE and u.axis_type is AxisType.WARP and u.src[0].arg == 64: wave32 = True
   if len(prg.src) > 1 and prg.src[1].op is Ops.LINEAR:
     for u in prg.src[1].src:
       if u.op is Ops.INS and getattr(u.arg[0], "name", None) == "SCRATCH_SIZE":
         private_segment_size = max(private_segment_size, u.src[0].val)
-  return n_bufs, n_vars, kernarg_size, param_sizes, lds_size, gids, lids, private_segment_size
+  return n_bufs, n_vars, kernarg_size, param_sizes, lds_size, gids, lids, private_segment_size, wave32
 
 def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
+  raw_arch = arch
+  arch = next(v for k, v in _arch_map.items() if raw_arch.startswith(k))
+  is_cdna, is_rdna4 = arch == "cdna", arch == "rdna4"
+  wave32 = not is_cdna
   insts = [u.arg[0] for u in lin.src]
   max_vgpr, max_sgpr, max_accvgpr, private_segment_size = scan_elf_regs(insts, scratch_inst_size)
-  n_bufs, n_vars, kernarg_size, param_sizes, lds_size, gids, lids, private_segment_size = scan_elf_meta(prg, private_segment_size)
+  n_bufs, n_vars, kernarg_size, param_sizes, lds_size, gids, lids, private_segment_size, wave32 = \
+    scan_elf_meta(prg, private_segment_size, wave32)
   code_bytes = b"".join(inst.to_bytes() for inst in insts)
-  raw_arch = arch
-  arch = next(v for k, v in _arch_map.items() if arch.startswith(k))
-  is_cdna, is_rdna4 = arch == "cdna", arch == "rdna4"
 
   # ** pad text to ISA alignment
   padding_inst = (s_nop_cdna(0) if is_cdna else s_code_end()).to_bytes()
@@ -87,7 +92,7 @@ def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
   accum_offset = round_up(max_vgpr, 4) if max_accvgpr > 0 else 0
   next_free_vgpr = round_up(accum_offset + max_accvgpr, 8) if max_accvgpr > 0 else round_up(max_vgpr, 8)
   next_free_sgpr = round_up(max_sgpr, 8)
-  vgpr_granule = max(0, (next_free_vgpr + 7) // 8 - 1)
+  vgpr_granule = max(0, (next_free_vgpr - 1) // (8 if is_cdna or wave32 else 4))
   # CDNA: add 6 for VCC(2) + FLAT_SCRATCH(2) + XNACK_MASK(2), next_free_sgpr is unused in RDNA.
   sgpr_granule = max(0, ceildiv(next_free_sgpr + 6, 8) - 1) if is_cdna else 0
   desc = amdgpu_kd.llvm_amdhsa_kernel_descriptor_t()
@@ -119,7 +124,7 @@ def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
                             int(2 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Z_SHIFT |
                             max(lids, default=0) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_VGPR_WORKITEM_ID_SHIFT)
   desc.kernel_code_properties = (1 << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_KERNARG_SEGMENT_PTR_SHIFT |
-                                 (0 if is_cdna else 1) << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32_SHIFT)
+                                 int(wave32) << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32_SHIFT)
   if is_cdna and max_accvgpr > 0:
     desc.compute_pgm_rsrc3 = max(0, accum_offset // 4 - 1) << amdgpu_kd.COMPUTE_PGM_RSRC3_GFX90A_ACCUM_OFFSET_SHIFT
   rodata = bytes(desc)
