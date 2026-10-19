@@ -1377,6 +1377,25 @@ class TestAMDRenderer(unittest.TestCase):
     scheduled = amd_lib._schedule_scalar_vmem([load0, load1, cast0, mul0, cast1, mul1], alu_breadth=True)
     self.assertEqual([id(x) for x in scheduled], [id(x) for x in (load0, load1, cast0, cast1, mul0, mul1)])
 
+  def test_scalar_vmem_scheduler_limits_alu_motion_with_looped_reg_state(self):
+    loop = UOp.range(8, 0, AxisType.LOOP)
+    reg = UOp.placeholder((1,), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
+    state = reg.after(loop)
+    base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
+    idx0 = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))
+    idx1 = _uop(Ops.INS, dtypes.uint32, (idx0, UOp.const(1, dtypes.uint32)), AMDOps.ADD, (Register("idx1", 261),))
+    load0 = _uop(Ops.INS, dtypes.float32, (base, idx0), AMDOps.LOAD, (Register("load0", 270),))
+    mul0 = _uop(Ops.INS, dtypes.float32, (load0, UOp.const(2.0, dtypes.float32)), AMDOps.MUL, (Register("mul0", 271),))
+    load1 = _uop(Ops.INS, dtypes.float32, (base, idx1), AMDOps.LOAD, (Register("load1", 272),))
+    mul1 = _uop(Ops.INS, dtypes.float32, (load1, UOp.const(3.0, dtypes.float32)), AMDOps.MUL, (Register("mul1", 273),))
+    from unittest.mock import patch
+    with patch.dict(os.environ, {"AMD_VOPD_FMAC":"0"}):
+      getenv.cache_clear()
+      try: scheduled = amd_lib._schedule_scalar_vmem([loop, state, load0, mul0, idx1, load1, mul1])
+      finally: getenv.cache_clear()
+    pos = {id(u):i for i,u in enumerate(scheduled)}
+    self.assertLess(pos[id(mul0)], pos[id(load1)])
+
   def test_scalar_vmem_scheduler_hoists_packed_byte_load(self):
     base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("sbase", 6),))
     idx0 = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))

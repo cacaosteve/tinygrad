@@ -606,15 +606,19 @@ def schedule_scalar_vmem(ops:list[UOp], alu_breadth:bool|None=None) -> list[UOp]
   schedule_decode_segments = not schedule_wmma_segments and \
     any(u.op is Ops.INS and _iop(u) is AMDOps.DOT4 for u in ops) and \
     sum(1 for u in ops if u.op is Ops.INS and _iop(u) is AMDOps.LOAD and u.dtype in (dtypes.uint, dtypes.uint32)) >= 8
+  looped_non_fmac_reg_state = any(u.op is Ops.RANGE for u in ops) and \
+    any(u.op is Ops.AFTER and u.addrspace is AddrSpace.REG for u in ops) and \
+    not any(u.op is Ops.INS and _iop(u) is AMDOps.FMAC for u in ops)
   if not schedule_wmma_segments and not schedule_decode_segments and \
      any(u.op is Ops.INS and (_iop(u) is AMDOps.WMMA or (_iop(u) is AMDOps.LOAD and not vmem_schedulable_load(u))) for u in ops): return ops
   def schedulable(u:UOp) -> bool:
     if u.op is Ops.BITCAST or (u.op is Ops.NOOP and u.dtype is not dtypes.void): return True  # value alias, never a void ordering gate
     if u.op is Ops.AFTER and u.addrspace is AddrSpace.REG: return True  # register accumulator binding, not a memory/state boundary
     if u.op is not Ops.INS or _iop(u) not in VMEM_SCHEDULABLE: return False
-    # Flash decode promote: full ALU-in-segment lets loads cross online-softmax RMW → NaN/MMU.
-    # SCHEDULE_VMEM_ALU folded into VOPD_FMAC invert (decode ship ALU=0; else 1). Mode 2 removed.
-    alu_mode = 0 if getenv("AMD_VOPD_FMAC", 0) else 1
+    # Loop-carried REG values are implicit mutable state. Keep non-FMAC loop ALU ops out of the
+    # VMEM scheduler window until it models their physical-register hazards with async loads.
+    # SCHEDULE_VMEM_ALU folded into VOPD_FMAC invert (decode ship ALU=0; else 1).
+    alu_mode = 0 if getenv("AMD_VOPD_FMAC", 0) or looped_non_fmac_reg_state else 1
     if alu_mode == 0 and _iop(u) not in (
         AMDOps.LOAD, AMDOps.MOV, AMDOps.PACK, AMDOps.EXTRACT, AMDOps.COLLECT, AMDOps.CAST, AMDOps.PACK_F16):
       return False
