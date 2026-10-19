@@ -204,7 +204,6 @@ def sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
       i += 1
       continue
     wmma_dst = _reg_idxs(u)
-    wmma_src = set().union(*(_reg_idxs(s) for s in u.src))
     end = i + 1
     glued = set(wmma_dst)
     while end < len(out):
@@ -213,6 +212,7 @@ def sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
       if not (_reg_idxs(v.src[0]) & glued): break
       glued |= _reg_idxs(v)
       end += 1
+    block_src = set().union(*(_reg_idxs(s) for item in out[i:end] for s in item.src))
     block = end - i
     j = end
     while j < len(out):
@@ -222,9 +222,7 @@ def sink_wmma_past_loads(ops:list[UOp]) -> list[UOp]:
       if _iop(v) is AMDOps.PACK_F16 and not _pack_f16_is_vec_load(v): break
       v_dst = _reg_idxs(v)
       v_src = set().union(*(_reg_idxs(s) for s in v.src))
-      if v_src & wmma_dst: break
-      if v_dst & wmma_src: break
-      if v_dst & wmma_dst: break
+      if v_src & glued or v_dst & (block_src | glued): break
       j += 1
     if j > end:
       chunk = out[i:end]

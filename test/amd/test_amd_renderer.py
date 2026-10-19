@@ -1695,6 +1695,19 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertLess(load_i, wait_i)
     self.assertLess(wait_i, mul_i)
 
+  def test_wmma_sink_preserves_glued_extract_dependencies(self):
+    acc = _uop(Ops.INS, dtypes.float, arg=AMDOps.DEFINE, tag=(Register("acc", 400),))
+    ab = _uop(Ops.INS, dtypes.half, arg=AMDOps.DEFINE, tag=(Register("ab", 300),))
+    wmma = _uop(Ops.INS, dtypes.float, (acc, ab, ab), AMDOps.WMMA, (Register("acc", 400),))
+    extract = _uop(Ops.INS, dtypes.float, (wmma, UOp.const(0)), AMDOps.EXTRACT, (Register("copy", 270),))
+    for hazard in ("read", "write"):
+      with self.subTest(hazard=hazard):
+        src = extract if hazard == "read" else UOp.const(1.0, dtypes.float)
+        dst = 280 if hazard == "read" else 270
+        following = _uop(Ops.INS, dtypes.float, (src, UOp.const(2.0, dtypes.float)), AMDOps.MUL, (Register("next", dst),))
+        ops = [wmma, extract, following]
+        self.assertEqual([id(u) for u in amd_lib._sink_wmma_past_loads(ops)], [id(u) for u in ops])
+
   def test_copy_destination_waits_for_outstanding_load(self):
     base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.DEFINE, tag=(Register("base", 6),))
     local = _uop(Ops.INS, dtypes.uint32, (UOp.const(64), UOp.const(0)), AMDOps.LDS_BASE)
