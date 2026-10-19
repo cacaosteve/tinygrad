@@ -434,8 +434,8 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     rng = np.random.default_rng(10618)
     for heads, kv_heads, dim in ((2, 1, 64), (3, 1, 64), (4, 1, 128), (8, 2, 64)):
       with self.subTest(heads=heads, kv_heads=kv_heads, dim=dim):
-        qn = rng.normal(0, 0.3, (1, heads, 32, dim)).astype(np.float16)
-        kn, vn = (rng.normal(0, 0.3, (1, kv_heads, 64, dim)).astype(np.float16) for _ in range(2))
+        qn = rng.normal(0, 1, (1, heads, 32, dim)).astype(np.float16)
+        kn, vn = (rng.normal(0, 1, (1, kv_heads, 64, dim)).astype(np.float16) for _ in range(2))
         q, k, v = (Tensor(x).realize() for x in (qn, kn, vn))
         keys, values = (np.repeat(x.astype(np.float64), heads // kv_heads, axis=1) for x in (kn, vn))
         score = qn.astype(np.float64) @ keys.swapaxes(-1, -2) / np.sqrt(dim)
