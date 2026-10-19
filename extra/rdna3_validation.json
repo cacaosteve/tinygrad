@@ -1,7 +1,7 @@
 {
   "date": "2026-10-18",
-  "source_commit": "be4ce7d04267d98d55ce335b74a622b628b2b88c",
-  "upstream_master": "c04397442b179dc3ecca03229c8c90a7d0aa211c",
+  "source_commit": "13072484260c1e1217da4a42df1578f7b80c7a26",
+  "upstream_master": "ae0d6439cd82fbfd7b6e67a915d134f6b0869b73",
   "status": "not PR-ready",
   "constraints": {
     "pull_request_opened": false,
@@ -34,7 +34,7 @@
       "skipped": 3,
       "subtests": 326
     },
-    "hardware_full": {
+    "hardware_full_previous": {
       "commit": "be4ce7d04",
       "passed": 1190,
       "skipped": 72,
@@ -125,6 +125,14 @@
       "commit": "a1092b4df",
       "result": "Restored upstream per-device kernel sizes, column-shard output metadata, row-shard allreduce, and dense fallback guard. CPU graph-contract test passes both row and column cases. No multi-GPU hardware validation."
     },
+    "hardware_full": {
+      "commit": "130724842",
+      "passed": 1211,
+      "skipped": 72,
+      "subtests": 930,
+      "seconds": 508.71,
+      "note": "Expanded serial gfx1100 suite exits zero. Includes the earlier bounded scope plus the complete float-UOp class, mapped staging-buffer reuse, and NaN/+Inf/-Inf cache-tail attention regression. Dedicated actual-source model soak passes another 360 complete generations; fresh model/core matrices are recorded separately."
+    },
     "single_gpu_coverage_limit": "An additional all-quantized-runtime run reached 61 passing tests, then failed trying AMD:1. This host has one GPU; do not count multi-GPU hardware as validated.",
     "combined_candidate": {
       "commit": "13072484260c1e1217da4a42df1578f7b80c7a26",
@@ -134,11 +142,13 @@
       "local_native_mock": {"passed": 382, "skipped": 3, "subtests": 412},
       "ruff": "passed",
       "mypy": "passed (221 files)",
-      "hip_bf16": "FAIL: TestBFloat16Type.test_bitcast (8 earlier cases pass). Also fails on pristine current master ae0d6439c; pristine older upstream bfa6337 passes. Not counted green or skipped. Isolated gfx11 software-storage fallback trial is 82edb33c6; hardware gate pending.",
+      "hip_bf16": "Installed ROCm 6.0 COMGR fails TestBFloat16Type.test_bitcast on candidate and pristine ae0d6439c. With privately unpacked upstream-CI ROCm 7.1 COMGR (verified ABI 3.0), unchanged candidate code passes the full bf16 scope: 18 passed, 1 skipped. No compatibility fallback adopted; 82edb33c6 remains unmerged and is not needed for the CI toolchain.",
       "harness_notes": "The first NULL attempt inherited CACHELEVEL=0 from benchmarking and failed a cache-expecting unit. Preserved that failure; reran normal CI with CCACHE=1/CACHELEVEL=2. The CI results above are from that corrected environment. Full local NULL collection cannot run in the shared local venv because hypothesis is absent; remote existing venv provides the dependencies. Neither shared venv was modified.",
       "flash_queued_and_frozen": "Actual DIRECT and HIP sources both pass; batches 10/50/100 and frozen KV128/KV2048 checks. Python prewait retained.",
-      "long_model_and_matrix": "Running on unchanged 130724842; no fresh performance acceptance yet.",
-      "results": "/home/admin441766/rdna3-validation-results-20261017/resume-2-20261018/staging-gates-130724842-r3"
+      "long_model_and_matrix": "Actual-source replay passes 240 chunk32 and 120 chunk1024 complete generations, all 33 output tokens identical in every generation. Both six-case model and 12-case ordinary matrices pass, separately with installed COMGR 6.0 and privately scoped upstream-CI COMGR 7.1. All numeric-fixture tokens also match between DIRECT, HIP and AMDLLVM in every case. New HIP compiler does not close DIRECT's 1.32-1.51x product-prefill latency gap.",
+      "results": "/home/admin441766/rdna3-validation-results-20261017/resume-2-20261018/comgr71-gates-130724842",
+      "legacy_compiler_results": "/home/admin441766/rdna3-validation-results-20261017/resume-2-20261018/staging-gates-130724842-r3",
+      "github_ci": "Not triggered for the candidate: no push or PR. Equivalent normal CPU/NULL scopes pass locally on the PC; official upstream ae0d6439c reports 78 successful GitHub checks."
     }
   },
   "performance": {
@@ -331,21 +341,21 @@
     "note": "Shared GGUF bitfield shifts avoid software division; native policy fully unrolls one bounded 32-value packed block only without an existing expansion. This is not a fresh HIP/LLVM paired model comparison, a general language-quality result, or evidence for every quantization/model."
   },
   "current_full_model": {
-    "measured_commit": "7007edb0a",
+    "measured_commit": "130724842",
     "model": "Llama 3.2 1B Q6_K, 1024 numeric prompt tokens, 33 generated tokens",
-    "method": "Seven complete generations per backend/chunk; medians of rounds 2 through 6. Synchronized wall time, normal KFD sleeping enabled, no spin-only workaround. All six cases generate identical tokens in every round.",
+    "method": "Seven complete generations per backend/chunk; medians of rounds 2 through 6. Synchronized wall time, normal KFD sleeping enabled, no spin-only workaround. All six cases generate identical tokens in every round. HIP uses the same ROCm 7.1 COMGR version as upstream CI, unpacked privately via ROCM_PATH. No system compiler or driver was replaced.",
     "comparison_limit": "Same-product paths, not identical kernel mappings: DIRECT/HIP use supported custom kernels; AMDLLVM uses generic graphs. This is not a general language-quality or universal compiler-speed claim.",
     "rows": [
-      {"backend": "direct", "chunk": 1024, "prefill_tps": 2257.71, "decode_tps": 238.58, "cold_prefill_compile_seconds": 4.259},
-      {"backend": "hip", "chunk": 1024, "prefill_tps": 2958.65, "decode_tps": 78.94, "cold_prefill_compile_seconds": 6.820},
-      {"backend": "llvm", "chunk": 1024, "prefill_tps": 145.04, "decode_tps": 30.62, "cold_prefill_compile_seconds": 7.035},
-      {"backend": "direct", "chunk": 32, "prefill_tps": 1494.88, "decode_tps": 299.29, "cold_prefill_compile_seconds": 3.629},
-      {"backend": "hip", "chunk": 32, "prefill_tps": 2249.98, "decode_tps": 101.95, "cold_prefill_compile_seconds": 4.676},
-      {"backend": "llvm", "chunk": 32, "prefill_tps": 143.93, "decode_tps": 30.85, "cold_prefill_compile_seconds": 6.985}
+      {"backend": "direct", "chunk": 1024, "prefill_tps": 2288.10, "decode_tps": 246.90, "cold_prefill_compile_seconds": 4.329},
+      {"backend": "hip", "chunk": 1024, "prefill_tps": 3011.13, "decode_tps": 80.71, "cold_prefill_compile_seconds": 6.408},
+      {"backend": "llvm", "chunk": 1024, "prefill_tps": 152.65, "decode_tps": 32.20, "cold_prefill_compile_seconds": 7.175},
+      {"backend": "direct", "chunk": 32, "prefill_tps": 1581.96, "decode_tps": 307.45, "cold_prefill_compile_seconds": 3.651},
+      {"backend": "hip", "chunk": 32, "prefill_tps": 2393.70, "decode_tps": 107.28, "cold_prefill_compile_seconds": 4.207},
+      {"backend": "llvm", "chunk": 32, "prefill_tps": 148.34, "decode_tps": 32.30, "cold_prefill_compile_seconds": 7.068}
     ],
-    "remaining_prefill_latency_vs_hip": {"chunk1024": 1.310, "chunk32": 1.505},
-    "artifacts": "Gaming PC: rdna3-validation-results-20261017/resume-1/model-rounding-matrix-20261018.json",
-    "soak_limit": "These six seven-round measurements pass. Longer model replay later reproduced a submission/timeline timeout on both the main candidate and an isolated row-reuse trial; short-run parity and throughput are not a long-run correctness proof."
+    "remaining_prefill_latency_vs_hip": {"chunk1024": 1.316, "chunk32": 1.513},
+    "artifacts": "Gaming PC: rdna3-validation-results-20261017/resume-2-20261018/comgr71-gates-130724842/model-matrix.json; local: rdna3-validation-artifacts-20261018/resume2-comgr71-gates-130724842/",
+    "soak_limit": "Actual combined source additionally passes 240 complete chunk32 and 120 complete chunk1024 generations with identical tokens, plus DIRECT/HIP queued/frozen flash replay. Reversed parent controls fail with drained queues/timeline regression; cache-policy bypass alone also fails. Gfx11 ring-side pre-fetch barrier fixes the tested corpus without bypass. This is bounded replay evidence, not proof of all workloads."
   },
   "kfd_completion_events": {
     "commit": "cf95684e7",
@@ -356,9 +366,9 @@
     "flash_gate": "afaf7309f: DIRECT and HIP prefill batches 10/50/100 pass independent NumPy output checks; synchronized prefill and attention decode also pass. Python prewait remains."
   },
   "known_blockers": [
-    "Fresh current-upstream HIP bf16 -> half bitcast regression after ae0d6439c: candidate and pristine ae0d6439c fail, older pristine upstream passes. Native direct and CPU/NULL gates pass. Gfx11 storage-preserving fallback trial 82edb33c6 is not accepted without its hardware gate.",
-    "Long model replay reproduces a runtime timeout on main be4ce7d04 and trial 2cb40f23e. Captured queues are drained, but timeline regresses (for example target 9007, signal 9005). CPU-visible compute command buffers contain the correct 9006/9007 release values. Submission visibility/ordering remains under investigation; not fixed by retries or the KFD wakeup repair.",
-    "Size gate fails: 31862 counted lines at be4ce7d04 versus MAX_LINE_COUNT=26500; do not conceal or exclude renderer code to pass.",
+    "Use current-CI ROCm 7.1 COMGR for HIP validation: installed legacy 6.0 miscompiles bf16 -> half bitcasts after upstream's native-bf16 switch. Privately scoped 7.1 passes on unchanged source; no system package/driver update or product compatibility fallback was made.",
+    "The captured long-model timeout is resolved on the tested gfx1100 corpus by a ring-side pre-fetch memory barrier (240+120 complete combined-source generations). Retain the frozen negative controls and broaden soak with future runtime changes; do not infer universal ordering correctness or remove the separate Python prewait.",
+    "Size gate fails: 31865 counted lines at 130724842 versus MAX_LINE_COUNT=26500 (10043 core lines); do not conceal or exclude renderer code or raise the limit to pretend it passes.",
     "An extra explicit MOCK+AMD:AMD null float4 probe also fails on the parent: its structural counter expects stale INS metadata. The normal NULL/CPU CI scopes pass. Reconcile this extra native scope without weakening physical memory correctness; no test-counter or expectation edits were accepted.",
     "Full-model Q6 prefill and short-batch Q6 WMMA are not uniformly HIP-competitive.",
     "Actual Llama 1B prefill uses generic D=64 symbolic attention, not the fast standalone aligned D=128 flash mapping; do not remove the correctness gates to change routing.",
@@ -435,20 +445,20 @@
     {
       "branch": "codex/rdna3-ib-prefetch-20261018",
       "commit": "a885c3170",
-      "accepted": false,
+      "accepted": true,
       "result": "Reuse the existing gfx11 memory-barrier encoder on the ring before indirect-buffer fetch, without cache-policy bypass. Packet regression fails on parent and passes after, preserving other target packets and a nonzero command-buffer view offset. External diagnostic: 240 complete model generations with identical tokens. Reversed policy-0 control again fails at generation 0 (target 184, signal 182), followed by passing GPU smoke. Actual candidate, without monkeypatches: 240 complete model generations with identical tokens. Local mock/compiler/DSL/HCQ scope: 381 passed, 3 skipped, 408 subtests; Ruff/mypy pass. Full physical suite stops at an existing decode NaN: 338 passed and 422 subtests before the failure. Independent poisoned-tail cases reproduce the same numerical failure on parent and trial, not only on the runtime trial."
     },
     {
       "branch": "codex/rdna3-copy-scoreboard-20261018",
       "commit": "1bbcd61a5",
       "merged_upstream_commit": "b2d67bbd1",
-      "accepted": false,
+      "accepted": true,
       "result": "Copies and VOPD pairs previously waited only for pending source reads, not pending writes to their physical destinations. Late VMEM/LDS results can overwrite a new initializer after its old load value is dead. Add destination-register dependencies, retaining scheduling. Four packet-order subtests (VMEM/LDS, single/paired MOV) fail on parent and pass after. Nine-shape poisoned-tail diagnostic fails identically on parent/runtime-only trial and passes with destination waits; HIP passes the same corpus. A 27-subtest NaN/+Inf/-Inf tail test plus the original cache-length regression pass on actual post-merge source b2d67bbd1. Post-merge local scope: 382 passed, 3 skipped, 412 subtests; Ruff/mypy (221 files) pass. Expanded full serial scope stops at raw float ADD: 1150 passed, 71 skipped, 916 subtests, one failure. That scope adds the whole TestFloatUOps class; the older 1190-test scope included only test_sqrt_edgecases. The same ADD failure reproduces on untouched be4ce7d04 and pristine upstream HIP. Input readback shows the first operand is already -3 instead of -2 before the shader runs; see the staging-reuse trial."
     },
     {
       "branch": "codex/rdna3-staging-reuse-20261018",
       "commit": "130724842",
-      "accepted": false,
+      "accepted": true,
       "result": "Temporary PYTHON staging storage was returned to the allocator cache while an asynchronous GPU copy still read it. Reinitializing the next same-size buffer overwrote the previous input. LRU=0 makes the raw ADD pass; a separate 16-buffer initialization regression fails at all three byte sizes (4, 64, 4096) on the parent. Before handing cached storage back for reuse, synchronize its mapped devices, matching the existing do_free ownership rule without making every copy synchronous or disabling reuse. The deterministic mapped-cache unit fails before and passes after. Local buffer/device/zero-copy/subbuffer scope: 41 passed, 4 skipped, 22 subtests (venv on PATH for subprocess python3); native mock/compiler/HCQ scope: 382 passed, 3 skipped, 412 subtests; Ruff/mypy (221 files) pass. Actual gfx1100 targeted scope: 21 passed, 38 subtests. Expanded full serial scope: 1211 passed, 72 skipped, 930 subtests, exit zero. Normal SPEC=2 CI: NULL 1887 passed, CPU 2041 passed. Long replay and fresh timings remain pending."
     }
   ],
@@ -486,7 +496,7 @@
     "date": "2026-10-18",
     "arch": "gfx1100",
     "pci_id": "1002:744c",
-    "status": "Full native serial and normal NULL/CPU CI pass on the combined trial. Flash replay passes; long-model replay and matrix running. HIP bf16 has a separately proven current-upstream regression, not counted green. Supersedes the previous wrong-card stop.",
+    "status": "Full native serial and normal NULL/CPU CI pass on the combined trial. Flash replay and 360 complete model generations pass. Legacy-COMGR model/core matrices are complete; current-CI COMGR 7.1 paired matrix is running. The bf16 regression is specific to the installed old compiler and passes with 7.1 on unchanged source. Supersedes the previous wrong-card stop.",
     "product_under_validation": "13072484260c1e1217da4a42df1578f7b80c7a26",
     "trial_worktree": "/Users/steve/tinygrad-rdna3-staging-reuse-20261018",
     "remote_trial": "/home/admin441766/rdna3-staging-reuse-20261018",
@@ -494,8 +504,8 @@
     "local_results": "/Users/steve/rdna3-validation-artifacts-20261018",
     "next": [
       "Expanded serial native scope and normal CPU/NULL CI pass on 130724842; do not substitute the older smaller scope for these counts.",
-      "DIRECT/HIP queued and frozen flash replay pass. Finish long model replay and paired performance matrix on unchanged 130724842; retain the proven upstream HIP bf16 failure as a failure.",
-      "Hardware-gate isolated gfx11 bf16 fallback 82edb33c6 and strided-GQA cleanup trial 11d946ebd only after the serial controller completes. The GQA trial removes the Tensor-level AMDRenderer-specific contiguous workaround; only its CPU reference gate (four subtests), Ruff and mypy have passed so far.",
+      "DIRECT/HIP queued and frozen flash replay and 360 model generations pass. Finish the paired matrix on unchanged 130724842 using privately scoped ROCm 7.1, while preserving the separate legacy-COMGR results.",
+      "Do not adopt gfx11 bf16 fallback 82edb33c6: the unchanged source passes with the CI compiler. Hardware-gate strided-GQA cleanup trial 11d946ebd after the serial controller completes. It removes the Tensor-level AMDRenderer-specific contiguous workaround; only its CPU reference gate (four subtests), Ruff and mypy have passed so far.",
       "Measure fresh paired whole-model throughput before accepting either fix or the independent symbolic-row trial.",
       "Integrate only validated changes into codex/rdna3-pr-ready-20261018; do not modify the emulator or open/push a PR."
     ]
@@ -504,10 +514,11 @@
     "gabriel_rdna3_pr_head": "c5640ec5e",
     "useful_recent_branches": [
       "early_estimates (85740d39f)",
-      "unified_stack (0ba9397af)",
+      "pre_isel_walk (1571a6cb2, new x86-only semantic preselection cleanup)",
+      "ins_is_call_v3 (dd31a682c)",
       "remove_range (3ef3c903e)"
     ],
-    "disposition": "Fresh review: official master advances from c04397442 to ae0d6439c, a single HIP bf16 cast cleanup. Merged into the isolated combined trial as b2d67bbd1 before physical regression; primary candidate not advanced yet. Gabriel early_estimates remains 85740d39f; ins_is_call_v3 remains dd31a682c and RDNA3 PR head/fork master remains c5640ec5e. These are unchanged, with no new comparable RDNA3 performance data. No wholesale Gabriel merge.",
+    "disposition": "Official master remains ae0d6439c; merged into the combined trial as b2d67bbd1. Its 78 reported GitHub checks are successful. Workflow pins ROCm 7.1 and Linux AMD renderer jobs use MOCKKFD; the PC's installed compiler is ROCm 6.0. Fresh Gabriel refs: early_estimates 85740d39f, ins_is_call_v3 dd31a682c and RDNA3 PR/fork master c5640ec5e unchanged. pre_isel_walk advanced to 1571a6cb2 with four Oct18 commits: 21 changed x86 lines move same-width casts and conditional-address/flag expansion before isel. Useful architectural guidance, not an RDNA3 perf change or merge target. graph_regs/unified_stack are no longer advertised branches. No wholesale Gabriel merge.",
     "compile_profile": "Large Q6 compile ~1029 ms after cleanup; estimates ~22 ms, rewrite ~608 ms. Estimates alone are not the dominant cold-compile bottleneck."
   }
 }
