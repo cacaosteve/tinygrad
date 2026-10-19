@@ -432,18 +432,22 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
 
   def test_generic_sdpa_gqa_strided_values(self):
     rng = np.random.default_rng(10618)
-    for heads, kv_heads, dim in ((2, 1, 64), (3, 1, 64), (4, 1, 128), (8, 2, 64)):
-      with self.subTest(heads=heads, kv_heads=kv_heads, dim=dim):
-        qn = rng.normal(0, 1, (1, heads, 32, dim)).astype(np.float16)
-        kn, vn = (rng.normal(0, 1, (1, kv_heads, 64, dim)).astype(np.float16) for _ in range(2))
+    cases = ((2, 1, 64, 32, 64), (3, 1, 64, 32, 64), (4, 1, 128, 32, 64), (8, 2, 64, 32, 64),
+             (8, 2, 32, 1, 37), (16, 4, 64, 16, 192), (32, 8, 128, 32, 256), (4, 2, 256, 64, 192), (6, 2, 96, 17, 65))
+    for heads, kv_heads, dim, tokens, length in cases:
+      with self.subTest(heads=heads, kv_heads=kv_heads, dim=dim, tokens=tokens, length=length):
+        qn = rng.normal(0, 1, (1, heads, tokens, dim)).astype(np.float16)
+        kn, vn = (rng.normal(0, 1, (1, kv_heads, length, dim)).astype(np.float16) for _ in range(2))
         q, k, v = (Tensor(x).realize() for x in (qn, kn, vn))
         keys, values = (np.repeat(x.astype(np.float64), heads // kv_heads, axis=1) for x in (kn, vn))
         score = qn.astype(np.float64) @ keys.swapaxes(-1, -2) / np.sqrt(dim)
         probability = np.exp(score - score.max(-1, keepdims=True))
         expected = probability / probability.sum(-1, keepdims=True) @ values
-        actual = q.scaled_dot_product_attention(k, v, enable_gqa=True).numpy()
-        self.assertTrue(np.isfinite(actual).all())
-        np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=2e-3)
+        runner = TinyJit(lambda: q.scaled_dot_product_attention(k, v, enable_gqa=True).realize())
+        for _ in range(4):
+          actual = runner().numpy()
+          self.assertTrue(np.isfinite(actual).all())
+          np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=2e-3)
 
   def test_prefill_attention_nonzero_asymmetric_qk(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
