@@ -272,6 +272,37 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     self.assertTrue(np.isfinite(actual).all())
     np.testing.assert_allclose(actual, x @ weight.astype(np.float32).T, rtol=2e-5, atol=1e-6)
 
+  def test_dense_gemv_long_k(self):
+    device = Tensor.empty(1).device
+    if not amd_custom_kernels_supported(device): self.skipTest("RDNA3/4 required")
+    if not amd_direct_isa(device): self.skipTest("Direct ISA required")
+    rng = np.random.default_rng(82)
+    weight = rng.normal(0, 0.01, (16, 8192)).astype(np.float16)
+    linear = Linear(8192, 16, bias=False)
+    linear.weight = Tensor(weight).realize()
+    for tokens in (1, 4):
+      with self.subTest(tokens=tokens):
+        x = rng.normal(0, 0.1, (tokens, 8192)).astype(np.float32)
+        actual = linear(Tensor(x)).numpy()
+        np.testing.assert_allclose(actual, x @ weight.astype(np.float32).T, rtol=2e-5, atol=1e-5)
+
+  def test_dense_gemm_wmma(self):
+    device = Tensor.empty(1).device
+    if not amd_custom_kernels_supported(device): self.skipTest("RDNA3/4 required")
+    if not amd_direct_isa(device): self.skipTest("Direct ISA required")
+    if _wmma_rdna4(device): self.skipTest("RDNA3 only")
+    rng = np.random.default_rng(83)
+    weight = rng.normal(0, 0.01, (4096, 2048)).astype(np.float16)
+    bias = rng.normal(0, 0.01, (4096,)).astype(np.float32)
+    for tokens, use_bias in ((16, False), (32, True)):
+      with self.subTest(tokens=tokens, use_bias=use_bias):
+        x = rng.normal(0, 0.1, (tokens, 2048)).astype(np.float32)
+        linear = Linear(2048, 4096, bias=use_bias)
+        linear.weight = Tensor(weight).realize()
+        if use_bias: linear.bias = Tensor(bias).realize()
+        expected = x @ weight.astype(np.float32).T + (bias if use_bias else 0)
+        np.testing.assert_allclose(linear(Tensor(x)).numpy(), expected, rtol=2e-3, atol=2e-4)
+
   def test_gated_delta_state_and_precision(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     for case in ("view", "reset", "half"):

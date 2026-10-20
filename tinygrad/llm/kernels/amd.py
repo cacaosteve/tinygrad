@@ -3,6 +3,7 @@ import contextlib, functools, math, os
 from dataclasses import replace
 from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
+from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv, ALLOW_DEVICE_USAGE
@@ -172,6 +173,19 @@ class Linear(nn.Linear):
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    if amd_direct_isa(x.device) and not isinstance(x.device, tuple) and not _wmma_rdna4(x.device) and \
+      self.weight.uop.axis is None and self.weight.dtype is dtypes.half and x.dtype is dtypes.float and \
+      self.in_features >= 2048 and self.out_features >= 4096 and self.in_features % 16 == self.out_features % 16 == 0:
+      numel, max_shape = x.numel(), x.max_shape
+      tokens = prod(max_shape[:-1])
+      if isinstance(tokens, int) and tokens >= 16 and tokens % 16 == 0:
+        inp = (x if isinstance(numel, int) else x.pad_to(max_shape)).reshape(tokens, self.in_features)
+        out = Tensor.empty(tokens, self.out_features, dtype=dtypes.float32, device=x.device)
+        fxn = functools.partial(_amd_f16_gemm_wmma_kernel, tokens=tokens, in_features=self.in_features,
+                                out_features=self.out_features)
+        srcs = (out, self.weight, inp.cast(dtypes.half).contiguous()) + (() if self.bias is None else (self.bias,))
+        result = Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*max_shape[:-1], self.out_features)
+        return result if isinstance(numel, int) else result.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return super().__call__(x)
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
@@ -630,7 +644,18 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
 # ******** tiny dense fp16 gemv ********
 
 @functools.cache
-def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_features:int, tokens:int) -> UOp:
+def _amd_f16_gemm_wmma_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_features:int, tokens:int) -> UOp:
+  bias: UOp|None = rest[0] if rest else None
+  token, output, k = UOp.range(tokens, 0), UOp.range(out_features, 1), UOp.range(in_features, 2)
+  total = (x[token, k].load() * w[output, k].load()).cast(dtypes.float32).reduce(k, arg=Ops.ADD)
+  if bias is not None: total = total + bias[output].load().cast(dtypes.float32)
+  # A single WMMA M tile removes one weak M range, so the K range is axis 6 rather than 7.
+  split_axis = 6 if tokens == 16 else 7
+  opts = (Opt(OptOps.TC, 0, (-1, 0, 1)), Opt(OptOps.SPLIT, split_axis, (4, AxisType.LOCAL, False)))
+  return out[token, output].store(total).end(token, output).sink(arg=KernelInfo(name="linear_f16_gemm_wmma", opts_to_apply=opts))
+
+@functools.cache
+def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_features:int, tokens:int, direct_isa:bool=False) -> UOp:
   bias: UOp|None = rest[0] if rest else None
   # one block per (token, output row), 32 lanes accumulate 4-wide chunks of the row
   lanes, val_chunk = WARP_SIZE, 4
@@ -641,12 +666,22 @@ def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_
   w = w.reshape((out_features, per, lanes*val_chunk))
   x = x.reshape((tokens, per, lanes*val_chunk))
   acc = UOp.const(0, dtypes.float32)
-  for i in range(per):
+  loop:UOp|None = None
+  if direct_isa and per > 32:
+    # Large static reductions create enough live VMEM results to corrupt values in RDNA3 regalloc.
+    # Keep short reductions unrolled, but carry the accumulator through a real loop for long K.
+    loop = UOp.range(per, 3, AxisType.LOOP)
     for j in range(val_chunk):
-      acc = acc + w[out_row, i, lane*val_chunk + j].load().float() * x[token, i, lane*val_chunk + j].load().float()
+      acc = acc.after(loop) + w[out_row, loop, lane*val_chunk + j].load().float() * x[token, loop, lane*val_chunk + j].load().float()
+  else:
+    for i in range(per):
+      for j in range(val_chunk):
+        acc = acc + w[out_row, i, lane*val_chunk + j].load().float() * x[token, i, lane*val_chunk + j].load().float()
   total = warp_reduce(acc, full_wave=True)
   if bias is not None: total = total + bias[out_row].load().float()
-  return out[token, out_row.valid(lane.eq(0))].store(total).end(token, out_row, lane).sink(arg=KernelInfo(name="linear_f16_gemv", opts_to_apply=()))
+  result = out[token, out_row.valid(lane.eq(0))].store(total)
+  if loop is not None: result = result.end(loop)
+  return result.end(token, out_row, lane).sink(arg=KernelInfo(name="linear_f16_gemv", opts_to_apply=()))
 
 def _view_back(t:Tensor) -> Tensor:
   # Widening half to float is exact; preserve casts that round or change the values.
@@ -660,7 +695,8 @@ def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
   weight = _view_back(layer.weight)
   x = x.contiguous() if x.dtype in (dtypes.half, dtypes.bfloat16, dtypes.float) else x.cast(dtypes.half).contiguous()
   out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
-  fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
+  fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens,
+                          direct_isa=amd_direct_isa(x.device))
   srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
   return Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
 
