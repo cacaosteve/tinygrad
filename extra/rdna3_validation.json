@@ -1,8 +1,8 @@
 {
-  "date": "2026-10-18",
-  "source_commit": "13072484260c1e1217da4a42df1578f7b80c7a26",
-  "upstream_master": "ae0d6439cd82fbfd7b6e67a915d134f6b0869b73",
-  "status": "not PR-ready",
+  "date": "2026-10-20",
+  "source_commit": "a04acc876201d9de3544e490bc8f8640f6fb6447",
+  "upstream_master": "51f657643270b985eef382647db680fa865698a2",
+  "status": "validated locally; not PR-ready because the upstream line-count gate fails",
   "constraints": {
     "pull_request_opened": false,
     "pushed_this_session": false,
@@ -12,6 +12,34 @@
     "arch": "gfx1100",
     "pci_id": "1002:744c",
     "family": "Navi31 / Radeon RX 7900"
+  },
+  "latest_validation": {
+    "hardware": {
+      "renderer": {"passed": 299, "subtests": 390, "seconds": 47.82},
+      "llm": {"passed": 67, "subtests": 376, "seconds": 112.22}
+    },
+    "cpu": {
+      "null": {"passed": 1892, "skipped": 86, "xfailed": 20, "subtests": 160},
+      "runtime": {"passed": 2044, "skipped": 323, "xfailed": 24, "subtests": 328},
+      "uint_alu": {"passed": 51, "skipped": 13, "subtests": 16}
+    },
+    "ruff": "passed",
+    "mypy": "passed (222 source files)",
+    "paired_matrix_median_us": {
+      "flash_prefill": {"direct": 256.062, "hip": 326.496, "direct_over_hip": 0.784},
+      "flash_decode": {"direct": 118.123, "hip": 116.689, "direct_over_hip": 1.012},
+      "matmul_h_2048": {"direct": 332.806, "hip": 307.251, "direct_over_hip": 1.083},
+      "q4_k_gemv_t1": {"direct": 105.759, "hip": 102.639, "direct_over_hip": 1.030},
+      "q5_k_gemv_t1": {"direct": 105.174, "hip": 104.649, "direct_over_hip": 1.005},
+      "q6_k_gemv_t1": {"direct": 118.669, "hip": 109.359, "direct_over_hip": 1.085},
+      "iq4_xs_gemv_t1": {"direct": 118.984, "hip": 100.974, "direct_over_hip": 1.178},
+      "q8_0_gemv_t1": {"direct": 110.019, "hip": 109.154, "direct_over_hip": 1.008},
+      "q6_k_gemv_t16": {"direct": 220.738, "hip": 149.663, "direct_over_hip": 1.475},
+      "q6_k_gemv_t32": {"direct": 226.468, "hip": 161.273, "direct_over_hip": 1.404},
+      "q6_k_gemv_t64": {"direct": 264.167, "hip": 196.303, "direct_over_hip": 1.346}
+    },
+    "matrix_correctness": "All Direct/HIP cases passed independent output checks; AMDLLVM quantized fallback uses different activation precision, so those timings are not treated as same-math parity.",
+    "model_run": "No GGUF was found under the gaming PC home, /mnt, or /tmp paths searched; full-model inference was not rerun in this session."
   },
   "validation": {
     "ruff": "passed",
@@ -368,7 +396,7 @@
   "known_blockers": [
     "Use current-CI ROCm 7.1 COMGR for HIP validation: installed legacy 6.0 miscompiles bf16 -> half bitcasts after upstream's native-bf16 switch. Privately scoped 7.1 passes on unchanged source; no system package/driver update or product compatibility fallback was made.",
     "The captured long-model timeout is resolved on the tested gfx1100 corpus by a ring-side pre-fetch memory barrier (240+120 complete combined-source generations). Retain the frozen negative controls and broaden soak with future runtime changes; do not infer universal ordering correctness or remove the separate Python prewait.",
-    "Size gate fails: 31865 counted lines at 130724842 versus MAX_LINE_COUNT=26500 (10043 core lines); do not conceal or exclude renderer code or raise the limit to pretend it passes.",
+    "Size gate fails: current source a04acc876 counts 31915 lines versus MAX_LINE_COUNT=26500 (10032 core lines; +6397 counted lines over origin/master 51f657643). Do not conceal or exclude renderer code or raise the limit to pretend it passes.",
     "An extra explicit MOCK+AMD:AMD null float4 probe also fails on the parent: its structural counter expects stale INS metadata. The normal NULL/CPU CI scopes pass. Reconcile this extra native scope without weakening physical memory correctness; no test-counter or expectation edits were accepted.",
     "Full-model Q6 prefill and short-batch Q6 WMMA are not uniformly HIP-competitive.",
     "Actual Llama 1B prefill uses generic D=64 symbolic attention, not the fast standalone aligned D=128 flash mapping; do not remove the correctness gates to change routing.",
