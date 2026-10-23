@@ -1,6 +1,7 @@
 import unittest, gc, struct, ctypes, threading, numpy as np
+from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
-from tinygrad.device import Buffer, BufferSpec
+from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import Ops, UOp, uopfunc
@@ -11,7 +12,7 @@ from tinygrad.runtime.autogen import libc
 from tinygrad.runtime.support.c import init_c_struct_t
 import tinygrad.runtime.support.hcq2 as hcq2
 from tinygrad.runtime.support.hcq2 import HCQ_DEVS, all_devices_in, hcq_compile_cache
-from test.null.test_hcq2 import chain, chain_input, compiled_chain, lower_hcq
+from test.null.test_hcq2 import compiled_chain, lower_hcq
 
 def cpu_buf(size:int=1, dtype=dtypes.uint8, **kwargs) -> UOp: return UOp.alloc((size,), dtype, device="CPU", **kwargs)
 
@@ -21,10 +22,10 @@ class TestHCQ2Schedule(unittest.TestCase):
     for jit in (False, True):
       with self.subTest(jit=jit):
         out, compiled, inputs = compiled_chain(2, jit=jit, device=Device.DEFAULT)
-        linked = link_linear(compiled, input_uops=inputs, allow_cache=not jit)
+        linked = link_linear(compiled, input_uops=inputs)
         before = tuple(inputs)
         for linear in (compiled, linked): self.assertIs(compile_linear(linear, input_uops=inputs, cache=not jit), linear)
-        self.assertIs(link_linear(linked, input_uops=inputs, allow_cache=not jit), linked)
+        self.assertIs(link_linear(linked, input_uops=inputs), linked)
         self.assertEqual(tuple(inputs), before)
         run_linear(linked, input_uops=inputs, jit=True, wait=True)
         self.assertEqual(out.tolist(), [4] * 4)
@@ -55,6 +56,18 @@ class TestHCQ2Schedule(unittest.TestCase):
     run_linear(UOp(Ops.LINEAR, src=(copyout, copyin, copyout)), wait=True)
     self.assertEqual(bytes(host.host[:]), bytes(new.host[:]))
 
+  @patch.object(type(Device["NULL"]), "host", "CPU")
+  def test_staging(self):
+    table = [("NULL", "NULL:1"), ("NULL", "CPU"), ("CPU", "NULL"), ("CL", "CPU"), ("CL", "METAL"), ("CL", "CPU", "NULL"),]
+    for path in table:
+      with self.subTest(path):
+        try: Device[path[0]], Device[path[-1]] # TODO: do not open devices?
+        except Exception: self.skipTest(f"{path} needs both devices")
+        copy = UOp.param(0, dtypes.uint8, 16, device=path[-1]).store_call(UOp.param(1, dtypes.uint8, 16, device=path[0]))
+        staged = hcq2.stage_copy(copy, *copy.src[1:3])
+        copies = (copy,) if staged is None else staged.src
+        self.assertEqual((copies[0].src[2].device, *(c.src[1].device for c in copies)), path)
+
   @unittest.skipIf(Device.DEFAULT == "METAL", "unified memory: METAL copies on the host and maps nothing")
   def test_map_cpu_buffer_preserves_contents(self):
     src = Buffer("CPU", 16, preallocate=True)
@@ -72,23 +85,12 @@ class TestHCQ2Schedule(unittest.TestCase):
       def f(a): return (a * 2 + 1).contiguous().realize()
       for _ in range(3): out = f(x)
       self.assertEqual(out.to("CPU").tolist(), [2.0 * i + 1] * 1024)
-    step(1) # warms the programs, templates and rings
+    for i in (1,2): step(i) # warms the programs and templates
     gc.collect()
     used = GlobalCounters.mem_used
-    for i in range(2, 5): step(i)
+    for i in range(3, 6): step(i)
     gc.collect()
     self.assertEqual(GlobalCounters.mem_used, used)
-
-  def test_jit_has_no_rt_buffers(self):
-    # a one shot link borrows ring slots, a jit's link owns its buffers: nothing it keeps may come from the ring
-    dev = Device[Device.DEFAULT]
-    specs = (BufferSpec(cpu_access=True), BufferSpec(host=True, uncached=True, cpu_access=True)) # device data, signals
-    ranges = [((b:=dev.rt_buffer(spec))._buf, b._buf + b.nbytes) for spec in specs]
-    x, f = chain_input(device=dev.device), TinyJit(lambda a: chain(a, 2).realize())
-    for _ in range(2): f(x)
-    for u in f.captured.linear.toposort(enter_calls=True):
-      if u.op is Ops.BUFFER and u.addrspace is AddrSpace.GLOBAL and (buf:=u.buffer).device == dev.device:
-        self.assertFalse(any(buf._buf < end and start < buf._buf + buf.nbytes for start, end in ranges))
 
 # the fence and the ffi run on the CPU runtime, which is always available
 @unittest.skipUnless(isinstance(Device["CPU"].renderer, (CStyleLanguage, LLVMRenderer)), "CALL is rendered in C style and LLVM only")
@@ -101,7 +103,7 @@ class TestHCQ2Fence(unittest.TestCase):
   def test_a_schedule_waits_for_its_previous_run(self):
     slots = UOp.alloc((4,), dtypes.uint64, device="CPU", name="slots")
     program = lower_and_compile(lower_hcq(fence:=hcq2.make_fence({"CPU": slots}, {"CPU": 1}), *hcq2.announce({"CPU": slots}, {"CPU": 1}, fence)))
-    linked = hcq2.hcq_link(program, allow_cache=False)
+    linked = hcq2.hcq_link(program)
     (i,) = [i for i, p in enumerate(program.src[0].without_after.src[1:]) if p.without_after.arg.name == "slots"]
     slots_mv = linked.src[0].without_after.src[1 + i].buffer.host.view(fmt='Q')
     slots_mv[0], base = 7, self.tl[1]
@@ -122,8 +124,8 @@ class TestHCQ2Fence(unittest.TestCase):
 class TestHCQ2FFI(unittest.TestCase):
   @staticmethod
   def _run(body:UOp) -> list[UOp]:
-    linear = hcq2.hcq_link(lower_and_compile(lower_hcq(body)), allow_cache=False)
-    assert hcq2.hcq_link(linear, allow_cache=False) is linear, "a linked linear links to itself, with the refs its call keeps"
+    linear = hcq2.hcq_link(lower_and_compile(lower_hcq(body)))
+    assert hcq2.hcq_link(linear) is linear, "a linked linear links to itself, with the refs its call keeps"
     run_linear(linear, jit=True)
     return [u for u in linear.src[0].without_after.src[1:] if u.op is Ops.BUFFER]
 
@@ -178,7 +180,7 @@ class TestHostCalls(unittest.TestCase):
     return UOp.from_buffer(Buffer("CPU", n * dtype.itemsize, initial_value=bytes(n * dtype.itemsize)), dtype)
   @staticmethod
   def _run(fxn, *bufs:UOp, **var_vals:int) -> list: # first buffer is the output
-    run_linear(hcq2.hcq_link(lower_and_compile(lower_hcq(fxn(*bufs))), allow_cache=False), var_vals, jit=True)
+    run_linear(hcq2.hcq_link(lower_and_compile(lower_hcq(fxn(*bufs)))), var_vals, jit=True)
     return bufs[0].buffer.host.view(fmt=bufs[0].dtype.fmt)[:]
 
   def test_no_addrs_no_placeholders(self):

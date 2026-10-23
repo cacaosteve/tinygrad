@@ -2,9 +2,8 @@ from __future__ import annotations
 from typing import cast, Any
 import os, ctypes, struct, functools, importlib, mmap, errno, contextlib, itertools, collections, atexit
 from dataclasses import dataclass, replace
-from tinygrad.runtime.support.hcq2 import HWQueue, encode_cmdbuf, to_name, patch, unwrap_view, layout_args
-from tinygrad.runtime.support.hcq2 import pack_args, make_program, ccall
-from tinygrad.uop.ops import sint, UOp, ProgramInfo
+from tinygrad.runtime.support.hcq2 import HWQueue, encode_cmdbuf, to_name, patch, unwrap_view, layout_args, pack_args, make_program, ccall
+from tinygrad.uop.ops import sint, UOp, ProgramInfo, Ops, UPat, PatternMatcher, KernelInfo, uopfunc
 from tinygrad.device import BufferStorage, BufferSpec, Buffer, Device, Allocator, Compiled
 from tinygrad.dtype import dtypes, DType
 from tinygrad.helpers import getenv, round_up, data64_le, DEBUG, PROFILE, ProfileEvent, lo32, hi32, prod, colored
@@ -15,18 +14,13 @@ from tinygrad.renderer.isa.rdna3 import AMDRenderer
 from tinygrad.runtime.autogen import kfd, hsa, amdgpu_kd, amdgpu_drm, libc
 from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.elf import elf_loader
-from tinygrad.runtime.support.memory import MMIOInterface
-from tinygrad.runtime.support.system import FileIOInterface
-from tinygrad.runtime.support.system import filter_visible_devices
+from tinygrad.runtime.support.memory import MMIOInterface, AddrSpace
+from tinygrad.runtime.support.system import FileIOInterface, filter_visible_devices, PCIIfaceBase, USBPCIDevice, MAP_FIXED, MAP_NORESERVE
 from tinygrad.runtime.support.am.amdev import AMDev, AMMemoryManager
 from tinygrad.runtime.support.amd import AMDReg, AMDIP, import_module, import_soc, import_pmc
-from tinygrad.runtime.support.system import PCIIfaceBase, USBPCIDevice, MAP_FIXED, MAP_NORESERVE
 from tinygrad.runtime.support.usb import USB3, setup_usb_rules, usb_reset
-from tinygrad.runtime.support.memory import AddrSpace
-if getenv("IOCTL"): import extra.hip_gpu_driver.hip_ioctl  # noqa: F401 # pylint: disable=unused-import
-
 from tinygrad.engine.realize import get_call_kernel_args
-from tinygrad.uop.ops import Ops, UPat, PatternMatcher, KernelInfo, uopfunc
+if getenv("IOCTL"): import extra.hip_gpu_driver.hip_ioctl  # noqa: F401 # pylint: disable=unused-import
 
 SQTT = ContextVar("SQTT", abs(VIZ.value)>=2)
 SQTT_ITRACE_SE_MASK, SQTT_LIMIT_SE, SQTT_SIMD_SEL, SQTT_TOKEN_EXCLUDE = \
@@ -189,6 +183,7 @@ class AMDComputeQueue(HWQueue):
     return slot
 
   def prof_stop(self, slot:UOp):
+    self.exec_barrier()
     if self.dev.pmc_enabled: self.pmc_read(slot)
     if self.dev.sqtt_enabled: self.sqtt_stop(slot)
 
@@ -392,6 +387,7 @@ class AMDComputeQueue(HWQueue):
 
     dispatch_init = self.gc.regCOMPUTE_DISPATCH_INITIATOR.encode(
       **({'cs_w32_en': int(data.wave32)} if self.target[0] != 9 else {}), force_start_at_000=1, compute_shader_en=1)
+    if data.private_segment_size: self.exec_barrier() # kernels share the scratch ring, each with its own TMPRING wave size
     self.acquire_mem(gli=0, gl2=0)
     if self.dev.prof_enabled: slot = self.prof_start(prg.arg, lib)
     self.wreg(self.gc.regCOMPUTE_PGM_LO, prog_addr >> 8)
@@ -407,8 +403,10 @@ class AMDComputeQueue(HWQueue):
     self.wreg(self.gc.regCOMPUTE_START_X, 0, 0, 0, *prg.arg.local_size, 0, 0)
     self.pkt3(self.pm4.PACKET3_DISPATCH_DIRECT, *prg.arg.global_size, dispatch_init)
     if self.dev.sqtt_enabled: self.pkt3(self.pm4.PACKET3_EVENT_WRITE, self.pm4.EVENT_TYPE(self.soc.THREAD_TRACE_MARKER) | self.pm4.EVENT_INDEX(0))
-    self.pkt3(self.pm4.PACKET3_EVENT_WRITE, self.pm4.EVENT_TYPE(self.soc.CS_PARTIAL_FLUSH) | self.pm4.EVENT_INDEX(EVENT_INDEX_PARTIAL_FLUSH))
     if self.dev.prof_enabled: self.prof_stop(slot)
+
+  def exec_barrier(self):
+    self.pkt3(self.pm4.PACKET3_EVENT_WRITE, self.pm4.EVENT_TYPE(self.soc.CS_PARTIAL_FLUSH) | self.pm4.EVENT_INDEX(EVENT_INDEX_PARTIAL_FLUSH))
 
   def wait(self, signal:UOp, value:UOp): self.wait_reg_mem(value.cast(dtypes.uint32), mem=signal.getaddr(self.devs))
 
@@ -456,6 +454,8 @@ class AMDComputeAQLQueue(AMDComputeQueue): # the ring holds 64 byte aql packets:
   def signal(self, signal:UOp, value:UOp):
     self.close_run(len(self.blob)) # close pm4, so we can sync xccs. without that wait-signal can race
     super().signal(signal, value)
+
+  def exec_barrier(self): pass
 
   def exec(self, call:UOp, prg:UOp):
     data, lib = amd_build_program(self.dev, prg, self.devs)
@@ -843,7 +843,7 @@ class AMDDevice(Compiled):
     self.iface = self._select_iface(device)
     self.is_usb = isinstance(self.iface, USBIface)
     self.is_vf = self.is_am() and self.iface.dev_impl.is_vf
-    self.can_recover, self.rtalloc_size = self.is_am() and not self.is_vf, (4 if self.is_usb else 64)<<20
+    self.can_recover = self.is_am() and not self.is_vf
 
     self.target:tuple[int, ...] = ((trgt:=self.iface.props['gfx_target_version']) // 10000, (trgt // 100) % 100, trgt % 100)
     self.arch = "gfx%d%x%x" % self.target
@@ -1019,11 +1019,6 @@ class AMDDevice(Compiled):
       print(colored(f"{self.device}: Warning: SQTT buffer is full (SE {se})! Increase SQTT buffer with SQTT_BUFFER_SIZE=X (in MB)", "yellow"))
     blob = bytes(self.sqtt_buf.host.view(fmt='B')[off:off + wptr])
     return (struct.pack('<Q', 0x11 | (4 << 13) | (0xf << 16) | (se << 24)) + blob) if self.target[0] == 9 else blob
-
-  def _at_profile_finalize(self): # the calibration kernels aren't profiles
-    self.synchronize()
-    super()._at_profile_finalize()
-    if self.prof_enabled: self.prof_read = self.prof_log.host.view(fmt='Q')[0]
 
   def collect_prof(self):
     if self.prof_enabled:
