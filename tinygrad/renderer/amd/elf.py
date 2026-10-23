@@ -64,11 +64,28 @@ def scan_elf_meta(prg:UOp, private_segment_size:int=0, wave32:bool=True):
       lds_size = max(lds_size, (u.src[1].val if len(u.src) > 1 else lds_size) + u.src[0].val)
     elif u.op is Ops.SPECIAL and u.arg.startswith("gidx"): gids.add(int(u.arg[-1]))
     elif u.op is Ops.SPECIAL and u.arg.startswith("lidx") and u.vmax > 0: lids.add(int(u.arg[-1]))
+    elif u.op is Ops.INS and getattr(u.arg[0], "name", None) == "SPECIAL" and u.src:
+      # ISA renderers lower SPECIAL to an instruction carrying the dimension index.
+      # Keep the launch descriptor's WGID/WITEM fields accurate after selection.
+      spec = int(u.src[0].val)
+      if spec < 3: lids.add(spec)
+      else: gids.add(spec - 3)
     elif u.op is Ops.RANGE and u.axis_type is AxisType.WARP and u.src[0].arg == 64: wave32 = True
   if len(prg.src) > 1 and prg.src[1].op is Ops.LINEAR:
     for u in prg.src[1].src:
       if u.op is Ops.INS and getattr(u.arg[0], "name", None) == "SCRATCH_SIZE":
         private_segment_size = max(private_segment_size, u.src[0].val)
+  # CALL lowering can place KERNARG instructions outside the program body. Include them when
+  # sizing the descriptor; otherwise an ALU argument appended after buffer pointers is omitted.
+  for u in prg.toposort():
+    if u.op is Ops.INS and getattr(u.arg[0], "name", None) == "KERNARG":
+      kernarg_size = max(kernarg_size, u.src[0].val + u.dtype.itemsize)
+  # The program signature also carries ALU params used only in launch metadata (e.g. a
+  # symbolic global size). Such params are passed by the caller even if no KERNARG load
+  # survives in the instruction body, so size the descriptor for the full ABI signature.
+  from tinygrad.device import TinyELF
+  signature = tuple((p.arg.name, p.addrspace, p.dtype, p.shape) for p in sorted(prg.arg.params, key=lambda p: p.arg.slot))
+  for offset, dtype in TinyELF.iter_sig(signature): kernarg_size = max(kernarg_size, offset + dtype.itemsize)
   return n_bufs, n_vars, kernarg_size, param_sizes, lds_size, gids, lids, private_segment_size, wave32
 
 def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:

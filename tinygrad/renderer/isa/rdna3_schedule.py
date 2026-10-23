@@ -5,10 +5,11 @@ import itertools
 
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import getenv
-from tinygrad.renderer.isa import Register, greg
+from tinygrad.renderer.isa import Register, greg, regs, with_regs
 from tinygrad.renderer.isa.rdna3_defs import (AMDOps, VGPR, iop as _iop, reg_idxs as _reg_idxs, elem_count as _elem_count,
   pack_f16_is_vec_load as _pack_f16_is_vec_load, pack_f16_half2_load as _pack_f16_half2_load,
   pack_f16_is_half2_lo_only as _pack_f16_is_half2_lo_only, reg_slots as _reg_slots, const_int as _const_int,
+  const_value as _const_value,
   lds_byte_off as _lds_byte_off, load_count_src as _load_count_src, tconst as _tconst)
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import UOp
@@ -439,7 +440,7 @@ def prefetch_a_after_packed_quant(ops:list[UOp]) -> list[UOp]:
     while j < len(out):
       v = out[j]
       if v.op is Ops.INS and _iop(v) is AMDOps.WMMA: break
-      if v.op is Ops.INS and _iop(v) in (AMDOps.BARRIER, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ,
+      if v.op is Ops.INS and _iop(v) in (AMDOps.BARRIER, AMDOps.LABEL, AMDOps.LABEL_OUT, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ,
                                         AMDOps.STORE, AMDOps.LSTORE, AMDOps.SSTORE):
         wide = []
         break
@@ -475,7 +476,7 @@ def prefetch_a_before_dequant_mix(ops:list[UOp]) -> list[UOp]:
   if not weights: return ops
   insert_at = weights[-1] + 1
   end = next((i for i,u in enumerate(out) if i > wmma0 and u.op is Ops.INS and
-              _iop(u) in (AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ, AMDOps.BARRIER,
+                  _iop(u) in (AMDOps.LABEL, AMDOps.LABEL_OUT, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ, AMDOps.BARRIER,
                           AMDOps.STORE, AMDOps.LSTORE, AMDOps.SSTORE)), len(out))
   late = [i for i,u in enumerate(out) if insert_at <= i < end and u.op is Ops.INS and
           _iop(u) is AMDOps.LOAD and u.dtype is dtypes.half and _elem_count(u) >= 8]
@@ -551,7 +552,8 @@ def hoist_gated_fmac_loads(ops:list[UOp]) -> list[UOp]:
   cmps = (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ, AMDOps.CMP_GE)
   bad_consumer = {AMDOps.LOAD, AMDOps.STORE, AMDOps.LLOAD, AMDOps.LSTORE, AMDOps.SLOAD, AMDOps.SSTORE,
                   AMDOps.WHERE, AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER, AMDOps.BRANCH,
-                  AMDOps.CBRANCH_SCC1, AMDOps.LABEL, AMDOps.LOOP_CMP}
+                  AMDOps.CBRANCH_SCC1, AMDOps.LABEL, AMDOps.LABEL_OUT, AMDOps.LOOP_CMP, AMDOps.LOOP_CMP_LT, AMDOps.LOOP_CMP_NE,
+                  AMDOps.LOOP_CMP_EQ}
   def group_at(i:int) -> tuple[UOp, ...]|None:
     if i + 5 >= len(ops): return None
     cmpa, addr, load, cmpv, val, consumer = ops[i:i+6]
@@ -697,16 +699,19 @@ def schedule_scalar_vmem(ops:list[UOp], alu_breadth:bool|None=None) -> list[UOp]
   return out
 
 def fma_mixhi_lo_map(uops:list[UOp]) -> dict[UOp, UOp]:
-  """Pair single-use half FMAs consumed by the same WMMA fragment pack.
+  """Pair packed half multiplications consumed by the same WMMA fragment pack.
 
-  The low result remains live through PACK_F16, so mixhi can safely update its high
-  half in place without changing instruction order or extending any input lifetime.
+  gfx1100 miscomputes quantized WMMA fragments when scalar FMA_TO_F16 results are paired
+  into mixlo/mixhi writes. Keep those results independent and assemble them with PACK_F16.
   """
   uses: dict[UOp, list[UOp]] = {}
   for u in uops:
     for src in u.src: uses.setdefault(src, []).append(u)
   ret: dict[UOp, UOp] = {}
-  fma_ops = (AMDOps.FMA_TO_F16, AMDOps.PACKED_F16_MUL_TO_F16)
+  # gfx1100 produces incorrect Q4/Q5/Q6 WMMA fragments when these scalar FMAs
+  # are paired into mixlo/mixhi writes. Keep each result independent and let
+  # PACK_F16 assemble them; packed IQ4 multiplies remain pairable.
+  fma_ops = (AMDOps.PACKED_F16_MUL_TO_F16,)
   for pack in uops:
     if pack.op is not Ops.INS or _iop(pack) is not AMDOps.PACK_F16 or _pack_f16_is_vec_load(pack): continue
     for lo, hi in zip(pack.src[::2], pack.src[1::2]):
@@ -896,8 +901,9 @@ def schedule_lload_2addr_pairs(ops:list[UOp]) -> list[UOp]:
   return out
 
 # Control-flow / sync ops that must not be crossed when clustering scratch traffic.
-_SCRATCH_CLUSTER_CF = (AMDOps.LABEL, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ,
-                       AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER, AMDOps.LOOP_CMP)
+_SCRATCH_CLUSTER_CF = (AMDOps.LABEL, AMDOps.LABEL_OUT, AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ,
+                       AMDOps.IF_MASK, AMDOps.END_MASK, AMDOps.BARRIER, AMDOps.LOOP_CMP, AMDOps.LOOP_CMP_LT,
+                       AMDOps.LOOP_CMP_NE, AMDOps.LOOP_CMP_EQ)
 _SCRATCH_BATCH_UNSAFE_USE = (AMDOps.SSTORE, AMDOps.STORE, AMDOps.SPILL)
 
 def cluster_const_scratch_stores(ops:list[UOp]) -> list[UOp]:
@@ -1049,11 +1055,11 @@ def pack_aligned_const_scratch_sloads(ops:list[UOp]) -> list[UOp]:
           [int(t) for t in idxs] == [int(idxs[0]) + k for k in range(4)]):  # type: ignore[arg-type]
         if u.src[0] not in packed_bases: packed_bases.append(u.src[0])
         wide = UOp(Ops.INS, src=(u.src[0], g[0].src[1], _load_count_src(4)),
-                   arg=(AMDOps.SLOAD, u.dtype), tag=(Register(f"sload4_{next(n)}", 0, _cons=VGPR),))
+                   arg=(AMDOps.SLOAD, u.dtype, Register(f"sload4_{next(n)}", 0, _cons=VGPR)))
         out.append(wide)
         for lane, old in enumerate(g):
-          ext = UOp(Ops.INS, src=(wide, _tconst(lane, dtypes.int32).rtag()),
-                    arg=(AMDOps.EXTRACT, u.dtype), tag=(Register(f"sload4e{lane}_{next(n)}", 0, _cons=VGPR),))
+          ext = UOp(Ops.INS, src=(wide, _tconst(lane, dtypes.int32)),
+                    arg=(AMDOps.EXTRACT, u.dtype, Register(f"sload4e{lane}_{next(n)}", 0, _cons=VGPR)))
           remap[old] = ext
           out.append(ext)
         packs += 1
@@ -1080,19 +1086,45 @@ def pack_aligned_const_scratch_sloads(ops:list[UOp]) -> list[UOp]:
 
 def protect_loop_invariant_fmac(lst:list[UOp]) -> list[UOp]:
   """VOP2 FMAC overwrites src0. Loop-invariant addend → MULACC reorder."""
+  # A loop-carried FMAC can start from a literal (usually zero) wrapped in AFTER to
+  # express the loop dependency. The implicit VOP2 accumulator needs a physical register
+  # initialized once before the loop; leaving the literal as src0 makes regalloc allocate
+  # the FMAC destination over unrelated loop temporaries without ever seeding it.
+  seed_inits: dict[UOp, list[UOp]] = {}
+  seed_values: dict[UOp, UOp] = {}
+  range_idxs = [(i, u) for i,u in enumerate(lst) if u.op is Ops.RANGE]
+  for i,u in enumerate(lst):
+    if u.op is not Ops.INS or _iop(u) is not AMDOps.FMAC or not u.src or u.src[0].op is not Ops.AFTER: continue
+    seed = u.src[0]
+    if greg(seed) is not None: continue
+    # Find the constant under any ordering wrappers, but retain those wrappers around the
+    # new register so the loop dependency and ordering edge remain intact.
+    leaf = seed
+    while leaf.op is Ops.AFTER and leaf.src: leaf = leaf.src[0]
+    if _const_value(leaf) is None: continue
+    loop = next(((ri,r) for ri,r in reversed(range_idxs) if ri < i and r in seed.ranges), None)
+    if loop is None: continue
+    ri,r = loop
+    reg = Register(f"fmac_seed_{ri}_{i}", 0, _cons=VGPR, size=4)
+    init = UOp(Ops.INS, src=(leaf,), arg=(AMDOps.MOV, u.dtype, reg))
+    seed_values[u] = seed.replace(src=(init, *seed.src[1:]))
+    seed_inits.setdefault(r, []).append(init)
   active:list[tuple[UOp, set[UOp]]] = []
   out:list[UOp] = []
   remap:dict[UOp, UOp] = {}
   for old in lst:
+    if old.op is Ops.RANGE: out.extend(seed_inits.get(old, ()))
     u = old.replace(src=tuple(remap.get(s, s) for s in old.src))
+    if old in seed_values: u = u.replace(src=(seed_values[old], *u.src[1:]))
     if u.op is Ops.RANGE:
       if active: active[-1][1].add(u)
       active.append((u, set()))
-    elif u.op is Ops.INS and _iop(u) is AMDOps.FMAC and active and u.src[0] not in active[-1][1]:
-      u = u.replace(src=(*u.src[1:], u.src[0]), arg=(AMDOps.MULACC, u.dtype))
+    elif old not in seed_values and u.op is Ops.INS and _iop(u) is AMDOps.FMAC and active and u.src[0] not in active[-1][1]:
+      u = u.replace(src=(*u.src[1:], u.src[0]), arg=(AMDOps.MULACC, u.dtype, *regs(u)))
     out.append(u)
     if u is not old: remap[old] = u
-    loop_end = u.src[1] if u.op in (Ops.END, Ops.BACKEDGE) else u.src[3] if u.op is Ops.INS and _iop(u) is AMDOps.LOOP_CMP else None
+    loop_end = u.src[1] if u.op in (Ops.END, Ops.BACKEDGE) else u.src[3] if u.op is Ops.INS and _iop(u) in (
+      AMDOps.LOOP_CMP, AMDOps.LOOP_CMP_LT, AMDOps.LOOP_CMP_NE, AMDOps.LOOP_CMP_EQ) else None
     if loop_end is not None:
       assert active and active[-1][0] is loop_end
       active.pop()
@@ -1102,12 +1134,12 @@ def protect_loop_invariant_fmac(lst:list[UOp]) -> list[UOp]:
 def schedule_loop_cmps(lst:list[UOp]) -> list[UOp]:
   """Evaluate boundless-loop condition before a REG_STORE mutates an operand."""
   out:list[UOp] = []
-  cmp_ops = {Ops.CMPLT:AMDOps.CMPLT, Ops.CMPNE:AMDOps.CMPNE, Ops.CMPEQ:AMDOps.CMPEQ}
+  cmp_ops = {AMDOps.LOOP_CMP_LT:AMDOps.CMPLT, AMDOps.LOOP_CMP_NE:AMDOps.CMPNE, AMDOps.LOOP_CMP_EQ:AMDOps.CMPEQ}
   for u in lst:
-    if u.op is not Ops.INS or _iop(u) is not AMDOps.LOOP_CMP:
+    if u.op is not Ops.INS or _iop(u) not in cmp_ops:
       out.append(u)
       continue
-    cmp = UOp(Ops.INS, src=u.src[:2], arg=(cmp_ops[u.tag], dtypes.bool))
+    cmp = UOp(Ops.INS, src=u.src[:2], arg=(cmp_ops[_iop(u)], dtypes.bool))
     cond_regs = {r for s in u.src[:2] if isinstance((r:=greg(s)), Register)}
     dep_reg = greg(u.src[2])
     insert = len(out)
@@ -1125,7 +1157,7 @@ def schedule_loop_cmps(lst:list[UOp]) -> list[UOp]:
         insert = update_idx if max(cond_defs, default=-1) < update_idx else i
         break
     out.insert(insert, cmp)
-    out.append(u.replace(src=(cmp, u.src[2], u.src[3])))
+    out.append(u.replace(src=(cmp, u.src[2], u.src[3]), arg=(AMDOps.LOOP_CMP, dtypes.bool)))
   return out
 
 _mul_strength_n = itertools.count()
@@ -1141,7 +1173,7 @@ def strength_reduce_int_muls(ops:list[UOp]) -> list[UOp]:
       a, b = u2.src
       c, x = _const_int(b), a
       if c is None: c, x = _const_int(a), b
-      mul_cons = u2.tag[0].cons if isinstance(u2.tag, tuple) and u2.tag else None
+      mul_cons = regs(u2)[0].cons if regs(u2) else None
       if c is not None and c > 1 and (c & (c - 1)) != 0 and c.bit_count() <= max_bits and mul_cons is VGPR:
         bits = [i for i in range(c.bit_length()) if c & (1 << i)]
         cons = mul_cons
@@ -1149,15 +1181,14 @@ def strength_reduce_int_muls(ops:list[UOp]) -> list[UOp]:
         for bit in bits:
           if bit == 0: terms.append(x)
           else:
-            sh = UOp(Ops.INS, src=(x, _tconst(bit, dtypes.int32)), arg=(AMDOps.SHL, u2.dtype),
-                     tag=(Register(f"mulsh{next(_mul_strength_n)}", 0, _cons=cons),))
+            sh = UOp(Ops.INS, src=(x, _tconst(bit, dtypes.int32)),
+                     arg=(AMDOps.SHL, u2.dtype, Register(f"mulsh{next(_mul_strength_n)}", 0, _cons=cons)))
             out.append(sh)
             terms.append(sh)
         acc = terms[0]
         for ti, t in enumerate(terms[1:]):
-          tag = u2.tag if ti == len(terms) - 2 else (Register(f"mulad{next(_mul_strength_n)}", 0, _cons=cons),)
-          if not isinstance(tag, tuple): tag = (tag,)
-          acc = UOp(Ops.INS, src=(acc, t), arg=(AMDOps.ADD, u2.dtype), tag=tag)
+          dst_regs = regs(u2) if ti == len(terms) - 2 else (Register(f"mulad{next(_mul_strength_n)}", 0, _cons=cons),)
+          acc = UOp(Ops.INS, src=(acc, t), arg=(AMDOps.ADD, u2.dtype) + dst_regs)
           out.append(acc)
         rewrite[u] = acc
         rewrite[u2] = acc
@@ -1210,7 +1241,7 @@ def lower_fma_mix_f32(lst:list[UOp]) -> list[UOp]:
   folds, skip_casts = fma_mix_f32_folds(lst)
   if not folds: return lst
   replace: dict[UOp, UOp] = {
-    u: UOp(Ops.INS, src=(u.src[0], hbase, f32), arg=(AMDOps.FMA_MIX_F32, dtypes.float32), tag=u.tag)
+    u: UOp(Ops.INS, src=(u.src[0], hbase, f32), arg=(AMDOps.FMA_MIX_F32, dtypes.float32) + regs(u))
     for u, (hbase, f32) in folds.items()}
   out: list[UOp] = []
   for u in lst:
@@ -1249,7 +1280,7 @@ def sink_alu_into_reg_store(ops: list[UOp]) -> list[UOp]:
     if greg(val) is dest:
       drop.add(u)
       continue
-    replace_alu[val] = val.replace(tag=(dest,))
+    replace_alu[val] = with_regs(val, (dest,))
     drop.add(u)
     cur = u.src[1]
     while cur is not val and cur.op is Ops.INS and _iop(cur) is AMDOps.MOV:

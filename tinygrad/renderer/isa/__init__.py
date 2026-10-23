@@ -3,6 +3,7 @@ import itertools
 from dataclasses import dataclass, field
 from tinygrad.dtype import DType
 from tinygrad.renderer import Renderer
+from tinygrad.device import TinyELF
 from tinygrad.uop.ops import PatternMatcher, UOp, Ops
 from typing import Any
 
@@ -36,14 +37,20 @@ class IselContext:
       if u.op is Ops.SPECIAL: return (2, u.arg)
       return (0, u.arg.slot) if u.arg.addrspace is not None else (1, u.expr)
     self.func_args = sorted([u for u in self.uses if u.op in {Ops.PARAM, Ops.SPECIAL}], key=arg_key)
+    params = sorted([u for u in sink.toposort() if u.op is Ops.PARAM], key=lambda u: u.arg.slot)
+    self.arg_offsets = {u: o for u, (o, _) in zip(params, TinyELF.iter_sig(tuple((None, u.addrspace, u.dtype, ()) for u in params)))}
 
   def vreg(self, cons:tuple[Register, ...]|Register, size:int=0):
     cons = cons if isinstance(cons, tuple) else (cons,)
     return Register(f"v{next(self.reg_n)}", 0, cons, size or cons[0].size)
 
+# the registers an INS defines follow its opcode and dtype in its arg
+def regs(u:UOp) -> tuple[Register, ...]: return u.arg[2:] if u.op is Ops.INS else ()
+def with_regs(u:UOp, r:tuple[Register, ...]) -> UOp: return u.replace(arg=u.arg[:2]+r)
+
 def rdef(u:UOp):
-  if u.op in {Ops.NOOP, Ops.AFTER, Ops.BITCAST} and u.src: return rdef(u.src[0])
-  return u.tag[0] if isinstance(u.tag, tuple) else u.tag
+  if u.op in {Ops.AFTER, Ops.BITCAST}: return rdef(u.src[0])
+  return r[0] if (r:=regs(u)) else None
 
 greg = rdef
 
@@ -58,7 +65,6 @@ class PreRegAllocContext:
 class LinearContext:
   def __init__(self, ren:ISARenderer):
     self.ren, self.stack_size = ren, 0
-    self.loop_label: dict[UOp, str] = {}
   def insert_linearized(self, uops:list[UOp]) -> list[UOp]: return uops
   def assign_spill_slot(self, r:Register, u:UOp) -> Any: raise NotImplementedError("arch specific")
   def register_buffers(self, uops:list[UOp]) -> set[UOp]: return set()
@@ -82,6 +88,7 @@ class ISARenderer(Renderer):
   def redefines_register(self, x:UOp) -> bool: return self.is_two_address(x)
   def is_promoted_reg_redef(self, x:UOp) -> bool: return False
   def prefer_phys(self, x:UOp, src_phys:list) -> Register|None: return None
+  def prefer_phys_needs_liveness(self, x:UOp) -> bool: return False
   def loop_end(self, x:UOp) -> UOp|None: return x.src[1] if x.op is Ops.END else None
   def rematerialize(self, x:UOp) -> bool: return False
   def is_rematerialized_constant(self, x:UOp) -> bool: return False

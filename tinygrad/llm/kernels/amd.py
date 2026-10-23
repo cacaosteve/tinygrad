@@ -180,7 +180,9 @@ class Linear(nn.Linear):
       self.in_features >= 2048 and self.out_features >= 4096 and self.in_features % 16 == self.out_features % 16 == 0:
       numel, max_shape = x.numel(), x.max_shape
       tokens = prod(max_shape[:-1])
-      if isinstance(tokens, int) and tokens >= 16 and tokens % 16 == 0:
+      # The hand split-K M32 kernel returns incorrect WMMA fragments on gfx1100; the generic
+      # matmul path uses the same direct renderer and is correct/competitive for other M tiles.
+      if isinstance(tokens, int) and tokens == 16:
         inp = (x if isinstance(numel, int) else x.pad_to(max_shape)).reshape(tokens, self.in_features)
         out = Tensor.empty(tokens, self.out_features, dtype=dtypes.float32, device=x.device)
         fxn = functools.partial(_amd_f16_gemm_wmma_kernel, tokens=tokens, in_features=self.in_features,
@@ -202,7 +204,8 @@ def _amd_fma_to_f16(a:UOp, b:UOp, c:UOp) -> UOp:
 
 def _amd_packed_f16_mul_to_f16(a:UOp, b:UOp, high:int) -> UOp:
   if a.op is Ops.INDEX: a = a.load()
-  return UOp(Ops.CUSTOMI, src=(a, b, UOp.const(high, dtypes.uint32)), arg=(AMD_PACKED_F16_MUL_TO_F16, dtypes.float16))
+  value = _half((a.cast(dtypes.uint32) >> UOp.const(high*16, dtypes.uint32)) & UOp.const(0xffff, dtypes.uint32))
+  return (value*b).cast(dtypes.float16)
 
 def _amd_load(ptr:UOp, lanes:int|None=None, packed_u32:bool=False, stream:bool=False) -> UOp:
   assert ptr.op is Ops.INDEX
@@ -576,8 +579,10 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
                                   rdna4:bool=False) -> UOp:
   # Mixed Q6 dequant wins short batches; larger prefill needs the wider 64-token layout.
   mixed_q6 = direct_isa and not rdna4 and ggml_type == Q6_K and resolve(out.shape[0] <= 64, False)
+  # A 128-token tile is measured faster from 256+; at 128 the two layouts are effectively tied.
+  q6_tile128 = direct_isa and not rdna4 and ggml_type == Q6_K and out.shape[0] >= 256 and out.shape[0] % 128 == 0
   token_tile = (32 if out.shape[0] % 32 == 0 else 16) if ggml_type == Q3_K or mixed_q6 else \
-    64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
+    128 if q6_tile128 else 64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
   # On RDNA3, a single Q6/Q8_0 output tile is faster than two for multi-token WMMA.
   output_tiles = 1 if direct_isa and (out_features % 32 or ggml_type in (IQ2_S, IQ3_XXS, IQ4_NL, IQ3_S) or
                                       ggml_type in (Q6_K, Q8_0) and not rdna4) else 2
@@ -612,6 +617,11 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
     if mixed_q6:
       bias = scale * -zero
       return tuple(_amd_fma_to_f16(_q6_byte_f32(word, b), scale, bias) for word in words for b in range(4))
+    if direct_isa and not rdna4 and ggml_type == Q6_K:
+      # Q6 values are unsigned 0..63. Convert directly to f32 and fold the -32 zero point into the multiply-add
+      # before narrowing; this removes unpack/sign-extension instructions from the RDNA3 multi-token WMMA path.
+      bias = scale * -zero
+      return tuple((_q6_byte_f32(word, b)*scale+bias).cast(dtypes.half) for word in words for b in range(4))
     return tuple((((word >> (b*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float()-zero)*scale-minimum).cast(dtypes.half)
                  for word in words for b in range(4))
   return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[ggml_type]//raw.dtype.itemsize,
@@ -884,8 +894,11 @@ _FLASH_DECODE = {
   # SCHEDULE_VMEM_ALU / REG_PROMOTE_SKIP / PACK_* folded into VOPD_FMAC / ACC_SMALL
   # MUL/FMAC_DELAY + MOV_ALIAS_SWIZZLE + FMA_MIX_ALL + SWIZZLE_VALU_GAP → VOPD_FMAC
   # SCHEDULE_FMAC_ADD → VOPD_FMAC_ALU
-  "AMD_VOPD_FMAC": "1",
-  "AMD_VOPD_FMAC_ALU": "1",
+  # gfx1100 GQA4 long decode is launch-nondeterministic with FMAC fusion; disabling it is
+  # latency-neutral on the locked 32-head/2048-token case and stable across repeated launches.
+  "AMD_VOPD_FMAC": "0",
+  # Pairing this with VOPD_FMAC corrupts GQA4 decode on gfx1100; keeping FMAC fusion alone is faster and correct.
+  "AMD_VOPD_FMAC_ALU": "0",
 }
 _FLASH_DECODE_ONLY = (
   "AMD_VOPD_FMAC", "AMD_VOPD_FMAC_ALU",

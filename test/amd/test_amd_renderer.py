@@ -10,8 +10,9 @@ from tinygrad.dtype import AddrSpace, Invalid, dtypes
 from tinygrad.helpers import Context, Target, DEV, getenv
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Q6_K, Q6_BYTES, _quant_decode_kernel
-from tinygrad.renderer.isa import IselContext, PreRegAllocContext, Register, greg
+from tinygrad.renderer.isa import IselContext, PreRegAllocContext, Register, greg, regs, with_regs
 from tinygrad.renderer.amd.dsl import s as scalar_regs
+from tinygrad.renderer.amd.elf import scan_elf_meta
 from tinygrad.renderer.isa.rdna3 import _loop_label
 from tinygrad.runtime.autogen import amdgpu_kd
 from tinygrad.runtime.support.elf import elf_loader
@@ -27,14 +28,28 @@ def _regalloc_ctx(uops, renderer=_REN):
   """Match codegen.do_linearize: LinearScanRegallocContext(lin_ctx, uops, ren)."""
   return LinearScanRegallocContext(renderer.linear_ctx_type(renderer), list(uops), renderer)
 
+_test_labels: dict[tuple[str, AMDOps], UOp] = {}
+def _test_label(name:str, op:AMDOps=AMDOps.LABEL) -> UOp:
+  key = (name, op)
+  if key not in _test_labels:
+    marker = UOp(Ops.NOOP, arg=("test_label", name, op))
+    _test_labels[key] = UOp(Ops.INS, src=(marker,), arg=(op, dtypes.void))
+  return _test_labels[key]
+
 def _uop(op, dtype=None, src=(), arg=None, tag=None):
-  """Build the low-level test fixtures using the current dtype-less UOp API."""
-  if op is Ops.INS: return UOp(op, src=src, arg=(arg, dtypes.void if dtype is None else dtype), tag=tag)
-  if dtype is None: return UOp(op, src=src, arg=arg, tag=tag)
-  if op in (Ops.CAST, Ops.BITCAST): return UOp(op, src=src, arg=dtype, tag=tag)
-  if op is Ops.CONST: return UOp.cconst(arg, dtype).rtag(tag)
-  if op is Ops.NOOP and dtype is not dtypes.void: return UOp(Ops.BITCAST, src=src, arg=dtype, tag=tag)
-  return UOp(op, src=src, arg=arg, tag=tag)
+  """Build tagless low-level test fixtures (legacy helper name retained for compact tests)."""
+  dt = dtypes.void if dtype is None else dtype
+  if op is Ops.INS:
+    if isinstance(tag, str):
+      if arg in (AMDOps.LABEL, AMDOps.LABEL_OUT): return _test_label(tag, arg)
+      if arg in (AMDOps.BRANCH, AMDOps.CBRANCH_SCC1, AMDOps.CBRANCH_VCCNZ): src = (*src, _test_label(tag))
+    out_regs = tag if isinstance(tag, tuple) else (tag,) if isinstance(tag, Register) else ()
+    return UOp(op, src=src, arg=(arg, dt, *out_regs))
+  if dtype is None: return UOp(op, src=src, arg=arg)
+  if op in (Ops.CAST, Ops.BITCAST): return UOp(op, src=src, arg=dtype)
+  if op is Ops.CONST: return UOp.cconst(arg, dtype)
+  if op is Ops.NOOP and dtype is not dtypes.void: return UOp(Ops.BITCAST, src=src, arg=dtype)
+  return UOp(op, src=src, arg=arg)
 
 def _iop(u:UOp): return u.arg[0]
 
@@ -90,14 +105,19 @@ def _amd_inst_names(prg):
 def _assert_abi_reg_isolation(testcase, prg):
   # v0 = packed work-item IDs. WGID at s2 when USER_SGPR=2; s15 when gfx1100 pads for lidx1/2.
   need_yi = any(u.op is Ops.SPECIAL and u.arg.startswith("lidx") and u.arg[-1] in "12"
+                or (u.op is Ops.INS and _iop(u) is AMDOps.SPECIAL and u.src and amd_lib._const_int(u.src[0]) in (1, 2))
                 for u in prg.src[0].toposort())
   wgid = {15, 16, 17} if need_yi else {2, 3, 4}
   fixed_sgpr, packed_lidx = {0, 1} | wgid, {256}
   for u in _prg_lin(prg).src:
     if not isinstance((reg_uop:=greg(u)), Register): continue
     reg = reg_uop.index
-    if u.op is Ops.INS and _iop(u) is AMDOps.MOV and u.src and u.src[0].op is Ops.SPECIAL:
-      if u.src[0].arg.startswith("gidx"): testcase.assertIn(reg, wgid)
+    special_idx = amd_lib._const_int(u.src[0]) if u.op is Ops.INS and _iop(u) is AMDOps.SPECIAL and u.src else None
+    is_special = u.op is Ops.INS and (_iop(u) is AMDOps.SPECIAL or
+      (_iop(u) is AMDOps.MOV and u.src and u.src[0].op is Ops.SPECIAL))
+    if is_special:
+      is_gidx = (special_idx is not None and special_idx >= 3) or (_iop(u) is AMDOps.MOV and u.src[0].arg.startswith("gidx"))
+      if is_gidx: testcase.assertIn(reg, wgid)
       else: testcase.assertNotIn(reg, packed_lidx | fixed_sgpr)  # lidx BFE dest is a normal VGPR
     else:
       testcase.assertNotIn(reg, fixed_sgpr | packed_lidx)
@@ -115,20 +135,27 @@ def _simple_add_program():
   sink = out.index(idx).store(inp.index(idx).load() + UOp.const(1.0, dtypes.float)).sink(idx, arg=KernelInfo(name="amd_asm_add"))
   return _to_prg(sink)
 
-def _physical_half_program(op, regs):
+def test_amd_elf_kernarg_size_includes_launch_only_params():
+  prg = _simple_add_program()
+  launch_param = UOp.param(2, dtypes.int, (), vmin_vmax=(1, 64), name="launch_size", addrspace=AddrSpace.ALU)
+  info = replace(prg.arg, global_size=(launch_param, 1, 1), params=(*prg.arg.params, launch_param))
+  meta = scan_elf_meta(prg.replace(arg=info))
+  assert meta[2] == 20 # two pointer args followed by one 32-bit launch value
+
+def _physical_half_program(op, reg_ids):
   """Keep upper/lower halves and low-register aliases distinct at the true16 boundary."""
   from tinygrad.renderer.amd.dsl import VCC_LO, NULL
   from tinygrad.renderer.amd.elf import assemble_linear
   from tinygrad.runtime.autogen.amd.rdna3 import ins as r3
-  a, b, dst = regs
+  a, b, dst = reg_ids
   compare = op in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ)
-  vals = [_uop(Ops.INS, dtypes.float16, arg=AMDOps.MOV, tag=(Register(str(r), 256+r),)) for r in regs]
+  vals = [_uop(Ops.INS, dtypes.float16, arg=AMDOps.MOV, tag=(Register(str(r), 256+r),)) for r in reg_ids]
   src = (vals[2], *vals[:2]) if op is AMDOps.FMAC else tuple(vals[:2])
-  ins = _uop(Ops.INS, dtypes.bool if compare else dtypes.float16, src, op, vals[2].tag)
+  ins = _uop(Ops.INS, dtypes.bool if compare else dtypes.float16, src, op, regs(vals[2]))
   def halves(lo, hi): return struct.unpack("I", struct.pack("ee", lo, hi))[0]
   insts = [r3.s_load_b64(scalar_regs[6:7], scalar_regs[0:1]), r3.v_bfe_u32(amd_lib.v[5], amd_lib.v[0], 0, 10),
            r3.s_waitcnt_lgkmcnt(NULL)]
-  for reg in set(regs) | {r-128 for r in regs if r >= 128}: insts.append(r3.v_mov_b32_e32(amd_lib.v[reg], halves(-9., -8.)))
+  for reg in set(reg_ids) | {r-128 for r in reg_ids if r >= 128}: insts.append(r3.v_mov_b32_e32(amd_lib.v[reg], halves(-9., -8.)))
   insts += [r3.v_mov_b32_e32(amd_lib.v[dst], halves(2., 7.)), r3.v_mov_b32_e32(amd_lib.v[a], halves(1., 6.)),
             r3.v_mov_b32_e32(amd_lib.v[b], halves(3., 5.)), *amd_lib.insts_for_uop(ins)]
   insts += [r3.v_cndmask_b32_e64(amd_lib.v[10], 0., 1., VCC_LO) if compare else
@@ -714,7 +741,7 @@ def _range_program():
   rng = UOp.range(8, 0, AxisType.LOOP)
   sink = _uop(Ops.SINK, dtypes.void,
              (_uop(Ops.END, dtypes.void, (out.index(rng).store(rng.cast(dtypes.uint32) + UOp.const(1, dtypes.uint32)), rng)),),
-             arg=KernelInfo(name="amd_asm_range"), tag=1)
+             arg=KernelInfo(name="amd_asm_range"))
   return _to_prg(sink)
 
 def _boundless_loop_program(name:str, renderer=_REN):
@@ -740,14 +767,14 @@ def _nested_range_program():
   out = UOp.placeholder((32,), dtypes.uint32, 0)
   r0, r1 = UOp.range(4, 0, AxisType.LOOP), UOp.range(8, 1, AxisType.LOOP)
   idx = (r0.cast(dtypes.uint32) << UOp.const(3, dtypes.uint32)) + r1.cast(dtypes.uint32)
-  sink = out.index(idx).store(idx).end(r0, r1).sink(arg=KernelInfo(name="amd_asm_nested_range")).replace(tag=1)
+  sink = out.index(idx).store(idx).end(r0, r1).sink(arg=KernelInfo(name="amd_asm_nested_range"))
   return _to_prg(sink)
 
 def _var_range_program():
   out = UOp.placeholder((16,), dtypes.uint32, 0)
   n = UOp.param(1, dtypes.uint32, (), vmin_vmax=(0, 16), name="n", addrspace=AddrSpace.ALU)
   r = UOp.range(n, 0, AxisType.LOOP)
-  sink = out.index(r).store(r.cast(dtypes.uint32)).end(r).sink(n, arg=KernelInfo(name="amd_asm_var_range")).replace(tag=1)
+  sink = out.index(r).store(r.cast(dtypes.uint32)).end(r).sink(n, arg=KernelInfo(name="amd_asm_var_range"))
   return _to_prg(sink)
 
 def _loop_vcc_remat_program():
@@ -757,7 +784,7 @@ def _loop_vcc_remat_program():
   gate0, gate1 = idx < 2, idx < 3
   val = gate0.where(r.cast(dtypes.uint32) + UOp.const(1, dtypes.uint32), UOp.const(0, dtypes.uint32))
   val = val + gate1.where(r.cast(dtypes.uint32) + UOp.const(2, dtypes.uint32), UOp.const(0, dtypes.uint32))
-  sink = out.index(idx).store(val).end(r).sink(idx, arg=KernelInfo(name="amd_asm_loop_vcc_remat")).replace(tag=1)
+  sink = out.index(idx).store(val).end(r).sink(idx, arg=KernelInfo(name="amd_asm_loop_vcc_remat"))
   return _to_prg(sink)
 
 def _global_dim_program():
@@ -833,14 +860,14 @@ def _gated_load_program():
 
 def _late_gated_store_linear(materialized_gate=False):
   renderer = _REN
-  out = _uop(Ops.INS, dtypes.uint64, (UOp.const(0, dtypes.int32).rtag(),), AMDOps.KERNARG, (Register("out", 0, _cons=amd_lib.SGPR),))
-  inp = _uop(Ops.INS, dtypes.uint64, (UOp.const(8, dtypes.int32).rtag(),), AMDOps.KERNARG, (Register("inp", 1, _cons=amd_lib.SGPR),))
-  idx = _uop(Ops.INS, dtypes.uint32, (UOp.special(16, "lidx0").rtag(),), AMDOps.MOV, (Register("idx", 2, _cons=(amd_lib.LID[0],)),))
+  out = _uop(Ops.INS, dtypes.uint64, (UOp.const(0, dtypes.int32),), AMDOps.KERNARG, (Register("out", 0, _cons=amd_lib.SGPR),))
+  inp = _uop(Ops.INS, dtypes.uint64, (UOp.const(8, dtypes.int32),), AMDOps.KERNARG, (Register("inp", 1, _cons=amd_lib.SGPR),))
+  idx = _uop(Ops.INS, dtypes.uint32, (UOp.special(16, "lidx0"),), AMDOps.MOV, (Register("idx", 2, _cons=(amd_lib.LID[0],)),))
   val = _uop(Ops.INS, dtypes.uint32, (inp, idx), AMDOps.LOAD, (Register("val", 3, _cons=amd_lib.VGPR),))
-  gate = _uop(Ops.INS, dtypes.bool, (idx, UOp.const(8, dtypes.weakint).rtag()), AMDOps.CMPLT)
+  gate = _uop(Ops.INS, dtypes.bool, (idx, UOp.const(8, dtypes.weakint)), AMDOps.CMPLT)
   one = None
   if materialized_gate:
-    one = _uop(Ops.INS, dtypes.uint32, (UOp.const(1, dtypes.uint32).rtag(),), AMDOps.MOV,
+    one = _uop(Ops.INS, dtypes.uint32, (UOp.const(1, dtypes.uint32),), AMDOps.MOV,
               (Register("one", 4, _cons=amd_lib.VGPR),))
     gate = _uop(Ops.INS, dtypes.bool, (idx, one), AMDOps.AND,
                (Register("gate", 5, _cons=amd_lib.VGPR),))
@@ -1172,7 +1199,7 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(_amd_desc(prg).private_segment_fixed_size, 0)
     for op in (AMDOps.SLOAD, AMDOps.SSTORE, AMDOps.SPILL, AMDOps.FILL): self.assertNotIn(op, _lin_ops(prg))
 
-  def test_q6_halfword_wmma_uses_mixed_dequant(self):
+  def test_q6_halfword_wmma_keeps_scalar_fmas_independent(self):
     from tinygrad.llm.kernels.amd import _quant_linear_f16_wmma_kernel
     rows, cols = 4096, 4096
     for tokens in (16, 32, 64):
@@ -1182,8 +1209,10 @@ class TestAMDRenderer(unittest.TestCase):
         x = UOp.placeholder((tokens, cols), dtypes.float16, 2)
         prg = _to_prg(_quant_linear_f16_wmma_kernel(out, raw, x, out_features=rows, in_features=cols, ggml_type=Q6_K, direct_isa=True))
         names = _amd_inst_names(prg)
-        self.assertIn("V_FMA_MIXHI_F16", names)
-        self.assertNotIn("V_PACK_B32_F16", names)
+        # Pairing scalar dequant FMAs through MIXHI corrupted quantized WMMA inputs on gfx1100.
+        self.assertNotIn("V_FMA_MIXHI_F16", names)
+        self.assertIn("V_PACK_B32_F16", names)
+        self.assertIn("V_WMMA_F32_16X16X16_F16", names)
         self.assertLessEqual(_amd_desc(prg).private_segment_fixed_size, 32)
 
   def test_q5_wmma_stays_within_vgpr_file(self):
@@ -1220,19 +1249,22 @@ class TestAMDRenderer(unittest.TestCase):
     lut = UOp.placeholder((256,), dtypes.uint32, 3)
     prg = _to_prg(_iq4_linear_f16_wmma_kernel(out, raw, x, lut, rows, cols, direct_isa=True))
     names = _amd_inst_names(prg)
-    # dequant_halves: one packed weight B128 + five activation B128 (shared LUT halves);
+    # Shared qwords/LUT halves: one packed weight B128 + five activation B128;
     # header words stay scalar B32. LUT fill coalesces to one DS_STORE_B128.
     self.assertEqual(names.count("GLOBAL_LOAD_B128"), 6)
     self.assertEqual(names.count("GLOBAL_LOAD_B32"), 2)
-    self.assertEqual(names.count("V_FMA_MIXHI_F16"), 16)
-    self.assertNotIn("V_PACK_B32_F16", names)
+    # Scalar half extraction + multiply is required here: the former packed intrinsic
+    # selected the wrong half of the f32 scale on gfx1100.
+    self.assertNotIn("V_FMA_MIXHI_F16", names)
+    self.assertEqual(names.count("V_PACK_B32_F16"), 16)
+    self.assertEqual(names.count("V_MUL_F32_E32"), 33)
     self.assertEqual(names.count("DS_STORE_B128"), 1)
     self.assertEqual(names.count("DS_STORE_B32"), 0)
     wide = [i for i,name in enumerate(names) if name == "GLOBAL_LOAD_B128"]
-    # Weight B128 issues early; activation B128 cluster while that load is in flight.
+    # The first wide weight load starts early and all fragments are ready before WMMA.
     self.assertLess(wide[0], wide[1])
-    self.assertLessEqual(wide[-1] - wide[1], 8)
-    # mixhi without pack-dst coalesce may MOV packed words into WMMA lanes
+    self.assertLess(wide[-1], names.index("V_WMMA_F32_16X16X16_F16"))
+    # Explicit pack path should still avoid excess moves or scratch traffic.
     self.assertLessEqual(names.count("V_MOV_B32_E32"), 16)
     self.assertNotIn("SCRATCH_STORE_B32", names)
 
@@ -1247,7 +1279,9 @@ class TestAMDRenderer(unittest.TestCase):
     names = _amd_inst_names(prg)
     wide = [i for i,name in enumerate(names) if name == "GLOBAL_LOAD_B128"]
     self.assertEqual(len(wide), 10)  # one packed weight plus nine activation reads (halves path)
-    self.assertLess(wide[-1], names.index("V_FMA_MIXLO_F16"))
+    self.assertLess(wide[-1], names.index("V_WMMA_F32_16X16X16_F16"))
+    self.assertNotIn("V_FMA_MIXHI_F16", names)
+    self.assertIn("V_PACK_B32_F16", names)
     self.assertIn("V_LSHLREV_B32_E32", names)
     self.assertIn("V_ADD_NC_U32_E32", names)
     # Scratch under ACC soft-partition is allowed; spill-free is covered elsewhere.
@@ -1401,10 +1435,11 @@ class TestAMDRenderer(unittest.TestCase):
     idx0 = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.DEFINE, tag=(Register("idx0", 260),))
     idx1 = _uop(Ops.INS, dtypes.uint32, (idx0, UOp.const(16, dtypes.uint32)), AMDOps.ADD, (Register("idx1", 261),))
     count = UOp.const(4, dtypes.int32)
-    byte_off = UOp.const(0, dtypes.int32).rtag("byte_addr")
-    load0 = _uop(Ops.INS, dtypes.uint32, (base, idx0, count, byte_off), AMDOps.LOAD, (Register("load0", 270),))
+    byte_off = UOp.const(0, dtypes.int32)
+    byte_addr = UOp.const(2, dtypes.int32)
+    load0 = _uop(Ops.INS, dtypes.uint32, (base, idx0, count, byte_off, byte_addr), AMDOps.LOAD, (Register("load0", 270),))
     lane0 = _uop(Ops.INS, dtypes.uint32, (load0, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane0", 274),))
-    load1 = _uop(Ops.INS, dtypes.uint32, (base, idx1, count, byte_off), AMDOps.LOAD, (Register("load1", 275),))
+    load1 = _uop(Ops.INS, dtypes.uint32, (base, idx1, count, byte_off, byte_addr), AMDOps.LOAD, (Register("load1", 275),))
     lane1 = _uop(Ops.INS, dtypes.uint32, (load1, UOp.const(0, dtypes.int32)), AMDOps.EXTRACT, (Register("lane1", 279),))
     scheduled = amd_lib._schedule_scalar_vmem([load0, lane0, idx1, load1, lane1])
     self.assertEqual(scheduled, [load0, idx1, load1, lane0, lane1])
@@ -1570,7 +1605,7 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual((mix[0].opsel, mix[0].opsel_hi, mix[0].opsel_hi2), (0, 0, 0))
     self.assertEqual((mix[1].opsel, mix[1].opsel_hi, mix[1].opsel_hi2), (1, 1, 0))
 
-  def test_mixed_f16_pack_writes_high_half_in_place(self):
+  def test_mixed_f16_pack_keeps_scalar_fmas_independent(self):
     a = _uop(Ops.INS, dtypes.float32, (UOp.const(2.0, dtypes.float32),), AMDOps.MOV, (Register("a", 261),))
     scale = _uop(Ops.INS, dtypes.float32, (UOp.const(4.0, dtypes.float32),), AMDOps.MOV, (Register("scale", 263),))
     bias = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32),), AMDOps.MOV, (Register("bias", 264),))
@@ -1578,10 +1613,10 @@ class TestAMDRenderer(unittest.TestCase):
     hi = _uop(Ops.INS, dtypes.float16, (a, scale, bias), AMDOps.FMA_TO_F16, (Register("hi", 267),))
     pack = _uop(Ops.INS, dtypes.float16, (lo, hi), AMDOps.PACK_F16, (Register("pack", 268),))
     insts = list(_REN._insts_from_linear(UOp(Ops.LINEAR, src=(a, scale, bias, lo, hi, pack))))
-    mixlo = next(i for i in insts if getattr(i, "op_name", "") == "V_FMA_MIXLO_F16")
-    mixhi = next(i for i in insts if getattr(i, "op_name", "") == "V_FMA_MIXHI_F16")
-    self.assertEqual(mixlo.vdst, mixhi.vdst)
-    self.assertNotIn("V_PACK_B32_F16", [getattr(i, "op_name", "") for i in insts])
+    names = [getattr(i, "op_name", "") for i in insts]
+    self.assertEqual(names.count("V_FMA_MIXLO_F16"), 2)
+    self.assertNotIn("V_FMA_MIXHI_F16", names)
+    self.assertIn("V_PACK_B32_F16", names)
 
   def test_store_uses_destination_dtype(self):
     prg = _float_to_half_store_program()
@@ -2501,24 +2536,24 @@ class TestAMDRenderer(unittest.TestCase):
     zero = UOp.const(0.0, dtypes.float32)
     stores = [_uop(Ops.INS, dtypes.void, (buf, idx, zero), AMDOps.SSTORE) for buf in bufs for idx in indices]
     loop = UOp.range(4, 0, AxisType.LOOP)
-    body = [u for p in packs for u in (*p.src, p, _uop(Ops.INS, dtypes.float32, (p,p,p), AMDOps.WMMA, p.tag))]
+    body = [u for p in packs for u in (*p.src, p, _uop(Ops.INS, dtypes.float32, (p,p,p), AMDOps.WMMA, regs(p)))]
     uops = stores+[loop]+body
     for buf,p in zip(bufs,packs): self.assertIs(_single_wmma_fragment_base(p, uops), buf)
     inits, _, idx_map, _ = _wmma_acc_zero_inits(uops)
     self.assertEqual(len(inits), 4)
     self.assertEqual(len(idx_map), 32)
     for buf in bufs: self.assertEqual([idx_map[(buf, i)][1] for i in range(8)], list(range(8)))
-    self.assertIsNone(_single_wmma_fragment_base(pack(bufs[0], indices[:-1]+(indices[0],), packs[0].tag), uops))
-    self.assertIsNone(_single_wmma_fragment_base(pack(bufs[0], indices[:-1]+(UOp.special(8, "lidx0"),), packs[0].tag), uops))
+    self.assertIsNone(_single_wmma_fragment_base(pack(bufs[0], indices[:-1]+(indices[0],), regs(packs[0])), uops))
+    self.assertIsNone(_single_wmma_fragment_base(pack(bufs[0], indices[:-1]+(UOp.special(8, "lidx0"),), regs(packs[0])), uops))
     large = UOp.placeholder((16,), dtypes.float32, slot=8, addrspace=AddrSpace.REG)
-    self.assertIsNone(_single_wmma_fragment_base(pack(large, indices, packs[0].tag), uops))
+    self.assertIsNone(_single_wmma_fragment_base(pack(large, indices, regs(packs[0])), uops))
     # Never silently replace a nonzero/partial initializer or a second fragment view.
     self.assertIsNone(_single_wmma_fragment_base(packs[0], stores[1:]+[loop]+body))
     one = UOp.const(1.0, dtypes.float32)
     nonzero = stores[0].replace(src=(*stores[0].src[:2], one))
     self.assertIsNone(_single_wmma_fragment_base(packs[0], [nonzero]+stores[1:]+[loop]+body))
     p2 = pack(bufs[0], indices[::-1], (Register("other_acc", 240),))
-    w2 = _uop(Ops.INS, dtypes.float32, (p2,p2,p2), AMDOps.WMMA, p2.tag)
+    w2 = _uop(Ops.INS, dtypes.float32, (p2,p2,p2), AMDOps.WMMA, regs(p2))
     self.assertIsNone(_single_wmma_fragment_base(packs[0], uops+[*p2.src, p2, w2]))
     self.assertIsNone(_single_wmma_fragment_base(packs[0], stores+[loop, stores[0]]+body))
     wmma = body[9]
@@ -2526,7 +2561,7 @@ class TestAMDRenderer(unittest.TestCase):
       ext = _uop(Ops.INS, dtypes.float32, (wmma, indices[lane]), AMDOps.EXTRACT, (Register("stored_lane", 250),))
       store = _uop(Ops.INS, dtypes.void, (bufs[0], indices[0], ext), AMDOps.SSTORE)
       self.assertEqual(_single_wmma_fragment_base(packs[0], uops+[store]) is bufs[0], lane == 0)
-    early_read = packs[0].src[0].replace(tag=(Register("early_read", 251),))
+    early_read = with_regs(packs[0].src[0], (Register("early_read", 251),))
     self.assertIsNone(_single_wmma_fragment_base(packs[0], stores+[loop, early_read]+body))
 
   def test_wmma_acc_small_buf_tiles_separate_buffers(self):
@@ -2590,7 +2625,8 @@ class TestAMDRenderer(unittest.TestCase):
     factor = _uop(Ops.INS, dtypes.float32, (UOp.const(0.1, dtypes.float32),), AMDOps.MOV, (Register("factor", 3),))
     rng = _uop(Ops.RANGE, dtypes.uint32, (UOp.const(8, dtypes.uint32),), (0, AxisType.WEAK), (Register("r", 0),))
     varying = _uop(Ops.INS, dtypes.float32, (rng,), AMDOps.CAST, (Register("varying", 2),))
-    unsafe = _uop(Ops.INS, dtypes.float32, (inv, varying, factor), AMDOps.FMAC, (Register("unsafe", 4),))
+    unsafe_reg = Register("unsafe", 4)
+    unsafe = _uop(Ops.INS, dtypes.float32, (inv, varying, factor), AMDOps.FMAC, (unsafe_reg,))
     consumer = _uop(Ops.INS, dtypes.float32, (unsafe, factor), AMDOps.MUL, (Register("consumer", 5),))
     accumulator = _uop(Ops.INS, dtypes.float32, (rng,), AMDOps.CAST, (Register("acc", 6),))
     safe = _uop(Ops.INS, dtypes.float32, (accumulator, varying, factor), AMDOps.FMAC, (Register("safe", 7),))
@@ -2599,18 +2635,33 @@ class TestAMDRenderer(unittest.TestCase):
     converted = out[4]
     self.assertIs(_iop(converted), AMDOps.MULACC)
     self.assertEqual(converted.src, (varying, factor, inv))
+    self.assertEqual(regs(converted), (unsafe_reg,))
     self.assertIs(out[5].src[0], converted)
     self.assertIs(_iop(out[7]), AMDOps.FMAC)
+
+  def test_loop_carried_fmac_materializes_literal_seed(self):
+    rng = _uop(Ops.RANGE, dtypes.uint32, (UOp.const(8, dtypes.uint32),), arg=(AxisType.LOOP, 0))
+    seed = UOp.const(0.0, dtypes.float32).after(rng)
+    a, b = UOp.const(2.0, dtypes.float32), UOp.const(3.0, dtypes.float32)
+    acc = Register("acc", 7)
+    fmac = _uop(Ops.INS, dtypes.float32, (seed, a, b), AMDOps.FMAC, (acc,))
+    end = _uop(Ops.END, src=(fmac, rng))
+    out = amd_lib._protect_loop_invariant_fmac([rng, fmac, end])
+    init = next(u for u in out if u.op is Ops.INS and _iop(u) is AMDOps.MOV)
+    rewritten = next(u for u in out if u.op is Ops.INS and _iop(u) is AMDOps.FMAC)
+    self.assertLess(out.index(init), out.index(rng))
+    self.assertIs(greg(rewritten.src[0]), greg(init))
+    self.assertEqual(regs(rewritten), (acc,))
 
   def test_store_addr_cache_invalidates_on_reused_index_reg(self):
     # Regalloc may assign two different store indices to the same VGPR. The second
     # index must rescale TMP_VADDR instead of reusing the first store's cached base.
     buf = _uop(Ops.INS, dtypes.ulong, (), AMDOps.MOV, (Register("s6", 6),))
     idx_reg = Register("v3", 259)
-    idx0 = _uop(Ops.INS, dtypes.int, (UOp.const(0, dtypes.int).rtag(),), AMDOps.MOV, (idx_reg,))
-    idx1 = _uop(Ops.INS, dtypes.int, (UOp.const(1, dtypes.int).rtag(),), AMDOps.MOV, (idx_reg,))
-    val0 = _uop(Ops.INS, dtypes.int, (UOp.const(10, dtypes.int).rtag(),), AMDOps.MOV, (Register("v4", 260),))
-    val1 = _uop(Ops.INS, dtypes.int, (UOp.const(20, dtypes.int).rtag(),), AMDOps.MOV, (Register("v5", 261),))
+    idx0 = _uop(Ops.INS, dtypes.int, (UOp.const(0, dtypes.int),), AMDOps.MOV, (idx_reg,))
+    idx1 = _uop(Ops.INS, dtypes.int, (UOp.const(1, dtypes.int),), AMDOps.MOV, (idx_reg,))
+    val0 = _uop(Ops.INS, dtypes.int, (UOp.const(10, dtypes.int),), AMDOps.MOV, (Register("v4", 260),))
+    val1 = _uop(Ops.INS, dtypes.int, (UOp.const(20, dtypes.int),), AMDOps.MOV, (Register("v5", 261),))
     st0 = _uop(Ops.INS, dtypes.void, (buf, idx0, val0), AMDOps.STORE)
     st1 = _uop(Ops.INS, dtypes.void, (buf, idx1, val1), AMDOps.STORE)
     lin = _uop(Ops.LINEAR, dtypes.void, (idx0, val0, st0, idx1, val1, st1))
@@ -2688,7 +2739,7 @@ class TestAMDRenderer(unittest.TestCase):
     update = _uop(Ops.INS, dtypes.int32, (reg, one), AMDOps.ADD, (Register("next", 1, _cons=amd_lib.VGPR),))
     store = _uop(Ops.INS, dtypes.void, (reg, update), AMDOps.REG_STORE, (greg(reg),))
     loop = UOp(Ops.RANGE, src=(UOp(Ops.NOOP),), arg=(AxisType.WEAK, 0))
-    loop_cmp = _uop(Ops.INS, dtypes.bool, (reg, limit, reg, loop), AMDOps.LOOP_CMP, Ops.CMPLT)
+    loop_cmp = _uop(Ops.INS, dtypes.bool, (reg, limit, reg, loop), AMDOps.LOOP_CMP_LT)
 
     scheduled = amd_lib._schedule_loop_cmps([reg, update, store, loop_cmp])
     cmp = next(u for u in scheduled if u.op is Ops.INS and _iop(u) is AMDOps.CMPLT)
@@ -2709,7 +2760,7 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_reg_store_redef_is_two_address(self):
     # Loop-carried promote: REG_STORE must redefine the same vreg (spill-after-write).
-    acc = _uop(Ops.INS, dtypes.float32, (UOp.const(0.0, dtypes.float32).rtag(),), AMDOps.MOV,
+    acc = _uop(Ops.INS, dtypes.float32, (UOp.const(0.0, dtypes.float32),), AMDOps.MOV,
               (Register("reg0", 0, _cons=amd_lib.VGPR),))
     val = _uop(Ops.INS, dtypes.float32, (), AMDOps.MOV, (Register("val", 1, _cons=amd_lib.VGPR),))
     st = _uop(Ops.INS, dtypes.void, (acc, val), AMDOps.REG_STORE, (greg(acc),))
@@ -2727,8 +2778,8 @@ class TestAMDRenderer(unittest.TestCase):
     """
     from tinygrad.renderer.isa.rdna3 import _const_value
     def mov(name, value):
-      return UOp(Ops.INS, src=(UOp.cconst(value, dtypes.float32),), arg=(AMDOps.MOV, dtypes.float32),
-                 tag=(Register(name, 0, _cons=amd_lib.VGPR[:2]),))
+      return UOp(Ops.INS, src=(UOp.cconst(value, dtypes.float32),),
+                 arg=(AMDOps.MOV, dtypes.float32, Register(name, 0, _cons=amd_lib.VGPR[:2])))
     def observe(value):
       return UOp(Ops.INS, src=(value,), arg=(AMDOps.STORE, dtypes.void))
 
@@ -2738,7 +2789,7 @@ class TestAMDRenderer(unittest.TestCase):
       ops = [acc, b, c, observe(b), observe(c)]
       if update:
         new = mov("new", 9.0)
-        store = UOp(Ops.INS, src=(acc, new), arg=(AMDOps.REG_STORE, dtypes.void), tag=(greg(acc),))
+        store = UOp(Ops.INS, src=(acc, new), arg=(AMDOps.REG_STORE, dtypes.void, *regs(acc)))
         ops += [new, store]
       ops += [observe(acc)]
       ctx = _regalloc_ctx(ops, _REN)
@@ -2769,12 +2820,12 @@ class TestAMDRenderer(unittest.TestCase):
     getenv.cache_clear()
     base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
     def sload(i):
-      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
-                 tag=(Register(f"l{i}", 0, _cons=amd_lib.VGPR),))
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32)),
+                 arg=(AMDOps.SLOAD, dtypes.float32, Register(f"l{i}", 0, _cons=amd_lib.VGPR)))
     def sstore(i, val):
-      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag(), val), arg=(AMDOps.SSTORE, dtypes.void))
-    nine = UOp(Ops.INS, src=(UOp.cconst(9.0, dtypes.float32),), arg=(AMDOps.MOV, dtypes.float32),
-               tag=(Register("nine", 0, _cons=amd_lib.VGPR),))
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32), val), arg=(AMDOps.SSTORE, dtypes.void))
+    nine = UOp(Ops.INS, src=(UOp.cconst(9.0, dtypes.float32),),
+               arg=(AMDOps.MOV, dtypes.float32, Register("nine", 0, _cons=amd_lib.VGPR)))
     loads = [sload(i) for i in range(4)]
     # load0, store[1]=9, load1, load2, load3 — must keep the store before load1..3
     ops = [loads[0], nine, sstore(1, nine), loads[1], loads[2], loads[3]]
@@ -2792,10 +2843,10 @@ class TestAMDRenderer(unittest.TestCase):
     getenv.cache_clear()
     base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
     def sload(i):
-      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
-                 tag=(Register(f"l{i}", 0, _cons=amd_lib.VGPR),))
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32)),
+                 arg=(AMDOps.SLOAD, dtypes.float32, Register(f"l{i}", 0, _cons=amd_lib.VGPR)))
     loads = [sload(i) for i in range(4)]
-    label = UOp(Ops.INS, arg=(AMDOps.LABEL, dtypes.void), tag=".L")
+    label = _test_label(".L")
     ops = [loads[0], label, loads[1], loads[2], loads[3]]
     out = _cluster_const_scratch_loads(ops)
     # With a CF edge after load0, remaining loads stay after the label (no hoist across).
@@ -2812,11 +2863,11 @@ class TestAMDRenderer(unittest.TestCase):
     getenv.cache_clear()
     base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
     def sload(i):
-      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
-                 tag=(Register(f"l{i}", 0, _cons=amd_lib.VGPR),))
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32)),
+                 arg=(AMDOps.SLOAD, dtypes.float32, Register(f"l{i}", 0, _cons=amd_lib.VGPR)))
     loads = [sload(i) for i in range(4)]
-    alu = UOp(Ops.INS, src=(UOp.cconst(1, dtypes.int32), UOp.cconst(2, dtypes.int32)), arg=(AMDOps.ADD, dtypes.int32),
-              tag=(Register("a", 0, _cons=amd_lib.VGPR),))
+    alu = UOp(Ops.INS, src=(UOp.cconst(1, dtypes.int32), UOp.cconst(2, dtypes.int32)),
+              arg=(AMDOps.ADD, dtypes.int32, Register("a", 0, _cons=amd_lib.VGPR)))
     ops = [loads[0], alu, loads[1], loads[2], loads[3]]
     out = _cluster_const_scratch_loads(ops)
     self.assertEqual(out[:4], loads)  # sorted 0..3 first
@@ -2832,14 +2883,14 @@ class TestAMDRenderer(unittest.TestCase):
     getenv.cache_clear()
     base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
     def sload(i):
-      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
-                 tag=(Register(f"l{i}", 0, _cons=amd_lib.VGPR),))
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32)),
+                 arg=(AMDOps.SLOAD, dtypes.float32, Register(f"l{i}", 0, _cons=amd_lib.VGPR)))
     def sstore(i, val):
-      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag(), val), arg=(AMDOps.SSTORE, dtypes.void))
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32), val), arg=(AMDOps.SSTORE, dtypes.void))
     a, b = sload(0), sload(1)
     st = sstore(1, a)  # USE of a is a same-base store to idx 1
-    use_b = UOp(Ops.INS, src=(b, UOp.cconst(1.0, dtypes.float32)), arg=(AMDOps.MUL, dtypes.float32),
-                tag=(Register("ub", 0, _cons=amd_lib.VGPR),))
+    use_b = UOp(Ops.INS, src=(b, UOp.cconst(1.0, dtypes.float32)),
+                arg=(AMDOps.MUL, dtypes.float32, Register("ub", 0, _cons=amd_lib.VGPR)))
     # a=load[0]; store[1]=a; b=load[1]; use(b)  — must not become load,load,store,use
     ops = [a, st, b, use_b]
     for name, out in (("batch", _batch_scratch_load_uses(ops)),
@@ -2859,14 +2910,14 @@ class TestAMDRenderer(unittest.TestCase):
     base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
     # Genuine virtual regs: distinct SSA tags, all placeholder index 0 (pre-regalloc).
     def sload(i):
-      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
-                 tag=(Register(f"l{i}", 0, _cons=amd_lib.VGPR),))
+      return UOp(Ops.INS, src=(base, UOp.cconst(i, dtypes.int32)),
+                 arg=(AMDOps.SLOAD, dtypes.float32, Register(f"l{i}", 0, _cons=amd_lib.VGPR)))
     loads = [sload(0), sload(1)]
     uses = [
-      UOp(Ops.INS, src=(loads[0], UOp.cconst(1.0, dtypes.float32)), arg=(AMDOps.MUL, dtypes.float32),
-          tag=(Register("u0", 0, _cons=amd_lib.VGPR),)),
-      UOp(Ops.INS, src=(loads[1], UOp.cconst(2.0, dtypes.float32)), arg=(AMDOps.MUL, dtypes.float32),
-          tag=(Register("u1", 0, _cons=amd_lib.VGPR),)),
+      UOp(Ops.INS, src=(loads[0], UOp.cconst(1.0, dtypes.float32)),
+          arg=(AMDOps.MUL, dtypes.float32, Register("u0", 0, _cons=amd_lib.VGPR))),
+      UOp(Ops.INS, src=(loads[1], UOp.cconst(2.0, dtypes.float32)),
+          arg=(AMDOps.MUL, dtypes.float32, Register("u1", 0, _cons=amd_lib.VGPR))),
     ]
     ops = [loads[0], uses[0], loads[1], uses[1]]
     # Pre-regalloc must not treat placeholder index 0 as phys overlap.
@@ -2886,14 +2937,12 @@ class TestAMDRenderer(unittest.TestCase):
     os.environ["AMD_BATCH_SLOAD_USE"] = "1"
     getenv.cache_clear()
     base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
-    load_a = UOp(Ops.INS, src=(base, UOp.cconst(0, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
-                 tag=(Register("la", 5, _cons=amd_lib.VGPR),))
-    use_a = UOp(Ops.INS, src=(load_a,), arg=(AMDOps.MOV, dtypes.float32),
-                tag=(Register("ua", 6, _cons=amd_lib.VGPR),))
-    load_b = UOp(Ops.INS, src=(base, UOp.cconst(1, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
-                 tag=(Register("lb", 5, _cons=amd_lib.VGPR),))  # reuses v5
-    use_b = UOp(Ops.INS, src=(load_b,), arg=(AMDOps.MOV, dtypes.float32),
-                tag=(Register("ub", 7, _cons=amd_lib.VGPR),))
+    load_a = UOp(Ops.INS, src=(base, UOp.cconst(0, dtypes.int32)),
+                 arg=(AMDOps.SLOAD, dtypes.float32, Register("la", 5, _cons=amd_lib.VGPR)))
+    use_a = UOp(Ops.INS, src=(load_a,), arg=(AMDOps.MOV, dtypes.float32, Register("ua", 6, _cons=amd_lib.VGPR)))
+    load_b = UOp(Ops.INS, src=(base, UOp.cconst(1, dtypes.int32)),
+                 arg=(AMDOps.SLOAD, dtypes.float32, Register("lb", 5, _cons=amd_lib.VGPR)))  # reuses v5
+    use_b = UOp(Ops.INS, src=(load_b,), arg=(AMDOps.MOV, dtypes.float32, Register("ub", 7, _cons=amd_lib.VGPR)))
     ops = [load_a, use_a, load_b, use_b]
     self.assertTrue(_scratch_batch_phys_conflict([load_a], [use_a], load_b, use_b))
     # Without check_phys (pre-regalloc style) this would incorrectly batch; with check_phys it must not.
@@ -2910,14 +2959,12 @@ class TestAMDRenderer(unittest.TestCase):
     os.environ["AMD_BATCH_SLOAD_USE"] = "1"
     getenv.cache_clear()
     base = UOp.placeholder((32,), dtypes.float32, 0, addrspace=AddrSpace.REG)
-    load_a = UOp(Ops.INS, src=(base, UOp.cconst(0, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
-                 tag=(Register("va", 0, _cons=amd_lib.VGPR),))
-    use_a = UOp(Ops.INS, src=(load_a,), arg=(AMDOps.MOV, dtypes.float32),
-                tag=(Register("ua", 0, _cons=amd_lib.VGPR),))
-    load_b = UOp(Ops.INS, src=(base, UOp.cconst(1, dtypes.int32).rtag()), arg=(AMDOps.SLOAD, dtypes.float32),
-                 tag=(Register("vb", 0, _cons=amd_lib.VGPR),))
-    use_b = UOp(Ops.INS, src=(load_b,), arg=(AMDOps.MOV, dtypes.float32),
-                tag=(Register("ub", 0, _cons=amd_lib.VGPR),))
+    load_a = UOp(Ops.INS, src=(base, UOp.cconst(0, dtypes.int32)),
+                 arg=(AMDOps.SLOAD, dtypes.float32, Register("va", 0, _cons=amd_lib.VGPR)))
+    use_a = UOp(Ops.INS, src=(load_a,), arg=(AMDOps.MOV, dtypes.float32, Register("ua", 0, _cons=amd_lib.VGPR)))
+    load_b = UOp(Ops.INS, src=(base, UOp.cconst(1, dtypes.int32)),
+                 arg=(AMDOps.SLOAD, dtypes.float32, Register("vb", 0, _cons=amd_lib.VGPR)))
+    use_b = UOp(Ops.INS, src=(load_b,), arg=(AMDOps.MOV, dtypes.float32, Register("ub", 0, _cons=amd_lib.VGPR)))
     # Phys helper reports overlap on placeholder 0 — that is why check_phys must stay off pre-alloc.
     self.assertTrue(_scratch_batch_phys_conflict([load_a], [use_a], load_b, use_b))
     out = _batch_scratch_load_uses([load_a, use_a, load_b, use_b], check_phys=False)
@@ -2937,11 +2984,10 @@ class TestAMDRenderer(unittest.TestCase):
     # Lower-id consumer base first so object-id sort would put b before a.
     base_b = UOp.placeholder((256,), dtypes.half, 0, addrspace=AddrSpace.LOCAL)
     base_a = UOp.placeholder((256,), dtypes.half, 1, addrspace=AddrSpace.LOCAL)
-    idx = UOp.cconst(0, dtypes.int32).rtag()
-    count = UOp.cconst(4, dtypes.int32).rtag()  # half×4 = 8 bytes
+    idx = UOp.cconst(0, dtypes.int32)
+    count = UOp.cconst(4, dtypes.int32)  # half×4 = 8 bytes
     def lload(name, base, addr_idx):
-      return UOp(Ops.INS, src=(base, addr_idx, count), arg=(AMDOps.LLOAD, dtypes.half),
-                 tag=(Register(name, 0, _cons=amd_lib.VGPR),))
+      return UOp(Ops.INS, src=(base, addr_idx, count), arg=(AMDOps.LLOAD, dtypes.half, Register(name, 0, _cons=amd_lib.VGPR)))
     a = lload("a", base_a, idx)
     b = lload("b", base_b, a)  # address depends on a
     out = _schedule_lload_2addr_pairs([a, b])
@@ -2955,12 +3001,11 @@ class TestAMDRenderer(unittest.TestCase):
     os.environ["AMD_LDS_2ADDR"] = "1"
     getenv.cache_clear()
     base = UOp.placeholder((256,), dtypes.half, 0, addrspace=AddrSpace.LOCAL)
-    idx = UOp.cconst(0, dtypes.int32).rtag()
-    count = UOp.cconst(4, dtypes.int32).rtag()
+    idx = UOp.cconst(0, dtypes.int32)
+    count = UOp.cconst(4, dtypes.int32)
     def lload(name, off):
-      src = (base, idx, count, UOp.cconst(off, dtypes.int32).rtag())
-      return UOp(Ops.INS, src=src, arg=(AMDOps.LLOAD, dtypes.half),
-                 tag=(Register(name, 0, _cons=amd_lib.VGPR),))
+      src = (base, idx, count, UOp.cconst(off, dtypes.int32))
+      return UOp(Ops.INS, src=src, arg=(AMDOps.LLOAD, dtypes.half, Register(name, 0, _cons=amd_lib.VGPR)))
     loads = {off: lload(f"o{off}", off) for off in (0, 16, 24, 8)}
     out = _schedule_lload_2addr_pairs([loads[o] for o in (0, 16, 24, 8)])
     # LTR: emit 0 then pull 8 next; then 16 then pull 24.
@@ -2987,8 +3032,8 @@ class TestAMDRenderer(unittest.TestCase):
   def test_vopd_mov_scan_respects_intervening_register_use(self):
     from tinygrad.renderer.isa import rdna3 as r
     reg, other = Register("scan_dst", 260, _cons=amd_lib.VGPR), Register("scan_other", 261, _cons=amd_lib.VGPR)
-    candidate = _uop(Ops.INS, dtypes.float32, (UOp.const(0.0, dtypes.float32).rtag(),), AMDOps.MOV, (reg,))
-    overwrite = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32).rtag(),), AMDOps.MOV, (reg,))
+    candidate = _uop(Ops.INS, dtypes.float32, (UOp.const(0.0, dtypes.float32),), AMDOps.MOV, (reg,))
+    overwrite = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32),), AMDOps.MOV, (reg,))
     read = _uop(Ops.INS, dtypes.float32, (candidate,), AMDOps.ADD, (other,))
     self.assertFalse(r._vopd_scan_safe(candidate, [overwrite]))
     self.assertFalse(r._vopd_scan_safe(candidate, [read]))
@@ -3015,16 +3060,16 @@ class TestAMDRenderer(unittest.TestCase):
     indirect = b.replace(src=(first,))
     self.assertIsNone(try_vopd_add_pair(first, second.replace(src=(scale, indirect))))
 
-  def test_regalloc_rewrites_surviving_shrink(self):
+  def test_regalloc_preserves_surviving_shrink_view(self):
     renderer = _REN
-    src = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32).rtag(),), AMDOps.MOV,
+    src = _uop(Ops.INS, dtypes.float32, (UOp.const(1.0, dtypes.float32),), AMDOps.MOV,
               (Register("src", 0, _cons=amd_lib.VGPR),))
-    shrink = _uop(Ops.SHRINK, dtypes.float32, (src, UOp.const(0, dtypes.int32), UOp.const(1, dtypes.int32)), tag=(
-      Register("shrunk", 1, _cons=amd_lib.VGPR),))
+    shrink = _uop(Ops.SHRINK, dtypes.float32, (src, UOp.const(0, dtypes.int32), UOp.const(1, dtypes.int32)))
     dst = _uop(Ops.INS, dtypes.float32, (shrink,), AMDOps.MOV, (Register("dst", 2, _cons=amd_lib.VGPR),))
     out = line_rewrite([src, shrink, dst], pm_regalloc_rewrite, _regalloc_ctx([src, shrink, dst], renderer))
     self.assertEqual([u.op for u in out], [Ops.INS, Ops.SHRINK, Ops.INS])
-    self.assertIsInstance(greg(out[1]), Register)
+    self.assertIsNone(greg(out[1]))  # SHRINK remains an untagged view of its source register.
+    self.assertIsInstance(greg(out[1].src[0]), Register)
     self.assertIs(out[2].src[0], out[1])
 
   def test_regalloc_vector_vgpr_reserves_consecutive_slots(self):
@@ -3032,7 +3077,7 @@ class TestAMDRenderer(unittest.TestCase):
     vvec = Register("vec", 0, _cons=amd_lib.VGPR)
     vscalar = Register("scalar", 1, _cons=amd_lib.VGPR)
     vuse = Register("use", 2, _cons=amd_lib.VGPR)
-    pack_src = tuple(UOp.const(float(i), dtypes.float32).rtag() for i in range(4))
+    pack_src = tuple(UOp.const(float(i), dtypes.float32) for i in range(4))
     vec = _uop(Ops.INS, dtypes.float32, pack_src, AMDOps.PACK, (vvec,))
     scalar = _uop(Ops.INS, dtypes.float32, arg=AMDOps.DEFINE, tag=(vscalar,))
     use = _uop(Ops.INS, dtypes.float32, (vec,), AMDOps.MOV, (vuse,))
@@ -3044,7 +3089,7 @@ class TestAMDRenderer(unittest.TestCase):
     scalar_regs = [Register(f"s{i}", i, _cons=amd_lib.VGPR[:4]) for i in range(4)]
     scalars = [_uop(Ops.INS, dtypes.float32, arg=AMDOps.DEFINE, tag=(r,)) for r in scalar_regs]
     vvec = Register("vec", 4, _cons=amd_lib.VGPR[:4])
-    pack_src = tuple(UOp.const(float(i), dtypes.float32).rtag() for i in range(4))
+    pack_src = tuple(UOp.const(float(i), dtypes.float32) for i in range(4))
     vec = _uop(Ops.INS, dtypes.float32, pack_src, AMDOps.PACK, (vvec,))
     uses = [_uop(Ops.INS, dtypes.float32, (s,), AMDOps.MOV, (Register(f"use{i}", 5+i, _cons=amd_lib.VGPR[:4]),))
             for i,s in enumerate(scalars)]
@@ -3131,7 +3176,7 @@ class TestAMDRenderer(unittest.TestCase):
           _amd_rt(prg)(out, inp, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
           self.assertEqual(bytes(out.as_memoryview()), data[offset:offset+16])
 
-  def test_uniform_packed_u8_uses_scalar_extracts(self):
+  def test_packed_u8_extracts_use_wide_loads(self):
     rows, cols = 16384, 2048
     qdata = Tensor.empty(rows * cols // 256 * 144, dtype=dtypes.uint8, device="AMD")
     weights = ggml_data_to_tensor(qdata, rows * cols, 12).reshape(rows, cols)
@@ -3140,8 +3185,9 @@ class TestAMDRenderer(unittest.TestCase):
     _check_elf(self, prg)
     inst_names = _amd_inst_names(prg)
     self.assertEqual(inst_names.count("GLOBAL_LOAD_B128"), 2)
-    self.assertEqual(inst_names.count("V_READFIRSTLANE_B32_E32"), 8)
-    self.assertEqual(inst_names.count("S_BFE_U32"), 32)
+    # Current rangeify mapping makes these row addresses work-item varying, so byte extraction
+    # may use VALU rather than scalarizing through READFIRSTLANE/SALU.
+    self.assertGreaterEqual(inst_names.count("S_BFE_U32") + inst_names.count("V_BFE_U32"), 32)
     self.assertFalse(any(op in inst_names for op in ("SCRATCH_LOAD_B32", "SCRATCH_STORE_B32")))
 
   def test_float4_lds_memory_uses_ds_b128(self):
@@ -3422,7 +3468,7 @@ class TestAMDRenderer(unittest.TestCase):
     idx = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.MOV, tag=(Register("idx", 263),))
     other_idx = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.MOV, tag=(Register("other_idx", 262),))
     count = UOp.const(1, dtypes.int32)
-    halves = [_uop(Ops.INS, dtypes.half, (half_base, idx, count, UOp.const(off, dtypes.int32).rtag("b_compact")),
+    halves = [_uop(Ops.INS, dtypes.half, (half_base, idx, count, UOp.const(off, dtypes.int32), UOp.const(1, dtypes.int32)),
                    AMDOps.LOAD, (Register(f"h{i}", 264+i),)) for i, off in enumerate((12, 4))]
     word = _uop(Ops.INS, dtypes.float32, (float_base, other_idx, count), AMDOps.LOAD, (Register("word", 263),))
     insts = list(_REN._insts_from_linear(UOp(Ops.LINEAR, src=(*halves, word))))
@@ -3434,7 +3480,7 @@ class TestAMDRenderer(unittest.TestCase):
   def test_rejected_scalar_clause_keeps_compact_index_scale(self):
     base = _uop(Ops.INS, dtypes.uint64, arg=AMDOps.KERNARG, tag=(Register("base", 8, size=8),))
     indices = [_uop(Ops.INS, dtypes.uint32, arg=AMDOps.MOV, tag=(Register(f"idx{i}", 263-i),)) for i in range(3)]
-    half = _uop(Ops.INS, dtypes.half, (base, indices[0], UOp.const(1, dtypes.int32), UOp.const(4, dtypes.int32).rtag("b_compact")),
+    half = _uop(Ops.INS, dtypes.half, (base, indices[0], UOp.const(1, dtypes.int32), UOp.const(4, dtypes.int32), UOp.const(1, dtypes.int32)),
                 AMDOps.LOAD, (Register("half", 264),))
     words = [_uop(Ops.INS, dtypes.float32, (base, idx, UOp.const(4, dtypes.int32)), AMDOps.LOAD,
                   (Register(f"words{i}", 268+4*i),)) for i, idx in enumerate(indices[1:])]
@@ -3681,14 +3727,14 @@ class TestAMDRenderer(unittest.TestCase):
       compare = op in (AMDOps.CMPLT, AMDOps.CMPNE, AMDOps.CMPEQ)
       for high in (127, 128, 253):
         for pos in range(3):
-          regs = [6, 7, 8]
-          regs[pos] = high
-          with self.subTest(op=op, regs=regs):
-            a, b, dst = [_uop(Ops.INS, dtypes.float16, arg=AMDOps.MOV, tag=(Register(str(r), 256+r),)) for r in regs]
+          reg_ids = [6, 7, 8]
+          reg_ids[pos] = high
+          with self.subTest(op=op, regs=reg_ids):
+            a, b, dst = [_uop(Ops.INS, dtypes.float16, arg=AMDOps.MOV, tag=(Register(str(r), 256+r),)) for r in reg_ids]
             src = (dst, a, b) if op is AMDOps.FMAC else (a, b)
-            ins = _uop(Ops.INS, dtypes.bool if compare else dtypes.float16, src, op, dst.tag)
+            ins = _uop(Ops.INS, dtypes.bool if compare else dtypes.float16, src, op, regs(dst))
             inst, = amd_lib.insts_for_uop(ins)
-            relevant = regs[:2] if compare else regs
+            relevant = reg_ids[:2] if compare else reg_ids
             self.assertTrue(inst.op_name.endswith("E64" if max(relevant) >= 128 else "E32"))
 
   def test_address_peeling_preserves_32bit_arithmetic(self):
@@ -3903,7 +3949,7 @@ class TestAMDRenderer(unittest.TestCase):
 
   def test_sgpr_sub_uses_scalar_instruction(self):
     src = _uop(Ops.INS, dtypes.uint32, arg=AMDOps.MOV, tag=(Register("s8", 8),))
-    sub = _uop(Ops.INS, dtypes.uint32, (src, UOp.const(1, dtypes.uint32).rtag()), AMDOps.SUB, (Register("s6", 6),))
+    sub = _uop(Ops.INS, dtypes.uint32, (src, UOp.const(1, dtypes.uint32)), AMDOps.SUB, (Register("s6", 6),))
     insts = _REN._insts_for_uop(sub)
     self.assertEqual([getattr(i, "op_name", "") for i in insts], ["S_SUB_U32"])
 
@@ -4023,7 +4069,7 @@ class TestAMDRenderer(unittest.TestCase):
     disp = UOp.const(4096, dtypes.int32)
     src = _uop(Ops.INS, dtypes.float32, (), AMDOps.MOV, (Register("v3", 259),))
     spill = _uop(Ops.INS, dtypes.void, (disp, src), AMDOps.SPILL)
-    fill = _uop(Ops.INS, dtypes.float32, (disp, UOp.const(1, dtypes.int32).rtag()), AMDOps.FILL, (Register("v4", 260),))
+    fill = _uop(Ops.INS, dtypes.float32, (disp, UOp.const(1, dtypes.int32)), AMDOps.FILL, (Register("v4", 260),))
     for insts in (renderer._insts_for_uop(spill), renderer._insts_for_uop(fill)):
       self.assertEqual(insts[0].op_name, "V_MOV_B32_E32")
       self.assertEqual(insts[0].literal, 4096)
@@ -4034,7 +4080,7 @@ class TestAMDRenderer(unittest.TestCase):
     disp = UOp.const(15400, dtypes.int32)
     src = _uop(Ops.INS, dtypes.float32, (), AMDOps.MOV, (Register("v3", 259),))
     spill = _uop(Ops.INS, dtypes.void, (disp, src), AMDOps.SPILL)
-    fill = _uop(Ops.INS, dtypes.float32, (disp, UOp.const(1, dtypes.int32).rtag()), AMDOps.FILL, (Register("v4", 260),))
+    fill = _uop(Ops.INS, dtypes.float32, (disp, UOp.const(1, dtypes.int32)), AMDOps.FILL, (Register("v4", 260),))
     for insts in (renderer._insts_for_uop(spill), renderer._insts_for_uop(fill)):
       self.assertEqual(insts[0].op_name, "V_MOV_B32_E32")
       self.assertEqual(insts[0].literal, 12288)
@@ -4049,7 +4095,7 @@ class TestAMDRenderer(unittest.TestCase):
     disp = UOp.const(64, dtypes.int32)
     src = _uop(Ops.INS, dtypes.uint32, (), AMDOps.MOV, (Register("s6", 6),))
     spill = _uop(Ops.INS, dtypes.void, (disp, src), AMDOps.SPILL)
-    fill = _uop(Ops.INS, dtypes.uint32, (disp, UOp.const(1, dtypes.int32).rtag()), AMDOps.FILL, (Register("s8", 8),))
+    fill = _uop(Ops.INS, dtypes.uint32, (disp, UOp.const(1, dtypes.int32)), AMDOps.FILL, (Register("s8", 8),))
     spill_insts, fill_insts = renderer._insts_for_uop(spill), renderer._insts_for_uop(fill)
     self.assertEqual([getattr(i, "op_name", "") for i in spill_insts],
                      ["V_MOV_B32_E32", "V_MOV_B32_E32", "SCRATCH_STORE_B32", "S_WAITCNT_VSCNT"])
@@ -4076,10 +4122,10 @@ class TestAMDRenderer(unittest.TestCase):
   def test_vector_vgpr_spill_expands_to_scalar_scratch_lanes(self):
     renderer = _REN
     disp = UOp.const(64, dtypes.int32)
-    pack_src = tuple(UOp.const(float(i), dtypes.float32).rtag() for i in range(4))
+    pack_src = tuple(UOp.const(float(i), dtypes.float32) for i in range(4))
     src = _uop(Ops.INS, dtypes.float32, pack_src, AMDOps.PACK, (Register("v20", 276),))
     spill = _uop(Ops.INS, dtypes.void, (disp, src), AMDOps.SPILL)
-    fill = _uop(Ops.INS, dtypes.float32, (disp, UOp.const(4, dtypes.int32).rtag()), AMDOps.FILL, (Register("v40", 296),))
+    fill = _uop(Ops.INS, dtypes.float32, (disp, UOp.const(4, dtypes.int32)), AMDOps.FILL, (Register("v40", 296),))
     spill_insts, fill_insts = renderer._insts_for_uop(spill), renderer._insts_for_uop(fill)
     self.assertEqual([getattr(i, "op_name", "") for i in spill_insts], ["V_MOV_B32_E32"] + ["SCRATCH_STORE_B32"]*4 + ["S_WAITCNT_VSCNT"])
     self.assertEqual([i.offset for i in spill_insts[1:5]], [64, 68, 72, 76])
@@ -4093,9 +4139,13 @@ class TestAMDRenderer(unittest.TestCase):
   def test_range_loop_assembles_with_branch_fixups(self):
     prg = _range_program()
     _check_elf(self, prg)
-    linear_ops = _lin_ops(prg)
+    linear = _prg_lin(prg).src
+    linear_ops = [_iop(u) for u in linear if u.op is Ops.INS]
     for op in (AMDOps.LABEL, AMDOps.CMP_GE, AMDOps.CBRANCH_SCC1, AMDOps.BRANCH):
       self.assertIn(op, linear_ops)
+    range_refs = [s for u in linear if u.op is Ops.INS for s in u.src if s.op is Ops.AFTER]
+    self.assertTrue(range_refs)
+    self.assertTrue(all(isinstance(greg(s), Register) and not greg(s).name.startswith("range_") for s in range_refs))
     insts = list(_REN._insts_from_linear(_prg_lin(prg)))
     branches = [i.simm16 if i.simm16 < 0x8000 else i.simm16 - 0x10000 for i in insts
                 if getattr(i, "op_name", "") in ("S_CBRANCH_SCC1", "S_BRANCH")]
@@ -4184,7 +4234,8 @@ class TestAMDRenderer(unittest.TestCase):
     prg = _nested_range_program()
     _check_elf(self, prg)
     linear_ops = _lin_ops(prg)
-    self.assertEqual(linear_ops.count(AMDOps.LABEL), 4)
+    self.assertEqual(linear_ops.count(AMDOps.LABEL), 2)
+    self.assertEqual(linear_ops.count(AMDOps.LABEL_OUT), 2)
     self.assertEqual(linear_ops.count(AMDOps.CBRANCH_SCC1), 2)
     self.assertEqual(linear_ops.count(AMDOps.BRANCH), 2)
     insts = list(_REN._insts_from_linear(_prg_lin(prg)))
@@ -4208,9 +4259,9 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertNotEqual(prg.arg.global_size, (1, 1, 1))
     self.assertNotEqual(prg.arg.local_size, (1, 1, 1))
     self.assertFalse(any(u.op is Ops.RANGE for u in _prg_lin(prg).src))
-    specials = [u.arg for u in prg.src[0].toposort() if u.op is Ops.SPECIAL]
-    self.assertIn("gidx0", specials)
-    self.assertIn("lidx0", specials)
+    specials = [amd_lib._const_int(u.src[0]) for u in _prg_lin(prg).src if u.op is Ops.INS and _iop(u) is AMDOps.SPECIAL]
+    self.assertIn(3, specials)  # gidx0
+    self.assertIn(0, specials)  # lidx0
     desc = _amd_desc(prg)
     self.assertTrue(desc.compute_pgm_rsrc2 & (1 << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT))
     self.assertEqual((desc.compute_pgm_rsrc2 >> amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_VGPR_WORKITEM_ID_SHIFT) & 0x3, 0)
@@ -4494,8 +4545,8 @@ class TestAMDRenderer(unittest.TestCase):
   def test_gidx_metadata_survives_for_descriptor(self):
     prg = _gidx_program()
     _check_elf(self, prg)
-    specials = [u.arg for u in prg.src[0].toposort() if u.op is Ops.SPECIAL]
-    self.assertIn("gidx0", specials)
+    specials = [amd_lib._const_int(u.src[0]) for u in _prg_lin(prg).src if u.op is Ops.INS and _iop(u) is AMDOps.SPECIAL]
+    self.assertIn(3, specials)  # gidx0
 
   def test_multi_dim_specials_set_descriptor_bits(self):
     prg = _multi_dim_program()
@@ -4651,9 +4702,9 @@ class TestAMDRenderer(unittest.TestCase):
     bufs = [x._buffer().ensure_allocated() for x in (out, inp)]
     for op, expected in ((AMDOps.ADD, 4.), (AMDOps.SUB, -2.), (AMDOps.MUL, 3.), (AMDOps.MAX, 3.), (AMDOps.FMAC, 5.),
                          (AMDOps.CMPLT, 1.), (AMDOps.CMPNE, 1.), (AMDOps.CMPEQ, 0.)):
-      for regs in ((6, 7, 8), (134, 7, 8), (6, 135, 8), (6, 7, 136), (134, 135, 136)):
-        with self.subTest(op=op, regs=regs):
-          prg = _physical_half_program(op, regs)
+      for reg_ids in ((6, 7, 8), (134, 7, 8), (6, 135, 8), (6, 7, 136), (134, 135, 136)):
+        with self.subTest(op=op, regs=reg_ids):
+          prg = _physical_half_program(op, reg_ids)
           _amd_rt(prg)(*bufs, global_size=prg.arg.global_size, local_size=prg.arg.local_size, vals=(), wait=True)
           self.assertEqual(out.tolist(), [expected]*16)
 

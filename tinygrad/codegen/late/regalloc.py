@@ -3,7 +3,7 @@ from bisect import bisect_left
 from tinygrad.device import CompileError
 from tinygrad.helpers import dedup
 from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat
-from tinygrad.renderer.isa import ISARenderer, Register, greg, rdef, LinearContext
+from tinygrad.renderer.isa import ISARenderer, Register, greg, rdef, regs, with_regs, LinearContext
 from tinygrad.dtype import dtypes, AddrSpace
 from typing import Any
 from dataclasses import replace
@@ -26,15 +26,20 @@ class LinearScanRegallocContext:
     # compute live ranges
     self.live_range: dict[Register, list[int]] = {}
     lr = self.live_range
-    loops: dict[int, int] = {} # the interval of each loop, from its RANGE to the last uop that reads that RANGE
+    loops: dict[int, int] = {} # the interval of each loop, from its RANGE to the last non pseudo uop that reads that RANGE
     for idx,u in reversed(list(enumerate(uops))):
       if u.op in PSEUDO_OPS: continue
-      defs = u.tag if isinstance(u.tag, tuple) else ()
+      defs = regs(u)
       for v in defs + tuple(rdef(s) for s in dedup(u.src)):
         if isinstance(v, Register): lr.setdefault(v, []).insert(0, idx)
       for v in defs:
         if v in lr and (n:=max((e for s,e in loops.items() if s <= lr[v][-1] < e), default=None)): lr[v].append(n)
-      if u.op is Ops.RANGE: loops[idx] = max(j for j,x in enumerate(uops) if u in x.src)
+      if u.op is Ops.RANGE:
+        # RANGE can be wrapped in AFTER ordering dependencies by linearization. Prefer the
+        # matching terminator so loop-invariant values remain live across every iteration.
+        ends = [j for j,x in enumerate(uops) if ren.loop_end(x) is u or
+                (x.op in (Ops.END, Ops.BACKEDGE) and any(u in s.toposort() for s in x.src[1:]))]
+        loops[idx] = max(ends) if ends else max(j for j,x in enumerate(uops) if u in x.src and x.op not in PSEUDO_OPS)
 
     # allocate registers
     self.locals: dict[UOp, UOp] = {}
@@ -56,6 +61,13 @@ class LinearScanRegallocContext:
     def slots(v:Register) -> int:
       if (ret:=slot_counts.get(v)) is None: slot_counts[v] = ret = ren.register_slots(self.vdef(v), v)
       return ret
+
+    def prefer_alias_safe(reg:Register, v:Register, i:int) -> bool:
+      # A preferred alias is only a free coalesce when every overlapped value is dead after
+      # this instruction. Otherwise the alias can clobber a still-live source value.
+      end = reg.index + slots(v)
+      return not any(r.index < end and reg.index < r.index + slots(vr) and any(j > i for j in lr[vr])
+                     for vr,r in live.items() if vr is not v)
 
     pinned: set[int] = set()  # live source phys regs; defs must not steal (except two-address)
 
@@ -107,8 +119,13 @@ class LinearScanRegallocContext:
         self.reals.setdefault(i, {})[v] = live[v]
         pinned.update(range(live[v].index, live[v].index + slots(v)))
 
-      if isinstance(u.tag, tuple):
-        for j,v in enumerate(u.tag):
+      if regs(u):
+        for j,v in enumerate(regs(u)):
+          # Explicit register buffers may be written more than once (e.g. a reduction
+          # accumulator). Keep the current assignment, matching the non-wide allocator.
+          if not self.wide and v in live:
+            self.reals.setdefault(i, {})[v] = live[v]
+            continue
           # Two-address WMMA/FMAC may redefine the same ACC pack tag across unrolled
           # tiles (flash ACC_SMALL). Live range starts at the first def; later defs
           # reuse the already-allocated phys reg instead of asserting.
@@ -154,8 +171,9 @@ class LinearScanRegallocContext:
                 self.remat_banned.add(v)
               continue
             cons = ((uses[0],) if uses[0] is not None and uses[0] in cons else ()) + tuple(r for r in cons if r not in uses)
-          elif j == 0 and (pref:=ren.prefer_phys(u, [live.get(greg(s)) for s in u.src])) is not None and pref in cons:
-            # Alias onto a src sub-register (e.g. EXTRACT → WMMA pack+lane) — skip pinned check.
+          elif j == 0 and (pref:=ren.prefer_phys(u, [live.get(greg(s)) for s in u.src])) is not None and pref in cons \
+               and (not ren.prefer_phys_needs_liveness(u) or prefer_alias_safe(pref, v, i)):
+            # Alias onto a src sub-register (e.g. EXTRACT → WMMA pack+lane) only if it is safe.
             live[v] = pref
             self.reals.setdefault(i, {})[v] = pref
             if self.wide:
@@ -189,7 +207,7 @@ class LinearScanRegallocContext:
       if self.wide:
         for rv in [rv for rv in live if rv in self.remat and not ren.keep_remat(self.vdef(rv))]: live.pop(rv, None)
 
-      if self.wide and u.op is Ops.BUFFER:
+      if self.wide and u.op in (Ops.BUFFER, Ops.ALLOC):
         if u.addrspace is AddrSpace.REG and u in self.reg_promotable: continue
         self.locals[u] = UOp.cconst(self.stack_size, dtypes.int32)
         self.stack_size += u.max_numel() * u.dtype.itemsize
@@ -210,7 +228,6 @@ class LinearScanRegallocContext:
         # loop-carried restores need exact phys regs
         for v,r in live_ins.pop().items():
           if v not in live or live[v] != r: live[v] = fill(v, i, (r,), pin=False)
-
 def wide_alloc(cons, i, nslots, allowed, live, lr, uops_len, slots_fn, pinned=frozenset()):
   # Candidates can describe an aligned multi-slot physical class (for example an
   # even 64-bit SGPR pair). Include covered sub-registers when validating width,
@@ -284,6 +301,8 @@ def wide_regalloc_rewrite(ctx, x:UOp):
                   for j in range(len(x.src)))
     if not spilled and i not in (ctx.first_real_idx, ctx.last_real_idx): return None
   nsrc = []
+  def retag(x:UOp, r:Register) -> UOp:
+    return x.replace(src=(retag(x.src[0],r),*x.src[1:])) if x.op in {Ops.AFTER, Ops.BITCAST} else with_regs(x, (r,))
   loop_end = ctx.ren.loop_end(ctx.uops[i])
   for j,su in enumerate(x.src):
     if loop_end is not None:
@@ -295,18 +314,19 @@ def wide_regalloc_rewrite(ctx, x:UOp):
       # Preserve the use dtype: no-op BITCASTs can share a vreg with a differently typed definition.
       nsrc.append(ctx.ren.bind(su.dtype, ctx.reals[i][vr]))
     elif isinstance(vr, Register) and vr in ctx.spills: nsrc.append(ctx.ren.fill(ctx.spills[vr], su, ctx.reals[i][vr]))
+    elif isinstance(vr, Register) and vr in ctx.reals.get(i, {}): nsrc.append(retag(su, ctx.reals[i][vr]))
     else: nsrc.append(su)
-  ndefs = tuple(ctx.reals[i][vr] for vr in x.tag) if isinstance(x.tag, tuple) else x.tag
-  if x.op is Ops.BUFFER:
-    if x in ctx.reg_promotable and x not in ctx.locals: nx = ctx.ren.isel_matcher.rewrite(x.replace(tag=ndefs))
-    else: nx = ctx.ren.isel_matcher.rewrite(ctx.ren.stack_pointer().index(ctx.locals[x], tag=ndefs))
-  else: nx = x.replace(src=tuple(nsrc), tag=ndefs)
+  ndefs = tuple(ctx.reals[i][vr] for vr in regs(x))
+  if x.op in (Ops.BUFFER, Ops.ALLOC):
+    if x in ctx.reg_promotable and x not in ctx.locals: nx = UOp(Ops.STACK)
+    else: nx = ctx.ren.isel_matcher.rewrite(ctx.ren.stack_pointer().index(ctx.locals[x]))
+  else: nx = with_regs(x.replace(src=tuple(nsrc)), ndefs) if regs(x) else x.replace(src=tuple(nsrc))
   before = [wide_restore(ctx, vr, r, i) for vr,r in ctx.insert_before.get(i, [])]
-  after = [ctx.ren.spill(ctx.spills[vr], nx) for vr in x.tag if vr in ctx.spills] if isinstance(x.tag, tuple) else []
+  after = [ctx.ren.spill(ctx.spills[vr], nx) for vr in regs(x) if vr in ctx.spills]
   if ctx.stack_size > 0:
     sp, offset = ctx.ren.stack_pointer(), UOp.cconst(ctx.stack_size, ctx.ren.stack_pointer().dtype)
-    if i == ctx.first_real_idx: before = [ctx.ren.isel_matcher.rewrite(UOp(Ops.SUB, src=(sp, offset), tag=sp.tag))] + before
-    elif i == ctx.last_real_idx: before += [ctx.ren.isel_matcher.rewrite(UOp(Ops.ADD, src=(sp, offset), tag=sp.tag))]
+    if i == ctx.first_real_idx: before = [ctx.ren.isel_matcher.rewrite(UOp(Ops.SUB, src=(sp, offset)))] + before
+    elif i == ctx.last_real_idx: before += [ctx.ren.isel_matcher.rewrite(UOp(Ops.ADD, src=(sp, offset)))]
   return nx, before + [nx] + after
 
 def regalloc_rewrite(ctx:LinearScanRegallocContext, x:UOp):
@@ -317,20 +337,22 @@ def regalloc_rewrite(ctx:LinearScanRegallocContext, x:UOp):
   if x.op in PSEUDO_OPS: return None
 
   nsrc = []
+  def retag(x:UOp, r:Register) -> UOp:
+    return x.replace(src=(retag(x.src[0],r),*x.src[1:])) if x.op in {Ops.AFTER, Ops.BITCAST} else with_regs(x, (r,))
   for j,s in enumerate(x.src):
     # v here is the virtual defined by the original s as s is the rewritten version
-    if i in ctx.reals and (v:=rdef(ctx.uops[i].src[j])) in ctx.spills:
-      nsrc.append(ctx.ren.fill(ctx.spills[v], ctx.vdef(v), replace(ctx.reals[i][v], size=v.size)))
+    if i in ctx.reals and (v:=rdef(ctx.uops[i].src[j])) in ctx.reals.get(i, {}):
+      reg = replace(ctx.reals[i][v], size=v.size)
+      if v in ctx.spills: nsrc.append(ctx.ren.fill(ctx.spills[v], ctx.vdef(v), reg))
+      else: nsrc.append(retag(s, reg))
     else: nsrc.append(s)
-  ndefs = tuple(replace(ctx.reals[i][v], size=v.size) for v in x.tag) if isinstance(x.tag, tuple) else x.tag
-  nx = x.replace(src=tuple(nsrc), tag=ndefs)
+  nx = with_regs(x.replace(src=tuple(nsrc)), tuple(replace(ctx.reals[i][v], size=v.size) for v in regs(x))) if regs(x) else x.replace(src=tuple(nsrc))
 
   before = [ctx.ren.fill(ctx.spills[v], ctx.vdef(v), replace(r, size=v.size)) for v,r in ctx.insert_before.get(i, [])]
-  after = [ctx.ren.spill(ctx.spills[v], nx) for v in x.tag if v in ctx.spills] if isinstance(x.tag, tuple) else []
+  after = [ctx.ren.spill(ctx.spills[v], nx) for v in regs(x) if v in ctx.spills]
 
   return nx, before + [nx] + after
 
 pm_regalloc_rewrite = PatternMatcher([
-  (UPat({Ops.INS, Ops.RANGE, Ops.END, Ops.BACKEDGE, Ops.BUFFER, Ops.PARAM, Ops.SPECIAL, Ops.SHRINK, Ops.LOAD, Ops.STORE} | PSEUDO_OPS, name="x"),
-        regalloc_rewrite),
+  (UPat({Ops.INS, Ops.RANGE, Ops.END, Ops.BACKEDGE, Ops.BUFFER, Ops.ALLOC} | PSEUDO_OPS, name="x"), regalloc_rewrite),
 ])

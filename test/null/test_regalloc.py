@@ -24,7 +24,7 @@ class TestRegalloc(unittest.TestCase):
     renderer.wide_regalloc = True
     physical = tuple(Register(f"p{i}", i, size=4) for i in range(2))
     virtual = tuple(Register(f"v{i}", 0, physical, size=4) for i in range(2))
-    uops = [UOp(Ops.INS, arg=("value", dtypes.float32), tag=(v,)) for v in virtual]
+    uops = [UOp(Ops.INS, arg=("value", dtypes.float32, v)) for v in virtual]
     for _ in range(2):
       context = PolicyContext(renderer)
       allocated = LinearScanRegallocContext(context, uops, renderer)

@@ -1,4 +1,4 @@
-import os, unittest
+import importlib.util, os, unittest
 from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
@@ -68,6 +68,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_q4_k_linear(self): self._test_quant_linear(12, 144)
   def test_iq4_linear(self): self._test_quant_linear(23, 136)
   def test_q5_linear(self): self._test_quant_linear(13, 176)
+  def test_q6_linear_wmma(self): self._test_quant_linear(14, 210, token_counts=(16, 32, 64, 128, 256))
   def test_q8_0_linear_small_blocks(self): self._test_quant_linear(8, 272, in_features=288, out_features=16, token_counts=(1, 16))
   def test_q6_linear_odd_blocks(self): self._test_quant_linear(14, 210, in_features=768, out_features=3, token_counts=(1, 3, 16))
   def test_q2_k_linear(self): self._test_quant_linear(10, 84, in_features=768, token_counts=(1, 3, 16))
@@ -90,6 +91,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
 
   def test_wmma_dequantization_basis(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    if importlib.util.find_spec("gguf") is None: self.skipTest("optional gguf package is not installed")
     from gguf import dequantize, GGMLQuantizationType
     rng = np.random.default_rng(1907)
     scales = np.array([0, 2**-24, -2**-24, 2**-14, -0.00035, .001, .0037, -.125, 1, -4, 8], np.float16)
@@ -117,6 +119,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
 
   def test_quant_linear_unaligned_storage_fallback(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    if importlib.util.find_spec("gguf") is None: self.skipTest("optional gguf package is not installed")
     from gguf import dequantize, GGMLQuantizationType
     rng = np.random.default_rng(73)
     x = rng.normal(size=(16, 256)).astype(np.float32)
@@ -134,6 +137,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
 
   def test_q6_short_wmma_dequantization_basis(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    if importlib.util.find_spec("gguf") is None: self.skipTest("optional gguf package is not installed")
     from gguf import dequantize, GGMLQuantizationType
     rng = np.random.default_rng(1907)
     scales = np.array([0, 2**-24, -2**-24, 2**-14, -0.00035, .001, .0037, -.125, 1, -4, 8], np.float16)
@@ -715,7 +719,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
              patch.object(amd_mod, "amd_flash_attention_decode", return_value=out), \
              patch.object(Tensor, "realize", autospec=True, side_effect=realize):
           self.assertIs(amd_mod.flash_attention(q, kv, 64), out)
-        self.assertEqual(calls, [((q, kv), 0), ((out,), 1)])
+        self.assertEqual(calls, [((q, kv), 0), ((out,), 0)])
       finally: getenv.cache_clear()
 
   def test_decode_builds_without_device_execution(self):
@@ -790,7 +794,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
       before = {k:os.environ.get(k) for k in keys}
       getenv.cache_clear()
       with amd_mod._flash_direct_compile_env(flash_acc_small=False):
-        self.assertEqual(getenv("AMD_VOPD_FMAC"), 1)
+        self.assertEqual(getenv("AMD_VOPD_FMAC"), 0)
         self.assertEqual(getenv("ALLOW_UPCAST16"), 1)
       self.assertEqual({k:os.environ.get(k) for k in keys}, before)
       with self.assertRaisesRegex(RuntimeError, "compile failed"):

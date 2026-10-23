@@ -61,18 +61,20 @@ def unwrap_const(x:UOp) -> UOp|None:
 def const_value(x:UOp):
   return c.val if (c:=unwrap_const(x)) is not None else None
 
-def tconst(value, dtype:DType, tag=None) -> UOp:
+def tconst(value, dtype:DType) -> UOp:
   """Typed bare constant for renderer-internal graphs, after the program spec boundary."""
-  return UOp.cconst(value, dtype).rtag(tag)
+  return UOp.cconst(value, dtype)
 
 class AMDOps(FastEnum):
   LABEL = auto()
+  LABEL_OUT = auto()
   DEFINE = auto()
   SCRATCH_BASE = auto()
   SCRATCH_SIZE = auto()
   SCRATCH_ADDR = auto()
   KERNARG = auto()
   MOV = auto()
+  SPECIAL = auto()
   PACK = auto()
   EXTRACT = auto()
   COLLECT = auto()
@@ -132,6 +134,9 @@ class AMDOps(FastEnum):
   LSHL_OR = auto()
   LSHL_ADD = auto()
   FMA_MIX_F32 = auto()  # srcs: (acc_f32, half, f32)
+  LOOP_CMP_LT = auto()
+  LOOP_CMP_NE = auto()
+  LOOP_CMP_EQ = auto()
 
 def iop(u:UOp):
   """Instruction selector carried by the dtype-less UOp INS argument."""
@@ -195,7 +200,7 @@ def mem_byte_off(u:UOp, src_i:int=3) -> int:
   return const_int(u.src[src_i]) or 0 if len(u.src) > src_i else 0
 
 def lds_byte_off(u:UOp) -> int: return mem_byte_off(u, 3)
-def load_count_src(n:int) -> UOp: return tconst(n, dtypes.int32).rtag()
+def load_count_src(n:int) -> UOp: return tconst(n, dtypes.int32)
 
 def pack_f16_is_vec_load(u:UOp) -> bool:
   """PACK_F16(half×n LOAD/LLOAD, ...) — not scalar-LOAD B packs."""

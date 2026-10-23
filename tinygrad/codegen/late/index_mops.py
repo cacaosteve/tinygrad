@@ -21,7 +21,7 @@ def _index_through_reshape(r:UOp, idx:UOp) -> UOp|None:
   return src.index(*src_idxs)
 
 def _index_through_permute(p:UOp, idx:UOp) -> UOp|None:
-  perm, idxs = p.arg, idx.src[1:]
+  perm, idxs = p.marg, idx.src[1:]
   if len(idxs) != len(perm): return None
   old_idxs: list[UOp|None] = [None] * len(perm)
   for i, pi in enumerate(perm): old_idxs[pi] = idxs[i]
