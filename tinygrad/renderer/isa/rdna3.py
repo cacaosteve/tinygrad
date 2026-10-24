@@ -46,6 +46,7 @@ def _mem_itemsize(dt:DType) -> int: return dt.itemsize
 _LOAD_FLAG_B_COMPACT = 1
 _LOAD_FLAG_BYTE_ADDR = 2
 _LOAD_FLAG_VOLATILE = 4
+_LOAD_FLAG_NONTEMPORAL = 8
 
 # --- emit: VOPD pairing (post-regalloc optional dual-issue) ---
 from tinygrad.renderer.isa import rdna3_vopd as _vopd
@@ -73,7 +74,11 @@ def _global_load_insts(u:UOp, addr:Reg, byte_off:int=0) -> list:
   saddr = _src(u.src[0])
   off_kw = {"offset": byte_off} if 0 < byte_off <= 0xfff else {}
   flags = _const_int(u.src[4]) if len(u.src) > 4 else 0
-  cache_kw = {"glc": 1, "dlc": 1} if flags is not None and flags & _LOAD_FLAG_VOLATILE else {}
+  cache_kw: dict[str, int] = {}
+  if flags is not None:
+    if flags & _LOAD_FLAG_VOLATILE: cache_kw.update(glc=1, dlc=1)
+    # Match HIP's __builtin_nontemporal_load lowering: bypass the device cache but retain SLC.
+    if flags & _LOAD_FLAG_NONTEMPORAL: cache_kw.update(slc=1, dlc=1)
   if slots == 1:
     if (load:=_global_load(u.dtype, _elem_count(u))) is None: raise CompileError(f"no global load {u.dtype}")
     return [load(_dst(u), addr, saddr=saddr, **off_kw, **cache_kw)]
@@ -837,6 +842,7 @@ def _load_ins(x:UOp, a:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp:
   volatile = param.op is Ops.PARAM and param.arg.volatile
   def global_load(src:tuple[UOp, ...], flags:int=0) -> UOp:
     if volatile: flags |= _LOAD_FLAG_VOLATILE
+    if x.arg == "nontemporal": flags |= _LOAD_FLAG_NONTEMPORAL
     return x.ins(AMDOps.LOAD, dtype=x.dtype, src=_load_src_flags(src, flags))
   if alt is not None and gate is not None:
     # Coalescing uses SHRINK addresses, which bypass the scalar pre-isel gated-load
@@ -1123,6 +1129,8 @@ AMD_ATOMIC_ADD = "__hip_atomic_fetch_add({0}, {1}, __ATOMIC_RELAXED, __HIP_MEMOR
 AMD_DOT4 = "__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)"
 AMD_BYTE_PERM = "__builtin_amdgcn_perm({}, {}, {})"
 AMD_NONTEMPORAL_LOAD = "__builtin_nontemporal_load({0})"
+AMD_NONTEMPORAL_U32_LOAD = "__builtin_nontemporal_load((const unsigned int*){0})"
+AMD_PACKED_U8X8_LOAD = "__builtin_nontemporal_load((const unsigned_int2*){0})"
 AMD_PACKED_U8X16_LOAD = "__builtin_nontemporal_load((const unsigned_int4*){0})"
 AMD_FMA_TO_F16 = "__builtin_amdgcn_fma_mixlo_f16({}, {}, {})"
 AMD_PACKED_F16_MUL_TO_F16 = "__builtin_amdgcn_fma_mixlo_f16_packed({}, {}, {})"
@@ -1170,10 +1178,12 @@ def _amd_custom_intrinsic(x:UOp) -> UOp|None:
   if arg == AMD_BYTE_PERM: return x.ins(AMDOps.BYTE_PERM)
   if arg == AMD_FMA_TO_F16: return x.ins(AMDOps.FMA_TO_F16)
   if arg == AMD_PACKED_F16_MUL_TO_F16: return x.ins(AMDOps.PACKED_F16_MUL_TO_F16)
-  if arg == AMD_PACKED_U8X16_LOAD and len(x.src) == 1 and x.src[0].op is Ops.SHRINK:
+  if arg in (AMD_PACKED_U8X8_LOAD, AMD_PACKED_U8X16_LOAD) and len(x.src) == 1 and x.src[0].op is Ops.SHRINK:
     ptr = x.src[0]
-    src:tuple[UOp, ...] = (ptr.src[0], ptr.src[1], _load_count_src(4))
-    return x.ins(AMDOps.LOAD, src=_load_src_flags(src, _LOAD_FLAG_BYTE_ADDR if ptr.src[0].dtype is dtypes.uint8 else 0))
+    count = 2 if arg == AMD_PACKED_U8X8_LOAD else 4
+    src:tuple[UOp, ...] = (ptr.src[0].buf_uop, ptr.src[1], _load_count_src(count))
+    flags = _LOAD_FLAG_NONTEMPORAL | (_LOAD_FLAG_BYTE_ADDR if ptr.src[0].dtype is dtypes.uint8 else 0)
+    return x.ins(AMDOps.LOAD, src=_load_src_flags(src, flags))
   if arg == AMD_MBCNT_LO and len(x.src) == 1: return x.src[0]
   if isinstance(arg, str) and arg.startswith(AMD_SWIZZLE_PREFIX) and arg.endswith("))"):
     try: offset = int(arg[len(AMD_SWIZZLE_PREFIX):-2])
@@ -1184,8 +1194,12 @@ def _amd_custom_intrinsic(x:UOp) -> UOp|None:
   return None
 
 def _nontemporal_load(x:UOp) -> UOp|None:
-  if _custom_name(x) != AMD_NONTEMPORAL_LOAD or len(x.src) != 1 or x.src[0].op is not Ops.INDEX: return None
-  return x.src[0].load(dtype=x.dtype)
+  if _custom_name(x) not in (AMD_NONTEMPORAL_LOAD, AMD_NONTEMPORAL_U32_LOAD) or len(x.src) != 1 or x.src[0].op is not Ops.INDEX: return None
+  if _custom_name(x) == AMD_NONTEMPORAL_U32_LOAD:
+    ptr = x.src[0]
+    return x.ins(AMDOps.LOAD, dtype=x.dtype, src=_load_src_flags((ptr.src[0].buf_uop, ptr.src[1], _load_count_src(1)),
+                                                                    _LOAD_FLAG_BYTE_ADDR | _LOAD_FLAG_NONTEMPORAL))
+  return x.src[0].load(arg="nontemporal")
 
 def _bitfield_extract(x:UOp, value:UOp, shift:UOp, mask:UOp) -> UOp|None:
   m = int(mask.val)

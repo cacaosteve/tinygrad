@@ -175,6 +175,30 @@ def _two_load_add_program():
   sink = out.index(idx).store(a.index(idx).load() + b.index(idx).load()).sink(idx, arg=KernelInfo(name="amd_asm_two_load_add"))
   return _to_prg(sink)
 
+def _nontemporal_load_program():
+  out = UOp.placeholder((16,), dtypes.float, 0)
+  a, b, c = (UOp.placeholder((16,), dtypes.float, i) for i in (1, 2, 3))
+  raw = UOp.placeholder((68,), dtypes.uint8, 4)
+  idx = UOp.special(16, "lidx0")
+  builtin = UOp(Ops.CUSTOMI, src=(a.index(idx),), arg=(amd_lib.AMD_NONTEMPORAL_LOAD, dtypes.float32))
+  packed = UOp(Ops.CUSTOMI, src=(raw.index(idx*4+2),), arg=(amd_lib.AMD_NONTEMPORAL_U32_LOAD, dtypes.uint32))
+  sink = out.index(idx).store(b.index(idx).load(arg="nontemporal") + builtin + c.index(idx).load() + packed.cast(dtypes.float32)).sink(
+    idx, arg=KernelInfo(name="amd_asm_nontemporal_load"))
+  return _to_prg(sink)
+
+def _nontemporal_vector_load_program():
+  raw = UOp.placeholder((64,), dtypes.uint8, 0)
+  out = UOp.placeholder((1,), dtypes.float, 1)
+  idx = UOp.special(1, "lidx0")
+  def packed(start:int, words:int, intrinsic:str):
+    shrink = UOp(Ops.SHRINK, src=(raw.flatten(), UOp.const(start), UOp.const(words*4)))
+    return UOp(Ops.CUSTOM, src=(shrink,), arg=(intrinsic, dtypes.uint32))
+  pair = packed(0, 2, amd_lib.AMD_PACKED_U8X8_LOAD)
+  quad = packed(16, 4, amd_lib.AMD_PACKED_U8X16_LOAD)
+  value = sum((pair[i].cast(dtypes.float) for i in range(2)), UOp.const(0, dtypes.float)) + \
+    sum((quad[i].cast(dtypes.float) for i in range(4)), UOp.const(0, dtypes.float))
+  return _to_prg(out.index(idx).store(value).sink(idx, arg=KernelInfo(name="amd_asm_nontemporal_vector_load")))
+
 def _matmul64_program():
   with Context(BEAM=0):
     ast = (Tensor.empty(64, 64, device="AMD") @ Tensor.empty(64, 64, device="AMD")).schedule_linear().src[-1].src[0]
@@ -1769,6 +1793,21 @@ class TestAMDRenderer(unittest.TestCase):
     self.assertEqual(inst_names.count("S_WAITCNT_VMCNT"), 1)
     last_load = max(i for i,n in enumerate(inst_names) if n == "GLOBAL_LOAD_B32")
     self.assertGreater(inst_names.index("S_WAITCNT_VMCNT"), last_load)
+
+  def test_nontemporal_load_preserves_slc_dlc_policy(self):
+    prg = _nontemporal_load_program()
+    loads = [i for i in _REN._insts_from_linear(_prg_lin(prg)) if i.op_name == "GLOBAL_LOAD_B32"]
+    self.assertEqual(len(loads), 4)
+    nontemporal = [i for i in loads if i.slc and i.dlc]
+    self.assertEqual(len(nontemporal), 3)  # direct LOAD arg, builtin f32, and byte-addressed builtin u32
+    self.assertTrue(all(not i.glc for i in nontemporal))
+    self.assertTrue(any(not i.slc and not i.dlc for i in loads))
+
+  def test_nontemporal_vector_load_widths(self):
+    loads = [i for i in _REN._insts_from_linear(_prg_lin(_nontemporal_vector_load_program()))
+             if i.op_name in ("GLOBAL_LOAD_B64", "GLOBAL_LOAD_B128")]
+    self.assertCountEqual([i.op_name for i in loads], ["GLOBAL_LOAD_B64", "GLOBAL_LOAD_B128"])
+    self.assertTrue(all(i.slc and i.dlc and not i.glc for i in loads))
 
   def test_integer_load_consumer_waits_vmcnt(self):
     # GLOBAL_LOAD reuses its address VGPR as the destination. Integer ALU must not

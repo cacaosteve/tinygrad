@@ -32,6 +32,8 @@ SMALL_BLOCK_QUANTS = {Q8_0: 17, IQ4_NL: 9}
 QUANT_NAMES = {Q8_0: "q8_0", Q2_K: "q2_k", Q3_K: "q3_k", Q4_K: "q4_k", Q5_K: "q5_k", Q6_K: "q6", IQ4_XS: "iq4_xs",
                IQ2_XS: "iq2_xs", IQ3_XXS: "iq3_xxs", IQ4_NL: "iq4_nl", IQ3_S: "iq3_s", IQ2_S: "iq2_s"}
 AMD_PACKED_U32X4_LOAD = "__builtin_nontemporal_load((const unsigned_int4*){0})"
+AMD_PACKED_U32X2_LOAD = "__builtin_nontemporal_load((const unsigned_int2*){0})"
+AMD_NONTEMPORAL_U32_LOAD = "__builtin_nontemporal_load((const unsigned int*){0})"
 AMD_FMA_TO_F16 = "__builtin_amdgcn_fma_mixlo_f16({}, {}, {})"
 AMD_PACKED_F16_MUL_TO_F16 = "__builtin_amdgcn_fma_mixlo_f16_packed({}, {}, {})"
 
@@ -222,11 +224,26 @@ def _amd_load(ptr:UOp, lanes:int|None=None, packed_u32:bool=False, stream:bool=F
 def _load_byte(raw:UOp, base:UOp, offset:int|UOp) -> UOp:
   size = raw.dtype.itemsize
   return (raw[base + offset//size].cast(dtypes.uint32) >> ((offset%size)*8)) & 255
-def _load_u32(raw:UOp, base:UOp, offset:int|UOp, stream:bool=False) -> UOp:
+def _load_u32(raw:UOp, base:UOp, offset:int|UOp, stream:bool=False, byte_load:bool=False) -> UOp:
   # Halfword-aligned formats cannot load u32 directly.
+  if byte_load:
+    assert stream and raw.dtype is dtypes.uint16
+    return UOp(Ops.CUSTOMI, src=(raw.bitcast(dtypes.uint8)[base*2+offset],), arg=(AMD_NONTEMPORAL_U32_LOAD, dtypes.uint32))
   lo, hi = (raw[base+offset//2+i] for i in range(2))
   if stream: lo, hi = _amd_load(lo), _amd_load(hi)
   return lo.cast(dtypes.uint32) | (hi.cast(dtypes.uint32) << 16)
+
+def _load_u32x4_byte(raw:UOp, base:UOp, offset:int|UOp) -> UOp:
+  byte_view = raw.bitcast(dtypes.uint8)
+  start = base*2 + offset
+  shrink = UOp(Ops.SHRINK, src=(byte_view.flatten(), start, UOp.const(16)))
+  return UOp(Ops.CUSTOM, src=(shrink,), arg=(AMD_PACKED_U32X4_LOAD, dtypes.uint32))
+
+def _load_u32x2_byte(raw:UOp, base:UOp, offset:int|UOp) -> UOp:
+  byte_view = raw.bitcast(dtypes.uint8)
+  start = base*2 + offset
+  shrink = UOp(Ops.SHRINK, src=(byte_view.flatten(), start, UOp.const(8)))
+  return UOp(Ops.CUSTOM, src=(shrink,), arg=(AMD_PACKED_U32X2_LOAD, dtypes.uint32))
 
 def _half(value:UOp) -> UOp: return value.cast(dtypes.uint16).bitcast(dtypes.float16).float()
 
@@ -318,10 +335,16 @@ def _iq_signed_word(word:UOp, signs:UOp) -> UOp:
   # Grid magnitudes are nonzero and <128, so each byte can be negated without a carry into its neighbor.
   return (word ^ mask) + (mask & 0x01010101)
 
-def _quant_word(raw:UOp, base:UOp, subgroup:UOp, i:int|UOp, ggml_type:int, grid:UOp|None) -> UOp:
+def _quant_word(raw:UOp, base:UOp, subgroup:UOp, i:int|UOp, ggml_type:int, grid:UOp|None,
+                direct_isa:bool=False, rdna4:bool=False, packed_q6:bool=False, q6_b64:bool=False) -> UOp:
   # Four packed weight bytes, shared by integer-dot decode and FP16 WMMA prefill.
   def byte(offset): return _load_byte(raw, base, offset)
-  def word(offset): return _load_u32(raw, base, offset, stream=ggml_type == Q6_K)
+  def word(offset):
+    if ggml_type == Q6_K and direct_isa and not rdna4 and q6_b64 and isinstance(i, int):
+      return _load_u32x2_byte(raw, base, offset-(i%2)*4)[i%2]
+    if ggml_type == Q6_K and direct_isa and not rdna4 and packed_q6 and isinstance(i, int):
+      return _load_u32x4_byte(raw, base, offset-(i%4)*4)[i%4]
+    return _load_u32(raw, base, offset, stream=ggml_type == Q6_K, byte_load=ggml_type == Q6_K)
   if ggml_type == Q8_0: return _load_u32(raw, base, 2+i*4, stream=True)
   if ggml_type in (Q4_K, Q5_K):
     offset = (4 if ggml_type == Q4_K else 12) + (subgroup//2)*8
@@ -577,10 +600,10 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
 def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
                                   out_features:int, in_features:int, ggml_type:int, direct_isa:bool=False,
                                   rdna4:bool=False) -> UOp:
-  # Mixed Q6 dequant wins short batches; larger prefill needs the wider 64-token layout.
+  # Mixed Q6 dequant wins on short batches; larger prefill uses wider token tiles.
   mixed_q6 = direct_isa and not rdna4 and ggml_type == Q6_K and resolve(out.shape[0] <= 64, False)
-  # A 128-token tile is measured faster from 256+; at 128 the two layouts are effectively tied.
-  q6_tile128 = direct_isa and not rdna4 and ggml_type == Q6_K and out.shape[0] >= 256 and out.shape[0] % 128 == 0
+  # A 128-token tile is measured faster from 512+; T256 keeps the 64-token layout with B128 loads.
+  q6_tile128 = direct_isa and not rdna4 and ggml_type == Q6_K and resolve(out.shape[0] >= 512, False) and resolve(out.shape[0] % 128 == 0, False)
   token_tile = (32 if out.shape[0] % 32 == 0 else 16) if ggml_type == Q3_K or mixed_q6 else \
     128 if q6_tile128 else 64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
   # On RDNA3, a single Q6/Q8_0 output tile is faster than two for multi-token WMMA.
@@ -613,7 +636,9 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
         scale *= (((sc >> (half*4)) & 15).float()+0.5)*0.25
       elif ggml_type == IQ3_S: scale *= (1+2*((byte(106+subgroup//2) >> ((subgroup%2)*4)) & 15)).float()
       elif ggml_type == IQ3_XXS: scale *= ((_load_u32(raw, base, 66+subgroup*4) >> 28).float()+0.5)*0.5
-    words = tuple(_quant_word(raw, base, subgroup, half*4+i, ggml_type, grid) for i in word_indices)
+    words = tuple(_quant_word(raw, base, subgroup, half*4+i, ggml_type, grid, direct_isa, rdna4,
+                              not q6_tile128, q6_tile128)
+                  for i in word_indices)
     if direct_isa and ggml_type == Q8_0:
       return tuple(_amd_fma_to_f16((word >> (b*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float(), scale, minimum)
                    for word in words for b in range(4))
