@@ -674,6 +674,16 @@
       "tokens_match": true,
       "note": "The previously recorded third-token flip was not reproduced with this numeric prompt. Its original prompt/sample capture was not available, so the earlier near-tie discrepancy remains unresolved rather than cleared."
     },
+    "qwen3_coder_30b_q4_natural_prompt": {
+      "prompt_text": "Write a short Python function that adds two integers.",
+      "prompt_tokens": [7985, 264, 2805, 13027, 729, 429, 11367, 1378, 25780, 13, 576, 729, 1265, 2924, 264, 4629, 917, 429],
+      "generated_tokens": 8,
+      "direct_output": [576, 729, 1265, 2924, 264, 4629, 917, 429],
+      "hip_output": [576, 729, 1265, 2924, 264, 4629, 917, 429],
+      "decoded_output": " The function should include a docstring that",
+      "tokens_match": true,
+      "note": "Same tokenizer IDs and output across backends for this prompt; the prior reported prompt was not preserved, so the earlier mismatch is still not fully replayed."
+    },
     "scope_and_remaining_gaps": {
       "counted_tinygrad_lines": 32063,
       "counted_line_delta_vs_fetched_master": 6558,
