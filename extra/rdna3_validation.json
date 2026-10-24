@@ -2,7 +2,7 @@
   "date": "2026-10-24",
   "source_commit": "7b88de7ad62e0a782b31fc3b4ca0167d048985bf",
   "upstream_master": "b388f0c24a84b3ecc6eb65c7f071891c5c21c30e",
-  "status": "Fresh gfx1100 hardware, NULL/CPU, Ruff, and mypy gates pass. Most paired kernels are within 8% of HIP, but IQ4_XS and multi-token Q6_K remain outside the 10% target. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
+  "status": "Fresh gfx1100 hardware, NULL/CPU, Ruff, and mypy gates pass. Alternating repeats confirm Q6_K T16 is about 23% and IQ4_XS T1 about 19% slower than HIP; the full matrix also shows Q6 T32/T64 outside 10%. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
   "candidate_state": "Current product tip is committed and pushed to the personal fork. The gaming PC is reachable and reports Navi31/gfx1100 (PCI 1002:744c); exact Navi31 SKU is not distinguishable from that PCI ID. The remote source tree used for validation contains the current tip. No PR is open.",
   "constraints": {
     "pull_request_opened": false,
@@ -655,6 +655,27 @@
       "q6_k_gemv_t16": {"direct": 166.611, "hip": 134.931, "ratio": 1.235},
       "q6_k_gemv_t32": {"direct": 171.721, "hip": 154.016, "ratio": 1.115},
       "q6_k_gemv_t64": {"direct": 205.466, "hip": 176.851, "ratio": 1.162}
+    },
+    "focused_order_balanced_repeat": {
+      "method": "Two process-level medians per backend in DIRECT/HIP/HIP/DIRECT order; 80 synchronized TinyJit samples per process. DIRECT and HIP passed the independent reference.",
+      "q6_k_gemv_t16": {
+        "direct_sample_medians_us": [167.036, 165.240],
+        "hip_sample_medians_us": [135.211, 134.790],
+        "combined_direct_us": 166.138,
+        "combined_hip_us": 135.000,
+        "direct_over_hip": 1.231,
+        "cold_compile_ms": {"direct_median": 359.643, "hip_median": 532.345},
+        "max_abs_err": {"direct": 0.0002441, "hip": 0.0002441}
+      },
+      "iq4_xs_gemv_t1": {
+        "direct_sample_medians_us": [116.641, 117.615],
+        "hip_sample_medians_us": [98.460, 98.826],
+        "combined_direct_us": 117.128,
+        "combined_hip_us": 98.643,
+        "direct_over_hip": 1.187,
+        "cold_compile_ms": {"direct_median": 319.564, "hip_median": 322.295},
+        "max_abs_err": {"direct": 0.0010681, "hip": 0.0010986}
+      }
     },
     "llama3_2_1b_q8_chunk128": {
       "prompt_tokens": 1024,
