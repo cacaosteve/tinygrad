@@ -863,8 +863,23 @@
           "expert_ggml_types": [12],
           "note": "Fixed-shape direct TinyJit logits probe only; promising but not representative of model.generate's symbolic/padded token dimension."
         },
-        "dynamic_generate_probe": "The first env-only benchmark was a no-op: it retained the integer token-axis guard, while model.generate supplies a symbolic axis. Its unchanged timing is not evidence about the custom path.",
-        "decision": "No product code kept. A dynamic padding dispatch was prepared locally but not transferred/tested after SSH became unreachable; static-shape result needs end-to-end dynamic correctness/performance gates before consideration."
+        "dynamic_generate_probe": {
+          "dispatch": "For RDNA3 DIRECT, route multi-token quantized ExpertWeights through moe_linear after padding symbolic token axes to max_shape; shrink outputs back to the runtime shape. This is default-on only for RDNA3 DIRECT; AMD_MOE_MULTI=1 remains an opt-in for other supported AMD renderers.",
+          "prompt_tokens": 128,
+          "decode_tokens": 32,
+          "max_context": 512,
+          "chunk_size": 32,
+          "direct_generic_before": {"warm_s": 178.799, "prefill_tps": 72.867, "decode_tps": 51.322},
+          "direct_moe_default": {"warm_s": 168.429, "prefill_tps": 544.220, "decode_tps": 51.526},
+          "hip_same_run_config": {"warm_s": 150.542, "prefill_tps": 131.263, "decode_tps": 102.233},
+          "amdllvm_same_run_config": {"warm_s": 173.165, "prefill_tps": 105.957, "decode_tps": 15.403},
+          "all_33_generated_token_ids_match": true,
+          "generated_prefix": [220, 16, 15],
+          "dynamic_partial_tail_test": "Q4_K with actual T=3 and max T=4; padded custom result matches generic fallback and CPU reference on RX 7900 XTX.",
+          "hardware_suite": "899 passed, 1 skipped, 425 subtests passed in 173.10s, serial DEV=AMD:AMD.",
+          "note": "On this Qwen3 30B A3B sample, RDNA3 DIRECT MoE prefill is ~7.47x faster than its generic fallback, ~4.15x HIP, and ~5.14x AMDLLVM. Decode is unchanged from the fallback, ~2x slower than HIP, but ~3.35x faster than AMDLLVM. All 33 token IDs match across all three backends. One run per backend; directional model result, not a broad performance matrix."
+        },
+        "decision": "Kept the dynamic multi-token path default-on for RDNA3 DIRECT after full Qwen3 30B Q4_K/Q6_K generation matched all token IDs, a dynamic partial-tail differential test passed, and the serial AMD hardware suite remained green. Decode and other kernels still require separate optimization."
       }
     },
     "qwen3_coder_30b_q4_numeric_smoke": {
@@ -893,7 +908,7 @@
       "size_gate_note": "MAX_LINE_COUNT=26500 is an explicit local override; sz.py defaults to no line cap. Current additions are primarily RDNA3 renderer/scheduler/TC/VOPD modules plus AMD kernel and shared-code changes.",
       "master_delta": "Branch is 160 commits ahead and 1 behind fetched origin/master. The one newer master commit is emulator-only and was not merged because emulator work is on hold.",
       "github_ci": "gh run list returned no workflow runs for this personal-fork branch; no PR was opened.",
-      "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 exceed the requested 10% HIP-gap target. Fresh Ollama GGUF runs show the 1B Q8 Llama output agrees across DIRECT/HIP/AMDLLVM, but Qwen3 Coder 30B A3B MoE dynamic generation is about 1.8x slower on DIRECT than HIP despite exact token agreement. A fixed-shape MoE prototype had a promising ~7.6x prefill speedup with 3/3 top-1 matches and high logit cosine, but no dynamic-padding or end-to-end generated-token validation was completed; do not treat it as a shipped improvement. The earlier natural-prompt Qwen mismatch still needs its original prompt for exact replay."
+      "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 still exceed the requested 10% HIP-gap target. A newly validated RDNA3 DIRECT dynamic MoE path changes the Qwen3 Coder 30B A3B prompt-128 result from 72.867 to 544.220 tok/s prefill (paired HIP: 131.263, AMDLLVM: 105.957); decode remains 51.526 vs HIP 102.233 and AMDLLVM 15.403 tok/s. All 33 generated token IDs match across these backends. This closes the measured MoE prefill deficit for that sample, not decode or general backend parity. The earlier natural-prompt Qwen mismatch still needs its original prompt for exact replay."
     }
   }
 }

@@ -251,6 +251,13 @@ class ExpertWeights:
     if self.weight_scale_inv is not None:
       ret = fp8_matmul(x.unsqueeze(-2), self.weight[sel], self.weight_scale_inv[sel], self.weight_block_size).squeeze(-2)
     elif self.ggml_type is not None and supported and isinstance(x.shape[1], int) and x.shape[1] == 1: ret = moe_linear(self, sel, x)
+    elif self.ggml_type is not None and supported and (
+      (not isinstance(self.weight.device, tuple) and amd_direct_isa(self.weight.device) and
+       not _wmma_rdna4(self.weight.device)) or getenv("AMD_MOE_MULTI", 0)):
+      if isinstance(x.shape[1], int): ret = moe_linear(self, sel, x)
+      else:
+        ret = moe_linear(self, sel.pad_to(sel.max_shape), x.pad_to(x.max_shape))
+        ret = ret.shrink(tuple((0, s) for s in (*sel.shape, self.weight.shape[1])))
     else: ret = (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
     return ret + self.bias[sel] if hasattr(self, 'bias') else ret
 

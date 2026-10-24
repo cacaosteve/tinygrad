@@ -7,7 +7,8 @@ from tinygrad.llm.kernels.amd import (Linear, _amd_flash_attention, amd_custom_k
                                       QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, _wmma_rdna4, Q4_K, IQ3_S, ExpertWeights)
 from tinygrad.llm.model import permute_rope
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.helpers import DEV, OSX
+from tinygrad.codegen import to_program_cache
+from tinygrad.helpers import DEV, OSX, getenv
 from test.runtime.test_llm_quantized import QuantLinearMixin
 
 class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
@@ -382,6 +383,38 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
 
   def test_moe_decode(self): self._test_moe_decode(Q4_K)
   def test_moe_decode_iq3_s(self): self._test_moe_decode(IQ3_S)
+
+  def test_moe_dynamic_multi(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    rng = np.random.default_rng(6)
+    E, T, actual_T, K, IN, OUT, typ = 4, 4, 3, 2, 256, 16, Q4_K
+    blocks = rng.integers(0, 256, (E*OUT*IN//256, QUANT_SIZES[typ]), dtype=np.uint8)
+    blocks[:, :2] = np.array([0.001], np.float16).view(np.uint8)
+    blocks[:, 2:4] = np.array([0.0001], np.float16).view(np.uint8)
+    decoded = ggml_data_to_tensor(Tensor(blocks.flatten()).contiguous().realize(), E*OUT*IN, typ).reshape(E, OUT, IN)
+    weights = decoded.numpy()
+    act = rng.standard_normal((1, T, K, IN)).astype(np.float32)
+    sel = np.stack([rng.choice(E, K, replace=False) for _ in range(T)])[None].astype(np.int32)
+    ew = ExpertWeights(E, IN, OUT)
+    ew.weight = decoded.half()
+    ew.set_quantized()
+    self.assertEqual(ew.ggml_type, typ)
+    tok_count = UOp.variable("moe_dynamic_tokens", 1, T).bind(actual_T)
+    sel_dyn, act_dyn = Tensor(sel)[:, :tok_count], Tensor(act)[:, :tok_count]
+
+    def run(direct:bool):
+      with patch("tinygrad.llm.kernels.amd.amd_direct_isa", return_value=direct), patch.dict(os.environ, {"AMD_MOE_MULTI": "0"}):
+        getenv.cache_clear()
+        to_program_cache.clear()
+        return ew(sel_dyn, act_dyn).pad_to((1, T, K, OUT)).numpy()[0, :actual_T]
+
+    try: baseline, actual = run(False), run(True)
+    finally:
+      getenv.cache_clear()
+      to_program_cache.clear()
+    expected = np.stack([[weights[sel[0, t, k]] @ act[0, t, k] for k in range(K)] for t in range(actual_T)])
+    np.testing.assert_allclose(baseline, expected, rtol=2e-2, atol=2e-2*np.abs(expected).max())
+    np.testing.assert_allclose(actual, baseline, rtol=2e-2, atol=2e-2*np.abs(baseline).max())
 
   def test_gated_delta_random_scan(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
