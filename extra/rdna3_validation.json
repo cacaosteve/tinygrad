@@ -764,6 +764,25 @@
         "method": "Direct/HIP/HIP/Direct, two medians per tested schedule, 60 synchronized TinyJit samples; all reference checks passed.",
         "mv0": {"default_direct_us": [116.255, 115.2105], "mv0_direct_us": [117.240, 116.950], "hip_us": [97.190, 99.310], "result": "No improvement; about 1% slower."},
         "two_output_rows_at_8192": {"default_direct_us": [116.650, 116.600], "two_rows_direct_us": [117.8305, 112.4455], "hip_us": [99.385, 99.105], "result": "About 1.3% faster by combined median, within noise; not retained."}
+      },
+      "fresh_full_matrix_2026_10_24": {
+        "method": "extra/rdna3_backend_matrix.py on physical gfx1100; all DIRECT/HIP and independent-reference gates passed. Ratios are DIRECT/HIP.",
+        "flash_prefill": {"direct_us": 265.1955, "hip_us": 323.585, "ratio": 0.820},
+        "flash_decode": {"direct_us": 122.4855, "hip_us": 109.265, "ratio": 1.121},
+        "half_matmul_2048": {"direct_us": 304.570, "hip_us": 288.590, "ratio": 1.055},
+        "q4_k_gemv_t1": {"direct_us": 104.340, "hip_us": 99.180, "ratio": 1.052},
+        "q5_k_gemv_t1": {"direct_us": 106.035, "hip_us": 97.335, "ratio": 1.089},
+        "q6_k_gemv_t1": {"direct_us": 112.475, "hip_us": 106.170, "ratio": 1.059},
+        "iq4_xs_gemv_t1": {"direct_us": 116.3455, "hip_us": 99.1405, "ratio": 1.174},
+        "q8_0_gemv_t1": {"direct_us": 106.285, "hip_us": 100.160, "ratio": 1.061},
+        "q6_k_gemv_t16": {"direct_us": 167.1055, "hip_us": 134.6305, "ratio": 1.241},
+        "q6_k_gemv_t32": {"direct_us": 185.8155, "hip_us": 155.681, "ratio": 1.194},
+        "q6_k_gemv_t64": {"direct_us": 204.926, "hip_us": 177.8305, "ratio": 1.152},
+        "note": "Flash prefill wins; decode is sensitive to paired-process order (fresh balanced repeat is 1.066×). IQ4 T1 and Q6 T16/T32/T64 remain outside the 10% target."
+      },
+      "upstream_review_2026_10_24": {
+        "master": "origin/master is b388f0c24, one commit ahead of the branch; #19015 only changes emulator stats. Not merged while emulator work is on hold.",
+        "gabriel": "reg_memory (042156664) is already an ancestor of origin/master. early_estimates (a7034469b) changes generic codegen/renderer estimates but has no RDNA3 files; remove_range is generic cleanup; ins_is_call_v3 is older register/CALL infrastructure, not a drop-in performance patch. No new RDNA3 backend code or comparable performance results were found."
       }
     },
     "llama3_2_1b_q8_chunk128": {
