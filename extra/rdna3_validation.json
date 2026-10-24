@@ -625,6 +625,19 @@
       "subtests": 425,
       "seconds": 163.31
     },
+    "hardware_retest_2026_10_24": {
+      "command": "AMD_SOFT_SYSFS=1 DEV=AMD:AMD pytest test/amd/hw test/device/amd/test_llm.py -x -q",
+      "passed": 898,
+      "skipped": 1,
+      "subtests": 425,
+      "seconds": 162.29,
+      "source_hashes_match": ["tinygrad/renderer/isa/rdna3.py", "tinygrad/llm/kernels/amd.py"]
+    },
+    "focused_perf_retest_2026_10_24": {
+      "method": "One warm child process per backend; 60 synchronized TinyJit samples; independent CPU/NumPy reference checks passed.",
+      "q6_k_gemv_t16": {"direct_us": 165.915, "hip_us": 134.501, "direct_over_hip": 1.234, "max_abs_error": 0.000244140625},
+      "iq4_xs_gemv_t1": {"direct_us": 112.7605, "hip_us": 98.94, "direct_over_hip": 1.140, "max_abs_error": 0.0010986328125}
+    },
     "null": {
       "suite": "DEV=NULL pytest test/null/ -x -q (serial; pytest-xdist unavailable)",
       "passed": 1895,
