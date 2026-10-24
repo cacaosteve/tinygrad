@@ -16,7 +16,7 @@ if __name__ == "__main__":
   print(f"load {time.perf_counter()-st:.3f}s", flush=True)
 
   st = time.perf_counter()
-  model.warmup()
+  model.warmup(chunk_size=args.chunk_size)
   print(f"warm {time.perf_counter()-st:.3f}s", flush=True)
 
   prompt = [257] + [1000+i%1000 for i in range(args.prompt_tokens-1)]

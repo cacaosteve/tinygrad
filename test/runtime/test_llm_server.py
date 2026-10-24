@@ -18,6 +18,14 @@ class TestTransformerGenerate(unittest.TestCase):
     model.warmup()
     self.assertIsInstance(next(model.generate([5, 6, 7, 8])), int)
 
+  def test_warmup_uses_requested_chunk_size(self):
+    model, chunks = Transformer(TEST_CONFIG), []
+    def generate(tokens, chunk_size=32):
+      chunks.append(chunk_size)
+      yield from (1, 2)
+    with patch.object(model, "generate", generate): model.warmup(chunk_size=16)
+    self.assertEqual(chunks, [16, 16])
+
   def test_first_recurrent_generate_before_state_init(self):
     model = Transformer(TEST_CONFIG)
     model.has_recurrent_block = True
