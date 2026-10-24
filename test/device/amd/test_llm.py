@@ -20,6 +20,27 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
       actual = _permute_rope_output(x.linear(weight.transpose()), heads, head_dim, rope_dim)
       np.testing.assert_array_equal(actual.numpy(), expected.numpy())
 
+  def test_q8_rope_output_row_permutation(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    rng = np.random.default_rng(42)
+    heads, head_dim, in_features = 2, 16, 256
+    packed = rng.integers(0, 256, (heads*head_dim*in_features//256, 272), dtype=np.uint8)
+    packed.reshape(-1, 34)[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, heads*head_dim*in_features, 8).reshape(heads*head_dim, in_features)
+    weight = ggml_data_to_tensor(Tensor(np.pad(packed.flatten(), (4, 0)), device="CPU")[4:],
+                                 heads*head_dim*in_features, 8).reshape(heads*head_dim, in_features).numpy()
+    x = rng.normal(size=(16, in_features)).astype(np.float16)
+    bias = rng.normal(size=heads*head_dim).astype(np.float32)
+    linear = Linear(in_features, heads*head_dim, bias=True)
+    linear.weight, linear.bias = decoded, Tensor(bias)
+    linear.quantized_rope_perm = (heads, head_dim, head_dim)
+    actual = linear(Tensor(x)).numpy()
+    weight = permute_rope(Tensor(weight.astype(np.float16).astype(np.float32), device="CPU"), heads, head_dim).numpy()
+    expected = x.astype(np.float16).astype(np.float32) @ weight.T + bias
+    self.assertEqual(linear.ggml_type, 8)
+    np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=2e-2)
+
   def test_wmma_architecture_selection(self):
     if not amd_custom_kernels_supported(device:=Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
     self.assertEqual(_wmma_rdna4(device), Device[device].target[0] == 12)
