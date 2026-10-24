@@ -666,6 +666,16 @@
       "tokens_match": true,
       "note": "Single paired run; verifies the chunk-size warmup regression and token agreement, not a median performance claim."
     },
+    "llama3_2_1b_q8_long_context_chunk128": {
+      "prompt_tokens": 4096,
+      "decode_tokens": 512,
+      "direct": {"prefill_tps": 5878.164, "decode_tps": 302.885},
+      "hip": {"prefill_tps": 1986.431, "decode_tps": 35.047},
+      "amdllvm": {"prefill_tps": 655.099, "decode_tps": 28.657},
+      "all_513_generated_token_ids_match": true,
+      "token_sha256": "a56c1d69a3862af56dc6b6d74dd4698bdb45fbbd54fd55cea8ac860dc512e3ff",
+      "note": "Same Q8 GGUF, numeric prompt, max_context=8192, and chunk_size=128 on all paths. One synchronized run per backend; useful end-to-end evidence, not a multi-run median."
+    },
     "qwen3_coder_30b_q4_numeric_smoke": {
       "prompt_tokens": 32,
       "decode_tokens": 2,
