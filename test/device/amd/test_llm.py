@@ -69,7 +69,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_iq4_linear(self): self._test_quant_linear(23, 136)
   def test_q5_linear(self): self._test_quant_linear(13, 176)
   def test_q6_linear_wmma(self): self._test_quant_linear(14, 210, token_counts=(16, 32, 64, 128, 256))
-  def test_q8_0_linear_wmma(self): self._test_quant_linear(8, 272, token_counts=(32,))
+  def test_q8_0_linear_wmma(self): self._test_quant_linear(8, 272, token_counts=(32, 128, 256, 512))
   def test_q8_0_linear_small_blocks(self): self._test_quant_linear(8, 272, in_features=288, out_features=16, token_counts=(1, 16))
   def test_q6_linear_odd_blocks(self): self._test_quant_linear(14, 210, in_features=768, out_features=3, token_counts=(1, 3, 16))
   def test_q2_k_linear(self): self._test_quant_linear(10, 84, in_features=768, token_counts=(1, 3, 16))

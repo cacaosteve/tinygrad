@@ -602,10 +602,12 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
                                   rdna4:bool=False) -> UOp:
   # Mixed Q6 dequant wins on short batches; larger prefill uses wider token tiles.
   mixed_q6 = direct_isa and not rdna4 and ggml_type == Q6_K and resolve(out.shape[0] <= 64, False)
-  # A 128-token tile is measured faster from 512+; T256 keeps the 64-token layout with B128 loads.
+  # Q6 needs 512+ tokens for a 128-token tile; T256 keeps 64-token tiles with B128 loads.
   q6_tile128 = direct_isa and not rdna4 and ggml_type == Q6_K and resolve(out.shape[0] >= 512, False) and resolve(out.shape[0] % 128 == 0, False)
+  # Q8's 128-token tile is faster at T128 and above; keep smaller/nonmultiple shapes on the 64-token path.
+  q8_tile128 = direct_isa and not rdna4 and ggml_type == Q8_0 and resolve(out.shape[0] >= 128, False) and resolve(out.shape[0] % 128 == 0, False)
   token_tile = (32 if out.shape[0] % 32 == 0 else 16) if ggml_type == Q3_K or mixed_q6 else \
-    128 if q6_tile128 else 64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
+    128 if q6_tile128 or q8_tile128 else 64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
   # On RDNA3, a single Q6/Q8_0 output tile is faster than two for multi-token WMMA.
   output_tiles = 1 if direct_isa and (out_features % 32 or ggml_type in (IQ2_S, IQ3_XXS, IQ4_NL, IQ3_S) or
                                       ggml_type in (Q6_K, Q8_0) and not rdna4) else 2
