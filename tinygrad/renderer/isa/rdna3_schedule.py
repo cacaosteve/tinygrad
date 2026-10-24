@@ -604,6 +604,12 @@ def schedule_scalar_vmem(ops:list[UOp], alu_breadth:bool|None=None) -> list[UOp]
   schedule_wmma_segments = \
     any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops) and \
     any(u.op is Ops.INS and _iop(u) is AMDOps.LOAD and u.dtype is dtypes.uint32 and _reg_slots(u) == 4 for u in ops)
+  # Mixed-f16 Q6 WMMA reads packed scales as independent scalar u16 loads. Keep the
+  # wide activation loads as boundaries, but schedule these scalar-load/cast segments.
+  schedule_q6_wmma_segments = \
+    any(u.op is Ops.INS and _iop(u) is AMDOps.WMMA for u in ops) and \
+    any(u.op is Ops.INS and _iop(u) is AMDOps.CVT_UBYTE_F32 for u in ops) and \
+    sum(1 for u in ops if u.op is Ops.INS and _iop(u) is AMDOps.LOAD and u.dtype is dtypes.uint16 and _reg_slots(u) == 1) >= 8
   # Q6/Q4 decode (linear_q6): many scalar packed-weight reads + dp4a/BFE chains between LLOADs.
   schedule_decode_segments = not schedule_wmma_segments and \
     any(u.op is Ops.INS and _iop(u) is AMDOps.DOT4 for u in ops) and \
@@ -611,7 +617,7 @@ def schedule_scalar_vmem(ops:list[UOp], alu_breadth:bool|None=None) -> list[UOp]
   looped_non_fmac_reg_state = any(u.op is Ops.RANGE for u in ops) and \
     any(u.op is Ops.AFTER and u.addrspace is AddrSpace.REG for u in ops) and \
     not any(u.op is Ops.INS and _iop(u) is AMDOps.FMAC for u in ops)
-  if not schedule_wmma_segments and not schedule_decode_segments and \
+  if not schedule_wmma_segments and not schedule_q6_wmma_segments and not schedule_decode_segments and \
      any(u.op is Ops.INS and (_iop(u) is AMDOps.WMMA or (_iop(u) is AMDOps.LOAD and not vmem_schedulable_load(u))) for u in ops): return ops
   def schedulable(u:UOp) -> bool:
     if u.op is Ops.BITCAST or (u.op is Ops.NOOP and u.dtype is not dtypes.void): return True  # value alias, never a void ordering gate
