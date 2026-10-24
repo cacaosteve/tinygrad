@@ -642,6 +642,21 @@
       "seconds": 469.63
     },
     "static_checks": {"ruff": "passed", "mypy": "passed (222 source files)"},
+    "additional_amd_tests": {
+      "physical_cfg_branch_diamond": {
+        "command": "DEV=AMD:AMD pytest test/amd/test_asm_kernel.py::TestAsmKernel::test_cfg_branch_diamond -x -q",
+        "result": "1 passed on physical gfx1100"
+      },
+      "supplementary_non_emulator_sweep": {
+        "result": "Stopped by a process-level segmentation fault in test/amd/test_llvm.py::TestLLVM::test_rdna3_disasm_gfx11_asm_vop3_from_vop2; later listed modules were not run in this invocation.",
+        "baseline_control": "The isolated test also segfaulted from a pristine git archive of fetched origin/master in the same gaming-PC venv. test/amd/test_llvm.py, test/amd/helpers.py, and tinygrad/runtime/support/c.py are unchanged on this branch.",
+        "classification": "Baseline LLVM C-wrapper/toolchain failure on this host, not a demonstrated RDNA3 branch regression."
+      },
+      "mock_cfg_branch_diamond": {
+        "result": "MOCK+AMD:AMD returned [2.0, 2.0, 3.0] instead of [2.0, 1.0, 3.0]; the same test passes on physical gfx1100.",
+        "scope": "Mock/emulator-side behavior only; emulator sources were not modified, consistent with the project hold."
+      }
+    },
     "paired_backend_matrix_median_us": {
       "method": "Current extra/rdna3_backend_matrix.py on gfx1100; direct/LLVM/HIP independent NumPy references passed. Ratios below are DIRECT/HIP.",
       "flash_prefill": {"direct": 268.466, "hip": 335.231, "ratio": 0.801},
