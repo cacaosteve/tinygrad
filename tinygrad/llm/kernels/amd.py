@@ -1085,9 +1085,10 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   if isinstance(valid_kv_len, UOp): cache_kv = Tensor(cache_kv.uop.after(valid_kv_len))
   B, H, D = cache_kv.shape[1], q.shape[1], cache_kv.shape[4]
   group = H // cache_kv.shape[2]
-  # Large GQA groups overflow the direct kernel's per-head score/softmax state. Split heads
-  # into independent launches; this keeps the common G<=4 path fused and correct.
-  if amd_direct_isa(q.device) and (group >= 8 or (D >= 256 and group >= 4 and isinstance(valid_kv_len, UOp))):
+  # Bound grouped score/value state: split at group*D>=2048; dynamic wide heads also stay conservative.
+  # Smaller groups fit in one CTA and avoid the per-head launch fanout.
+  if amd_direct_isa(q.device) and ((group >= 8 and group*D >= 2048) or
+                                  (D >= 256 and group >= 4 and isinstance(valid_kv_len, UOp))):
     first = amd_flash_attention_decode(q[:, :1], cache_kv[:, :, :1], valid_kv_len, max_kv_len)
     return first.cat(*(amd_flash_attention_decode(q[:, h:h+1], cache_kv[:, :, h//group:h//group+1],
                          valid_kv_len, max_kv_len) for h in range(1, H)), dim=1)

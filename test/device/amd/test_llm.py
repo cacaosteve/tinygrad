@@ -634,6 +634,12 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   @unittest.skipIf(OSX and DEV.interface.startswith("MOCK"), "TODO: incorrect results in the macOS AMD emulator")
   def test_flash_attention_decode_large_gqa_group(self): self._test_flash_decode(8, 1, 256, 256, 73)
 
+  def test_flash_attention_decode_gqa_state_budget(self):
+    if not amd_direct_isa(Tensor.empty(1).device): self.skipTest("RDNA3 DIRECT required")
+    for heads, kv_heads, dim in ((32, 4, 128), (8, 1, 64), (16, 1, 64), (32, 1, 32)):
+      with self.subTest(heads=heads, kv_heads=kv_heads, dim=dim):
+        self._test_flash_decode(heads, kv_heads, dim, 512, 129, symbolic=True)
+
   def _test_flash_decode(self, heads, kv_heads, dim, n, valid, symbolic=False):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     rng = np.random.default_rng(42)
