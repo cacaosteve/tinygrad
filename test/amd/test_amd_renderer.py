@@ -235,6 +235,14 @@ def _uint_var_program():
   sink = out.index(idx).store(inp.index(idx).load() + var).sink(idx, var, arg=KernelInfo(name="amd_asm_uint_var"))
   return _to_prg(sink)
 
+def _uint_var_first_program():
+  out = UOp.placeholder((16,), dtypes.uint32, 1)
+  inp = UOp.placeholder((16,), dtypes.uint32, 2)
+  var = UOp.param(0, dtypes.uint32, (), vmin_vmax=(0, 10), name="var", addrspace=AddrSpace.ALU)
+  idx = UOp.special(16, "lidx0")
+  sink = out.index(idx).store(inp.index(idx).load() + var).sink(idx, var, arg=KernelInfo(name="amd_asm_uint_var_first"))
+  return _to_prg(sink)
+
 def _uint_var_mul_program():
   out = UOp.placeholder((16,), dtypes.uint32, 0)
   inp = UOp.placeholder((16,), dtypes.uint32, 1)
@@ -1516,6 +1524,13 @@ class TestAMDRenderer(unittest.TestCase):
     kernarg_offsets = [u.src[0].val for u in _prg_lin(prg).src if u.op is Ops.INS and _iop(u) is AMDOps.KERNARG]
     self.assertEqual(sorted(kernarg_offsets), [0, 8, 16])
     self.assertEqual(_amd_desc(prg).kernarg_size, 20)
+
+  def test_alu_param_before_buffers_respects_call_order(self):
+    prg = _uint_var_first_program()
+    _check_elf(self, prg)
+    kernarg_offsets = [u.src[0].val for u in _prg_lin(prg).src if u.op is Ops.INS and _iop(u) is AMDOps.KERNARG]
+    self.assertEqual(sorted(kernarg_offsets), [0, 8, 16])
+    self.assertEqual(_amd_desc(prg).kernarg_size, 24)
 
   def test_multiple_alu_params_are_dense_after_buffers(self):
     prg = _two_uint_var_program()

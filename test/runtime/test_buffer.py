@@ -55,13 +55,21 @@ class TestAllocatorCache(unittest.TestCase):
   def test_reuse_waits_for_mapped_devices(self):
     allocator = Allocator(Mock())
     peers = [Mock(), Mock()]
-    storage = BufferStorage(object(), maps={peer:BufferStorage(object()) for peer in peers})
+    progress = [[0, 5], [0, 9]]
+    for peer, timeline in zip(peers, progress):
+      peer.timeline = Mock()
+      peer.timeline.host.view.return_value = timeline
+    storage = BufferStorage(object(), host=Mock(), maps={peer:BufferStorage(object()) for peer in peers})
+    fresh = BufferStorage(object())
+    allocator._alloc = Mock(return_value=fresh)
     with Context(LRU=1):
       allocator.free(storage, 4)
       for peer in peers: peer.synchronize.assert_not_called()
+      self.assertIs(allocator.alloc(4), fresh)
+      progress[0][0], progress[1][0] = 5, 9
       self.assertIs(allocator.alloc(4), storage)
       for peer in peers:
-        peer.synchronize.assert_called_once_with()
+        peer.synchronize.assert_not_called()
         peer.allocator._unmap.assert_not_called()
 
 if __name__ == "__main__": unittest.main()

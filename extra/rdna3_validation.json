@@ -1,8 +1,8 @@
 {
-  "date": "2026-10-20",
-  "source_commit": "a04acc876201d9de3544e490bc8f8640f6fb6447",
-  "upstream_master": "51f657643270b985eef382647db680fa865698a2",
-  "status": "validated locally; not PR-ready because the upstream line-count gate fails",
+  "date": "2026-10-23",
+  "source_commit": "612c19d0d plus the verified working tree (9 modified files)",
+  "upstream_master": "0958ebd7ca533455dc1feaa5194a783b8c69aedb",
+  "status": "not PR-ready: upstream size gate fails, Qwen3-Coder exact-token mismatch is unresolved, and Q6 multi-token is 1.4-1.5x slower than HIP",
   "constraints": {
     "pull_request_opened": false,
     "pushed_this_session": false,
@@ -11,35 +11,47 @@
   "hardware": {
     "arch": "gfx1100",
     "pci_id": "1002:744c",
-    "family": "Navi31 / Radeon RX 7900"
+    "family": "Navi31 / Radeon RX 7900; 24 GiB VRAM (XTX-class; PCI ID is shared across Navi31 SKUs)",
+    "vram_bytes": 25753026560
   },
   "latest_validation": {
-    "hardware": {
-      "renderer": {"passed": 299, "subtests": 390, "seconds": 47.82},
-      "llm": {"passed": 67, "subtests": 376, "seconds": 112.22}
-    },
-    "cpu": {
-      "null": {"passed": 1892, "skipped": 86, "xfailed": 20, "subtests": 160},
-      "runtime": {"passed": 2044, "skipped": 323, "xfailed": 24, "subtests": 328},
-      "uint_alu": {"passed": 51, "skipped": 13, "subtests": 16}
-    },
+    "hardware": {"command": "DEV=AMD:AMD python -m pytest -x -q test/amd/hw test/device/amd/test_llm.py", "passed": 891,
+      "skipped": 4, "subtests": 321, "seconds": 152.67},
+    "local_targeted": {"command": "python -m pytest -x -q test/amd/test_amd_renderer.py test/amd/test_kfd_events.py test/runtime/test_buffer.py test/runtime/test_custom_kernel.py",
+      "passed": 338, "skipped": 66, "xfailed": 4, "subtests": 207, "seconds": 68.87},
     "ruff": "passed",
     "mypy": "passed (222 source files)",
+    "size_gate": {"command": "MAX_LINE_COUNT=26500 python sz.py", "result": "failed", "total_lines": 31946,
+      "limit": 26500, "over_by": 5446, "core_lines": 9981},
+    "pr_diff": {"files": 59, "insertions": 15405, "deletions": 434},
     "paired_matrix_median_us": {
-      "flash_prefill": {"direct": 256.062, "hip": 326.496, "direct_over_hip": 0.784},
-      "flash_decode": {"direct": 118.123, "hip": 116.689, "direct_over_hip": 1.012},
-      "matmul_h_2048": {"direct": 332.806, "hip": 307.251, "direct_over_hip": 1.083},
-      "q4_k_gemv_t1": {"direct": 105.759, "hip": 102.639, "direct_over_hip": 1.030},
-      "q5_k_gemv_t1": {"direct": 105.174, "hip": 104.649, "direct_over_hip": 1.005},
-      "q6_k_gemv_t1": {"direct": 118.669, "hip": 109.359, "direct_over_hip": 1.085},
-      "iq4_xs_gemv_t1": {"direct": 118.984, "hip": 100.974, "direct_over_hip": 1.178},
-      "q8_0_gemv_t1": {"direct": 110.019, "hip": 109.154, "direct_over_hip": 1.008},
-      "q6_k_gemv_t16": {"direct": 220.738, "hip": 149.663, "direct_over_hip": 1.475},
-      "q6_k_gemv_t32": {"direct": 226.468, "hip": 161.273, "direct_over_hip": 1.404},
-      "q6_k_gemv_t64": {"direct": 264.167, "hip": 196.303, "direct_over_hip": 1.346}
+      "flash_prefill": {"direct": 267.02, "hip": 332.274, "direct_over_hip": 0.804},
+      "flash_decode": {"direct": 130.102, "hip": 111.778, "direct_over_hip": 1.164},
+      "matmul_h_2048": {"direct": 325.389, "hip": 290.375, "direct_over_hip": 1.121},
+      "q4_k_gemv_t1": {"direct": 105.438, "hip": 100.704, "direct_over_hip": 1.047},
+      "q5_k_gemv_t1": {"direct": 107.153, "hip": 99.403, "direct_over_hip": 1.078},
+      "q6_k_gemv_t1": {"direct": 118.538, "hip": 104.893, "direct_over_hip": 1.130},
+      "iq4_xs_gemv_t1": {"direct": 119.403, "hip": 101.333, "direct_over_hip": 1.178},
+      "q8_0_gemv_t1": {"direct": 108.533, "hip": 106.573, "direct_over_hip": 1.018},
+      "q6_k_gemv_t16": {"direct": 223.151, "hip": 149.833, "direct_over_hip": 1.489},
+      "q6_k_gemv_t32": {"direct": 230.046, "hip": 163.427, "direct_over_hip": 1.408},
+      "q6_k_gemv_t64": {"direct": 271.040, "hip": 188.247, "direct_over_hip": 1.440}
     },
     "matrix_correctness": "All Direct/HIP cases passed independent output checks; AMDLLVM quantized fallback uses different activation precision, so those timings are not treated as same-math parity.",
-    "model_run": "No GGUF was found under the gaming PC home, /mnt, or /tmp paths searched; full-model inference was not rerun in this session."
+    "llama3_2_1b_q8": {
+      "prompt1024_chunk32": {"direct_prefill_tps": 2570.782, "hip_prefill_tps": 2631.140, "direct_decode_tps": 173.284,
+        "hip_decode_tps": 86.027, "tokens_match": true},
+      "prompt2048_chunk32": {"direct_prefill_tps": 2510.969, "hip_prefill_tps": 1903.465, "direct_decode_tps": 166.565,
+        "hip_decode_tps": 56.086, "tokens_match": true}
+    },
+    "qwen3_coder_30b_q4_smoke": {
+      "prompt_tokens": 32, "max_context": 128, "decode_tokens": 2, "seed": 42,
+      "direct": {"warm_s": 178.513, "prefill_tps": 72.620, "decode_tps": 10.932, "output": [1012, 198, 82]},
+      "hip": {"warm_s": 147.543, "prefill_tps": 130.937, "decode_tps": 12.099, "output": [1012, 198, 9]},
+      "direct_flash_disabled_output": [1012, 198, 82],
+      "status": "same-seed token mismatch after two shared tokens; not counted exact-correct pending logits comparison"
+    },
+    "q6_layout_ab": "Disabling mixed-f16 dequant regressed T16/T32 about 10%; two output tiles failed correctness; forcing 16-token WMMA tiles regressed T32/T64; forcing 64-token tiles instead of 128 regressed T256/T1024. Shipping layout restored."
   },
   "validation": {
     "ruff": "passed",

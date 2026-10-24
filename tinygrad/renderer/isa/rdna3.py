@@ -1236,12 +1236,7 @@ def _emit_lidx(dst, dim:int) -> list:
   return [r3.v_bfe_u32(dst, v0, dim * 10, 10)]
 
 def _kernarg_offset(ctx:IselContext, x:UOp) -> int:
-  params = [u for u in ctx.func_args if u.op is Ops.PARAM]
-  bufs = [u for u in params if u.arg.addrspace is not AddrSpace.ALU]
-  vals = [u for u in params if u.arg.addrspace is AddrSpace.ALU]
-  if x.arg.addrspace is AddrSpace.ALU:
-    return len(bufs) * 8 + next(i for i,u in enumerate(vals) if u.arg == x.arg) * 4
-  return next(i for i,u in enumerate(bufs) if u.arg == x.arg) * 8
+  return ctx.arg_offsets[x]
 
 def _is_scalar_source(x:UOp) -> bool:
   if _unwrap_const(x) is not None: return True

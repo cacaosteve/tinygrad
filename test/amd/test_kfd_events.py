@@ -7,20 +7,22 @@ from tinygrad.engine.realize import run_linear
 from tinygrad.uop import Ops
 from tinygrad.runtime.autogen import kfd
 from tinygrad.runtime.autogen.am import pm4_nv
-from tinygrad.runtime.ops_amd import AMDAllocator, AMDComputeQueue, AMDSDMAQueue, KFDIface
+from tinygrad.runtime.ops_amd import AMDAllocator, AMDComputeQueue, AMDSDMAQueue, KFDIface, WAIT_REG_MEM_FUNCTION_EQ
 from tinygrad.runtime.support.hcq2 import timeline
+
+def amd_param(shape, dtype): return UOp.param(next(UOp.unique_num), dtype, shape, device="AMD")
 
 class TestKFDEvents(unittest.TestCase):
   def test_gfx11_flushes_host_writes_before_fetching_indirect_buffer(self):
-    base = UOp.placeholder((96,), dtypes.uint8, device="AMD")
+    base = amd_param((96,), dtypes.uint8)
     cmdbuf = base[16:80]
     for major in (9, 10, 11, 12):
       with self.subTest(major=major):
         q = object.__new__(AMDComputeQueue)
-        q.dev, q.devs, q.queue, q.target = SimpleNamespace(host="CPU", compute_queue=object()), ("AMD",), "COMPUTE:0", (major, 0, 0)
+        req, done = SimpleNamespace(addr=(100,), fields_mask=lambda _:0xffffffff), SimpleNamespace(addr=(104,))
+        q.dev, q.devs, q.queue, q.target = SimpleNamespace(host="CPU", compute_queue=object(), hdp_flush=(req, done)), \
+          ("AMD",), "COMPUTE:0", (major, 0, 0)
         q.pm4, q.prof_bump, q.blob, q.patches = pm4_nv, lambda buf:buf, bytearray(b"body"), []
-        q.nbio = SimpleNamespace(version=(7, 11), regBIF_BX_PF1_GPU_HDP_FLUSH_REQ=SimpleNamespace(addr=(100,)),
-                                 regBIF_BX_PF1_GPU_HDP_FLUSH_DONE=SimpleNamespace(addr=(104,)))
         with patch("tinygrad.runtime.ops_amd._queue_args", return_value=[]), \
              patch("tinygrad.runtime.ops_amd.patch", return_value=cmdbuf) as patcher, patch("tinygrad.runtime.ops_amd.amd_push"):
           q.submit(cmdbuf)
@@ -32,7 +34,8 @@ class TestKFDEvents(unittest.TestCase):
         if major == 11:
           self.assertEqual(len(blob), 76)
           self.assertEqual(words[:7], (pm4_nv.PACKET3(pm4_nv.PACKET3_WAIT_REG_MEM, 5),
-                                      pm4_nv.WAIT_REG_MEM_OPERATION(1) | pm4_nv.WAIT_REG_MEM_FUNCTION(5), 100, 104, 0xffffffff, 0xffffffff, 4))
+                                      pm4_nv.WAIT_REG_MEM_OPERATION(1) | pm4_nv.WAIT_REG_MEM_FUNCTION(WAIT_REG_MEM_FUNCTION_EQ),
+                                      100, 104, 0xffffffff, 0xffffffff, 4))
           self.assertEqual(words[7], pm4_nv.PACKET3(pm4_nv.PACKET3_ACQUIRE_MEM, 6))
         else: self.assertEqual(len(blob), 16)
 
@@ -44,7 +47,7 @@ class TestKFDEvents(unittest.TestCase):
       def has_copy_queue(self): raise AssertionError("event allocation recursively initialized the copy queue")
     dev = Dev()
     dev.iface, iface.dev, iface.alloc = iface, dev, Mock()
-    page = UOp.placeholder((4096,), dtypes.uint64, device="AMD")
+    page = amd_param((4096,), dtypes.uint64)
     events = [SimpleNamespace(), *[SimpleNamespace(event_slot_index=s, event_id=i) for s,i in ((7, 11), (8, 12), (9, 13))]]
     def allocate(device, size, options, preallocate):
       AMDAllocator(dev)._alloc(size, options)
@@ -59,7 +62,7 @@ class TestKFDEvents(unittest.TestCase):
   def test_event_id_and_mailbox_slot_are_distinct(self):
     iface = object.__new__(KFDIface)
     iface.dev = SimpleNamespace(device="AMD")
-    page = UOp.placeholder((4096,), dtypes.uint64, device="AMD")
+    page = amd_param((4096,), dtypes.uint64)
     events = [SimpleNamespace(event_slot_index=slot, event_id=eid) for slot,eid in ((7, 11), (8, 12), (9, 13))]
     with patch.object(KFDIface, "event_page", Mock(), create=True), \
          patch.object(kfd, "AMDKFD_IOC_CREATE_EVENT", side_effect=events) as create, \
@@ -71,14 +74,15 @@ class TestKFDEvents(unittest.TestCase):
       self.assertEqual(create.call_count, 3)
 
   def test_timeline_wakes_registered_event(self):
-    mailbox = UOp.placeholder((1,), dtypes.uint64, device="AMD")
+    mailbox = amd_param((1,), dtypes.uint64)
     iface = object.__new__(KFDIface)
     iface.__dict__["queue_event"] = (mailbox, 11)
     value = UOp.const(19, dtypes.uint64)
     for queue_type in (AMDComputeQueue, AMDSDMAQueue):
       for interface in (iface, object()):
-        for signal in (timeline("AMD"), UOp.placeholder((2,), dtypes.uint64, device="AMD").rtag("batch_slots"), timeline("CPU")):
-          with self.subTest(queue=queue_type.__name__, kfd=interface is iface, tag=signal.tag, device=signal.device):
+        for signal in (timeline("AMD"), UOp.alloc((2,), dtypes.uint64, device="AMD", name="batch_slots"), timeline("CPU")):
+          signal_name = getattr(signal.buf_uop.arg, "name", None)
+          with self.subTest(queue=queue_type.__name__, kfd=interface is iface, name=signal_name, device=signal.device):
             q = object.__new__(queue_type)
             q.dev, q.devs, q.target = SimpleNamespace(iface=interface), ("AMD",), (11, 0, 0)
             q.pm4 = SimpleNamespace(data_sel__mec_release_mem__send_32_bit_low=1,
@@ -87,7 +91,7 @@ class TestKFDEvents(unittest.TestCase):
                                      SDMA_PKT_TRAP_INT_CONTEXT_INT_CONTEXT=lambda x:x)
             q.pred_exec, q.release_mem, q.q = lambda **kw:contextlib.nullcontext(), Mock(), Mock()
             q.signal(signal, value)
-            wake = interface is iface and signal.tag == "timeline" and signal.device == "AMD"
+            wake = interface is iface and signal_name == "timeline" and signal.device == "AMD"
             emit = q.release_mem if queue_type is AMDComputeQueue else q.q
             self.assertEqual(emit.call_count, 2 if wake else 1)
             if wake:

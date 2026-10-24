@@ -69,6 +69,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_iq4_linear(self): self._test_quant_linear(23, 136)
   def test_q5_linear(self): self._test_quant_linear(13, 176)
   def test_q6_linear_wmma(self): self._test_quant_linear(14, 210, token_counts=(16, 32, 64, 128, 256))
+  def test_q8_0_linear_wmma(self): self._test_quant_linear(8, 272, token_counts=(32,))
   def test_q8_0_linear_small_blocks(self): self._test_quant_linear(8, 272, in_features=288, out_features=16, token_counts=(1, 16))
   def test_q6_linear_odd_blocks(self): self._test_quant_linear(14, 210, in_features=768, out_features=3, token_counts=(1, 3, 16))
   def test_q2_k_linear(self): self._test_quant_linear(10, 84, in_features=768, token_counts=(1, 3, 16))
@@ -628,6 +629,25 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
       try:
         with patch.object(Tensor, "scaled_dot_product_attention", side_effect=AssertionError("expected DIRECT flash")):
           actual = flash_attention(Tensor(q), Tensor(cache).realize(), valid).numpy()
+      finally: getenv.cache_clear()
+    np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=2e-3)
+
+  def test_prefill_attention_direct_d64_uses_custom_kernel(self):
+    if not amd_direct_isa(Tensor.empty(1).device): self.skipTest("RDNA3 DIRECT required")
+    rng = np.random.default_rng(44)
+    q = rng.normal(size=(1, 4, 32, 64)).astype(np.float16)
+    cache = rng.normal(size=(2, 1, 1, 64, 64)).astype(np.float16)
+    k, v = (np.repeat(cache[i].astype(np.float32), 4, axis=1) for i in range(2))
+    scores = (q.astype(np.float32) @ k.swapaxes(-1, -2)) / np.sqrt(64)
+    scores = np.where(np.arange(64)[None, :] <= np.arange(32, 64)[:, None], scores, -np.inf)
+    probs = np.exp(scores - scores.max(-1, keepdims=True))
+    expected = (probs / probs.sum(-1, keepdims=True)) @ v
+    from tinygrad.helpers import getenv
+    with patch.dict(os.environ, {"AMD_FLASH_ACC_SMALL": "1", "AMD_WMMA_ACC_SMALL": "0"}):
+      getenv.cache_clear()
+      try:
+        with patch.object(Tensor, "scaled_dot_product_attention", side_effect=AssertionError("expected D64 WMMA attention")):
+          actual = flash_attention(Tensor(q), Tensor(cache).realize(), 64).numpy()
       finally: getenv.cache_clear()
     np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=2e-3)
 

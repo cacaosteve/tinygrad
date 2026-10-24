@@ -614,6 +614,9 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
       elif ggml_type == IQ3_S: scale *= (1+2*((byte(106+subgroup//2) >> ((subgroup%2)*4)) & 15)).float()
       elif ggml_type == IQ3_XXS: scale *= ((_load_u32(raw, base, 66+subgroup*4) >> 28).float()+0.5)*0.5
     words = tuple(_quant_word(raw, base, subgroup, half*4+i, ggml_type, grid) for i in word_indices)
+    if direct_isa and ggml_type == Q8_0:
+      return tuple(_amd_fma_to_f16((word >> (b*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float(), scale, minimum)
+                   for word in words for b in range(4))
     if mixed_q6:
       bias = scale * -zero
       return tuple(_amd_fma_to_f16(_q6_byte_f32(word, b), scale, bias) for word in words for b in range(4))
@@ -1366,16 +1369,16 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   D, N, group = q.shape[3], assigned_kv.shape[3], q.shape[1] // assigned_kv.shape[2]
   decode = resolve(T_real == 1, False)
   direct_isa = amd_direct_isa(q.device)
+  direct_layout = direct_isa and D != 64
   # Shape/LDS gates from upstream master; fall back to SDPA when hand kernels cannot run.
   # The C/LLVM prefill mapping needs one additional float32 BLOCK_M×BLOCK_N LDS tile;
   # without accounting for it D=320 requests 68 KiB and fails HIP codegen on gfx1100.
-  lds_extra = 0 if direct_isa else BLOCK_M * BLOCK_N * 4
+  lds_extra = 0 if direct_layout else BLOCK_M * BLOCK_N * 4
   supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and group*((D+LDS_PAD)*2+8) <= 65536 if decode else
     D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) + lds_extra <= 65536 and N % BLOCK_N == 0 and
     q.max_shape[2] % BLOCK_M == 0)
-  # The direct ISA prefill WMMA mapping is numerically unsafe for D=64 on Navi31; use the
-  # generic SDPA path for that case rather than exposing uninitialized fragment lanes.
-  if not supported or (not decode and D == 64 and amd_direct_isa(q.device)):
+  # The DIRECT D=64 WMMA mapping exposes uninitialized fragment lanes; use the shared tile mapping instead.
+  if not supported:
     _flash_clear_decode_policy()
     k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
     mask = None if decode else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
@@ -1394,7 +1397,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   aligned_causal_start = isinstance(valid_end, int) and q_tokens is not None and (valid_end-q_tokens) % BLOCK_M == 0
   # The hand PV path is wrong for partial query/KV-tile overlaps. Keep it to aligned,
   # statically known lengths; a bound UOp is still a runtime scalar in the compiled kernel.
-  if direct_isa and (not getenv("AMD_FLASH_DIRECT", 0) or not aligned_causal_start):
+  if direct_layout and (not getenv("AMD_FLASH_DIRECT", 0) or not aligned_causal_start):
     _flash_clear_decode_policy()
     k, v = assigned_kv[0, :, :, 0:valid_end, :], assigned_kv[1, :, :, 0:valid_end, :]
     mask = Tensor.full((1, 1, T_real, valid_end), float("-inf"), dtype=dtypes.float32, device=q.device, buffer=False).triu(valid_end-T_real+1)
@@ -1403,9 +1406,9 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # AMD_FLASH_ACC_SMALL is set for this realize (not via FLASH_DIRECT process-wide —
   # that parked every matmul and broke eye/GEMM). ACC_SMALL defaults on for DIRECT;
   # AMD_FLASH_ACC_SMALL=0 disables; AMD_WMMA_ACC_SMALL=1 forces (unsafe for quant).
-  # Keep the partial K unroll on direct ISA; HIP retains its ranged QK mapping.
+  # Keep the partial K unroll on the direct tile layout; shared layouts retain ranged QK mapping.
   use_acc_small = bool(getenv("AMD_WMMA_ACC_SMALL", 0) or getenv("AMD_FLASH_ACC_SMALL", 1))
-  use_k_unroll = 2 if direct_isa else 0
+  use_k_unroll = 2 if direct_layout else 0
   # Keep QKV producers out of the flash-only accumulator partition and scheduler.
   if ALLOW_DEVICE_USAGE: q.realize(assigned_kv)
   # Build+realize under ACC_SMALL remat + ALLOW_UPCAST16=0 (must wrap custom_kernel).

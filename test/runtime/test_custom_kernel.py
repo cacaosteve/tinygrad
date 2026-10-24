@@ -12,6 +12,7 @@ from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CStyleLanguage
 from tinygrad.renderer.llvmir import LLVMRenderer
+from tinygrad.renderer.isa import ISARenderer
 from test.helpers import assert_kernel_count
 from test.null.test_custom_kernel import custom_elementwise_add_kernel, custom_elementwise_addmul_kernel, custom_gemm
 
@@ -546,6 +547,7 @@ class TestCustomKernel(unittest.TestCase):
   def test_custom_kernel_sched_copy(self): self.test_custom_kernel_sched(use_custom=True)
 
   @unittest.skipIf(Device.DEFAULT == "CPU", "test needs to copy from CPU to another device")
+  @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, ISARenderer), "ISA renderers emit binaries, not compilable source")
   def test_call_to_program(self):
     t = Tensor([-1]).realize()
     # render a source string

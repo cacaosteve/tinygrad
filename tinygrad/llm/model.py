@@ -282,7 +282,7 @@ class TransformerBlock(FFNBlock):
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
     # The custom kernels implement causal attention, not sliding windows or sink columns.
     if amd_custom_kernels_supported(x.device) and not (self.config.sliding_window or self.config.attn_sinks) and \
-       (self.config.ssm is not None or (amd_direct_isa(x.device) and T == 1)):
+       (self.config.ssm is not None or (amd_direct_isa(x.device) and (T == 1 or self.config.head_dim == 64))):
       attn = flash_attention(q, assigned_kv, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
