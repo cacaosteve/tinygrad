@@ -692,6 +692,43 @@
         "max_abs_err": {"direct": 0.0010681, "hip": 0.0010986}
       }
     },
+    "decode_balanced_repeat_2026_10_24": {
+      "method": "Fresh paired processes in DIRECT/HIP/HIP/DIRECT order; 80 synchronized TinyJit samples per process; both paths passed the independent reference.",
+      "direct_sample_medians_us": [116.5255, 115.4805],
+      "hip_sample_medians_us": [109.6505, 108.0255],
+      "combined_direct_us": 116.003,
+      "combined_hip_us": 108.838,
+      "direct_over_hip": 1.066
+    },
+    "hardware_retest_2026_10_24": {
+      "branch_commit": "0ba70d9ce",
+      "code_commit": "7b88de7ad62e0a782b31fc3b4ca0167d048985bf",
+      "suite": "DEV=AMD:AMD pytest test/amd/hw test/device/amd/test_llm.py -x -q on physical gfx1100; source SHA256 matched local checkout for rdna3.py, schedule, emit, VOPD, amd.py, renderer tests, and backend matrix.",
+      "result": {"passed": 898, "skipped": 1, "subtests": 425, "seconds": 162.38},
+      "focused_quant_repeat": {
+        "method": "Fresh process-level DIRECT/HIP/HIP/DIRECT order; independent reference passed for each run.",
+        "q6_k_gemv_4096x4096_t16": {
+          "direct_sample_medians_us": [178.850, 167.020],
+          "hip_sample_medians_us": [136.2605, 133.595],
+          "combined_direct_us": 172.935,
+          "combined_hip_us": 134.9278,
+          "direct_over_hip": 1.282,
+          "max_abs_err": {"direct": 0.00024414, "hip": 0.00024414}
+        },
+        "iq4_xs_gemv_8192x2048_t1": {
+          "direct_sample_medians_us": [115.930, 116.4105],
+          "hip_sample_medians_us": [99.275, 98.831],
+          "combined_direct_us": 116.1703,
+          "combined_hip_us": 99.053,
+          "direct_over_hip": 1.173,
+          "max_abs_err": {"direct": 0.00106812, "hip": 0.00109863}
+        }
+      },
+      "rejected_experiment": {
+        "change": "Experimental two-output-tile Q6 T16 WMMA layout in a separate worktree only.",
+        "result": "Incorrect on hardware: omitted/zero output regions, max absolute error 4462.84. Reproduced twice; no product files changed."
+      }
+    },
     "llama3_2_1b_q8_chunk128": {
       "prompt_tokens": 1024,
       "decode_tokens": 32,
