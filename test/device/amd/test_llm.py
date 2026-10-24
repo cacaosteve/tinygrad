@@ -4,7 +4,7 @@ import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.llm.kernels.amd import (Linear, _amd_flash_attention, amd_custom_kernels_supported, amd_direct_isa,
                                       _permute_rope_output, q8_quantize, flash_attention, gated_delta_prefill,
-                                      QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, _wmma_rdna4)
+                                      QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, _wmma_rdna4, Q4_K, IQ3_S, ExpertWeights)
 from tinygrad.llm.model import permute_rope
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.helpers import DEV, OSX
@@ -358,6 +358,30 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         out = gated_delta_prefill(q, q, Tensor.ones(1, 1, 1, 4), beta, Tensor.ones(1, 1, 1), state, start)
         np.testing.assert_array_equal(out.numpy(), 32)
         np.testing.assert_array_equal(state.numpy(), 1)
+
+  def _test_moe_decode(self, typ:int):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    rng = np.random.default_rng(5)
+    E, T, K, IN, OUT, size = 4, 1, 2, 256, 16, QUANT_SIZES[typ]
+    blocks = rng.integers(0, 256, (E*OUT*IN//256, size), dtype=np.uint8)
+    blocks[:, :2] = np.array([0.001], np.float16).view(np.uint8)
+    blocks[:, 2:4] = np.array([0.0001], np.float16).view(np.uint8)
+    decoded = ggml_data_to_tensor(Tensor(blocks.flatten()).contiguous().realize(), E*OUT*IN, typ).reshape(E, OUT, IN)
+    w = decoded.numpy()
+    act = rng.standard_normal((1, T, K, IN)).astype(np.float32)
+    sel = np.stack([rng.choice(E, K, replace=False) for _ in range(T)])[None].astype(np.int32)
+    ew = ExpertWeights(E, IN, OUT)
+    ew.weight = decoded.half()
+    ew.set_quantized()
+    self.assertEqual(ew.ggml_type, typ)
+    got = ew(Tensor(sel), Tensor(act)).numpy()[0]
+    for t in range(T):
+      for j in range(K):
+        ref = w[sel[0, t, j]] @ act[0, t, j]
+        np.testing.assert_allclose(got[t, j], ref, rtol=2e-2, atol=2e-2*np.abs(ref).max())
+
+  def test_moe_decode(self): self._test_moe_decode(Q4_K)
+  def test_moe_decode_iq3_s(self): self._test_moe_decode(IQ3_S)
 
   def test_gated_delta_random_scan(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
