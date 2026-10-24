@@ -707,13 +707,15 @@
     },
     "qwen3_coder_30b_q4_natural_prompt": {
       "prompt_text": "Write a short Python function that adds two integers.",
-      "prompt_tokens": [7985, 264, 2805, 13027, 729, 429, 11367, 1378, 25780, 13, 576, 729, 1265, 2924, 264, 4629, 917, 429],
-      "generated_tokens": 8,
-      "direct_output": [576, 729, 1265, 2924, 264, 4629, 917, 429],
-      "hip_output": [576, 729, 1265, 2924, 264, 4629, 917, 429],
-      "decoded_output": " The function should include a docstring that",
+      "prompt_token_count": 10,
+      "prompt_tokens": [7985, 264, 2805, 13027, 729, 429, 11367, 1378, 25780, 13],
+      "generated_tokens": 32,
+      "direct_output": [576, 729, 1265, 2924, 264, 4629, 917, 429, 14758, 1128, 279, 729, 1558, 11, 1181, 5029, 11, 323, 1181, 470, 897, 13, 22406, 11, 279, 729, 1265, 2924, 1946, 10519, 311, 5978],
+      "hip_output": [576, 729, 1265, 2924, 264, 4629, 917, 429, 14758, 1128, 279, 729, 1558, 11, 1181, 5029, 11, 323, 1181, 470, 897, 13, 22406, 11, 279, 729, 1265, 2924, 1946, 10519, 311, 5978],
+      "decoded_output": " The function should include a docstring that explains what the function does, its parameters, and its return value. Additionally, the function should include input validation to ensure",
+      "token_sha256": "a4057c3d9413b3548dcfa23999d9d80d7b7052f90bcef7a56b4b77ebf0246319",
       "tokens_match": true,
-      "note": "Same tokenizer IDs and output across backends for this prompt; the prior reported prompt was not preserved, so the earlier mismatch is still not fully replayed."
+      "note": "Direct and HIP matched for 32 generated tokens on this prompt; the prior reported prompt was not preserved, so the earlier mismatch is still not fully replayed."
     },
     "scope_and_remaining_gaps": {
       "counted_tinygrad_lines": 32063,
