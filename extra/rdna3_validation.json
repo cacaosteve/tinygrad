@@ -1,8 +1,8 @@
 {
   "date": "2026-10-23",
-  "source_commit": "612c19d0d plus the verified working tree (9 modified files)",
+  "source_commit": "bacd8ca0bd2f9fcde6c7a7d18a82a1fcb434edc8",
   "upstream_master": "0958ebd7ca533455dc1feaa5194a783b8c69aedb",
-  "status": "not PR-ready: upstream size gate fails, Qwen3-Coder exact-token mismatch is unresolved, and Q6 multi-token is 1.4-1.5x slower than HIP",
+  "status": "not PR-ready: upstream size gate fails by 5446 counted lines, Q6 multi-token is 1.4-1.5x slower than HIP, and Qwen3-Coder Q4 has an observed third-token flip with small sampled-score disagreement",
   "constraints": {
     "pull_request_opened": false,
     "pushed_this_session": false,
@@ -19,11 +19,18 @@
       "skipped": 4, "subtests": 321, "seconds": 152.67},
     "local_targeted": {"command": "python -m pytest -x -q test/amd/test_amd_renderer.py test/amd/test_kfd_events.py test/runtime/test_buffer.py test/runtime/test_custom_kernel.py",
       "passed": 338, "skipped": 66, "xfailed": 4, "subtests": 207, "seconds": 68.87},
+    "local_changed_null": {"command": "python -m pytest -x -q test/null/test_compile_env.py test/null/test_gen_float4.py test/null/test_hcq2.py test/null/test_llm_sharding.py test/null/test_llm_weight_views.py test/null/test_pickle.py test/null/test_regalloc.py test/null/test_uop_graph.py test/null/test_uop_symbolic.py test/null/test_validate_oob.py",
+      "passed": 386, "xfailed": 8, "subtests": 77, "parallel_workers": "pytest-xdist unavailable in local environment; ran serially"},
+    "local_runtime_targeted": {"command": "python -m pytest -x -q -k 'not test_cummax and not test_cummin and not test_hardswish' test/runtime/test_ops.py test/runtime/test_tensor_cores.py",
+      "passed": 435, "skipped": 5, "deselected_baseline_failures": 3, "subtests": 135, "seconds": 196.28},
+    "baseline_runtime_failures": ["test/runtime/test_ops.py::TestOps::test_cummax", "test/runtime/test_ops.py::TestOps::test_cummin", "test/runtime/test_ops.py::TestOps::test_hardswish"],
+    "gguf_runtime": {"command": "DEV=CPU python -m pytest -x -q test/runtime/test_gguf.py test/runtime/test_llm_tp.py",
+      "passed": 75, "skipped": 2, "subtests": 22, "python_dependency": "gguf 0.19.0 installed in gaming-PC test venv only"},
     "ruff": "passed",
     "mypy": "passed (222 source files)",
     "size_gate": {"command": "MAX_LINE_COUNT=26500 python sz.py", "result": "failed", "total_lines": 31946,
-      "limit": 26500, "over_by": 5446, "core_lines": 9981},
-    "pr_diff": {"files": 59, "insertions": 15405, "deletions": 434},
+      "master_total_lines": 25450, "branch_net_counted_lines": 6496, "limit": 26500, "over_by": 5446, "core_lines": 9981},
+    "pr_diff": {"files": 60, "insertions": 15463, "deletions": 430},
     "paired_matrix_median_us": {
       "flash_prefill": {"direct": 267.02, "hip": 332.274, "direct_over_hip": 0.804},
       "flash_decode": {"direct": 130.102, "hip": 111.778, "direct_over_hip": 1.164},
@@ -49,7 +56,12 @@
       "direct": {"warm_s": 178.513, "prefill_tps": 72.620, "decode_tps": 10.932, "output": [1012, 198, 82]},
       "hip": {"warm_s": 147.543, "prefill_tps": 130.937, "decode_tps": 12.099, "output": [1012, 198, 9]},
       "direct_flash_disabled_output": [1012, 198, 82],
-      "status": "same-seed token mismatch after two shared tokens; not counted exact-correct pending logits comparison"
+      "dynamic_sample_capture": {"method": "Diagnostic JIT capture returned the pre-argmax sampled-score vector; host argmax selected the next token. Same prompt and shared generated tokens on both backends.",
+        "direct_tokens": [1012, 198, 82], "hip_tokens": [1012, 198, 9],
+        "step3_direct_top2": [[82, 12.655459827712], [9, 12.568911413248]],
+        "step3_hip_top2": [[9, 12.660771913728], [82, 12.627496402944]],
+        "step3_sampled_score_max_abs": 0.144469917696, "step3_sampled_score_rms": 0.033249809676813784},
+      "status": "Exact-token parity still differs at token 3; sampled-score vectors are close overall but reorder near-top candidates. This does not identify a gross kernel fault and is not counted as exact-correct."
     },
     "q6_layout_ab": "Disabling mixed-f16 dequant regressed T16/T32 about 10%; two output tiles failed correctness; forcing 16-token WMMA tiles regressed T32/T64; forcing 64-token tiles instead of 128 regressed T256/T1024. Shipping layout restored."
   },
