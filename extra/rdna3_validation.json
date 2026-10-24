@@ -669,7 +669,9 @@
         "test": "test/device/amd/test_arange.py::TestIndexing::test_llama_8b_rope_backward_bf16",
         "direct": "Fails op-count bound: 2,165,047,296 vs 838,860,800 maximum (64.5 ops/element).",
         "hip": "Passes on the same host.",
-        "classification": "Confirmed generic backward matmul/optimizer efficiency deficit, not a forward LLM correctness failure. Prior F16 measurement also failed its tighter op-count bound."
+        "f16": "Direct fails 1,821,442,048 vs 67,108,864 (54.3 ops/element); HIP passes.",
+        "beam_experiment": "BEAM=1 reduces BF16 to 381,616,128 and passes, but F16 remains 476,413,952 vs 67,108,864; disabling the beam cache costs about 29 seconds for this BF16 schedule search. TC_OPT=1/2 did not change the BF16 count.",
+        "classification": "Confirmed generic backward matmul/optimizer efficiency deficit, not a forward LLM correctness failure. The beam result is not a viable global default and no product workaround was accepted."
       }
     },
     "paired_backend_matrix_median_us": {
@@ -742,6 +744,26 @@
       "rejected_experiment": {
         "change": "Experimental two-output-tile Q6 T16 WMMA layout in a separate worktree only.",
         "result": "Incorrect on hardware: omitted/zero output regions, max absolute error 4462.84. Reproduced twice; no product files changed."
+      },
+      "q6_load_width_ab": {
+        "method": "Direct/HIP/HIP/Direct order with two process medians each, 60 synchronized TinyJit samples per process; independent references passed.",
+        "packed_u32x4_to_scalar": {
+          "default_direct_us": [180.056, 165.280],
+          "scalar_direct_us": [197.8405, 199.1655],
+          "hip_us": [135.8205, 134.200],
+          "result": "Scalar loads are about 15% slower than the packed baseline."
+        },
+        "packed_u32x4_to_u32x2": {
+          "default_direct_us": [169.3205, 166.7055],
+          "u32x2_direct_us": [186.0405, 185.025],
+          "hip_us": [136.2155, 134.260],
+          "result": "64-bit paired loads are about 10% slower than the packed baseline."
+        }
+      },
+      "iq4_mapping_ab": {
+        "method": "Direct/HIP/HIP/Direct, two medians per tested schedule, 60 synchronized TinyJit samples; all reference checks passed.",
+        "mv0": {"default_direct_us": [116.255, 115.2105], "mv0_direct_us": [117.240, 116.950], "hip_us": [97.190, 99.310], "result": "No improvement; about 1% slower."},
+        "two_output_rows_at_8192": {"default_direct_us": [116.650, 116.600], "two_rows_direct_us": [117.8305, 112.4455], "hip_us": [99.385, 99.105], "result": "About 1.3% faster by combined median, within noise; not retained."}
       }
     },
     "llama3_2_1b_q8_chunk128": {
@@ -790,7 +812,7 @@
       "size_gate_note": "MAX_LINE_COUNT=26500 is an explicit local override; sz.py defaults to no line cap. Current additions are primarily RDNA3 renderer/scheduler/TC/VOPD modules plus AMD kernel and shared-code changes.",
       "master_delta": "Branch is 160 commits ahead and 1 behind fetched origin/master. The one newer master commit is emulator-only and was not merged because emulator work is on hold.",
       "github_ci": "gh run list returned no workflow runs for this personal-fork branch; no PR was opened.",
-      "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 exceed the requested 10% HIP-gap target. A prior Llama Q6 chunk-1024 comparison also showed a prefill deficit; no fresh Q6 full-model run was possible with the currently installed Llama Q8 model. The prior natural-prompt Qwen mismatch needs its original prompt or a new representative prompt for a valid replay."
+      "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 exceed the requested 10% HIP-gap target. A prior Llama Q6 chunk-1024 comparison also showed a prefill deficit. No GGUF was found in the gaming PC's home cache, Documents, or Downloads for a fresh full-model replay; the previously recorded Q8 model results remain one-run evidence. The prior natural-prompt Qwen mismatch needs its original prompt or a new representative prompt for a valid replay."
     }
   }
 }
