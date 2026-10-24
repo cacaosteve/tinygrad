@@ -1,8 +1,9 @@
 {
   "date": "2026-10-23",
-  "source_commit": "bacd8ca0bd2f9fcde6c7a7d18a82a1fcb434edc8",
+  "source_commit": "b0fddcce57fbcecc45ff02b0dc801f9fcb598dbe",
   "upstream_master": "0958ebd7ca533455dc1feaa5194a783b8c69aedb",
-  "status": "not PR-ready: upstream size gate fails by 5446 counted lines, Q6 multi-token is 1.4-1.5x slower than HIP, and Qwen3-Coder Q4 has an observed third-token flip with small sampled-score disagreement",
+  "status": "not PR-ready: upstream size gate fails by 5450 counted lines, Q6 multi-token remains about 1.09-1.64x slower than HIP depending on token count, and Qwen3-Coder Q4 still has an observed third-token flip",
+  "candidate_state": "Code/tests committed locally at source_commit (not pushed); this validation file is a working-tree update. The gaming PC became unreachable during a follow-up diagnostic, and its mirror may contain the diagnostic-only extended mixed-Q6 variant. Resync the committed local tree before any remote tests.",
   "constraints": {
     "pull_request_opened": false,
     "pushed_this_session": false,
@@ -15,8 +16,12 @@
     "vram_bytes": 25753026560
   },
   "latest_validation": {
-    "hardware": {"command": "DEV=AMD:AMD python -m pytest -x -q test/amd/hw test/device/amd/test_llm.py", "passed": 891,
-      "skipped": 4, "subtests": 321, "seconds": 152.67},
+    "hardware": {"command": "DEV=AMD:AMD python -m pytest -x -q test/amd/hw test/device/amd/test_llm.py", "passed": 894,
+      "skipped": 1, "subtests": 422, "seconds": 162.38, "card": "gfx1100 / PCI 1002:744c"},
+    "local_amd_renderer": {"command": "python -m pytest test/amd/test_amd_renderer.py -x -q",
+      "passed": 254, "skipped": 51, "subtests": 183, "seconds": 109.95, "parallel_workers": "pytest-xdist unavailable; ran serially"},
+    "remote_amd_renderer": {"command": "DEV=AMD:AMD python -m pytest test/amd/test_amd_renderer.py -x -q",
+      "passed": 305, "subtests": 390, "seconds": 48.81},
     "local_targeted": {"command": "python -m pytest -x -q test/amd/test_amd_renderer.py test/amd/test_kfd_events.py test/runtime/test_buffer.py test/runtime/test_custom_kernel.py",
       "passed": 338, "skipped": 66, "xfailed": 4, "subtests": 207, "seconds": 68.87},
     "local_changed_null": {"command": "python -m pytest -x -q test/null/test_compile_env.py test/null/test_gen_float4.py test/null/test_hcq2.py test/null/test_llm_sharding.py test/null/test_llm_weight_views.py test/null/test_pickle.py test/null/test_regalloc.py test/null/test_uop_graph.py test/null/test_uop_symbolic.py test/null/test_validate_oob.py",
@@ -28,8 +33,8 @@
       "passed": 75, "skipped": 2, "subtests": 22, "python_dependency": "gguf 0.19.0 installed in gaming-PC test venv only"},
     "ruff": "passed",
     "mypy": "passed (222 source files)",
-    "size_gate": {"command": "MAX_LINE_COUNT=26500 python sz.py", "result": "failed", "total_lines": 31946,
-      "master_total_lines": 25450, "branch_net_counted_lines": 6496, "limit": 26500, "over_by": 5446, "core_lines": 9981},
+    "size_gate": {"command": "MAX_LINE_COUNT=26500 python sz.py", "result": "failed", "total_lines": 31950,
+      "master_total_lines": 25450, "branch_net_counted_lines": 6500, "limit": 26500, "over_by": 5450, "core_lines": 9981},
     "pr_diff": {"files": 60, "insertions": 15463, "deletions": 430},
     "paired_matrix_median_us": {
       "flash_prefill": {"direct": 267.02, "hip": 332.274, "direct_over_hip": 0.804},
@@ -40,10 +45,29 @@
       "q6_k_gemv_t1": {"direct": 118.538, "hip": 104.893, "direct_over_hip": 1.130},
       "iq4_xs_gemv_t1": {"direct": 119.403, "hip": 101.333, "direct_over_hip": 1.178},
       "q8_0_gemv_t1": {"direct": 108.533, "hip": 106.573, "direct_over_hip": 1.018},
-      "q6_k_gemv_t16": {"direct": 223.151, "hip": 149.833, "direct_over_hip": 1.489},
-      "q6_k_gemv_t32": {"direct": 230.046, "hip": 163.427, "direct_over_hip": 1.408},
-      "q6_k_gemv_t64": {"direct": 271.040, "hip": 188.247, "direct_over_hip": 1.440}
+      "q6_k_gemv_t16": {"direct": 185.170, "hip": 147.395, "direct_over_hip": 1.256},
+      "q6_k_gemv_t32": {"direct": 195.335, "hip": 163.850, "direct_over_hip": 1.192},
+      "q6_k_gemv_t64": {"direct": 233.930, "hip": 187.365, "direct_over_hip": 1.249}
     },
+    "paired_matrix_20261023_us": {
+      "method": "Same-machine synchronized TinyJit runs with independent output checks; backend cases run in separate child processes.",
+      "flash_prefill": {"direct": 268.780, "hip": 328.605, "direct_over_hip": 0.818},
+      "flash_decode": {"direct": 128.164, "hip": 112.140, "direct_over_hip": 1.143},
+      "matmul_h_2048": {"direct": 322.629, "hip": 289.380, "direct_over_hip": 1.115},
+      "q4_k_gemv_t1": {"direct": 105.075, "hip": 101.085, "direct_over_hip": 1.039},
+      "q5_k_gemv_t1": {"direct": 106.360, "hip": 100.800, "direct_over_hip": 1.055},
+      "q6_k_gemv_t1": {"direct": 120.320, "hip": 108.235, "direct_over_hip": 1.112},
+      "iq4_xs_gemv_t1": {"direct": 118.745, "hip": 103.040, "direct_over_hip": 1.152},
+      "q8_0_gemv_t1": {"direct": 111.435, "hip": 104.955, "direct_over_hip": 1.062},
+      "correctness": "All Direct/HIP cases passed their independent references."
+    },
+    "q6_scalar_vmem_schedule_ab": {"change": "Schedule independent scalar u16 loads in mixed-f16 Q6 WMMA segments; wide activation loads and WMMA remain boundaries.",
+      "instruction_shape": "The repeated 16-load group now issues the scalar loads before use with one s_clause and vmcnt(15..0), rather than reusing one VGPR with vmcnt(0) after each load.",
+      "metadata": {"allocated_vgpr": 104, "private_bytes": 0, "lds_bytes": 0},
+      "previous_median_us": {"t16": 223.151, "t32": 230.046, "t64": 271.040},
+      "current_median_us": {"t16": 185.170, "t32": 195.335, "t64": 233.930},
+      "direct_improvement_pct": {"t16": 17.0, "t32": 15.1, "t64": 13.7},
+      "correctness": "Direct outputs pass the independent NumPy reference at T16/T32/T64; serial gfx1100 hardware+LLM suite passes 894 tests, 1 skipped, 422 subtests."},
     "matrix_correctness": "All Direct/HIP cases passed independent output checks; AMDLLVM quantized fallback uses different activation precision, so those timings are not treated as same-math parity.",
     "llama3_2_1b_q8": {
       "prompt1024_chunk32": {"direct_prefill_tps": 2570.782, "hip_prefill_tps": 2631.140, "direct_decode_tps": 173.284,
@@ -63,7 +87,25 @@
         "step3_sampled_score_max_abs": 0.144469917696, "step3_sampled_score_rms": 0.033249809676813784},
       "status": "Exact-token parity still differs at token 3; sampled-score vectors are close overall but reorder near-top candidates. This does not identify a gross kernel fault and is not counted as exact-correct."
     },
-    "q6_layout_ab": "Disabling mixed-f16 dequant regressed T16/T32 about 10%; two output tiles failed correctness; forcing 16-token WMMA tiles regressed T32/T64; forcing 64-token tiles instead of 128 regressed T256/T1024. Shipping layout restored."
+    "q6_vector_load_ab": {
+      "accepted": "Q6 direct uses one byte-addressed non-temporal B128 load for each four-word group below the 128-token tile, and B64 for the 128-token tile. Both use SLC+DLC cache flags.",
+      "paired_medians_us": {
+        "t16": {"direct": 177.75, "hip": 141.86, "ratio": 1.253},
+        "t32": {"direct": 200.91, "hip": 163.86, "ratio": 1.226},
+        "t64_repeated_3_pairs": {"direct": 204.00, "hip": 186.89, "ratio": 1.091},
+        "t128": {"direct": 289.18, "hip": 212.46, "ratio": 1.361},
+        "t256_repeated_3_pairs": {"direct": 424.03, "hip": 259.35, "ratio": 1.635},
+        "t512_b64_128tile": {"direct": 598.79, "hip": 473.84, "ratio": 1.264, "note": "direct samples were variable; p10 was 532.15 us"},
+        "t1024": {"direct": 1030.00, "hip": 905.58, "ratio": 1.137}
+      },
+      "correctness": "All timed direct and HIP outputs passed the independent NumPy check (max_abs_err 0.0002442). The full serial hardware suite passed on the safe <=64-token mixed-Q6 threshold.",
+      "rejected": [
+        "B64 on the 64-token layout was slower than B128 at T16-T128 and effectively tied/slightly slower at T256.",
+        "64-token tile with B128 at T512 was correct but about 1.98x HIP; retain the 128-token tile with B64.",
+        "Extending mixed-Q6 to T128+ failed test_wmma_preserves_nonzero_initial_accumulator (893 passed, 1 failed); reverted to mixed-Q6 <=64 tokens. The isolated failure passes after revert."
+      ]
+    },
+    "q6_layout_ab": "Disabling mixed-f16 dequant regressed T16/T32 about 10%; two output tiles failed correctness; forcing 16-token WMMA tiles regressed T32/T64. Forcing a 64-token tile at T512 was also much slower. The safe shipping layout uses mixed-Q6 through T64, B128 through T256, and a 128-token tile with B64 from T512."
   },
   "validation": {
     "ruff": "passed",
