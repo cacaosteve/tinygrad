@@ -670,7 +670,7 @@
         "direct": "Fails op-count bound: 2,165,047,296 vs 838,860,800 maximum (64.5 ops/element).",
         "hip": "Passes on the same host.",
         "f16": "Direct fails 1,821,442,048 vs 67,108,864 (54.3 ops/element); HIP passes.",
-        "beam_experiment": "BEAM=1 reduces BF16 to 381,616,128 and passes, but F16 remains 476,413,952 vs 67,108,864; disabling the beam cache costs about 29 seconds for this BF16 schedule search. TC_OPT=1/2 did not change the BF16 count.",
+        "beam_experiment": "BEAM=1 reduces BF16 to 381,616,128 and passes, but F16 remains 476,413,952 vs 67,108,864; disabling the beam cache costs about 29 seconds for this BF16 schedule search. TC_OPT=1/2 did not change the BF16 count. Fresh F16 searches: BEAM=2 gives 259,751,936 ops; BEAM=4 gives 90,112,000 ops (2.7 ops/element, still above the 67,108,864 bound) after 106.82s. BEAM=8 with IGNORE_BEAM_CACHE=1 and BEAM_TIMEOUT_SEC=5 exited in lower_and_compile after about 169s without an op count; cause not diagnosed.",
         "classification": "Confirmed generic backward matmul/optimizer efficiency deficit, not a forward LLM correctness failure. The beam result is not a viable global default and no product workaround was accepted."
       }
     },
