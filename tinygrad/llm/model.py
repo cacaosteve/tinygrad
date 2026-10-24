@@ -3,7 +3,7 @@ import enum, functools, itertools, math, pathlib, re
 from dataclasses import dataclass, replace
 from typing import Callable, TypeVar
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, amd_direct_isa
+from tinygrad.llm.kernels.amd import Q8_0, Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, amd_direct_isa
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
 from tinygrad.uop.ops import resolve
 from tinygrad.helpers import unwrap, round_up
@@ -609,13 +609,20 @@ class Transformer:
                       beta_fast=kv.get(f'{arch}.rope.scaling.yarn_beta_fast', 32.0),
                       beta_slow=kv.get(f'{arch}.rope.scaling.yarn_beta_slow', 1.0)) if kv.get(f'{arch}.rope.scaling.type') == 'yarn' else None
 
-    # Permute RoPE weights from interleaved to half-split layout.
+    # Permute RoPE weights from interleaved to half-split layout. For direct RDNA3 Q8_0 Llama Q/K,
+    # retain the packed rows and move the same permutation to the linear output instead.
+    direct_q8_rope = arch == 'llama' and shard == 1 and amd_direct_isa(devices)
+    quantized_rope_perms:dict[str, tuple[int, int, int]] = {}
     for name in state_dict:
       if arch in ('kimi-linear', 'glm5-next'): continue
       if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
-        state_dict[name] = permute_rope(state_dict[name], n_heads, rope_dim)
+        if direct_q8_rope and entries[name][2] == Q8_0:
+          quantized_rope_perms[name] = (n_heads, state_dict[name].shape[0]//n_heads, rope_dim)
+        else: state_dict[name] = permute_rope(state_dict[name], n_heads, rope_dim)
       elif arch == 'llama' and 'attn_k.weight' in name:
-        state_dict[name] = permute_rope(state_dict[name], n_kv_heads, state_dict[name].shape[0]//n_kv_heads)
+        kv_head_dim = state_dict[name].shape[0]//n_kv_heads
+        if direct_q8_rope and entries[name][2] == Q8_0: quantized_rope_perms[name] = (n_kv_heads, kv_head_dim, kv_head_dim)
+        else: state_dict[name] = permute_rope(state_dict[name], n_kv_heads, kv_head_dim)
       elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
         state_dict[name] = permute_rope(state_dict[name], 1, state_dict[name].shape[0]-kv_lora_rank)
     config = TransformerConfig(
@@ -649,6 +656,9 @@ class Transformer:
       sliding_window=kv.get(f'{arch}.attention.sliding_window', 0),
       sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0), hc=hc, indexer=indexer)
     model = Transformer(config)
+    for name,perm in quantized_rope_perms.items():
+      _, block, linear, _ = name.split(".")
+      getattr(model.blk[int(block)], linear).quantized_rope_perm = perm
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster

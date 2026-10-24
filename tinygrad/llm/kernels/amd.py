@@ -123,6 +123,15 @@ def _reg(shape:tuple[int, ...], slot:int, value:float, dep:UOp|None=None) -> UOp
 
 # ******** quant linear: q8-activation kernels over packed ggml weights ********
 
+def _permute_rope_output(x:Tensor, n_heads:int, head_dim:int, rope_dim:int) -> Tensor:
+  """Apply permute_rope's output-row shuffle after a linear instead of materializing permuted weights."""
+  assert x.shape[-1] == n_heads*head_dim and 0 < rope_dim <= head_dim and rope_dim % 2 == 0
+  lead = x.shape[:-1]
+  x = x.reshape(*lead, n_heads, head_dim)
+  prefix = head_dim - rope_dim
+  tail = x[..., prefix:].reshape(*lead, n_heads, rope_dim//2, 2).transpose(-1, -2).reshape(*lead, n_heads, rope_dim)
+  return (x[..., :prefix].cat(tail, dim=len(lead)+1) if prefix else tail).reshape(*lead, n_heads*head_dim)
+
 class Linear(nn.Linear):
   ggml_type:int|None = None
   use_custom_quant = True
@@ -130,6 +139,7 @@ class Linear(nn.Linear):
   def __init__(self, in_features:int, out_features:int, bias=True):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
+    self.quantized_rope_perm:tuple[int, int, int]|None = None
   def set_quantized(self, decoded:Tensor):
     if self.in_features % Q8_GROUP_SIZE: return
     packed_sizes = {typ: decoded.numel() * type_size // 256 for typ,type_size in QUANT_SIZES.items()
@@ -168,7 +178,7 @@ class Linear(nn.Linear):
         if self.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) and self.out_features <= 2048 \
           and self.in_features % (WARP_SIZE*4) == 0 and self.weight.uop.axis is None:
           numel, max_shape = x.numel(), x.max_shape
-          if isinstance(numel, int) or prod(max_shape) // self.in_features <= 32:
+          if self.quantized_rope_perm is None and (isinstance(numel, int) or prod(max_shape) // self.in_features <= 32):
             out = f16_gemv(self, x if isinstance(numel, int) else x.pad_to(max_shape))
             return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
         self.use_custom_quant = supported = False  # not a supported quant format
@@ -192,6 +202,9 @@ class Linear(nn.Linear):
         srcs = (out, self.weight, inp.cast(dtypes.half).contiguous()) + (() if self.bias is None else (self.bias,))
         result = Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*max_shape[:-1], self.out_features)
         return result if isinstance(numel, int) else result.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    if self.quantized_rope_perm is not None:
+      result = _permute_rope_output(x.linear(self.weight.transpose(), None), *self.quantized_rope_perm)
+      return result if self.bias is None else result + self.bias
     return super().__call__(x)
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
@@ -689,6 +702,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   if len(result.shape) == 3: result = result.sum(-1)
   if splits > 1: result = result.reshape(splits, tokens, out_features).sum(0)
   result = result.reshape(*x.shape[:-1], out_features)
+  if layer.quantized_rope_perm is not None: result = _permute_rope_output(result, *layer.quantized_rope_perm)
   return result if layer.bias is None else result + layer.bias
 
 # ******** tiny dense fp16 gemv ********

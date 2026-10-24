@@ -3,13 +3,23 @@ from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.llm.kernels.amd import (Linear, _amd_flash_attention, amd_custom_kernels_supported, amd_direct_isa,
-                                      q8_quantize, flash_attention, gated_delta_prefill, QUANT_SIZES, HALFWORD_QUANTS,
-                                      SMALL_BLOCK_QUANTS, _wmma_rdna4)
+                                      _permute_rope_output, q8_quantize, flash_attention, gated_delta_prefill,
+                                      QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, _wmma_rdna4)
+from tinygrad.llm.model import permute_rope
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.helpers import DEV, OSX
 from test.runtime.test_llm_quantized import QuantLinearMixin
 
 class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
+  def test_rope_output_row_permutation(self):
+    heads, head_dim, in_features = 2, 8, 16
+    x = Tensor(np.arange(3*in_features, dtype=np.float32).reshape(3, in_features), device="CPU")
+    weight = Tensor(np.arange(heads*head_dim*in_features, dtype=np.float32).reshape(heads*head_dim, in_features), device="CPU")
+    for rope_dim in (4, 8):
+      expected = x.linear(permute_rope(weight, heads, rope_dim).transpose())
+      actual = _permute_rope_output(x.linear(weight.transpose()), heads, head_dim, rope_dim)
+      np.testing.assert_array_equal(actual.numpy(), expected.numpy())
+
   def test_wmma_architecture_selection(self):
     if not amd_custom_kernels_supported(device:=Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
     self.assertEqual(_wmma_rdna4(device), Device[device].target[0] == 12)
