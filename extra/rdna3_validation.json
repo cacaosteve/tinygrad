@@ -655,6 +655,21 @@
       "mock_cfg_branch_diamond": {
         "result": "MOCK+AMD:AMD returned [2.0, 2.0, 3.0] instead of [2.0, 1.0, 3.0]; the same test passes on physical gfx1100.",
         "scope": "Mock/emulator-side behavior only; emulator sources were not modified, consistent with the project hold."
+      },
+      "broad_amd_suite_2026_10_24": {
+        "command": "DEV=AMD:AMD pytest test/amd --ignore=test/amd/test_emu2_pcode.py --ignore=test/amd/test_llvm.py -x -q",
+        "result": "1332 passed, 99 skipped, 1411 subtests in 104.97s on the exact branch source.",
+        "excluded": "Emulator suite is on hold. test/amd/test_llvm.py uses the AMDLLVM C assembly helper, which segfaulted in the first broad attempt; the same helper crash class was previously reproduced on pristine origin/master."
+      },
+      "amd_device_suite_2026_10_24": {
+        "command": "DEV=AMD:AMD pytest test/device/amd -k 'not llama_8b_rope_backward' -x -q",
+        "result": "77 passed, 70 skipped, 2 deselected, 385 subtests in 116.11s on gfx1100."
+      },
+      "rope_backward_op_count_gap": {
+        "test": "test/device/amd/test_arange.py::TestIndexing::test_llama_8b_rope_backward_bf16",
+        "direct": "Fails op-count bound: 2,165,047,296 vs 838,860,800 maximum (64.5 ops/element).",
+        "hip": "Passes on the same host.",
+        "classification": "Confirmed generic backward matmul/optimizer efficiency deficit, not a forward LLM correctness failure. Prior F16 measurement also failed its tighter op-count bound."
       }
     },
     "paired_backend_matrix_median_us": {
