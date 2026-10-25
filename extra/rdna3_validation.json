@@ -1,9 +1,9 @@
 {
   "date": "2026-10-24",
-  "source_commit": "7b88de7ad62e0a782b31fc3b4ca0167d048985bf",
+  "source_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
   "upstream_master": "b388f0c24a84b3ecc6eb65c7f071891c5c21c30e",
-  "status": "Fresh gfx1100 hardware, NULL/CPU, Ruff, and mypy gates pass. Repeated tests confirm Q6_K T16 and IQ4_XS T1 exceed the 10% HIP target. Ollama-stored GGUFs enabled full-model runs: Llama 3.2 1B Q8 matched across DIRECT/HIP/AMDLLVM and DIRECT led in this single run; Qwen3 Coder 30B MoE dynamic generation was about 1.8x slower on DIRECT than HIP. An exploratory fixed-shape MoE path was much faster on three static prompts, but dynamic-generation padding and hardware validation remain undone. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
-  "candidate_state": "Product tip is committed to the personal fork. The gaming PC became unreachable on 2026-10-24 (SSH/SCP returned Network is unreachable). The isolated remote test source may retain the temporary AMD_MOE_MULTI static-only probe edit and untracked probe script; the default path is unchanged because the env flag was unset. Local product source was restored and matches the pushed branch. Remove the remote temporary files/patch when the host returns. No PR is open.",
+  "status": "Fresh gfx1100 hardware, NULL/CPU, Ruff, and mypy gates pass. The 2026-10-24 GQA state-budget change passed the serial hardware suite and reduced direct attention dispatch fanout. A paired Qwen3 Coder 30B synthetic prompt run now has matching DIRECT/HIP tokens and nearly equal decode (83.196 vs 82.054 tok/s); the natural-prompt repeat was interrupted when the gaming PC became unreachable. Repeated tests still show Q6_K T16 and IQ4_XS T1 outside the 10% HIP target. Full-model performance is workload-sensitive; these single runs are directional, not a universal parity claim. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
+  "candidate_state": "Product tip 44e769cdaceb56004b077ca1ef040226ac4321f9 is committed to and pushed on the personal fork. The gaming PC was confirmed as Navi31/gfx1100, then became unreachable during a natural-prompt benchmark. The isolated remote test checkout still has the equivalent GQA patch uncommitted plus owned diagnostic/snapshot files under extra/; remove those exact temporary changes/files when the host returns. Local product source matches the pushed branch. Emulator sources were not modified. No PR is open.",
   "constraints": {
     "pull_request_opened": false,
     "branch_pushed": true,
@@ -902,13 +902,33 @@
       "tokens_match": true,
       "note": "Direct and HIP matched for 32 generated tokens on this prompt; the prior reported prompt was not preserved, so the earlier mismatch is still not fully replayed."
     },
+    "gqa_decode_state_budget_2026_10_24": {
+      "source_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
+      "rule": "For RDNA3 DIRECT, split per-head decode only when group>=8 and group*D>=2048; preserve the conservative symbolic wide-head split for D>=256 and group>=4.",
+      "symbolic_gfx1100_cases": [
+        {"gqa_group": 8, "head_dim": 128, "valid_kv": 129, "split_median_us": 525.284, "fused_median_us": 131.778, "speedup": 3.98, "max_abs_err": 0.000127},
+        {"gqa_group": 8, "head_dim": 64, "valid_kv": 129, "split_median_us": 224.897, "fused_median_us": 122.839, "speedup": 1.83},
+        {"gqa_group": 16, "head_dim": 64, "valid_kv": 129, "split_median_us": 344.517, "fused_median_us": 178.678, "speedup": 1.93},
+        {"gqa_group": 32, "head_dim": 32, "valid_kv": 129, "split_median_us": 557.404, "fused_median_us": 397.036, "speedup": 1.40}
+      ],
+      "hardware_suite": {"device": "gfx1100 / PCI 1002:744c", "passed": 900, "skipped": 1, "subtests": 429, "seconds": 186.98},
+      "qwen3_coder_30b_q4_synthetic_prompt128": {
+        "prompt_tokens": 128,
+        "decode_tokens": 16,
+        "direct": {"load_s": 28.003, "warm_s": 136.570, "prefill_tps": 549.167, "decode_tps": 83.196},
+        "hip": {"load_s": 26.375, "warm_s": 149.072, "prefill_tps": 131.954, "decode_tps": 82.054},
+        "all_17_returned_token_ids_match": true,
+        "note": "One paired run using extra/benchmark_llm.py and the numeric synthetic prompt. Decode is essentially tied; the repetitive continuation makes this directional, not a natural-language model-quality benchmark."
+      },
+      "natural_prompt_rerun": "Started with the exact saved 10-token prompt, but the host became unreachable before model load/warmup completed; no timing or output was collected."
+    },
     "scope_and_remaining_gaps": {
       "counted_tinygrad_lines": 32063,
       "counted_line_delta_vs_fetched_master": 6558,
       "size_gate_note": "MAX_LINE_COUNT=26500 is an explicit local override; sz.py defaults to no line cap. Current additions are primarily RDNA3 renderer/scheduler/TC/VOPD modules plus AMD kernel and shared-code changes.",
       "master_delta": "Branch is 160 commits ahead and 1 behind fetched origin/master. The one newer master commit is emulator-only and was not merged because emulator work is on hold.",
       "github_ci": "gh run list returned no workflow runs for this personal-fork branch; no PR was opened.",
-      "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 still exceed the requested 10% HIP-gap target. A newly validated RDNA3 DIRECT dynamic MoE path changes the Qwen3 Coder 30B A3B prompt-128 result from 72.867 to 544.220 tok/s prefill (paired HIP: 131.263, AMDLLVM: 105.957); decode remains 51.526 vs HIP 102.233 and AMDLLVM 15.403 tok/s. All 33 generated token IDs match across these backends. This closes the measured MoE prefill deficit for that sample, not decode or general backend parity. The earlier natural-prompt Qwen mismatch still needs its original prompt for exact replay."
+      "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 remain outside the 10% HIP-gap target. The RDNA3 DIRECT dynamic MoE path still has the recorded strong prefill result (544.220 tok/s vs HIP 131.263 on the earlier prompt-128/32-token run). The post-GQA paired prompt-128/16-token run measures DIRECT/HIP decode at 83.196/82.054 tok/s with all returned token IDs matching; this supersedes the earlier decode comparison only for that exact run, not as a broad parity claim. The 10-token natural-prompt recheck was interrupted by host loss, and the older 32-token natural prompt matched exactly before this change."
     }
   }
 }
