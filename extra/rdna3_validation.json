@@ -1,9 +1,9 @@
 {
   "date": "2026-10-25",
   "source_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
-  "upstream_master": "b388f0c24a84b3ecc6eb65c7f071891c5c21c30e",
-  "status": "The pushed GQA state-budget change passes the serial gfx1100 hardware suite and the focused symbolic GQA decode retest. A fresh paired Qwen3 Coder 30B natural-prompt comparison matched all 32 generated token IDs; DIRECT decode throughput was about 17.6% below HIP while prefill was about 1.95x faster. A one-step VIZ profile found extra DIRECT time in Q4 MoE, Q8 quantization, and generic E_2_4 kernels; attribution is suggestive, not proof of a single root cause. Repeated matrix tests still show Q6_K T16 and IQ4_XS T1 outside the 10% HIP target. These model results are workload-specific, not a universal parity claim. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
-  "candidate_state": "Code tip 44e769cdaceb56004b077ca1ef040226ac4321f9 and validation notes through 8749d5a61 are committed to and pushed on the personal fork. The gaming PC is currently reachable; lspci reports Navi31 PCI 1002:744c and tinygrad reports gfx1100. The focused symbolic GQA decode retest passes. Both isolated remote test checkouts are now clean and synced to 8749d5a61; only our generated multi-gigabyte VIZ profiles and exact GQA snapshot/temp scripts were removed. Emulator sources were not modified. No PR is open.",
+  "upstream_master": "d16046fb5893f6ba14643fb4115df5a30d59e101",
+  "status": "The pushed GQA state-budget change passes the serial gfx1100 hardware suite and the focused symbolic GQA decode retest. A fresh paired Qwen3 Coder 30B natural-prompt comparison matched all 32 generated token IDs; DIRECT decode throughput was about 17.6% below HIP while prefill was about 1.95x faster. A one-step VIZ profile found extra DIRECT time in Q4 MoE, Q8 quantization, and generic E_2_4 kernels; attribution is suggestive, not proof of a single root cause. Repeated matrix tests still show Q6_K T16 and IQ4_XS T1 outside the 10% HIP target. Current master advanced six commits; a full merge was attempted and cleanly aborted after conflicts exposed shared AMD-kernel overlap, with no merge changes left in the worktree. These model results are workload-specific, not a universal parity claim. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
+  "candidate_state": "Code tip 44e769cdaceb56004b077ca1ef040226ac4321f9 and validation notes through 0b5a39a95 are committed to and pushed on the personal fork. The gaming PC is currently reachable; lspci reports Navi31 PCI 1002:744c and tinygrad reports gfx1100. The focused symbolic GQA decode retest passes. Both isolated remote test checkouts are clean and synced to 0b5a39a95. The full master merge is not present in this branch; its conflict was aborted with the candidate tree restored. Emulator checkout/sources were not touched. No PR is open.",
   "constraints": {
     "pull_request_opened": false,
     "branch_pushed": true,
@@ -972,9 +972,15 @@
       "counted_tinygrad_lines": 32063,
       "counted_line_delta_vs_fetched_master": 6558,
       "size_gate_note": "MAX_LINE_COUNT=26500 is an explicit local override; sz.py defaults to no line cap. Current additions are primarily RDNA3 renderer/scheduler/TC/VOPD modules plus AMD kernel and shared-code changes.",
-      "master_delta": "Branch is 160 commits ahead and 1 behind fetched origin/master. The one newer master commit is emulator-only and was not merged because emulator work is on hold.",
+      "master_delta": "Against origin/master d16046fb5, branch is 177 commits ahead and 6 behind. The six upstream commits since b388f0c24 include the generic rangeify store-hazard fix, gater cleanup, CDNA LLM support, GLM MLA updates, an RDMA barrier tweak, and emulator stats. A full merge was attempted and aborted without changing the candidate because shared AMD kernel/model files conflicted; the most substantial overlap is in tinygrad/llm/kernels/amd.py between RDNA3 DIRECT code and the newer CDNA WMMA/layout API. Needs narrow, tested integration before claiming current-master compatibility.",
       "github_ci": "gh run list returned no workflow runs for this personal-fork branch; no PR was opened.",
-      "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 remain outside the 10% HIP-gap target. The RDNA3 DIRECT dynamic MoE path has a strong earlier prompt-128/32-token prefill result (544.220 tok/s vs HIP 131.263). The 2026-10-25 paired natural Qwen3 Coder 30B prompt matches all 32 returned token IDs: DIRECT decode 104.919 vs HIP 127.321 tok/s and prefill 173.569 vs HIP 89.082 tok/s. One-step profiling points to Q4/Q8 and generic E_2_4 costs, but does not prove full gap attribution. No broad parity claim."
+      "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 remain outside the 10% HIP-gap target. The RDNA3 DIRECT dynamic MoE path has a strong earlier prompt-128/32-token prefill result (544.220 tok/s vs HIP 131.263). The 2026-10-25 paired natural Qwen3 Coder 30B prompt matches all 32 returned token IDs: DIRECT decode 104.919 vs HIP 127.321 tok/s and prefill 173.569 vs HIP 89.082 tok/s. One-step profiling points to Q4/Q8 and generic E_2_4 costs, but does not prove full gap attribution. No broad parity claim.",
+      "latest_master_merge_audit_2026_10_25": {
+        "master": "d16046fb5893f6ba14643fb4115df5a30d59e101",
+        "branch_ahead_behind": {"ahead": 177, "behind": 6},
+        "merge_attempt": "Aborted after conflicts in test/device/amd/test_llm.py, tinygrad/llm/kernels/amd.py, and tinygrad/llm/model.py. Candidate tree is clean at 0b5a39a95; no PR or emulator-checkout changes.",
+        "decision": "Do not force-resolve the shared amd.py conflict as a single side. First identify which generic rangeify/gater fixes should be integrated separately and how to preserve upstream CDNA behavior alongside the RDNA3-specific kernel path."
+      }
     }
   }
 }
