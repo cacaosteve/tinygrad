@@ -2,8 +2,8 @@
   "date": "2026-10-25",
   "source_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
   "upstream_master": "d16046fb5893f6ba14643fb4115df5a30d59e101",
-  "status": "The pushed GQA state-budget change passes the serial gfx1100 hardware suite and the focused symbolic GQA decode retest. A fresh paired Qwen3 Coder 30B natural-prompt comparison matched all 32 generated token IDs; DIRECT decode throughput was about 17.6% below HIP while prefill was about 1.95x faster. A one-step VIZ profile found extra DIRECT time in Q4 MoE, Q8 quantization, and generic E_2_4 kernels; attribution is suggestive, not proof of a single root cause. Repeated matrix tests still show Q6_K T16 and IQ4_XS T1 outside the 10% HIP target. Current master advanced six commits; a full merge was attempted and cleanly aborted after conflicts exposed shared AMD-kernel overlap, with no merge changes left in the worktree. These model results are workload-specific, not a universal parity claim. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
-  "candidate_state": "Code tip 44e769cdaceb56004b077ca1ef040226ac4321f9 and validation notes through 0b5a39a95 are committed to and pushed on the personal fork. The gaming PC is currently reachable; lspci reports Navi31 PCI 1002:744c and tinygrad reports gfx1100. The focused symbolic GQA decode retest passes. Both isolated remote test checkouts are clean and synced to 0b5a39a95. The full master merge is not present in this branch; its conflict was aborted with the candidate tree restored. Emulator checkout/sources were not touched. No PR is open.",
+  "status": "The pushed GQA state-budget change passes the serial gfx1100 hardware suite and focused symbolic GQA decode retest. A fresh paired Qwen3 Coder 30B natural-prompt comparison matched all 32 generated token IDs; DIRECT decode throughput was about 17.6% below HIP while prefill was about 1.95x faster. A fresh order-balanced matrix reconfirmed Q6_K T16 at 1.257x HIP and IQ4_XS T1 at 1.194x HIP, both independently reference-correct. A one-step VIZ profile found extra DIRECT time in Q4 MoE, Q8 quantization, and generic E_2_4 kernels; attribution is suggestive, not proof of a single root cause. Current master advanced six commits; a full merge was attempted and cleanly aborted after conflicts exposed shared AMD-kernel overlap, with no merge changes left in the worktree. These model results are workload-specific, not a universal parity claim. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
+  "candidate_state": "RDNA3 code tip 44e769cdaceb56004b077ca1ef040226ac4321f9 is committed to and pushed on the personal fork; the latest validation/integration notes are also pushed. The gaming PC is currently reachable; lspci reports Navi31 PCI 1002:744c and tinygrad reports gfx1100. Focused symbolic GQA tests and the order-balanced Q6/IQ4 matrix pass correctness. Both isolated remote test checkouts were clean at the same code tip when checked. The full master merge is not present in this branch; its conflict was aborted with the candidate tree restored. Emulator checkout/sources were not touched. No PR is open.",
   "constraints": {
     "pull_request_opened": false,
     "branch_pushed": true,
@@ -980,6 +980,29 @@
         "branch_ahead_behind": {"ahead": 177, "behind": 6},
         "merge_attempt": "Aborted after conflicts in test/device/amd/test_llm.py, tinygrad/llm/kernels/amd.py, and tinygrad/llm/model.py. Candidate tree is clean at 0b5a39a95; no PR or emulator-checkout changes.",
         "decision": "Do not force-resolve the shared amd.py conflict as a single side. First identify which generic rangeify/gater fixes should be integrated separately and how to preserve upstream CDNA behavior alongside the RDNA3-specific kernel path."
+      },
+      "focused_quant_matrix_2026_10_25": {
+        "source_code_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
+        "method": "Fresh DIRECT/HIP/HIP/DIRECT child-process order, 60 synchronized TinyJit samples per child; extra/rdna3_backend_matrix.py GEMV path with independent NumPy reference before and after timing.",
+        "device": "gfx1100 / PCI 1002:744c",
+        "q6_k_gemv_4096x4096_t16": {
+          "direct_sample_medians_us": [180.0855, 181.531],
+          "hip_sample_medians_us": [143.6855, 143.8855],
+          "direct_combined_us": 180.80825,
+          "hip_combined_us": 143.7855,
+          "direct_over_hip": 1.2575,
+          "all_finite_and_reference_correct": true,
+          "max_abs_err": {"direct": 0.00024414, "hip": 0.00024414}
+        },
+        "iq4_xs_gemv_8192x2048_t1": {
+          "direct_sample_medians_us": [121.51, 118.0905],
+          "hip_sample_medians_us": [100.9805, 99.7],
+          "direct_combined_us": 119.80025,
+          "hip_combined_us": 100.34025,
+          "direct_over_hip": 1.1939,
+          "all_finite_and_reference_correct": true,
+          "max_abs_err": {"direct": 0.00106812, "hip": 0.00109863}
+        }
       }
     }
   }
