@@ -1,9 +1,9 @@
 {
-  "date": "2026-10-24",
+  "date": "2026-10-25",
   "source_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
   "upstream_master": "b388f0c24a84b3ecc6eb65c7f071891c5c21c30e",
-  "status": "Fresh gfx1100 hardware, NULL/CPU, Ruff, and mypy gates pass. The 2026-10-24 GQA state-budget change passed the serial hardware suite and reduced direct attention dispatch fanout. A paired Qwen3 Coder 30B synthetic prompt run now has matching DIRECT/HIP tokens and nearly equal decode (83.196 vs 82.054 tok/s); the natural-prompt repeat was interrupted when the gaming PC became unreachable. Repeated tests still show Q6_K T16 and IQ4_XS T1 outside the 10% HIP target. Full-model performance is workload-sensitive; these single runs are directional, not a universal parity claim. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
-  "candidate_state": "Product tip 44e769cdaceb56004b077ca1ef040226ac4321f9 is committed to and pushed on the personal fork. The gaming PC was confirmed as Navi31/gfx1100, then became unreachable during a natural-prompt benchmark. The isolated remote test checkout still has the equivalent GQA patch uncommitted plus owned diagnostic/snapshot files under extra/; remove those exact temporary changes/files when the host returns. Local product source matches the pushed branch. Emulator sources were not modified. No PR is open.",
+  "status": "The pushed GQA state-budget change passes the serial gfx1100 hardware suite and the focused symbolic GQA decode retest. A fresh paired Qwen3 Coder 30B natural-prompt comparison matched all 32 generated token IDs; DIRECT decode throughput was about 17.6% below HIP while prefill was about 1.95x faster. A one-step VIZ profile found extra DIRECT time in Q4 MoE, Q8 quantization, and generic E_2_4 kernels; attribution is suggestive, not proof of a single root cause. Repeated matrix tests still show Q6_K T16 and IQ4_XS T1 outside the 10% HIP target. These model results are workload-specific, not a universal parity claim. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
+  "candidate_state": "Code tip 44e769cdaceb56004b077ca1ef040226ac4321f9 and validation notes through 8749d5a61 are committed to and pushed on the personal fork. The gaming PC is currently reachable; lspci reports Navi31 PCI 1002:744c and tinygrad reports gfx1100. The focused symbolic GQA decode retest passes. Both isolated remote test checkouts are now clean and synced to 8749d5a61; only our generated multi-gigabyte VIZ profiles and exact GQA snapshot/temp scripts were removed. Emulator sources were not modified. No PR is open.",
   "constraints": {
     "pull_request_opened": false,
     "branch_pushed": true,
@@ -920,7 +920,53 @@
         "all_17_returned_token_ids_match": true,
         "note": "One paired run using extra/benchmark_llm.py and the numeric synthetic prompt. Decode is essentially tied; the repetitive continuation makes this directional, not a natural-language model-quality benchmark."
       },
-      "natural_prompt_rerun": "Started with the exact saved 10-token prompt, but the host became unreachable before model load/warmup completed; no timing or output was collected."
+      "natural_prompt_rerun_2026_10_25": {
+        "prompt": "Write a short Python function that adds two integers.",
+        "prompt_tokens": 10,
+        "generated_token_ids": 32,
+        "all_direct_hip_token_ids_match": true,
+        "pair_order": "DIRECT/HIP, then HIP/DIRECT in a fresh repeat",
+        "direct": {
+          "decode_tps_samples": [104.974, 104.865],
+          "decode_tps_median": 104.919,
+          "prefill_tps_samples": [174.878, 172.260],
+          "prefill_tps_median": 173.569
+        },
+        "hip": {
+          "decode_tps_samples": [127.485, 127.158],
+          "decode_tps_median": 127.321,
+          "prefill_tps_samples": [88.823, 89.341],
+          "prefill_tps_median": 89.082
+        },
+        "interpretation": "DIRECT decode throughput is about 17.6% lower (about 1.21x HIP latency); DIRECT prefill throughput is about 1.95x HIP. Same prompt and exact output IDs in both backends. This is model-level throughput on one prompt, not isolated attention timing or a broad workload result."
+      },
+      "focused_retest_2026_10_25": {
+        "device": "Navi31 PCI 1002:744c; tinygrad AMDDevice arch gfx1100",
+        "command": "DEV=AMD:AMD python -m pytest test/device/amd/test_llm.py -x -q -k 'flash_attention_decode_gqa_state_budget or flash_attention_decode_symbolic_gqa or flash_attention_decode_large_gqa_group'",
+        "result": "3 passed, 73 deselected, 4 subtests in 25.58s"
+      },
+      "one_natural_decode_step_viz_profile": {
+        "method": "VIZ capture around one natural-prompt model decode step on the candidate DIRECT and HIP paths; per-kernel GPU intervals summed by kernel name. Diagnostic profile, not synchronized wall throughput.",
+        "direct_gpu_ms_and_calls": {
+          "moe_q4_k": [1.430, 120],
+          "linear_q4_k": [1.172, 168],
+          "q8_quantize": [0.543, 337],
+          "linear_q6": [0.325, 25],
+          "moe_q6": [0.431, 24],
+          "flash_decode_partial": [0.726, 48],
+          "flash_decode_combine": [0.068, 48],
+          "E_2_4": [0.732, 96]
+        },
+        "hip_gpu_ms_and_calls": {
+          "moe_q4_k": [1.191, 120],
+          "linear_q4_k": [0.934, 168],
+          "q8_quantize": [0.502, 337],
+          "linear_q6": [0.374, 25],
+          "moe_q6": [0.365, 24],
+          "E_2_4": [0.222, 96]
+        },
+        "note": "Q4 paths add about 0.48 ms, Q8 quantization about 0.04 ms, and E_2_4 about 0.51 ms in this captured step. DIRECT flash partial/combine sum to about 0.79 ms; HIP uses different kernel names, so this profile is not a direct one-to-one attribution. E_2_4's AST semantics remain unidentified; map it before optimizing."
+      }
     },
     "scope_and_remaining_gaps": {
       "counted_tinygrad_lines": 32063,
@@ -928,7 +974,7 @@
       "size_gate_note": "MAX_LINE_COUNT=26500 is an explicit local override; sz.py defaults to no line cap. Current additions are primarily RDNA3 renderer/scheduler/TC/VOPD modules plus AMD kernel and shared-code changes.",
       "master_delta": "Branch is 160 commits ahead and 1 behind fetched origin/master. The one newer master commit is emulator-only and was not merged because emulator work is on hold.",
       "github_ci": "gh run list returned no workflow runs for this personal-fork branch; no PR was opened.",
-      "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 remain outside the 10% HIP-gap target. The RDNA3 DIRECT dynamic MoE path still has the recorded strong prefill result (544.220 tok/s vs HIP 131.263 on the earlier prompt-128/32-token run). The post-GQA paired prompt-128/16-token run measures DIRECT/HIP decode at 83.196/82.054 tok/s with all returned token IDs matching; this supersedes the earlier decode comparison only for that exact run, not as a broad parity claim. The 10-token natural-prompt recheck was interrupted by host loss, and the older 32-token natural prompt matched exactly before this change."
+      "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 remain outside the 10% HIP-gap target. The RDNA3 DIRECT dynamic MoE path has a strong earlier prompt-128/32-token prefill result (544.220 tok/s vs HIP 131.263). The 2026-10-25 paired natural Qwen3 Coder 30B prompt matches all 32 returned token IDs: DIRECT decode 104.919 vs HIP 127.321 tok/s and prefill 173.569 vs HIP 89.082 tok/s. One-step profiling points to Q4/Q8 and generic E_2_4 costs, but does not prove full gap attribution. No broad parity claim."
     }
   }
 }
