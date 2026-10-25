@@ -2,7 +2,7 @@
   "date": "2026-10-25",
   "source_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
   "upstream_master": "d16046fb5893f6ba14643fb4115df5a30d59e101",
-  "status": "The pushed GQA state-budget change passes the serial gfx1100 hardware suite and focused symbolic GQA decode retest. A fresh paired Qwen3 Coder 30B natural-prompt comparison matched all 32 generated token IDs; DIRECT decode throughput was about 17.6% below HIP while prefill was about 1.95x faster. A fresh order-balanced matrix reconfirmed Q6_K T16 at 1.257x HIP and IQ4_XS T1 at 1.194x HIP, both independently reference-correct. A one-step VIZ profile found extra DIRECT time in Q4 MoE, Q8 quantization, and generic E_2_4 kernels; attribution is suggestive, not proof of a single root cause. Current master advanced six commits; a full merge was attempted and cleanly aborted after conflicts exposed shared AMD-kernel overlap, with no merge changes left in the worktree. These model results are workload-specific, not a universal parity claim. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
+  "status": "The pushed GQA state-budget change passes a fresh full serial gfx1100 suite (900 passed, 1 skipped, 429 subtests) and focused symbolic GQA decode retest. A fresh paired Qwen3 Coder 30B natural-prompt comparison matched all 32 generated token IDs; DIRECT decode throughput was about 17.6% below HIP while prefill was about 1.95x faster. A fresh order-balanced matrix reconfirmed Q6_K T16 at 1.257x HIP and IQ4_XS T1 at 1.194x HIP, both independently reference-correct. A one-step VIZ profile found extra DIRECT time in Q4 MoE, Q8 quantization, and generic E_2_4 kernels; attribution is suggestive, not proof of a single root cause. Current master advanced six commits; a full merge was attempted and cleanly aborted after conflicts exposed shared AMD-kernel overlap, with no merge changes left in the worktree. These model results are workload-specific, not a universal parity claim. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
   "candidate_state": "RDNA3 code tip 44e769cdaceb56004b077ca1ef040226ac4321f9 is committed to and pushed on the personal fork; the latest validation/integration notes are also pushed. The gaming PC is currently reachable; lspci reports Navi31 PCI 1002:744c and tinygrad reports gfx1100. Focused symbolic GQA tests and the order-balanced Q6/IQ4 matrix pass correctness. Both isolated remote test checkouts were clean at the same code tip when checked. The full master merge is not present in this branch; its conflict was aborted with the candidate tree restored. Emulator checkout/sources were not touched. No PR is open.",
   "constraints": {
     "pull_request_opened": false,
@@ -944,6 +944,12 @@
         "device": "Navi31 PCI 1002:744c; tinygrad AMDDevice arch gfx1100",
         "command": "DEV=AMD:AMD python -m pytest test/device/amd/test_llm.py -x -q -k 'flash_attention_decode_gqa_state_budget or flash_attention_decode_symbolic_gqa or flash_attention_decode_large_gqa_group'",
         "result": "3 passed, 73 deselected, 4 subtests in 25.58s"
+      },
+      "full_serial_hardware_retest_2026_10_25": {
+        "source_code_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
+        "command": "DEV=AMD:AMD AMD_SOFT_SYSFS=1 python -m pytest test/amd/hw test/device/amd/test_llm.py -x -q",
+        "device": "gfx1100 / PCI 1002:744c",
+        "result": {"passed": 900, "skipped": 1, "subtests": 429, "seconds": 191.06, "exit_code": 0}
       },
       "one_natural_decode_step_viz_profile": {
         "method": "VIZ capture around one natural-prompt model decode step on the candidate DIRECT and HIP paths; per-kernel GPU intervals summed by kernel name. Diagnostic profile, not synchronized wall throughput.",
