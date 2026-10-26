@@ -578,7 +578,7 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
     assert isinstance(ast.arg, KernelInfo), "requires KernelInfo on arg to to_program"
     stage_st = time.perf_counter_ns()
     ast = graph_rewrite(ast, pm_lower_calls, ctx=renderer, name="lower calls", walk=True)
-    full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.arg is None or not ast.arg.optimized)
+    full_sink = full_rewrite_to_sink(ast, renderer, optimize=not ast.arg.optimized)
     if compile_timing: timings["rewrite_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
     # Opt-in: schedule later WMMA groups' loads after prior WMMA (flash latency hide).
     hints = getattr(ast.arg, "schedule_hints", ())
