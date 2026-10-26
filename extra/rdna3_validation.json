@@ -2,7 +2,7 @@
   "date": "2026-10-25",
   "source_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
   "upstream_master": "eed5bc2ab9e1bdd83477e3a5e95c064e6fb8b15e",
-  "status": "The candidate has been integrated with origin/master eed5bc2ab and passes the serial gfx1100 AMD hardware/LLM suite (900 passed, 1 skipped, 429 subtests), CPU/UOp/LLM regressions (788 passed, 9 skipped, 2 xfailed, 169 subtests), Ruff, and mypy (222 files). The paired kernel matrix is correct, but DIRECT remains >10% slower than HIP on decode, half matmul, IQ4, and Q6 multi-token GEMV. A post-merge Qwen3 30B synthetic-prompt smoke matches 33 output IDs and shows strong MoE prefill, but is only one run. Important PR blocker: upstream .github/workflows/test.yml enforces MAX_LINE_COUNT=26500; current sz.py count is 32083, 5583 over the gate. GitHub Actions is disabled on the personal fork, so manual CI dispatch is unavailable. No PR has been opened.",
+  "status": "The candidate has been integrated with origin/master eed5bc2ab and passes the serial gfx1100 AMD hardware/LLM suite (900 passed, 1 skipped, 429 subtests), CPU/UOp/LLM regressions (788 passed, 9 skipped, 2 xfailed, 169 subtests), Ruff, and mypy (222 files). The paired kernel matrix is correct, but DIRECT remains >10% slower than HIP on decode, half matmul, IQ4, and Q6 multi-token GEMV. Qwen3 30B synthetic MoE prefill is strong; Llama 3.2 1B is throughput-competitive but differed from HIP by two punctuation tokens consistently, so token-exact model parity is not established. Important PR blocker: upstream .github/workflows/test.yml enforces MAX_LINE_COUNT=26500; current sz.py count is 32083, 5583 over the gate. GitHub Actions is disabled on the personal fork, so manual CI dispatch is unavailable. No PR has been opened.",
   "candidate_state": "The candidate branch now contains a validated merge of origin/master eed5bc2ab plus the RDNA3 source tip 44e769cdaceb56004b077ca1ef040226ac4321f9. Validation ran on Navi31 PCI 1002:744c (gfx1100); Ruff and mypy pass. The emulator checkout/sources were not touched. No PR is open.",
   "constraints": {
     "pull_request_opened": false,
@@ -1012,6 +1012,21 @@
       "hip": {"load_s": 30.558, "warm_s": 152.393, "prefill_tps": 129.064, "decode_tps": 101.420},
       "outputs": {"direct": [220, 16, 15], "hip": [220, 16, 15], "all_33_token_ids_match": true},
       "interpretation": "DIRECT is ~4.08x faster on this synthetic MoE-heavy prefill and ~4% faster on decode in this single run. The repetitive output and one-sided run order make this a correctness/integration smoke and directional result, not a natural-prompt or broad model-performance claim."
+    },
+    "post_master_llama32_1b_smoke_2026_10_25": {
+      "source_merge_commit": "383b994fae2bf6edb9357e73dd92cab6168bd101",
+      "model": "Llama 3.2 1B Instruct Q6_K, Ollama GGUF blob sha256-74701a8c35f6c8d9a4b91f3f3497643001d63e0c7a84e085bed452548fa88d45",
+      "device": "gfx1100 / PCI 1002:744c",
+      "method": "extra/benchmark_llm.py, synthetic 128-token prompt, 32 generated tokens, max_context=512, chunk_size=32; two repeated runs per backend in DIRECT/HIP order.",
+      "direct": {"prefill_tps_samples": [1991.082, 2016.613], "decode_tps_samples": [260.367, 259.998]},
+      "hip": {"prefill_tps_samples": [2113.198, 2109.354], "decode_tps_samples": [208.792, 208.542]},
+      "outputs": {
+        "direct": [76, 198, 322, 220, 16, 13, 220, 19127, 279, 1988, 323, 2612, 7482, 627, 322, 220, 17, 13, 220, 19127, 279, 1988, 323, 2612, 18893, 627, 322, 220, 18, 13, 220, 19127, 279],
+        "hip": [76, 198, 322, 220, 16, 13, 220, 19127, 279, 1988, 323, 2612, 7482, 198, 322, 220, 17, 13, 220, 19127, 279, 1988, 323, 2612, 18893, 198, 322, 220, 18, 13, 220, 19127, 279],
+        "mismatch_indices": [13, 25],
+        "replay": "Each backend reproduced its same token sequence on the second run. The two mismatches are token 627 ('.\\n') on DIRECT versus 198 ('\\n') on HIP; remaining 31 output IDs match."
+      },
+      "interpretation": "DIRECT prefill throughput is ~5% higher and decode throughput ~25% higher in these paired repeats. Text differs only by two punctuation tokens in this synthetic completion, but strict token-exact model parity is false; broader/natural prompt evaluation is still needed."
     },
     "post_master_q6_wmma_interleave_probe_2026_10_25": {
       "source_merge_commit": "383b994fae2bf6edb9357e73dd92cab6168bd101",
