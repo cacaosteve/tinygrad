@@ -877,7 +877,7 @@ def _vec_load_half(ptr:UOp, lanes:int) -> tuple[UOp, ...]:
   return tuple(vec[i] if vec[i].dtype is dtypes.half else vec[i].cast(dtypes.half) for i in range(lanes))
 
 @functools.cache
-def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4):
+def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4, score_batch=4):
   valid_kv_len = _unbind(valid_kv_len)
   _, B, H_KV, N, D = cast(tuple[int, int, int, int, int], cache_kv.shape)
   _, H, M, _ = cast(tuple[int, int, int, int], q.shape)
@@ -895,8 +895,7 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   # Each block scans every PARTIALS-th chunk, keeping an online softmax across rounds.
   chunk_round = UOp.range((total_chunks-1-block_chunk)//PARTIALS+1, 4, AxisType.LOOP)
   chunk_id = block_chunk + chunk_round*PARTIALS
-  # Batch four keys so independent reductions share swizzle/permlane stages without over-expanding live state.
-  score_batch = 4
+  # Batch independent keys so reductions share swizzle/permlane stages without over-expanding live state.
   # A finite initial max keeps fully masked waves from computing exp(-inf - -inf).
   acc_reg, max_reg, sum_reg = _reg((G, DPL), 2, 0), _reg((G,), 3, -1e30), _reg((G,), 4, 0)
   prev_acc, prev_max, prev_sum = acc_reg.after(chunk_round), max_reg.after(chunk_round), sum_reg.after(chunk_round)
@@ -1123,8 +1122,10 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   assert block_n % waves == 0
   while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
+  # Smaller score batches reduce DIRECT decode latency on Navi31; keep HIP/RDNA4 defaults.
+  score_batch = 2 if amd_direct_isa(q.device) and not _is_rdna4(q.device) else 4
   fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len,
-                          block_n=block_n, waves=waves)
+                          block_n=block_n, waves=waves, score_batch=score_batch)
   fxn = functools.partial(_flash_kernel, fxn)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len + block_n - 1) // block_n

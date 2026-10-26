@@ -1,5 +1,5 @@
 {
-  "date": "2026-10-25",
+  "date": "2026-10-26",
   "source_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
   "upstream_master": "c10034fc2f507db94833b656e86250565c0086dd",
   "status": "The candidate is merged through origin/master c10034fc2 and passes the latest serial RX 7900/gfx1100 suite (835 passed, 96 skipped, 53 subtests), focused UOp/isel tests (86 passed, 3 skipped, 1 xfailed, 2 subtests), Ruff, and mypy (222 files). Earlier CPU/UOp/LLM regressions also passed. Batched quant WMMA testing found Q4/Q5 near HIP at T16/T32 but 24–36% slower at T64, while IQ4/Q8 are 26–62% slower for T16/T32/T64. Decode, half matmul, and Q6 multi-token also remain >10% slower than HIP. Qwen3 30B natural prompt output matched 32 tokens; Llama 3.2 1B Q6 synthetic output differed from HIP by two punctuation tokens, so token-exact model parity is not established broadly. The upstream .github/workflows/test.yml size gate still fails: 32,083 lines versus 26,500 (5,583 over). GitHub Actions is disabled on the personal fork, so manual CI dispatch is unavailable. No PR has been opened.",
@@ -8,6 +8,52 @@
     "pull_request_opened": false,
     "branch_pushed": true,
     "emulator_sources_modified": false
+  },
+  "flash_decode_followup_2026_10_26": {
+    "measured_source_commit_before_change": "fc0fbabcc",
+    "hardware": "RX 7900-class Navi31 / gfx1100, PCI 1002:744c",
+    "method": "Fresh-process direct/HIP flash decode on the same 32-head, GQA4, D128, 2048-KV fixture; 80 synchronized TinyJit samples per child, independent NumPy reference checks before and after timing.",
+    "score_batch_4_baseline": {
+      "direct_medians_us": [125.079, 126.8695],
+      "hip_medians_us": [112.789, 113.6795],
+      "direct_mean_us": 125.97425,
+      "hip_mean_us": 113.23425,
+      "direct_over_hip": 1.1125
+    },
+    "score_batch_2_trial": {
+      "direct_medians_us": [121.6345, 123.3795],
+      "hip_medians_us": [112.6595, 110.6295],
+      "direct_mean_us": 122.507,
+      "hip_mean_us": 111.6445,
+      "direct_over_hip_shared_trial": 1.0973,
+      "all_runs_finite_and_reference_correct": true,
+      "reference_max_abs_error": 0.00005388,
+      "focused_decode_tests": {
+        "DEV=AMD:AMD": "10 passed, 66 deselected, 10 subtests passed",
+        "DEV=AMD": "8 passed, 2 skipped, 66 deselected, 6 subtests passed"
+      }
+    },
+    "final_candidate_direct_ab": {
+      "method": "Alternating baseline score_batch=4 and exact candidate score_batch=2 in fresh child processes; 80 synchronized samples per child. Then two HIP score_batch=4 children.",
+      "direct_batch_4_medians_us": [128.9995, 125.555],
+      "direct_batch_2_medians_us": [122.67, 122.6245],
+      "direct_mean_us_batch_4": 127.27725,
+      "direct_mean_us_batch_2": 122.64725,
+      "direct_latency_reduction_pct": 3.64,
+      "hip_batch_4_medians_us": [113.25, 110.885],
+      "hip_mean_us": 112.0675,
+      "direct_over_hip_batch_4": 1.1357,
+      "direct_over_hip_batch_2": 1.0944,
+      "all_runs_finite_and_reference_correct": true,
+      "reference_max_abs_error": 0.00005388
+    },
+    "waves_4_trial": {
+      "direct_median_us": 127.484,
+      "score_batch_4_direct_mean_us": 127.354,
+      "reference_correct": true,
+      "decision": "No win; leave waves at 8."
+    },
+    "decision": "Specialize score_batch=2 for RDNA3 DIRECT only; preserve score_batch=4 for HIP, RDNA4, and CDNA. Against the same-session HIP score_batch=4 mean, DIRECT score_batch=2 is 1.0818x latency (about 8.2% slower), versus the baseline's 1.1125x. This is one synthetic decode fixture, not a broad model-parity claim."
   },
   "hardware": {
     "arch": "gfx1100",
