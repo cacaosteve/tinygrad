@@ -550,6 +550,12 @@
       "same_session_reference_checked_baseline_us": {"direct": 252.001, "hip": 188.477},
       "decision": "This group count is structurally incompatible with the current RDNA3 WMMA stack layout; do not keep the change or infer a performance result. A different kernel-layout/WMMA representation would be required."
     },
+    "q6_t64_mixed_dequant_single_tile_trial": {
+      "source_commit": "9364c0ffe",
+      "setup": "Isolated detached worktree; retain the validated mixed-Q6 dequant arithmetic but use one 64-token WMMA tile at T64 instead of two 32-token tiles. No trial code was copied into the candidate.",
+      "result": "Independent NumPy reference failed before timing with max absolute error about 4553.48; no latency was measured.",
+      "decision": "Reject a single 64-token T64 tile with the current RDNA3 Q6 layout. Together with the two-output-tile failure, this points to a layout/codegen correctness constraint; keep the validated two-32-token-tile layout."
+    },
     "interpretation": "DIRECT beats HIP on flash prefill and is within 10% on ordinary Q4/Q5/Q6/Q8 single-token GEMV. Remaining measured >10% gaps are flash decode (+16%), IQ4_XS GEMV (+21%), Q6_K WMMA multi-token (+22–32%), and half matmul (+9.7%, near the bar). AMDLLVM is much slower on quantized GEMV/flash; half matmul is its small win. This is a bounded suite, not universal workload coverage.",
     "q6_t64_two_output_tiles_trial": {
       "setup": "Isolated detached worktree; force output_tiles=2 for direct Q6_K only at T64. No trial code copied into the branch.",
