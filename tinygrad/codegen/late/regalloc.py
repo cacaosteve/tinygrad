@@ -341,7 +341,7 @@ def regalloc_rewrite(ctx:LinearScanRegallocContext, x:UOp):
     return x.replace(src=(retag(x.src[0],r),*x.src[1:])) if x.op in {Ops.AFTER, Ops.BITCAST} else with_regs(x, (r,))
   for j,s in enumerate(x.src):
     # v here is the virtual defined by the original s as s is the rewritten version
-    if i in ctx.reals and (v:=rdef(ctx.uops[i].src[j])) in ctx.reals.get(i, {}):
+    if (v:=rdef(ctx.uops[i].src[j])) in ctx.reals.get(i, {}):
       reg = replace(ctx.reals[i][v], size=v.size)
       if v in ctx.spills: nsrc.append(ctx.ren.fill(ctx.spills[v], ctx.vdef(v), reg))
       else: nsrc.append(retag(s, reg))

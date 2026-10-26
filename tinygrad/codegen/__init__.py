@@ -572,11 +572,11 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   """
   compile_timing, timings = getenv("COMPILE_TIMING", 0), {}
   total_st = time.perf_counter_ns()
+  if VIZ: graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
   if ast.op is Ops.PROGRAM: prg = ast
   elif ast.op is Ops.SINK:
     assert isinstance(ast.arg, KernelInfo), "requires KernelInfo on arg to to_program"
     stage_st = time.perf_counter_ns()
-    if VIZ: graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
     ast = graph_rewrite(ast, pm_lower_calls, ctx=renderer, name="lower calls", walk=True)
     full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.arg is None or not ast.arg.optimized)
     if compile_timing: timings["rewrite_ms"] = (time.perf_counter_ns() - stage_st) / 1e6
