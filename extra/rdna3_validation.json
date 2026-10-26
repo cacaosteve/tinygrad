@@ -1,8 +1,8 @@
 {
   "date": "2026-10-25",
   "source_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
-  "upstream_master": "d16046fb5893f6ba14643fb4115df5a30d59e101",
-  "status": "The pushed GQA state-budget change passes a fresh full serial gfx1100 suite (900 passed, 1 skipped, 429 subtests) and focused symbolic GQA decode retest. A fresh paired Qwen3 Coder 30B natural-prompt comparison matched all 32 generated token IDs; DIRECT decode throughput was about 17.6% below HIP while prefill was about 1.95x faster. A fresh order-balanced matrix reconfirmed Q6_K T16 at 1.257x HIP and IQ4_XS T1 at 1.194x HIP, both independently reference-correct. A one-step VIZ profile found extra DIRECT time in Q4 MoE, Q8 quantization, and generic E_2_4 kernels; attribution is suggestive, not proof of a single root cause. Current master advanced six commits; a full merge was attempted and cleanly aborted after conflicts exposed shared AMD-kernel overlap. Gabriel's newest reg_memory branch is a useful register-ALLOC design lead but remains incomplete and contains no RDNA3 work. These model results are workload-specific, not a universal parity claim. The 26,500-line limit below was a local explicit override, not sz.py's default or an established upstream gate. No official CI run is attached to this fork branch.",
+  "upstream_master": "015a9bea51dba69b2789bfa886013e9cf2c38203",
+  "status": "The pushed GQA state-budget change passes a fresh full serial gfx1100 suite (900 passed, 1 skipped, 429 subtests). The refreshed three-backend matrix is correct against independent references: DIRECT beats HIP on 32-token flash prefill (269 vs 333 us), is within 8–20% on most single-token quant GEMVs, but trails by 14% on flash decode, 13% on half matmul, and 20% on IQ4. Q6 multi-token WMMA remains the clearest measured gap at 26–32% slower than HIP for T16/T32/T64. A T64-wide tile experiment failed half the output and was reverted. The paired Qwen3 Coder 30B natural-prompt comparison still matches all 32 generated token IDs; DIRECT decode throughput was about 17.6% below HIP while prefill was about 1.95x faster. Current master is 015a9bea5; the branch is 181 commits ahead and 8 behind it. The earlier merge trial exposed shared AMD-kernel/model conflicts and remains unresolved. Gabriel's newest reg_memory branch is a register-ALLOC design lead but has no RDNA3 work and is not a safe cherry-pick. These workload results do not establish universal parity. The 26,500-line limit below was a local explicit override, not sz.py's default or an upstream gate. No official CI run is attached to this fork branch.",
   "candidate_state": "RDNA3 code tip 44e769cdaceb56004b077ca1ef040226ac4321f9 is committed to and pushed on the personal fork; the latest validation/integration notes are also pushed. The gaming PC is currently reachable; lspci reports Navi31 PCI 1002:744c and tinygrad reports gfx1100. Focused symbolic GQA tests and the order-balanced Q6/IQ4 matrix pass correctness. Both isolated remote test checkouts were clean at the same code tip when checked. The full master merge is not present in this branch; its conflict was aborted with the candidate tree restored. Emulator checkout/sources were not touched. No PR is open.",
   "constraints": {
     "pull_request_opened": false,
@@ -616,14 +616,14 @@
     "compile_profile": "Large Q6 compile ~1029 ms after cleanup; estimates ~22 ms, rewrite ~608 ms. Estimates alone are not the dominant cold-compile bottleneck."
   },
   "current_validation": {
-    "tested_tip": "7b88de7ad62e0a782b31fc3b4ca0167d048985bf",
+    "tested_tip": "0b5a39a95 (isolated remote test checkout; product source 44e769cda)",
     "hardware": {
       "device": "Navi31 / gfx1100, PCI 1002:744c",
       "suite": "DEV=AMD:AMD pytest test/amd/hw test/device/amd/test_llm.py -x -q",
-      "passed": 898,
+      "passed": 900,
       "skipped": 1,
-      "subtests": 425,
-      "seconds": 163.31
+      "subtests": 429,
+      "seconds": 194.48
     },
     "hardware_retest_2026_10_24": {
       "command": "AMD_SOFT_SYSFS=1 DEV=AMD:AMD pytest test/amd/hw test/device/amd/test_llm.py -x -q",
@@ -689,17 +689,26 @@
     },
     "paired_backend_matrix_median_us": {
       "method": "Current extra/rdna3_backend_matrix.py on gfx1100; direct/LLVM/HIP independent NumPy references passed. Ratios below are DIRECT/HIP.",
-      "flash_prefill": {"direct": 268.466, "hip": 335.231, "ratio": 0.801},
-      "flash_decode": {"direct": 117.846, "hip": 112.571, "ratio": 1.047},
-      "half_matmul_2048": {"direct": 301.831, "hip": 286.025, "ratio": 1.055},
-      "q4_k_gemv_t1": {"direct": 103.026, "hip": 98.410, "ratio": 1.047},
-      "q5_k_gemv_t1": {"direct": 105.905, "hip": 98.045, "ratio": 1.080},
-      "q6_k_gemv_t1": {"direct": 112.731, "hip": 106.986, "ratio": 1.054},
-      "iq4_xs_gemv_t1": {"direct": 116.051, "hip": 98.820, "ratio": 1.174},
-      "q8_0_gemv_t1": {"direct": 107.781, "hip": 104.805, "ratio": 1.028},
-      "q6_k_gemv_t16": {"direct": 166.611, "hip": 134.931, "ratio": 1.235},
-      "q6_k_gemv_t32": {"direct": 171.721, "hip": 154.016, "ratio": 1.115},
-      "q6_k_gemv_t64": {"direct": 205.466, "hip": 176.851, "ratio": 1.162}
+      "flash_prefill": {"direct": 268.869, "hip": 332.975, "ratio": 0.807},
+      "flash_decode": {"direct": 127.148, "hip": 111.264, "ratio": 1.143},
+      "half_matmul_2048": {"direct": 333.323, "hip": 296.030, "ratio": 1.126},
+      "q4_k_gemv_t1": {"direct": 107.525, "hip": 99.441, "ratio": 1.081},
+      "q5_k_gemv_t1": {"direct": 108.275, "hip": 98.986, "ratio": 1.094},
+      "q6_k_gemv_t1": {"direct": 121.305, "hip": 109.351, "ratio": 1.109},
+      "iq4_xs_gemv_t1": {"direct": 122.470, "hip": 102.236, "ratio": 1.198},
+      "q8_0_gemv_t1": {"direct": 109.387, "hip": 98.137, "ratio": 1.115},
+      "q6_k_gemv_t16": {"direct": 181.353, "hip": 144.138, "ratio": 1.258},
+      "q6_k_gemv_t32": {"direct": 205.493, "hip": 163.659, "ratio": 1.256},
+      "q6_k_gemv_t64": {"direct": 248.238, "hip": 188.089, "ratio": 1.320}
+    },
+    "q6_t16_resource_snapshot_2026_10_25": {
+      "method": "Parsed the compiled Q6 T16 kernel's AMD code-object descriptor on gfx1100; raw values are diagnostic and do not by themselves explain runtime.",
+      "direct": {"global_size": [128, 1, 1], "code_object_bytes": 2391, "private_segment_bytes": 0, "group_segment_bytes": 0, "rsrc1": "0x40bc000c"},
+      "hip": {"global_size": [64, 1, 1], "code_object_bytes": 7664, "private_segment_bytes": 0, "group_segment_bytes": 4096, "rsrc1": "0x40bf0090"}
+    },
+    "rejected_q6_t64_tile64_experiment_2026_10_25": {
+      "change": "Temporarily use one 64-token WMMA tile for the direct Q6 T64 case instead of the validated 32-token tiling.",
+      "result": "Independent NumPy reference failed: 131072/262144 elements (50%) violated tolerance; maximum absolute difference 4553.4824. The edit was reverted in both isolated checkouts; baseline Q6 results above remain unchanged."
     },
     "focused_order_balanced_repeat": {
       "method": "Two process-level medians per backend in DIRECT/HIP/HIP/DIRECT order; 80 synchronized TinyJit samples per process. DIRECT and HIP passed the independent reference.",
@@ -978,7 +987,7 @@
       "counted_tinygrad_lines": 32063,
       "counted_line_delta_vs_fetched_master": 6558,
       "size_gate_note": "MAX_LINE_COUNT=26500 is an explicit local override; sz.py defaults to no line cap. Current additions are primarily RDNA3 renderer/scheduler/TC/VOPD modules plus AMD kernel and shared-code changes.",
-      "master_delta": "Against origin/master d16046fb5, branch is 177 commits ahead and 6 behind. The six upstream commits since b388f0c24 include the generic rangeify store-hazard fix, gater cleanup, CDNA LLM support, GLM MLA updates, an RDMA barrier tweak, and emulator stats. A full merge was attempted and aborted without changing the candidate because shared AMD kernel/model files conflicted; the most substantial overlap is in tinygrad/llm/kernels/amd.py between RDNA3 DIRECT code and the newer CDNA WMMA/layout API. Needs narrow, tested integration before claiming current-master compatibility.",
+      "master_delta": "Against origin/master 015a9bea5, branch is 181 commits ahead and 8 behind. The upstream-only commits include the generic rangeify store-hazard fix, gater cleanup, CDNA LLM support, GLM MLA updates, RDMA barrier and emulator-stat changes, plus HCQ1 test cleanup and an x86 no-op touchup. A merge trial against d16046fb5 conflicted in test/device/amd/test_llm.py, tinygrad/llm/kernels/amd.py, and tinygrad/llm/model.py; no merge has been applied. Preserve the upstream CDNA kernel path while integrating the RDNA3-specific code before claiming current-master compatibility.",
       "github_ci": "gh run list returned no workflow runs for this personal-fork branch; no PR was opened.",
       "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 remain outside the 10% HIP-gap target. The RDNA3 DIRECT dynamic MoE path has a strong earlier prompt-128/32-token prefill result (544.220 tok/s vs HIP 131.263). The 2026-10-25 paired natural Qwen3 Coder 30B prompt matches all 32 returned token IDs: DIRECT decode 104.919 vs HIP 127.321 tok/s and prefill 173.569 vs HIP 89.082 tok/s. One-step profiling points to Q4/Q8 and generic E_2_4 costs, but does not prove full gap attribution. No broad parity claim.",
       "latest_master_merge_audit_2026_10_25": {
