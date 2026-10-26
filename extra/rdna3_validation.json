@@ -451,6 +451,30 @@
     "artifacts": "Gaming PC: rdna3-validation-results-20261017/resume-2-20261018/comgr71-gates-130724842/model-matrix.json; local: rdna3-validation-artifacts-20261018/resume2-comgr71-gates-130724842/",
     "soak_limit": "Actual combined source additionally passes 240 complete chunk32 and 120 complete chunk1024 generations with identical tokens, plus DIRECT/HIP queued/frozen flash replay. Reversed parent controls fail with drained queues/timeline regression; cache-policy bypass alone also fails. Gfx11 ring-side pre-fetch barrier fixes the tested corpus without bypass. This is bounded replay evidence, not proof of all workloads."
   },
+  "current_full_model_q8_smoke_2026_10_25": {
+    "measured_commit": "8e702bded",
+    "model": "Llama 3.2 1B Q8_0 GGUF",
+    "hardware": "RX 7900-class Navi 31, gfx1100, PCI 1002:744c",
+    "method": "1024 numeric prompt tokens, 17 generated token IDs (first token included in prefill, then 16 decode tokens), chunk size 128, max context 2048. Normal warmup before timing. Repeated process runs on the same source; three DIRECT and two HIP observations were captured. All observed outputs were identical.",
+    "median_throughput_tokens_per_second": {
+      "direct": {"prefill": 6285.347, "decode": 181.709},
+      "hip": {"prefill": 3785.4985, "decode": 88.0275},
+      "direct_over_hip": {"prefill": 1.6604, "decode": 2.0642}
+    },
+    "captured_run_values": {
+      "direct": [
+        {"prefill": 5691.165, "decode": 180.124},
+        {"prefill": 6285.347, "decode": 181.709},
+        {"prefill": 6295.790, "decode": 182.236}
+      ],
+      "hip": [
+        {"prefill": 3795.445, "decode": 87.820},
+        {"prefill": 3775.552, "decode": 88.235}
+      ]
+    },
+    "output_token_ids": [1023, 1024, 529, 1026, 1027, 1028, 1029, 1030, 1031, 1032, 1033, 1034, 1035, 1036, 1037, 1038, 1039],
+    "interpretation": "A useful Q8_0 end-to-end smoke on the latest merged source; it does not contradict the separate Q6_K model matrix, which still shows a DIRECT prefill deficit. This short numeric-prompt run is not broad model-quality or general parity evidence."
+  },
   "kfd_completion_events": {
     "commit": "cf95684e7",
     "physical_gate": "34 tests and 20 subtests passed after d9e42c45e, including fresh compute-first startup and six drained-event compute/copy wake checks. Without the wake fix all six checks return WAIT_RESULT_TIMEOUT; with it they return COMPLETE.",
