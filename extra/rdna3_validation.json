@@ -2,7 +2,7 @@
   "date": "2026-10-25",
   "source_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
   "upstream_master": "eed5bc2ab9e1bdd83477e3a5e95c064e6fb8b15e",
-  "status": "The candidate has now been integrated with origin/master eed5bc2ab in an isolated merge trial and fast-forwarded locally. On the RX 7900 XTX-class gfx1100, the merged tree passes the serial AMD hardware/LLM suite (900 passed, 1 skipped, 429 subtests), 788 CPU/UOp/LLM regressions (9 skipped, 2 xfailed, 169 subtests), Ruff, and mypy (222 files). The paired three-backend matrix remains reference-correct: DIRECT is ~19% faster than HIP on flash prefill, ~14% slower on decode, ~11% slower on half matmul, ~6–8% slower on Q4/Q5/Q6 single-token GEMV, ~22% slower on IQ4, and ~23–32% slower on Q6 multi-token GEMV. AMDLLVM is much slower on the specialized quantized GEMVs. This is not universal HIP/LLVM parity; Q6 multi-token, IQ4, and decode remain the clearest performance gaps. The 26,500-line limit below is a local explicit override, not sz.py's default or an upstream gate. No PR has been opened.",
+  "status": "The candidate has been integrated with origin/master eed5bc2ab and passes the serial gfx1100 AMD hardware/LLM suite (900 passed, 1 skipped, 429 subtests), CPU/UOp/LLM regressions (788 passed, 9 skipped, 2 xfailed, 169 subtests), Ruff, and mypy (222 files). The paired kernel matrix is correct, but DIRECT remains >10% slower than HIP on decode, half matmul, IQ4, and Q6 multi-token GEMV. A post-merge Qwen3 30B synthetic-prompt smoke matches 33 output IDs and shows strong MoE prefill, but is only one run. Important PR blocker: upstream .github/workflows/test.yml enforces MAX_LINE_COUNT=26500; current sz.py count is 32083, 5583 over the gate. GitHub Actions is disabled on the personal fork, so manual CI dispatch is unavailable. No PR has been opened.",
   "candidate_state": "The candidate branch now contains a validated merge of origin/master eed5bc2ab plus the RDNA3 source tip 44e769cdaceb56004b077ca1ef040226ac4321f9. Validation ran on Navi31 PCI 1002:744c (gfx1100); Ruff and mypy pass. The emulator checkout/sources were not touched. No PR is open.",
   "constraints": {
     "pull_request_opened": false,
@@ -1025,11 +1025,11 @@
       "decision": "Do not enable interleave for this path: T16 is within noise, while T32 is ~16% slower and T64 ~30% slower. Correctness is unchanged; the existing opt-in remains off by default."
     },
     "scope_and_remaining_gaps": {
-      "counted_tinygrad_lines": 32063,
-      "counted_line_delta_vs_fetched_master": 6558,
-      "size_gate_note": "MAX_LINE_COUNT=26500 is an explicit local override; sz.py defaults to no line cap. Current additions are primarily RDNA3 renderer/scheduler/TC/VOPD modules plus AMD kernel and shared-code changes.",
-      "master_delta": "Against origin/master eed5bc2ab, the validated merge commit 383b994fa is 183 commits ahead and 0 behind. It includes upstream rangeify/gater, CDNA LLM, GLM MLA, RDMA barrier, emulator stats, HCQ1 cleanup, CMPNE, and x86 updates while retaining the RDNA3 direct renderer. The AMD kernel integration explicitly preserves HIP CDNA support and restricts the direct renderer to RDNA3/4.",
-      "github_ci": "gh run list returned no workflow runs for this personal-fork branch; no PR was opened.",
+    "counted_tinygrad_lines": 32083,
+    "counted_line_delta_vs_fetched_master": 6574,
+    "size_gate_note": "Upstream .github/workflows/test.yml runs MAX_LINE_COUNT=26500 python sz.py as a Unit Tests CI step. Current count is 32083 versus origin/master 25509, so this branch fails that gate by 5583 lines. Do not raise the limit or hide backend code to claim a pass.",
+    "master_delta": "Against origin/master eed5bc2ab, merge commit 383b994fa is 183 commits ahead and 0 behind; current candidate tip 586124d84 is 184 ahead and 0 behind. The merge includes upstream rangeify/gater, CDNA LLM, GLM MLA, RDMA barrier, emulator stats, HCQ1 cleanup, CMPNE, and x86 updates while retaining the RDNA3 direct renderer. The AMD kernel integration preserves HIP CDNA support and restricts the direct renderer to RDNA3/4.",
+      "github_ci": "No CI runs exist for this feature branch because push CI targets master and pull_request; workflow_dispatch was attempted for Unit Tests and rejected because Actions are disabled on the personal fork. No PR was opened.",
       "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 remain outside the 10% HIP-gap target. The RDNA3 DIRECT dynamic MoE path has a strong earlier prompt-128/32-token prefill result (544.220 tok/s vs HIP 131.263). The 2026-10-25 paired natural Qwen3 Coder 30B prompt matches all 32 returned token IDs: DIRECT decode 104.919 vs HIP 127.321 tok/s and prefill 173.569 vs HIP 89.082 tok/s. One-step profiling points to Q4/Q8 and generic E_2_4 costs, but does not prove full gap attribution. No broad parity claim.",
       "latest_master_merge_audit_2026_10_25": {
         "master": "eed5bc2ab9e1bdd83477e3a5e95c064e6fb8b15e",
