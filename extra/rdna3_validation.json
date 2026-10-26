@@ -1013,6 +1013,17 @@
       "outputs": {"direct": [220, 16, 15], "hip": [220, 16, 15], "all_33_token_ids_match": true},
       "interpretation": "DIRECT is ~4.08x faster on this synthetic MoE-heavy prefill and ~4% faster on decode in this single run. The repetitive output and one-sided run order make this a correctness/integration smoke and directional result, not a natural-prompt or broad model-performance claim."
     },
+    "post_master_q6_wmma_interleave_probe_2026_10_25": {
+      "source_merge_commit": "383b994fae2bf6edb9357e73dd92cab6168bd101",
+      "device": "gfx1100 / PCI 1002:744c",
+      "method": "DIRECT only; Q6_K 4096x4096 at T16/T32/T64; 60 synchronized TinyJit samples per child; independent reference check in every child.",
+      "median_us_interleave_off_on": {
+        "t16": {"off": 180.729, "on": 179.949, "max_abs_err": 0.000244140625},
+        "t32": {"off": 201.919, "on": 233.505, "max_abs_err": 0.000244140625},
+        "t64": {"off": 252.685, "on": 328.487, "max_abs_err": 0.000244140625}
+      },
+      "decision": "Do not enable interleave for this path: T16 is within noise, while T32 is ~16% slower and T64 ~30% slower. Correctness is unchanged; the existing opt-in remains off by default."
+    },
     "scope_and_remaining_gaps": {
       "counted_tinygrad_lines": 32063,
       "counted_line_delta_vs_fetched_master": 6558,
