@@ -496,6 +496,21 @@
     "output": {"generated_ids": 33, "direct_sha256": "a3003ecff44279e09f787403c92a8ca171b2f04c77894d1dcac2f54a46a31459", "hip_sha256": "a3003ecff44279e09f787403c92a8ca171b2f04c77894d1dcac2f54a46a31459", "all_ids_match": true},
     "interpretation": "Useful exact-output current-source smoke for a Q4_K/Q6_K MoE model. It repeats the directional prefill win from the earlier synthetic Qwen run but is only one pair; the separate natural-prompt test and Q6 Llama matrix still show other workload-specific tradeoffs."
   },
+  "current_qwen3_coder_30b_natural_2026_10_25": {
+    "measured_commit": "8e702bded",
+    "model": "Qwen3 Coder 30B A3B IT, Ollama GGUF blob sha256-dc987f85086b7d4fb8b3093ff0d952430ab798958e37c457c20ca2e148d55dda",
+    "hardware": "RX 7900-class Navi 31, gfx1100, PCI 1002:744c",
+    "prompt": "Write a short Python function that adds two integers.",
+    "prompt_token_ids": [7985, 264, 2805, 13027, 729, 429, 11367, 1378, 25780, 13],
+    "method": "One fresh same-source run per backend; max_context=512, warmup chunk_size=32, 32 generated IDs total. Prefill rate uses the time to first generated token; decode rate covers the remaining 31 tokens.",
+    "direct": {"load_s": 25.581, "warm_s": 140.227, "prefill_tps": 687.748, "decode_tps": 104.550},
+    "hip": {"load_s": 38.819, "warm_s": 152.188, "prefill_tps": 332.378, "decode_tps": 126.121},
+    "direct_over_hip": {"prefill": 2.069, "decode": 0.829},
+    "output_token_ids": [576, 729, 1265, 2924, 264, 4629, 917, 429, 14758, 1128, 279, 729, 1558, 11, 1181, 5029, 11, 323, 1181, 470, 897, 13, 22406, 11, 279, 729, 1265, 2924, 1946, 10519, 311, 5978],
+    "output_sha256": "35a04c1532d608f8cbff3d443326ad0204dc5ad723852236bda0d7348ba4d928",
+    "all_32_ids_match": true,
+    "interpretation": "Fresh natural-prompt output parity is confirmed. DIRECT is ~2.07x faster on prefill but ~17% slower on decode for this sample; decode remains outside the 10% target. One prompt is not broad language-quality evidence."
+  },
   "latest_full_backend_matrix_2026_10_25": {
     "measured_commit": "8e702bded",
     "device": "RX 7900-class Navi 31, gfx1100, PCI 1002:744c",
