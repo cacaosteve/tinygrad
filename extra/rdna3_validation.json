@@ -496,6 +496,25 @@
     "output": {"generated_ids": 33, "direct_sha256": "a3003ecff44279e09f787403c92a8ca171b2f04c77894d1dcac2f54a46a31459", "hip_sha256": "a3003ecff44279e09f787403c92a8ca171b2f04c77894d1dcac2f54a46a31459", "all_ids_match": true},
     "interpretation": "Useful exact-output current-source smoke for a Q4_K/Q6_K MoE model. It repeats the directional prefill win from the earlier synthetic Qwen run but is only one pair; the separate natural-prompt test and Q6 Llama matrix still show other workload-specific tradeoffs."
   },
+  "latest_full_backend_matrix_2026_10_25": {
+    "measured_commit": "8e702bded",
+    "device": "RX 7900-class Navi 31, gfx1100, PCI 1002:744c",
+    "method": "extra/rdna3_backend_matrix.py on the gaming PC; 60 synchronized TinyJit samples per child with independent NumPy/CPU reference checks before and after timing. DIRECT, AMDLLVM, and HIP. Includes Q6_K multi-token T16/T32/T64. All 33 backend/workload children passed; zero errors.",
+    "median_us_direct_llvm_hip": {
+      "flash_prefill_t32": {"direct": 268.57, "llvm": 423.253, "hip": 332.889, "direct_over_hip": 0.807},
+      "flash_decode_t1": {"direct": 129.6075, "llvm": 250.381, "hip": 111.3335, "direct_over_hip": 1.164},
+      "matmul_h_2048": {"direct": 328.709, "llvm": 292.53, "hip": 299.575, "direct_over_hip": 1.097},
+      "q4_k_gemv_t1": {"direct": 106.228, "llvm": 369.104, "hip": 101.188, "direct_over_hip": 1.050},
+      "q5_k_gemv_t1": {"direct": 107.198, "llvm": 990.7185, "hip": 101.1685, "direct_over_hip": 1.060},
+      "q6_k_gemv_t1": {"direct": 117.378, "llvm": 348.95, "hip": 109.053, "direct_over_hip": 1.076},
+      "iq4_xs_gemv_t1": {"direct": 122.433, "llvm": 140.723, "hip": 101.173, "direct_over_hip": 1.210},
+      "q8_0_gemv_t1": {"direct": 110.478, "llvm": 119.173, "hip": 107.4385, "direct_over_hip": 1.028},
+      "q6_k_gemv_t16": {"direct": 179.722, "llvm": 365.7345, "hip": 143.818, "direct_over_hip": 1.250},
+      "q6_k_gemv_t32": {"direct": 202.4015, "llvm": 434.428, "hip": 165.222, "direct_over_hip": 1.225},
+      "q6_k_gemv_t64": {"direct": 250.121, "llvm": 619.671, "hip": 190.177, "direct_over_hip": 1.315}
+    },
+    "interpretation": "DIRECT beats HIP on flash prefill and is within 10% on ordinary Q4/Q5/Q6/Q8 single-token GEMV. Remaining measured >10% gaps are flash decode (+16%), IQ4_XS GEMV (+21%), Q6_K WMMA multi-token (+22–32%), and half matmul (+9.7%, near the bar). AMDLLVM is much slower on quantized GEMV/flash; half matmul is its small win. This is a bounded suite, not universal workload coverage."
+  },
   "kfd_completion_events": {
     "commit": "cf95684e7",
     "physical_gate": "34 tests and 20 subtests passed after d9e42c45e, including fresh compute-first startup and six drained-event compute/copy wake checks. Without the wake fix all six checks return WAIT_RESULT_TIMEOUT; with it they return COMPLETE.",
