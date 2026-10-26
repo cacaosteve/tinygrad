@@ -1,9 +1,9 @@
 {
   "date": "2026-10-25",
   "source_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
-  "upstream_master": "eed5bc2ab9e1bdd83477e3a5e95c064e6fb8b15e",
-  "status": "The candidate has been integrated with origin/master eed5bc2ab and passes the serial gfx1100 AMD hardware/LLM suite (900 passed, 1 skipped, 429 subtests), CPU/UOp/LLM regressions (788 passed, 9 skipped, 2 xfailed, 169 subtests), Ruff, and mypy (222 files). Batched quant WMMA testing found Q4/Q5 near HIP at T16/T32 but 24–36% slower at T64, while IQ4/Q8 are 26–62% slower for T16/T32/T64. Decode, half matmul, and Q6 multi-token also remain >10% slower than HIP. Qwen3 30B synthetic MoE prefill is strong; Llama 3.2 1B is throughput-competitive but differed from HIP by two punctuation tokens consistently, so token-exact model parity is not established. Important PR blocker: upstream .github/workflows/test.yml enforces MAX_LINE_COUNT=26500; current sz.py count is 32083, 5583 over the gate. GitHub Actions is disabled on the personal fork, so manual CI dispatch is unavailable. No PR has been opened.",
-  "candidate_state": "The candidate branch now contains a validated merge of origin/master eed5bc2ab plus the RDNA3 source tip 44e769cdaceb56004b077ca1ef040226ac4321f9. Validation ran on Navi31 PCI 1002:744c (gfx1100); Ruff and mypy pass. The emulator checkout/sources were not touched. No PR is open.",
+  "upstream_master": "c10034fc2f507db94833b656e86250565c0086dd",
+  "status": "The candidate is merged through origin/master c10034fc2 and passes the latest serial RX 7900/gfx1100 suite (835 passed, 96 skipped, 53 subtests), focused UOp/isel tests (86 passed, 3 skipped, 1 xfailed, 2 subtests), Ruff, and mypy (222 files). Earlier CPU/UOp/LLM regressions also passed. Batched quant WMMA testing found Q4/Q5 near HIP at T16/T32 but 24–36% slower at T64, while IQ4/Q8 are 26–62% slower for T16/T32/T64. Decode, half matmul, and Q6 multi-token also remain >10% slower than HIP. Qwen3 30B natural prompt output matched 32 tokens; Llama 3.2 1B Q6 synthetic output differed from HIP by two punctuation tokens, so token-exact model parity is not established broadly. The upstream .github/workflows/test.yml size gate still fails: 32,083 lines versus 26,500 (5,583 over). GitHub Actions is disabled on the personal fork, so manual CI dispatch is unavailable. No PR has been opened.",
+  "candidate_state": "The candidate branch is at merge commit da2ddea79, incorporating origin/master c10034fc2 plus the RDNA3 source tip 44e769cdaceb56004b077ca1ef040226ac4321f9. The latest merged code was tested on Navi31 PCI 1002:744c (gfx1100); Ruff, mypy, and the focused UOp/isel tests pass. The emulator checkout/sources were not touched. No PR is open.",
   "constraints": {
     "pull_request_opened": false,
     "branch_pushed": true,
@@ -616,14 +616,15 @@
     "compile_profile": "Large Q6 compile ~1029 ms after cleanup; estimates ~22 ms, rewrite ~608 ms. Estimates alone are not the dominant cold-compile bottleneck."
   },
   "current_validation": {
-    "tested_tip": "0b5a39a95 (isolated remote test checkout; product source 44e769cda)",
+    "tested_tip": "da2ddea79 (candidate after merging origin/master c10034fc2)",
     "hardware": {
       "device": "Navi31 / gfx1100, PCI 1002:744c",
-      "suite": "DEV=AMD:AMD pytest test/amd/hw test/device/amd/test_llm.py -x -q",
-      "passed": 900,
-      "skipped": 1,
-      "subtests": 429,
-      "seconds": 194.48
+      "suite": "AMD_SOFT_SYSFS=1 python -m pytest test/amd/hw test/device/amd/test_llm.py -x -q",
+      "passed": 835,
+      "skipped": 96,
+      "subtests": 53,
+      "seconds": 75.28,
+      "note": "Post-merge run; no failures."
     },
     "hardware_retest_2026_10_24": {
       "command": "AMD_SOFT_SYSFS=1 DEV=AMD:AMD pytest test/amd/hw test/device/amd/test_llm.py -x -q",
@@ -1122,10 +1123,10 @@
     "counted_tinygrad_lines": 32083,
     "counted_line_delta_vs_fetched_master": 6574,
     "size_gate_note": "Upstream .github/workflows/test.yml runs MAX_LINE_COUNT=26500 python sz.py as a Unit Tests CI step. Current count is 32083 versus origin/master 25509, so this branch fails that gate by 5583 lines. Do not raise the limit or hide backend code to claim a pass.",
-    "master_delta": "The candidate remains 0 commits behind origin/master eed5bc2ab. It includes merge commit 383b994fa plus later docs-only validation updates. The merge includes upstream rangeify/gater, CDNA LLM, GLM MLA, RDMA barrier, emulator stats, HCQ1 cleanup, CMPNE, and x86 updates while retaining the RDNA3 direct renderer. The AMD kernel integration preserves HIP CDNA support and restricts the direct renderer to RDNA3/4.",
+    "master_delta": "The candidate remains 0 commits behind origin/master c10034fc2. It includes prior merge 383b994fa and follow-up merge da2ddea79. Upstream's only change since eed5bc2ab removes a dead ast.arg-is-None check; the preceding KernelInfo assertion makes the new condition equivalent. The RDNA3 renderer and HIP/CDNA integration remain intact.",
       "github_ci": "No CI runs exist for this feature branch because push CI targets master and pull_request; workflow_dispatch was attempted for Unit Tests and rejected because Actions are disabled on the personal fork. No PR was opened.",
       "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 remain outside the 10% HIP-gap target. The RDNA3 DIRECT dynamic MoE path has a strong earlier prompt-128/32-token prefill result (544.220 tok/s vs HIP 131.263). The 2026-10-25 paired natural Qwen3 Coder 30B prompt matches all 32 returned token IDs: DIRECT decode 104.919 vs HIP 127.321 tok/s and prefill 173.569 vs HIP 89.082 tok/s. One-step profiling points to Q4/Q8 and generic E_2_4 costs, but does not prove full gap attribution. No broad parity claim.",
-      "latest_master_merge_audit_2026_10_25": {
+      "previous_master_merge_audit_2026_10_25": {
         "master": "eed5bc2ab9e1bdd83477e3a5e95c064e6fb8b15e",
         "merge_commit": "383b994fae2bf6edb9357e73dd92cab6168bd101",
         "branch_ahead_behind": {"ahead": 183, "behind": 0},
@@ -1133,11 +1134,32 @@
         "validation": {"gfx1100_hardware": "900 passed, 1 skipped, 429 subtests in 208.70s", "cpu_uop_llm": "788 passed, 9 skipped, 2 xfailed, 169 subtests in 208.68s", "ruff": "passed", "mypy": "passed; 222 source files"},
         "decision": "The merge is validation-clean on the RX 7900. Remaining performance gaps are recorded in post_master_merge_matrix_2026_10_25; no universal parity claim."
       },
+      "latest_master_merge_audit_2026_10_25": {
+        "master": "c10034fc2f507db94833b656e86250565c0086dd",
+        "previous_master": "eed5bc2ab9e1bdd83477e3a5e95c064e6fb8b15e",
+        "merge_commit": "da2ddea79c72af9b5e392e98319b2f16adb765c4",
+        "branch_ahead_behind_at_merge": {"ahead": 193, "behind": 0},
+        "diff": "One upstream line removes the unreachable ast.arg-is-None fallback after an assertion that ast.arg is KernelInfo. Conflict resolved to the upstream condition while preserving compile-timing and WMMA-scheduling hooks.",
+        "validation": {
+          "gfx1100_hardware": "835 passed, 96 skipped, 53 subtests in 75.28s",
+          "focused_uop_isel": "86 passed, 3 skipped, 1 xfailed, 2 subtests",
+          "ruff": "passed",
+          "mypy": "passed; 222 source files",
+          "pytest_xdist": "Unavailable in local environment; serial execution used."
+        },
+        "decision": "Merge is clean and tested. No PR was opened and the emulator checkout was not touched."
+      },
       "gabriel_latest_review_2026_10_25": {
         "reg_memory_tip": "d7f57dc69055a9c31ef06c7ff4d6d0de0f55af92",
         "changes": "Two commits, 4 files: codegen/__init__.py, generic late regalloc, ISA renderer interface, and x86. Replaces the Register dataclass with named REG ALLOC nodes/classes, aligning with the Discord proposal to represent virtual registers explicitly in the graph.",
         "rdna3_relevance": "Architectural idea only; the branch changes no RDNA3 files and has no RDNA3 performance evidence.",
-        "review": "Not ready to cherry-pick: x86 pin still calls the new IselContext.vreg with its old argument order, and LinearScanRegallocContext.vdef is commented out. early_estimates and ins_is_call_v3 remain generic renderer/CALL work, not RDNA3 optimization."
+        "review": "Not ready to cherry-pick: x86 pin still calls the new IselContext.vreg with its old argument order, and LinearScanRegallocContext.vdef is commented out. early_estimates and ins_is_call_v3 remain generic renderer/CALL work, not RDNA3 optimization.",
+        "fresh_refs_after_fetch_2026_10_25": {
+          "reg_memory": "Unchanged at d7f57dc69 (Oct 25); 4 files and no RDNA3/AMD implementation changes.",
+          "early_estimates": "a7034469b (Oct 22); generic renderer/codegen estimate work and tests, no RDNA3 implementation or hardware speed evidence.",
+          "remove_range": "e9c9a30f3 (Oct 21); broad UOp/renderer work, no RDNA3 implementation changes.",
+          "decision": "No fetched Gabriel branch provides a safe RDNA3 cherry-pick or new RX 7900 performance result."
+        }
       },
       "focused_quant_matrix_2026_10_25": {
         "source_code_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
