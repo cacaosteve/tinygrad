@@ -3,7 +3,8 @@ import enum, functools, itertools, math, pathlib, re
 from dataclasses import dataclass, replace
 from typing import Callable, TypeVar
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
-from tinygrad.llm.kernels.amd import Q8_0, Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, amd_direct_isa
+from tinygrad.llm.kernels.amd import (Q8_0, Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention,
+                                      amd_custom_kernels_supported, amd_direct_isa)
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
 from tinygrad.uop.ops import resolve
 from tinygrad.helpers import unwrap, round_up
