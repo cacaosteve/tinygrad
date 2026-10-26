@@ -1026,7 +1026,12 @@
         "mismatch_indices": [13, 25],
         "replay": "Each backend reproduced its same token sequence on the second run. The two mismatches are token 627 ('.\\n') on DIRECT versus 198 ('\\n') on HIP; remaining 31 output IDs match."
       },
-      "interpretation": "DIRECT prefill throughput is ~5% higher and decode throughput ~25% higher in these paired repeats. Text differs only by two punctuation tokens in this synthetic completion, but strict token-exact model parity is false; broader/natural prompt evaluation is still needed."
+      "natural_prompt_followup": {
+        "prompt": "Write a short Python function that adds two integers.",
+        "method": "Interactive tinygrad.llm.cli with the GGUF model's chat template; one DIRECT and one HIP completion.",
+        "result": "Both backends generated the same valid add_integers function and docstring, but completions were not text-identical: titles, examples, and some prose differed. This is semantic agreement on one prompt, not token equality or a model-quality benchmark."
+      },
+      "interpretation": "DIRECT prefill throughput is ~5% higher and decode throughput ~25% higher in paired synthetic-prompt repeats. Strict token-exact model parity is false on the synthetic prompt, although the two token differences only add periods before newlines; the natural prompt produced a semantically equivalent but text-different answer."
     },
     "post_master_q6_wmma_interleave_probe_2026_10_25": {
       "source_merge_commit": "383b994fae2bf6edb9357e73dd92cab6168bd101",
