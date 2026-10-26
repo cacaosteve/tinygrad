@@ -2,7 +2,7 @@
   "date": "2026-10-25",
   "source_commit": "44e769cdaceb56004b077ca1ef040226ac4321f9",
   "upstream_master": "eed5bc2ab9e1bdd83477e3a5e95c064e6fb8b15e",
-  "status": "The candidate has been integrated with origin/master eed5bc2ab and passes the serial gfx1100 AMD hardware/LLM suite (900 passed, 1 skipped, 429 subtests), CPU/UOp/LLM regressions (788 passed, 9 skipped, 2 xfailed, 169 subtests), Ruff, and mypy (222 files). The paired kernel matrix is correct, but DIRECT remains >10% slower than HIP on decode, half matmul, IQ4, and Q6 multi-token GEMV. Qwen3 30B synthetic MoE prefill is strong; Llama 3.2 1B is throughput-competitive but differed from HIP by two punctuation tokens consistently, so token-exact model parity is not established. Important PR blocker: upstream .github/workflows/test.yml enforces MAX_LINE_COUNT=26500; current sz.py count is 32083, 5583 over the gate. GitHub Actions is disabled on the personal fork, so manual CI dispatch is unavailable. No PR has been opened.",
+  "status": "The candidate has been integrated with origin/master eed5bc2ab and passes the serial gfx1100 AMD hardware/LLM suite (900 passed, 1 skipped, 429 subtests), CPU/UOp/LLM regressions (788 passed, 9 skipped, 2 xfailed, 169 subtests), Ruff, and mypy (222 files). Batched quant WMMA testing found Q4/Q5 near HIP at T16/T32 but 24–36% slower at T64, while IQ4/Q8 are 26–62% slower for T16/T32/T64. Decode, half matmul, and Q6 multi-token also remain >10% slower than HIP. Qwen3 30B synthetic MoE prefill is strong; Llama 3.2 1B is throughput-competitive but differed from HIP by two punctuation tokens consistently, so token-exact model parity is not established. Important PR blocker: upstream .github/workflows/test.yml enforces MAX_LINE_COUNT=26500; current sz.py count is 32083, 5583 over the gate. GitHub Actions is disabled on the personal fork, so manual CI dispatch is unavailable. No PR has been opened.",
   "candidate_state": "The candidate branch now contains a validated merge of origin/master eed5bc2ab plus the RDNA3 source tip 44e769cdaceb56004b077ca1ef040226ac4321f9. Validation ran on Navi31 PCI 1002:744c (gfx1100); Ruff and mypy pass. The emulator checkout/sources were not touched. No PR is open.",
   "constraints": {
     "pull_request_opened": false,
@@ -1044,11 +1044,31 @@
       },
       "decision": "Do not enable interleave for this path: T16 is within noise, while T32 is ~16% slower and T64 ~30% slower. Correctness is unchanged; the existing opt-in remains off by default."
     },
+    "post_master_quant_wmma_prefill_2026_10_25": {
+      "source_merge_commit": "383b994fae2bf6edb9357e73dd92cab6168bd101",
+      "device": "gfx1100 / PCI 1002:744c",
+      "method": "DIRECT and HIP; Q4_K/Q5_K/IQ4_XS/Q8_0, 8192x2048 at T16/T32/T64; 60 synchronized TinyJit samples per child with independent reference checks.",
+      "median_us_direct_vs_hip": {
+        "q4_k_t16": {"direct": 117.5425, "hip": 116.558, "direct_over_hip": 1.008},
+        "q4_k_t32": {"direct": 122.628, "hip": 121.853, "direct_over_hip": 1.006},
+        "q4_k_t64": {"direct": 157.084, "hip": 126.968, "direct_over_hip": 1.237},
+        "q5_k_t16": {"direct": 122.573, "hip": 114.923, "direct_over_hip": 1.067},
+        "q5_k_t32": {"direct": 127.8285, "hip": 122.143, "direct_over_hip": 1.047},
+        "q5_k_t64": {"direct": 176.2145, "hip": 129.123, "direct_over_hip": 1.365},
+        "iq4_xs_t16": {"direct": 153.854, "hip": 122.3285, "direct_over_hip": 1.258},
+        "iq4_xs_t32": {"direct": 170.494, "hip": 113.858, "direct_over_hip": 1.497},
+        "iq4_xs_t64": {"direct": 180.9295, "hip": 123.028, "direct_over_hip": 1.471},
+        "q8_0_t16": {"direct": 163.364, "hip": 110.793, "direct_over_hip": 1.475},
+        "q8_0_t32": {"direct": 178.4695, "hip": 123.048, "direct_over_hip": 1.450},
+        "q8_0_t64": {"direct": 208.18, "hip": 128.478, "direct_over_hip": 1.620}
+      },
+      "interpretation": "Q4/Q5 WMMA prefill is near parity through T32 but falls behind at T64; IQ4_XS and Q8_0 show a substantial DIRECT gap at every tested batch. This is now the clearest measured optimization target, not the Q4/Q5 single-token GEMV path."
+    },
     "scope_and_remaining_gaps": {
     "counted_tinygrad_lines": 32083,
     "counted_line_delta_vs_fetched_master": 6574,
     "size_gate_note": "Upstream .github/workflows/test.yml runs MAX_LINE_COUNT=26500 python sz.py as a Unit Tests CI step. Current count is 32083 versus origin/master 25509, so this branch fails that gate by 5583 lines. Do not raise the limit or hide backend code to claim a pass.",
-    "master_delta": "Against origin/master eed5bc2ab, merge commit 383b994fa is 183 commits ahead and 0 behind; current candidate tip 586124d84 is 184 ahead and 0 behind. The merge includes upstream rangeify/gater, CDNA LLM, GLM MLA, RDMA barrier, emulator stats, HCQ1 cleanup, CMPNE, and x86 updates while retaining the RDNA3 direct renderer. The AMD kernel integration preserves HIP CDNA support and restricts the direct renderer to RDNA3/4.",
+    "master_delta": "Against origin/master eed5bc2ab, merge commit 383b994fa is 183 commits ahead and 0 behind; current candidate tip 1b1fc4eaf is 189 ahead and 0 behind. The merge includes upstream rangeify/gater, CDNA LLM, GLM MLA, RDMA barrier, emulator stats, HCQ1 cleanup, CMPNE, and x86 updates while retaining the RDNA3 direct renderer. The AMD kernel integration preserves HIP CDNA support and restricts the direct renderer to RDNA3/4.",
       "github_ci": "No CI runs exist for this feature branch because push CI targets master and pull_request; workflow_dispatch was attempted for Unit Tests and rejected because Actions are disabled on the personal fork. No PR was opened.",
       "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 remain outside the 10% HIP-gap target. The RDNA3 DIRECT dynamic MoE path has a strong earlier prompt-128/32-token prefill result (544.220 tok/s vs HIP 131.263). The 2026-10-25 paired natural Qwen3 Coder 30B prompt matches all 32 returned token IDs: DIRECT decode 104.919 vs HIP 127.321 tok/s and prefill 173.569 vs HIP 89.082 tok/s. One-step profiling points to Q4/Q8 and generic E_2_4 costs, but does not prove full gap attribution. No broad parity claim.",
       "latest_master_merge_audit_2026_10_25": {
