@@ -485,6 +485,17 @@
     },
     "interpretation": "Q8_0 end-to-end evidence on the latest merged source: repeated short runs and one 4096-token-context pair favor DIRECT, with exact output IDs in the long pair. This does not contradict the separate Q6_K model matrix, which still shows a DIRECT prefill deficit. Numeric-prompt runs on one model are not broad language-quality or universal parity evidence."
   },
+  "current_qwen3_coder_30b_smoke_2026_10_25": {
+    "measured_commit": "8e702bded",
+    "model": "Qwen3 Coder 30B A3B IT, Ollama GGUF blob sha256-dc987f85086b7d4fb8b3093ff0d952430ab798958e37c457c20ca2e148d55dda",
+    "hardware": "RX 7900-class Navi 31, gfx1100, PCI 1002:744c",
+    "method": "One paired run per backend on the same source: synthetic 128-token numeric prompt, 32 decode tokens, max_context=512, chunk_size=32. Warmup completed before throughput timing.",
+    "direct": {"load_s": 85.918, "warm_s": 140.594, "prefill_tps": 535.565, "decode_tps": 105.584},
+    "hip": {"load_s": 31.760, "warm_s": 153.003, "prefill_tps": 128.370, "decode_tps": 101.248},
+    "direct_over_hip": {"prefill": 4.172, "decode": 1.043},
+    "output": {"generated_ids": 33, "direct_sha256": "a3003ecff44279e09f787403c92a8ca171b2f04c77894d1dcac2f54a46a31459", "hip_sha256": "a3003ecff44279e09f787403c92a8ca171b2f04c77894d1dcac2f54a46a31459", "all_ids_match": true},
+    "interpretation": "Useful exact-output current-source smoke for a Q4_K/Q6_K MoE model. It repeats the directional prefill win from the earlier synthetic Qwen run but is only one pair; the separate natural-prompt test and Q6 Llama matrix still show other workload-specific tradeoffs."
+  },
   "kfd_completion_events": {
     "commit": "cf95684e7",
     "physical_gate": "34 tests and 20 subtests passed after d9e42c45e, including fresh compute-first startup and six drained-event compute/copy wake checks. Without the wake fix all six checks return WAIT_RESULT_TIMEOUT; with it they return COMPLETE.",
