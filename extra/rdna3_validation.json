@@ -1003,6 +1003,16 @@
       },
       "interpretation": "Prefill is a measured win; decode, half matmul, IQ4, and multi-token Q6 remain >10% slower than HIP. This is a focused matrix, not universal workload coverage."
     },
+    "post_master_qwen3_30b_smoke_2026_10_25": {
+      "source_merge_commit": "383b994fae2bf6edb9357e73dd92cab6168bd101",
+      "model": "Qwen3 Coder 30B A3B IT, Ollama GGUF blob sha256-dc987f85086b7d4fb8b3093ff0d952430ab798958e37c457c20ca2e148d55dda",
+      "device": "gfx1100 / PCI 1002:744c",
+      "method": "Same extra/benchmark_llm.py command/config on DIRECT then HIP: synthetic 128-token prompt, 32 generated tokens, max_context=512, chunk_size=32; one run per backend.",
+      "direct": {"load_s": 63.629, "warm_s": 141.239, "prefill_tps": 526.010, "decode_tps": 105.618},
+      "hip": {"load_s": 30.558, "warm_s": 152.393, "prefill_tps": 129.064, "decode_tps": 101.420},
+      "outputs": {"direct": [220, 16, 15], "hip": [220, 16, 15], "all_33_token_ids_match": true},
+      "interpretation": "DIRECT is ~4.08x faster on this synthetic MoE-heavy prefill and ~4% faster on decode in this single run. The repetitive output and one-sided run order make this a correctness/integration smoke and directional result, not a natural-prompt or broad model-performance claim."
+    },
     "scope_and_remaining_gaps": {
       "counted_tinygrad_lines": 32063,
       "counted_line_delta_vs_fetched_master": 6558,
