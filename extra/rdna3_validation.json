@@ -1064,11 +1064,55 @@
       },
       "interpretation": "Q4/Q5 WMMA prefill is near parity through T32 but falls behind at T64; IQ4_XS and Q8_0 show a substantial DIRECT gap at every tested batch. This is now the clearest measured optimization target, not the Q4/Q5 single-token GEMV path."
     },
+    "quant_wmma_followup_trials_2026_10_25": {
+      "source_tip": "6311a3a66",
+      "device": "gfx1100 / PCI 1002:744c",
+      "method": "Isolated temporary worktrees; every benchmark child checked against the independent NumPy reference. Unless noted, 60 synchronized TinyJit samples per child.",
+      "q8_t64_tile128_trial": {
+        "direct_baseline_run_medians_us": [209.9335, 210.6035, 209.5185],
+        "direct_forced128_run_medians_us": [207.8485, 207.264, 207.5535],
+        "hip_run_medians_us": [128.4975, 128.143],
+        "correct": true,
+        "decision": "About 1.1% faster than baseline, too small to separate confidently from noise; do not change the T64 product policy."
+      },
+      "q8_t128_tile64_trial": {
+        "direct_shipped128_run_medians_us": [231.044, 231.1395, 230.6095],
+        "direct_forced64_run_medians_us": [231.049, 230.739, 230.944],
+        "hip_run_medians_us": [153.948, 152.643],
+        "correct": true,
+        "decision": "The current 128-token tile and forced 64-token tile are tied; retain the existing policy."
+      },
+      "iq4_t32_dequant_halves_trial": {
+        "direct_shared_run_medians_us": [172.292, 171.1965, 171.1065],
+        "direct_unshared_run_medians_us": [171.276, 171.2715, 171.0815],
+        "hip_run_medians_us": [114.1475, 116.757],
+        "allocated_vgpr_wave32": {"direct": 144, "hip": 96},
+        "scratch_bytes": {"direct": 0, "hip": 0},
+        "lds_bytes": {"direct": 1024, "hip": 5120},
+        "correct": true,
+        "decision": "Disabling shared dequant halves did not change allocated VGPRs or runtime. The LUT/dequant-sharing toggle is not the remaining lever."
+      },
+      "q8_t64_resource_snapshot": {
+        "median_us": {"direct": 209.9335, "hip": 128.32025},
+        "allocated_vgpr_wave32": {"direct": 128, "hip": 208},
+        "scratch_bytes": {"direct": 0, "hip": 0},
+        "lds_bytes": {"direct": 0, "hip": 16384},
+        "correct": true,
+        "interpretation": "DIRECT is substantially slower despite lower VGPR allocation and no scratch. VGPR pressure alone cannot explain the Q8 gap; the different LDS/mapping/instruction strategy needs investigation."
+      },
+      "q45_t64_forced_tile64_smoke": {
+        "q4_k": {"direct_us": 157.9025, "baseline_direct_us": 157.084, "hip_us": 126.968, "correct": true},
+        "q5_k": {"direct_us": 178.762, "baseline_direct_us": 176.2145, "correct": true},
+        "samples": 10,
+        "decision": "The wider token tile was correct for these two shapes but showed no speed improvement; keep the validated 32-token product tile."
+      },
+      "next_diagnostic": "Do not keep sweeping tile sizes or dequant-sharing switches. Q8 needs a mapping/LDS/instruction-strategy investigation; IQ4 needs a real reduction in live register demand. SQTT is blocked by the host's privileged stable-clock requirement. No trial code was copied into the candidate."
+    },
     "scope_and_remaining_gaps": {
     "counted_tinygrad_lines": 32083,
     "counted_line_delta_vs_fetched_master": 6574,
     "size_gate_note": "Upstream .github/workflows/test.yml runs MAX_LINE_COUNT=26500 python sz.py as a Unit Tests CI step. Current count is 32083 versus origin/master 25509, so this branch fails that gate by 5583 lines. Do not raise the limit or hide backend code to claim a pass.",
-    "master_delta": "Against origin/master eed5bc2ab, merge commit 383b994fa is 183 commits ahead and 0 behind; current candidate tip 1b1fc4eaf is 189 ahead and 0 behind. The merge includes upstream rangeify/gater, CDNA LLM, GLM MLA, RDMA barrier, emulator stats, HCQ1 cleanup, CMPNE, and x86 updates while retaining the RDNA3 direct renderer. The AMD kernel integration preserves HIP CDNA support and restricts the direct renderer to RDNA3/4.",
+    "master_delta": "Against origin/master eed5bc2ab, merge commit 383b994fa is 183 commits ahead and 0 behind; current candidate tip 6311a3a66 is 190 ahead and 0 behind. The merge includes upstream rangeify/gater, CDNA LLM, GLM MLA, RDMA barrier, emulator stats, HCQ1 cleanup, CMPNE, and x86 updates while retaining the RDNA3 direct renderer. The AMD kernel integration preserves HIP CDNA support and restricts the direct renderer to RDNA3/4.",
       "github_ci": "No CI runs exist for this feature branch because push CI targets master and pull_request; workflow_dispatch was attempted for Unit Tests and rejected because Actions are disabled on the personal fork. No PR was opened.",
       "performance": "IQ4_XS T1 and Q6_K T16/T32/T64 remain outside the 10% HIP-gap target. The RDNA3 DIRECT dynamic MoE path has a strong earlier prompt-128/32-token prefill result (544.220 tok/s vs HIP 131.263). The 2026-10-25 paired natural Qwen3 Coder 30B prompt matches all 32 returned token IDs: DIRECT decode 104.919 vs HIP 127.321 tok/s and prefill 173.569 vs HIP 89.082 tok/s. One-step profiling points to Q4/Q8 and generic E_2_4 costs, but does not prove full gap attribution. No broad parity claim.",
       "latest_master_merge_audit_2026_10_25": {
