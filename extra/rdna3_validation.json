@@ -473,7 +473,17 @@
       ]
     },
     "output_token_ids": [1023, 1024, 529, 1026, 1027, 1028, 1029, 1030, 1031, 1032, 1033, 1034, 1035, 1036, 1037, 1038, 1039],
-    "interpretation": "A useful Q8_0 end-to-end smoke on the latest merged source; it does not contradict the separate Q6_K model matrix, which still shows a DIRECT prefill deficit. This short numeric-prompt run is not broad model-quality or general parity evidence."
+    "long_context_pair": {
+      "prompt_tokens": 4096,
+      "decode_tokens": 512,
+      "max_context": 8192,
+      "chunk_size": 128,
+      "direct": {"prefill_tps": 5948.064, "decode_tps": 302.354, "generated_ids": 513, "output_ids_sha256": "9dec0ed2c9b227699e775adce18120deae153ab86bdcf8581901d7a617572823"},
+      "hip": {"prefill_tps": 1948.388, "decode_tps": 35.463, "generated_ids": 513, "output_ids_sha256": "9dec0ed2c9b227699e775adce18120deae153ab86bdcf8581901d7a617572823"},
+      "direct_over_hip": {"prefill": 3.053, "decode": 8.526},
+      "note": "One same-source pair; all 513 generated IDs match by SHA-256. Stronger context-length correctness and throughput evidence than the short smoke, but still a single numeric prompt on one model."
+    },
+    "interpretation": "Q8_0 end-to-end evidence on the latest merged source: repeated short runs and one 4096-token-context pair favor DIRECT, with exact output IDs in the long pair. This does not contradict the separate Q6_K model matrix, which still shows a DIRECT prefill deficit. Numeric-prompt runs on one model are not broad language-quality or universal parity evidence."
   },
   "kfd_completion_events": {
     "commit": "cf95684e7",
