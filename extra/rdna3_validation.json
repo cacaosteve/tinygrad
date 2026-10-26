@@ -535,6 +535,14 @@
       "hip": {"kernel": "linear_q6_f16_wmma", "private_bytes": 0, "lds_bytes": 16384, "vgpr_allocation_field": 29, "sgpr_allocation_field": 2, "rsrc1": "0x40af009d", "binary_bytes": 9840},
       "interpretation": "DIRECT uses fewer encoded VGPR allocation blocks and no private/LDS storage yet is ~31.5% slower. This argues against spills or register pressure being the sole bottleneck; the remaining gap likely involves instruction/work mapping or dequant scheduling. Resource descriptors alone do not prove the exact cause."
     },
+    "q6_t64_vopd_fmac_trial": {
+      "method": "Alternating fresh-process DIRECT-off, HIP, DIRECT-on, DIRECT-on, HIP, DIRECT-off; 60 synchronized TinyJit samples per child with independent reference checks.",
+      "direct_off_medians_us": [249.809, 249.759],
+      "direct_vopd_fmac_on_medians_us": [248.269, 250.999],
+      "hip_medians_us": [189.3205, 189.176],
+      "all_children_reference_correct": true,
+      "decision": "No meaningful effect: DIRECT medians are 249.784 us off versus 249.634 us on, while HIP is 189.248 us. A preceding single 200.4 us observation did not reproduce and is treated as an outlier. Do not enable VOPD_FMAC for Q6 based on this trial."
+    },
     "interpretation": "DIRECT beats HIP on flash prefill and is within 10% on ordinary Q4/Q5/Q6/Q8 single-token GEMV. Remaining measured >10% gaps are flash decode (+16%), IQ4_XS GEMV (+21%), Q6_K WMMA multi-token (+22–32%), and half matmul (+9.7%, near the bar). AMDLLVM is much slower on quantized GEMV/flash; half matmul is its small win. This is a bounded suite, not universal workload coverage.",
     "q6_t64_two_output_tiles_trial": {
       "setup": "Isolated detached worktree; force output_tiles=2 for direct Q6_K only at T64. No trial code copied into the branch.",
