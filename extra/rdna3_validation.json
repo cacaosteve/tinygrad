@@ -518,6 +518,11 @@
       "setup": "Isolated detached worktree; force output_tiles=2 for direct Q6_K only at T64. No trial code copied into the branch.",
       "result": "Independent reference check failed before timing: half the output columns were zero/incorrect, max absolute error about 4553.48. Baseline one-tile direct is 250.121 us and HIP is 190.177 us from the immediately preceding matrix.",
       "decision": "Reject two output tiles; keep the validated single-output-tile Q6_K layout. The T64 gap needs a different scheduling/dequant strategy."
+    },
+    "q6_t64_nonmixed_dequant_trial": {
+      "setup": "Isolated detached worktree; mixed_q6 enabled only through T32 so T64 uses the 64-token tile and non-mixed f32 multiply/add dequant. No trial code copied into the branch.",
+      "result": {"direct_us": 293.9045, "direct_baseline_us": 250.121, "direct_slowdown": 1.175, "hip_us": 188.8195, "direct_max_abs_error": 0.00024414, "variant_matrix_errors": 0},
+      "decision": "Correct but 17.5% slower than the mixed-Q6 baseline; keep mixed_q6 at T64."
     }
   },
   "kfd_completion_events": {
