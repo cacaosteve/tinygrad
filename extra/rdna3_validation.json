@@ -528,6 +528,13 @@
       "q6_k_gemv_t32": {"direct": 202.4015, "llvm": 434.428, "hip": 165.222, "direct_over_hip": 1.225},
       "q6_k_gemv_t64": {"direct": 250.121, "llvm": 619.671, "hip": 190.177, "direct_over_hip": 1.315}
     },
+    "q6_t64_resource_snapshot": {
+      "shape": "Q6_K 4096x4096, T64, wave32",
+      "method": "Read the compiled code-object descriptor from the direct and HIP kernel binaries on gfx1100; no profiling instrumentation.",
+      "direct": {"kernel": "linear_q6_f16_wmma", "private_bytes": 0, "lds_bytes": 0, "vgpr_allocation_field": 14, "sgpr_allocation_field": 0, "rsrc1": "0x40ac000e", "binary_bytes": 3031},
+      "hip": {"kernel": "linear_q6_f16_wmma", "private_bytes": 0, "lds_bytes": 16384, "vgpr_allocation_field": 29, "sgpr_allocation_field": 2, "rsrc1": "0x40af009d", "binary_bytes": 9840},
+      "interpretation": "DIRECT uses fewer encoded VGPR allocation blocks and no private/LDS storage yet is ~31.5% slower. This argues against spills or register pressure being the sole bottleneck; the remaining gap likely involves instruction/work mapping or dequant scheduling. Resource descriptors alone do not prove the exact cause."
+    },
     "interpretation": "DIRECT beats HIP on flash prefill and is within 10% on ordinary Q4/Q5/Q6/Q8 single-token GEMV. Remaining measured >10% gaps are flash decode (+16%), IQ4_XS GEMV (+21%), Q6_K WMMA multi-token (+22–32%), and half matmul (+9.7%, near the bar). AMDLLVM is much slower on quantized GEMV/flash; half matmul is its small win. This is a bounded suite, not universal workload coverage.",
     "q6_t64_two_output_tiles_trial": {
       "setup": "Isolated detached worktree; force output_tiles=2 for direct Q6_K only at T64. No trial code copied into the branch.",
